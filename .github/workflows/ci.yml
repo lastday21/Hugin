@@ -125,8 +125,8 @@ jobs:
           test "$(docker compose port api 8000)" = "127.0.0.1:8010"
           test "$(docker inspect --format '{{.Config.User}}' "$container_id")" = "10001:10001"
           test "$(docker inspect --format '{{.HostConfig.ReadonlyRootfs}}' "$container_id")" = "true"
-          test "$(docker compose exec --no-tty api id -u)" = "10001"
-          docker compose exec --no-tty api sh -c 'test -w /data'
+          test "$(docker compose exec -T api id -u)" = "10001"
+          docker compose exec -T api sh -c 'test -w /data'
 
       - name: Показать журнал при ошибке
         if: failure()
@@ -176,8 +176,8 @@ jobs:
           test "$(docker compose port api 8000)" = "127.0.0.1:8010"
           test "$(docker inspect --format '{{.Config.User}}' "$container_id")" = "10001:10001"
           test "$(docker inspect --format '{{.HostConfig.ReadonlyRootfs}}' "$container_id")" = "true"
-          test "$(docker compose exec --no-tty api id -u)" = "10001"
-          docker compose exec --no-tty api sh -c 'test -w /data'
+          test "$(docker compose exec -T api id -u)" = "10001"
+          docker compose exec -T api sh -c 'test -w /data'
 
       - name: Показать журнал при ошибке
         if: failure()
