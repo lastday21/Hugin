@@ -1,92 +1,203 @@
-name: CI
+name: Проверка и публикация
 
 on:
   push:
-    branches: ["main"]
+    branches: [main]
   pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hugin-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  UV_NO_PROGRESS: "1"
+  UV_PYTHON_DOWNLOADS: never
+  UV_VERSION: "0.11.28"
 
 jobs:
-  lint:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+  python:
+    name: Python — ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    env:
+      HUGIN_ENVIRONMENT: test
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+    steps:
+      - name: Получить исходный код
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Установить Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.12"
 
-      - name: Install Poetry
-        run: python -m pip install --upgrade pip poetry
+      - name: Установить uv
+        if: runner.os == 'Windows'
+        run: python -m pip install "uv==$env:UV_VERSION"
 
-      - name: Install dependencies
-        run: poetry install --no-interaction --with dev
+      - name: Установить uv
+        if: runner.os != 'Windows'
+        run: python -m pip install "uv==$UV_VERSION"
 
-      - name: Ruff check
-        run: poetry run ruff check .
+      - name: Установить зависимости
+        run: uv sync --locked --all-groups
 
-      - name: Ruff format check
-        run: poetry run ruff format --check .
+      - name: Проверить качество кода
+        run: uv run --no-sync ruff check .
 
-      - name: Mypy
-        run: poetry run mypy --config-file pyproject.toml .
+      - name: Проверить форматирование
+        run: uv run --no-sync ruff format --check .
 
+      - name: Проверить типы
+        run: uv run --no-sync mypy src tests
 
-  unit-tests:
+      - name: Выполнить проверки
+        run: uv run --no-sync pytest --cov=hugin --cov-branch --cov-report=term-missing
+
+  package:
+    name: Пакет Python
+    needs: python
     runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+    timeout-minutes: 10
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+    steps:
+      - name: Получить исходный код
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Установить Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.12"
 
-      - name: Install Poetry
-        run: python -m pip install --upgrade pip poetry
+      - name: Установить uv
+        run: python -m pip install "uv==$UV_VERSION"
 
-      - name: Install dependencies
-        run: poetry install --no-interaction --with dev
+      - name: Собрать пакет
+        run: uv build --clear --no-sources --out-dir dist
 
-      - name: Pytest
-        run: poetry run pytest -m "not integration"
+      - name: Проверить установку пакета
+        shell: bash
+        run: |
+          python -m venv package-check
+          package-check/bin/python -m pip install dist/*.whl
+          package-check/bin/python -c "from hugin.api.app import create_app; assert create_app().title == 'Hugin'"
 
+  container:
+    name: Контейнер
+    if: github.event_name != 'push' || github.ref != 'refs/heads/main'
+    needs: package
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
 
-#  integration-tests:
-#    runs-on: ubuntu-latest
-#    services:
-#      postgres:
-#        image: postgres:16
-#        env:
-#          POSTGRES_USER: postgres
-#          POSTGRES_PASSWORD: postgres
-#          POSTGRES_DB: postgres
-#        ports:
-#          - 5432:5432
-#        options: >-
-#          --health-cmd "pg_isready -U postgres -d postgres"
-#          --health-interval 5s
-#          --health-timeout 5s
-#    env:
-#      APP_ENV: test
-#      DATABASE_URL: postgresql+psycopg://postgres:postgres@localhost:5432/postgres
-#    steps:
-#      - name: Checkout
-#        uses: actions/checkout@v4
-#
-#      - name: Set up Python
-#        uses: actions/setup-python@v5
-#        with:
-#          python-version: "3.12"
-#          cache: "pip"
-#
-#      - name: Install dependencies
-#        run: |
-#          python -m pip install --upgrade pip
-#          pip install -r requirements.txt
-#
-#      - name: Run integration tests
-#        run: |
-#          pytest -q -m integration
+    steps:
+      - name: Получить исходный код
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Проверить настройки контейнера
+        run: |
+          docker compose config --quiet
+          docker build --check .
+
+      - name: Собрать и запустить контейнер
+        run: docker compose up --detach --build --wait
+
+      - name: Проверить ограничения и ответ
+        shell: bash
+        run: |
+          container_id="$(docker compose ps --quiet api)"
+          response="$(curl --fail --silent --show-error http://127.0.0.1:8010/health)"
+          jq --exit-status '.status == "ok" and .service == "hugin" and (.version | type == "string" and length > 0)' <<<"$response"
+          test "$(docker compose port api 8000)" = "127.0.0.1:8010"
+          test "$(docker inspect --format '{{.Config.User}}' "$container_id")" = "10001:10001"
+          test "$(docker inspect --format '{{.HostConfig.ReadonlyRootfs}}' "$container_id")" = "true"
+          test "$(docker compose exec --no-tty api id -u)" = "10001"
+          docker compose exec --no-tty api sh -c 'test -w /data'
+
+      - name: Показать журнал при ошибке
+        if: failure()
+        run: docker compose logs --no-color api
+
+      - name: Остановить контейнер
+        if: always()
+        run: docker compose down --volumes --remove-orphans
+
+  publish:
+    name: Опубликовать образ
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: package
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Получить исходный код
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Проверить настройки контейнера
+        run: |
+          docker compose config --quiet
+          docker build --check .
+
+      - name: Собрать образ
+        run: >-
+          docker build
+          --label "org.opencontainers.image.revision=$GITHUB_SHA"
+          --tag hugin:local
+          .
+
+      - name: Запустить контейнер
+        run: docker compose up --detach --no-build --wait
+
+      - name: Проверить ограничения и ответ
+        shell: bash
+        run: |
+          container_id="$(docker compose ps --quiet api)"
+          response="$(curl --fail --silent --show-error http://127.0.0.1:8010/health)"
+          jq --exit-status '.status == "ok" and .service == "hugin" and (.version | type == "string" and length > 0)' <<<"$response"
+          test "$(docker compose port api 8000)" = "127.0.0.1:8010"
+          test "$(docker inspect --format '{{.Config.User}}' "$container_id")" = "10001:10001"
+          test "$(docker inspect --format '{{.HostConfig.ReadonlyRootfs}}' "$container_id")" = "true"
+          test "$(docker compose exec --no-tty api id -u)" = "10001"
+          docker compose exec --no-tty api sh -c 'test -w /data'
+
+      - name: Показать журнал при ошибке
+        if: failure()
+        run: docker compose logs --no-color api
+
+      - name: Остановить контейнер
+        if: always()
+        run: docker compose down --volumes --remove-orphans
+
+      - name: Войти в хранилище образов
+        shell: bash
+        env:
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "$REGISTRY_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+
+      - name: Опубликовать проверенный образ
+        shell: bash
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          docker tag hugin:local "$image:$GITHUB_SHA"
+          docker tag hugin:local "$image:latest"
+          docker push "$image:$GITHUB_SHA"
+          docker push "$image:latest"
