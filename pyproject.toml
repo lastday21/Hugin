@@ -1,0 +1,46 @@
+[project]
+name = "Replace_me"
+version = "0.1.0"
+requires-python = ">=3.12"
+dynamic = ["dependencies"]
+
+#poetry lock
+#poetry install --with dev
+#poetry run pre-commit install --hook-type pre-push
+
+[tool.poetry]
+package-mode = false
+
+[tool.poetry.dependencies]
+python = "^3.12"
+
+[tool.poetry.group.dev.dependencies]
+ruff = "*"
+mypy = "*"
+pytest = "*"
+pre-commit = "*"
+
+[build-system]
+requires = ["poetry-core>=1.8.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.ruff]
+target-version = "py312"
+
+[tool.pytest.ini_options]
+markers = [
+  "integration: tests requiring database",
+]
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.mypy]
+python_version = "3.12"
+files = ["app", "tests"]
+
+ignore_missing_imports = true
+
+show_error_codes = true
+pretty = true
+warn_unused_ignores = true
+no_implicit_optional = true
