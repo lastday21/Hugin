@@ -22,6 +22,16 @@ uv run hugin
 
 После запуска проверка состояния доступна по адресу `http://127.0.0.1:8000/health`.
 
+При запуске схема SQLite автоматически обновляется до текущей версии. База хранится в каталоге данных Hugin: `%LOCALAPPDATA%\Hugin\hugin.db` в Windows и `/data/hugin.db` в контейнере.
+
+Ручное управление схемой:
+
+```powershell
+uv run hugin-db upgrade
+uv run hugin-db current
+uv run hugin-db downgrade
+```
+
 ## Запуск в Docker
 
 ```powershell

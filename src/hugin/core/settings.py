@@ -30,6 +30,10 @@ class Settings(BaseSettings):
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
     data_dir: Path = Field(default_factory=default_data_dir)
 
+    @property
+    def database_path(self) -> Path:
+        return self.data_dir / "hugin.db"
+
 
 @lru_cache
 def get_settings() -> Settings:

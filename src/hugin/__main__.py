@@ -3,10 +3,12 @@ from __future__ import annotations
 import uvicorn
 
 from hugin.core.settings import get_settings
+from hugin.database import upgrade_database
 
 
 def main() -> None:
     settings = get_settings()
+    upgrade_database(settings)
     uvicorn.run(
         "hugin.api.app:create_app",
         factory=True,

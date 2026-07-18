@@ -18,6 +18,7 @@ def test_explicit_data_directory_is_preserved(tmp_path: Path) -> None:
     settings = Settings(data_dir=tmp_path)
 
     assert settings.data_dir == tmp_path
+    assert settings.database_path == tmp_path / "hugin.db"
 
 
 def test_default_data_directory_uses_local_app_data(
