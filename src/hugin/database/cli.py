@@ -4,12 +4,17 @@ import argparse
 from collections.abc import Sequence
 
 from hugin.core.settings import get_settings
-from hugin.database.schema import current_revision, downgrade_database, upgrade_database
+from hugin.database.schema import (
+    check_database_schema,
+    current_revision,
+    downgrade_database,
+    upgrade_database,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="hugin-db")
-    parser.add_argument("command", choices=("upgrade", "downgrade", "current"))
+    parser.add_argument("command", choices=("upgrade", "downgrade", "current", "check"))
     return parser
 
 
@@ -21,6 +26,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         upgrade_database(settings)
     elif arguments.command == "downgrade":
         downgrade_database(settings)
-    else:
+    elif arguments.command == "current":
         print(current_revision(settings) or "base")
+    else:
+        check_database_schema(settings)
     return 0

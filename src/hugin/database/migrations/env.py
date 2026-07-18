@@ -4,6 +4,7 @@ from alembic import context
 from sqlalchemy import create_engine, pool
 from sqlalchemy.engine import URL
 
+import hugin.database.models  # noqa: F401
 from hugin.database.base import Base
 
 config = context.config

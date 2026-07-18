@@ -29,6 +29,10 @@ def downgrade_database(settings: Settings, revision: str = "base") -> None:
     command.downgrade(_alembic_config(settings), revision)
 
 
+def check_database_schema(settings: Settings) -> None:
+    command.check(_alembic_config(settings))
+
+
 def current_revision(settings: Settings) -> str | None:
     if not settings.database_path.exists():
         return None

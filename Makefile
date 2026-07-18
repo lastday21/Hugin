@@ -1,4 +1,4 @@
-.PHONY: install format lint test check run db-upgrade db-current db-downgrade docker-build docker-up docker-down docker-logs precommit-install
+.PHONY: install format lint test check run db-upgrade db-current db-check db-downgrade docker-build docker-up docker-down docker-logs precommit-install
 
 install:
 	uv sync --all-groups
@@ -25,6 +25,9 @@ db-upgrade:
 
 db-current:
 	uv run hugin-db current
+
+db-check:
+	uv run hugin-db check
 
 db-downgrade:
 	uv run hugin-db downgrade

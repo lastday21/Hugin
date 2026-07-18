@@ -7,6 +7,7 @@ from sqlalchemy import inspect, text
 
 from hugin.core.settings import Settings
 from hugin.database import (
+    check_database_schema,
     cli,
     create_database,
     current_revision,
@@ -37,7 +38,7 @@ def test_migration_reaches_baseline(tmp_path: Path) -> None:
 
     assert current_revision(settings) is None
 
-    upgrade_database(settings)
+    upgrade_database(settings, "0001_baseline")
 
     database = create_database(settings)
     try:
@@ -45,6 +46,10 @@ def test_migration_reaches_baseline(tmp_path: Path) -> None:
         assert current_revision(settings) == "0001_baseline"
     finally:
         database.close()
+
+    upgrade_database(settings)
+    assert current_revision(settings) == "0002_core_entities"
+    check_database_schema(settings)
 
     downgrade_database(settings)
     assert current_revision(settings) is None
@@ -60,5 +65,6 @@ def test_database_cli_manages_schema(
 
     assert cli.main(["upgrade"]) == 0
     assert cli.main(["current"]) == 0
-    assert capsys.readouterr().out.strip() == "0001_baseline"
+    assert capsys.readouterr().out.strip() == "0002_core_entities"
+    assert cli.main(["check"]) == 0
     assert cli.main(["downgrade"]) == 0

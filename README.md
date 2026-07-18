@@ -29,8 +29,11 @@ uv run hugin
 ```powershell
 uv run hugin-db upgrade
 uv run hugin-db current
+uv run hugin-db check
 uv run hugin-db downgrade
 ```
+
+Первая предметная схема хранит вакансии, единственный отклик на каждую вакансию и последовательный журнал событий отклика. Создание намерения отправки и события `APPLY_INTENT` выполняется в одной транзакции.
 
 ## Запуск в Docker
 
