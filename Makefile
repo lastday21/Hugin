@@ -1,16 +1,24 @@
+.PHONY: install format lint test check run precommit-install
+
 install:
-	\tpoetry install --with dev
+	uv sync --all-groups
+
+format:
+	uv run ruff format .
+	uv run ruff check --fix .
 
 lint:
-	\tpoetry run ruff check .
-	\tpoetry run ruff format --check .
-	\tpoetry run mypy --config-file pyproject.toml .
+	uv run ruff check .
+	uv run ruff format --check .
+	uv run mypy
 
 test:
-	\tpoetry run pytest -m "not integration"
+	uv run pytest --cov=hugin --cov-report=term-missing
 
-test-integration:
-	\tpoetry run pytest -m "integration"
+check: lint test
+
+run:
+	uv run hugin
 
 precommit-install:
-	\tpoetry run pre-commit install --hook-type pre-push
+	uv run pre-commit install --hook-type pre-push

@@ -1,34 +1,26 @@
 repos:
-  - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v4.6.0
-    hooks:
-      - id: end-of-file-fixer
-      - id: trailing-whitespace
-      - id: check-yaml
-      - id: check-added-large-files
-
   - repo: local
     hooks:
       - id: ruff-check
         name: ruff-check
-        entry: poetry run ruff check .
+        entry: uv run ruff check .
         language: system
         pass_filenames: false
 
       - id: ruff-format
         name: ruff-format
-        entry: poetry run ruff format --check .
+        entry: uv run ruff format --check .
         language: system
         pass_filenames: false
 
       - id: mypy
         name: mypy
-        entry: poetry run mypy --config-file pyproject.toml .
+        entry: uv run mypy
         language: system
         pass_filenames: false
 
       - id: pytest
         name: pytest
-        entry: poetry run pytest -m "not integration"
+        entry: uv run pytest --cov=hugin --cov-report=term-missing
         language: system
         pass_filenames: false
