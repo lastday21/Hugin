@@ -1,0 +1,35 @@
+name: hugin
+
+services:
+  api:
+    build:
+      context: .
+      target: runtime
+    image: hugin:local
+    environment:
+      HUGIN_API_HOST: 0.0.0.0
+      HUGIN_API_PORT: 8000
+      HUGIN_DATA_DIR: /data
+      HUGIN_ENVIRONMENT: production
+      HUGIN_LOG_LEVEL: ${HUGIN_LOG_LEVEL:-INFO}
+    ports:
+      - "127.0.0.1:${HUGIN_DOCKER_PORT:-8010}:8000"
+    volumes:
+      - hugin-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    init: true
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+volumes:
+  hugin-data:
