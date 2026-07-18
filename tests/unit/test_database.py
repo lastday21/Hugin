@@ -48,7 +48,7 @@ def test_migration_reaches_baseline(tmp_path: Path) -> None:
         database.close()
 
     upgrade_database(settings)
-    assert current_revision(settings) == "0002_core_entities"
+    assert current_revision(settings) == "0003_queue_and_states"
     check_database_schema(settings)
 
     downgrade_database(settings)
@@ -65,6 +65,6 @@ def test_database_cli_manages_schema(
 
     assert cli.main(["upgrade"]) == 0
     assert cli.main(["current"]) == 0
-    assert capsys.readouterr().out.strip() == "0002_core_entities"
+    assert capsys.readouterr().out.strip() == "0003_queue_and_states"
     assert cli.main(["check"]) == 0
     assert cli.main(["downgrade"]) == 0

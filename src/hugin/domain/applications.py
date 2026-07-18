@@ -24,6 +24,7 @@ class ApplicationEventType(StrEnum):
     APPLY_INTENT = "APPLY_INTENT"
     APPLIED = "APPLIED"
     UNKNOWN_RESULT = "UNKNOWN_RESULT"
+    STATE_CHANGED = "STATE_CHANGED"
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,3 +50,9 @@ class DuplicateApplicationError(ValueError):
     def __init__(self, vacancy_id: int) -> None:
         super().__init__(f"Application for vacancy {vacancy_id} already exists")
         self.vacancy_id = vacancy_id
+
+
+class ApplicationNotFoundError(LookupError):
+    def __init__(self, application_id: int) -> None:
+        super().__init__(f"Application {application_id} was not found")
+        self.application_id = application_id
