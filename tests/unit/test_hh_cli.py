@@ -34,7 +34,7 @@ class FakeBrowser:
     authenticated = False
     created: FakeBrowser | None = None
 
-    def __init__(self, profile_dir: object, login_url: str, timeout_ms: int) -> None:
+    def __init__(self, profile_dir: Path, login_url: str, timeout_ms: int) -> None:
         self.profile_dir = profile_dir
         self.login_url = login_url
         self.timeout_ms = timeout_ms
@@ -114,7 +114,7 @@ def test_login_reuses_authenticated_profile(
     assert hh_cli.run(["login", "--account-id", "2"]) == 0
     assert FakeBrowser.created is not None
     assert FakeBrowser.created.opened
-    assert str(FakeBrowser.created.profile_dir).endswith("browser-profiles\\account-2")
+    assert FakeBrowser.created.profile_dir == tmp_path / "browser-profiles" / "account-2"
 
 
 def test_manual_confirmation_can_finish_in_open_browser(
