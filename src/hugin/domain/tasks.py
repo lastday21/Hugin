@@ -20,7 +20,6 @@ class SystemState(StrEnum):
     AUTH_REQUIRED = "AUTH_REQUIRED"
     CAPTCHA_REQUIRED = "CAPTCHA_REQUIRED"
     ACCOUNT_WARNING = "ACCOUNT_WARNING"
-    EMERGENCY_STOPPED = "EMERGENCY_STOPPED"
 
 
 @dataclass(frozen=True, slots=True)

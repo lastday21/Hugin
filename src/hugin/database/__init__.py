@@ -1,4 +1,4 @@
-from hugin.database.engine import Database, create_database, sqlite_url
+from hugin.database.engine import Database, create_database, postgresql_url
 from hugin.database.schema import (
     check_database_schema,
     current_revision,
@@ -12,6 +12,6 @@ __all__ = [
     "create_database",
     "current_revision",
     "downgrade_database",
-    "sqlite_url",
+    "postgresql_url",
     "upgrade_database",
 ]

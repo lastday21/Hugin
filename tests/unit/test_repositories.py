@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from pathlib import Path
 
 import pytest
 from sqlalchemy import func, select
@@ -18,15 +17,11 @@ from hugin.domain import (
 )
 from hugin.repositories import ApplicationRepository, VacancyRepository
 
-
-@pytest.fixture
-def settings(tmp_path: Path) -> Settings:
-    selected = Settings(environment="test", data_dir=tmp_path)
-    upgrade_database(selected)
-    return selected
+pytestmark = pytest.mark.integration
 
 
 def test_vacancy_upsert_preserves_identity_and_updates_data(settings: Settings) -> None:
+    upgrade_database(settings)
     database = create_database(settings)
     published_at = datetime(2026, 7, 18, 10, 0, tzinfo=UTC)
 
@@ -61,6 +56,7 @@ def test_vacancy_upsert_preserves_identity_and_updates_data(settings: Settings) 
 
 
 def test_apply_intent_is_atomic_and_unique_per_vacancy(settings: Settings) -> None:
+    upgrade_database(settings)
     database = create_database(settings)
 
     try:
@@ -105,6 +101,7 @@ def test_apply_intent_is_atomic_and_unique_per_vacancy(settings: Settings) -> No
 
 
 def test_deleting_vacancy_removes_local_application_history(settings: Settings) -> None:
+    upgrade_database(settings)
     database = create_database(settings)
 
     try:

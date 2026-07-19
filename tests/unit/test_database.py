@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from pathlib import Path
-
 import pytest
 from sqlalchemy import inspect, text
 
@@ -15,27 +13,23 @@ from hugin.database import (
     upgrade_database,
 )
 
+pytestmark = pytest.mark.integration
 
-def test_database_enables_integrity_pragmas(tmp_path: Path) -> None:
-    settings = Settings(environment="test", data_dir=tmp_path)
+
+def test_database_uses_postgresql(settings: Settings) -> None:
     database = create_database(settings)
 
     try:
         with database.engine.connect() as connection:
-            foreign_keys = connection.execute(text("PRAGMA foreign_keys")).scalar_one()
-            busy_timeout = connection.execute(text("PRAGMA busy_timeout")).scalar_one()
-            journal_mode = connection.execute(text("PRAGMA journal_mode")).scalar_one()
+            version = connection.execute(text("SHOW server_version_num")).scalar_one()
 
-        assert foreign_keys == 1
-        assert busy_timeout == 5000
-        assert journal_mode == "wal"
+        assert database.engine.dialect.name == "postgresql"
+        assert int(version) >= 180000
     finally:
         database.close()
 
 
-def test_migration_reaches_baseline(tmp_path: Path) -> None:
-    settings = Settings(environment="test", data_dir=tmp_path)
-
+def test_migration_reaches_baseline(settings: Settings) -> None:
     assert current_revision(settings) is None
 
     upgrade_database(settings, "0001_baseline")
@@ -56,11 +50,10 @@ def test_migration_reaches_baseline(tmp_path: Path) -> None:
 
 
 def test_database_cli_manages_schema(
-    tmp_path: Path,
+    settings: Settings,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    settings = Settings(environment="test", data_dir=tmp_path)
     monkeypatch.setattr(cli, "get_settings", lambda: settings)
 
     assert cli.main(["upgrade"]) == 0

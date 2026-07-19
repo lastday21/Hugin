@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 
 import pytest
 from sqlalchemy.orm import Session
@@ -29,12 +28,7 @@ from hugin.repositories import (
 )
 from hugin.services import QueueService
 
-
-@pytest.fixture
-def settings(tmp_path: Path) -> Settings:
-    selected = Settings(environment="test", data_dir=tmp_path)
-    upgrade_database(selected)
-    return selected
+pytestmark = pytest.mark.integration
 
 
 def create_application(session: Session, hh_id: str, resume_hh_id: str) -> int:
@@ -49,6 +43,7 @@ def create_application(session: Session, hh_id: str, resume_hh_id: str) -> int:
 
 
 def test_queue_respects_system_state_and_priority(settings: Settings) -> None:
+    upgrade_database(settings)
     database = create_database(settings)
     now = datetime(2026, 7, 18, 12, 0, tzinfo=UTC)
 
@@ -76,6 +71,7 @@ def test_queue_respects_system_state_and_priority(settings: Settings) -> None:
 
 
 def test_unknown_result_requires_reconciliation_before_retry(settings: Settings) -> None:
+    upgrade_database(settings)
     database = create_database(settings)
     now = datetime(2026, 7, 18, 12, 0, tzinfo=UTC)
 
@@ -128,6 +124,7 @@ def test_unknown_result_requires_reconciliation_before_retry(settings: Settings)
 
 
 def test_missing_system_state_is_reported(settings: Settings) -> None:
+    upgrade_database(settings)
     database = create_database(settings)
 
     try:
@@ -149,6 +146,7 @@ def test_missing_system_state_is_reported(settings: Settings) -> None:
 def test_application_transition_appends_event_and_rejects_invalid_path(
     settings: Settings,
 ) -> None:
+    upgrade_database(settings)
     database = create_database(settings)
 
     try:
@@ -185,6 +183,7 @@ def test_application_transition_appends_event_and_rejects_invalid_path(
 
 
 def test_queue_rejects_invalid_or_duplicate_tasks(settings: Settings) -> None:
+    upgrade_database(settings)
     database = create_database(settings)
 
     try:

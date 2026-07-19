@@ -5,7 +5,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -29,10 +29,12 @@ class Settings(BaseSettings):
     api_port: int = Field(default=8000, ge=1, le=65535)
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
     data_dir: Path = Field(default_factory=default_data_dir)
-
-    @property
-    def database_path(self) -> Path:
-        return self.data_dir / "hugin.db"
+    database_host: str = "127.0.0.1"
+    database_port: int = Field(default=5432, ge=1, le=65535)
+    database_name: str = "hugin"
+    database_user: str = "hugin"
+    database_password: SecretStr = SecretStr("")
+    database_connect_timeout: int = Field(default=5, ge=1, le=60)
 
 
 @lru_cache

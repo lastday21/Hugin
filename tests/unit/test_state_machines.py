@@ -27,7 +27,7 @@ def test_valid_state_transitions() -> None:
     [
         (ApplicationState.VIEWED, ApplicationState.QUEUED, ensure_application_transition),
         (TaskState.COMPLETED, TaskState.RUNNING, ensure_task_transition),
-        (SystemState.EMERGENCY_STOPPED, SystemState.RUNNING, ensure_system_transition),
+        (SystemState.ACCOUNT_WARNING, SystemState.CAPTCHA_REQUIRED, ensure_system_transition),
     ],
 )
 def test_invalid_state_transitions_are_rejected(

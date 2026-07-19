@@ -1,6 +1,29 @@
 name: hugin
 
 services:
+  db:
+    image: postgres:18-bookworm
+    environment:
+      POSTGRES_DB: ${HUGIN_DATABASE_NAME:-hugin}
+      POSTGRES_USER: ${HUGIN_DATABASE_USER:-hugin}
+      POSTGRES_PASSWORD: ${HUGIN_DATABASE_PASSWORD:?Укажите HUGIN_DATABASE_PASSWORD в файле .env}
+    ports:
+      - "127.0.0.1:${HUGIN_POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - hugin-postgres:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
   api:
     build:
       context: .
@@ -10,8 +33,16 @@ services:
       HUGIN_API_HOST: 0.0.0.0
       HUGIN_API_PORT: 8000
       HUGIN_DATA_DIR: /data
+      HUGIN_DATABASE_HOST: db
+      HUGIN_DATABASE_PORT: 5432
+      HUGIN_DATABASE_NAME: ${HUGIN_DATABASE_NAME:-hugin}
+      HUGIN_DATABASE_USER: ${HUGIN_DATABASE_USER:-hugin}
+      HUGIN_DATABASE_PASSWORD: ${HUGIN_DATABASE_PASSWORD:?Укажите HUGIN_DATABASE_PASSWORD в файле .env}
       HUGIN_ENVIRONMENT: production
       HUGIN_LOG_LEVEL: ${HUGIN_LOG_LEVEL:-INFO}
+    depends_on:
+      db:
+        condition: service_healthy
     ports:
       - "127.0.0.1:${HUGIN_DOCKER_PORT:-8010}:8000"
     volumes:
@@ -33,3 +64,4 @@ services:
 
 volumes:
   hugin-data:
+  hugin-postgres:

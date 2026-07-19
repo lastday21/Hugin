@@ -18,7 +18,22 @@ def test_explicit_data_directory_is_preserved(tmp_path: Path) -> None:
     settings = Settings(data_dir=tmp_path)
 
     assert settings.data_dir == tmp_path
-    assert settings.database_path == tmp_path / "hugin.db"
+
+
+def test_database_settings_are_read_from_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HUGIN_DATABASE_HOST", "database.internal")
+    monkeypatch.setenv("HUGIN_DATABASE_PORT", "5544")
+    monkeypatch.setenv("HUGIN_DATABASE_NAME", "hugin_test")
+    monkeypatch.setenv("HUGIN_DATABASE_USER", "hugin_user")
+    monkeypatch.setenv("HUGIN_DATABASE_PASSWORD", "secret")
+
+    settings = Settings()
+
+    assert settings.database_host == "database.internal"
+    assert settings.database_port == 5544
+    assert settings.database_name == "hugin_test"
+    assert settings.database_user == "hugin_user"
+    assert settings.database_password.get_secret_value() == "secret"
 
 
 def test_default_data_directory_uses_local_app_data(

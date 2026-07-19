@@ -7,7 +7,7 @@ from alembic.config import Config
 from alembic.runtime.migration import MigrationContext
 
 from hugin.core.settings import Settings
-from hugin.database.engine import create_database, sqlite_url
+from hugin.database.engine import create_database, postgresql_url
 
 
 def _alembic_config(settings: Settings) -> Config:
@@ -16,12 +16,11 @@ def _alembic_config(settings: Settings) -> Config:
         "script_location",
         str(Path(__file__).with_name("migrations")),
     )
-    config.attributes["database_url"] = sqlite_url(settings.database_path)
+    config.attributes["database_url"] = postgresql_url(settings)
     return config
 
 
 def upgrade_database(settings: Settings, revision: str = "head") -> None:
-    settings.data_dir.mkdir(parents=True, exist_ok=True)
     command.upgrade(_alembic_config(settings), revision)
 
 
@@ -34,9 +33,6 @@ def check_database_schema(settings: Settings) -> None:
 
 
 def current_revision(settings: Settings) -> str | None:
-    if not settings.database_path.exists():
-        return None
-
     database = create_database(settings)
     try:
         with database.engine.connect() as connection:
