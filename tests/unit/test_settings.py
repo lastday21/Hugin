@@ -18,6 +18,12 @@ def test_explicit_data_directory_is_preserved(tmp_path: Path) -> None:
     settings = Settings(data_dir=tmp_path)
 
     assert settings.data_dir == tmp_path
+    assert settings.browser_profile_dir(3) == tmp_path / "browser-profiles" / "account-3"
+
+
+def test_browser_profile_requires_positive_account_id(tmp_path: Path) -> None:
+    with pytest.raises(ValueError):
+        Settings(data_dir=tmp_path).browser_profile_dir(0)
 
 
 def test_database_settings_are_read_from_environment(monkeypatch: pytest.MonkeyPatch) -> None:

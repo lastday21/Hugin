@@ -1,7 +1,7 @@
 .PHONY: install format lint test check run db-upgrade db-current db-check db-downgrade docker-build docker-up docker-down docker-logs precommit-install
 
 install:
-	uv sync --all-groups
+	uv sync --all-groups --all-extras
 
 format:
 	uv run ruff format .

@@ -6,12 +6,14 @@ Hugin — местный персональный агент поиска раб
 
 - Python 3.12;
 - uv 0.11 или новее;
-- Docker Desktop с поддержкой Docker Compose.
+- Docker Desktop с поддержкой Docker Compose;
+- Chromium для Playwright (нужен только видимому браузеру Windows).
 
 ## Подготовка
 
 ```powershell
-uv sync --all-groups
+uv sync --all-groups --all-extras
+uv run playwright install chromium
 Copy-Item .env.example .env
 ```
 
@@ -51,6 +53,25 @@ Invoke-RestMethod http://127.0.0.1:8010/health
 ```
 
 Docker Compose запускает серверную часть и PostgreSQL 18. Порты приложения и базы доступны только через `127.0.0.1`. Данные PostgreSQL хранятся в томе `hugin-postgres`, остальные рабочие данные — в `hugin-data`. Политика `restart: unless-stopped` поднимает контейнеры после запуска Docker Desktop. Видимый браузер и возможности Windows в контейнер не переносятся.
+
+## Вход в hh.ru
+
+Видимый браузер запускается в Windows, а не внутри Docker. Логин и пароль сохраняются
+в защищённом хранилище Windows и не записываются в PostgreSQL, файлы проекта или журнал.
+Команды спрашивают пароль скрыто, поэтому он не остаётся в истории PowerShell.
+
+```powershell
+uv run hugin-hh save --account-id 1
+uv run hugin-hh login --account-id 1
+```
+
+Для каждого аккаунта используется отдельный постоянный профиль Chromium в
+`%LOCALAPPDATA%\Hugin\browser-profiles`. Если hh.ru запросит одноразовый код или проверку,
+программа оставит окно открытым: эти действия выполняются вручную. Удалить сохранённые данные:
+
+```powershell
+uv run hugin-hh delete --account-id 1
+```
 
 Остановка без удаления рабочих данных:
 

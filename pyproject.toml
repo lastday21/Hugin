@@ -13,14 +13,22 @@ dependencies = [
     "uvicorn[standard]>=0.35,<1",
 ]
 
+[project.optional-dependencies]
+browser = [
+    "keyring>=25.6,<26",
+    "playwright>=1.52,<2",
+]
+
 [project.scripts]
 hugin = "hugin.__main__:main"
 hugin-db = "hugin.database.cli:main"
+hugin-hh = "hugin.hh_cli:main"
 
 [dependency-groups]
 dev = [
     "httpx>=0.28,<1",
     "mypy>=1.17,<2",
+    "playwright>=1.52,<2",
     "pre-commit>=4.2,<5",
     "pytest>=8.4,<10",
     "pytest-cov>=6.2,<8",
