@@ -6,11 +6,7 @@ from hugin.domain.applications import ApplicationState
 from hugin.domain.tasks import SystemState, TaskState
 
 APPLICATION_TRANSITIONS: dict[ApplicationState, frozenset[ApplicationState]] = {
-    ApplicationState.DISCOVERED: frozenset({ApplicationState.FILTERED, ApplicationState.CLOSED}),
-    ApplicationState.FILTERED: frozenset({ApplicationState.ANALYZED, ApplicationState.CLOSED}),
-    ApplicationState.ANALYZED: frozenset({ApplicationState.QUEUED, ApplicationState.CLOSED}),
-    ApplicationState.QUEUED: frozenset({ApplicationState.APPLYING, ApplicationState.CLOSED}),
-    ApplicationState.APPLYING: frozenset({ApplicationState.APPLIED}),
+    ApplicationState.APPLYING: frozenset({ApplicationState.APPLIED, ApplicationState.CLOSED}),
     ApplicationState.APPLIED: frozenset(
         {
             ApplicationState.VIEWED,

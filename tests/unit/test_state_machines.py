@@ -25,7 +25,7 @@ def test_valid_state_transitions() -> None:
 @pytest.mark.parametrize(
     ("current", "target", "transition"),
     [
-        (ApplicationState.VIEWED, ApplicationState.QUEUED, ensure_application_transition),
+        (ApplicationState.VIEWED, ApplicationState.APPLYING, ensure_application_transition),
         (TaskState.COMPLETED, TaskState.RUNNING, ensure_task_transition),
         (SystemState.ACCOUNT_WARNING, SystemState.CAPTCHA_REQUIRED, ensure_system_transition),
     ],

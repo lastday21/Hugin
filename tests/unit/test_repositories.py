@@ -15,7 +15,13 @@ from hugin.domain import (
     DuplicateApplicationError,
     VacancyData,
 )
-from hugin.repositories import ApplicationRepository, VacancyRepository
+from hugin.repositories import (
+    AccountRepository,
+    ApplicationRepository,
+    DirectionRepository,
+    ResumeRepository,
+    VacancyRepository,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -55,41 +61,73 @@ def test_vacancy_upsert_preserves_identity_and_updates_data(settings: Settings) 
         database.close()
 
 
-def test_apply_intent_is_atomic_and_unique_per_vacancy(settings: Settings) -> None:
+def test_apply_intent_is_unique_per_account_vacancy_and_resume(settings: Settings) -> None:
     upgrade_database(settings)
     database = create_database(settings)
 
     try:
         with database.sessions.begin() as session:
+            account = AccountRepository(session).create("Main account")
+            resumes = ResumeRepository(session)
+            backend = resumes.upsert(account.id, "resume-1", "Backend developer")
+            automation = resumes.upsert(account.id, "resume-2", "Automation engineer")
+            direction = DirectionRepository(session).create(account.id, "Backend")
+            DirectionRepository(session).attach_resume(direction.id, backend.id)
             vacancy = VacancyRepository(session).upsert(
                 VacancyData(
                     hh_id="456",
-                    title="Backend developer",
+                    title="Python developer",
                     source_url="https://hh.ru/vacancy/456",
                 )
             )
             repository = ApplicationRepository(session)
-            application = repository.create_apply_intent(vacancy.id, "resume-1")
+            first = repository.create_apply_intent(account.id, vacancy.id, backend.id, direction.id)
+            second = repository.create_apply_intent(account.id, vacancy.id, automation.id)
 
-            assert application.state is ApplicationState.APPLYING
-            assert repository.get_by_vacancy_id(vacancy.id) == application
-            assert repository.get_by_vacancy_id(-1) is None
-            events = repository.list_events(application.id)
+            assert first.state is ApplicationState.APPLYING
+            assert repository.get_by_key(account.id, vacancy.id, backend.id) == first
+            assert repository.get_by_key(account.id, vacancy.id, -1) is None
+            assert repository.list_by_vacancy_id(vacancy.id) == [first, second]
+            events = repository.list_events(first.id)
             assert [event.event_type for event in events] == [ApplicationEventType.APPLY_INTENT]
-            assert events[0].payload == {"resume_hh_id": "resume-1"}
+            assert events[0].payload == {
+                "account_id": account.id,
+                "resume_id": backend.id,
+                "direction_id": direction.id,
+            }
 
             with pytest.raises(DuplicateApplicationError) as error:
-                repository.create_apply_intent(vacancy.id, "resume-2")
+                repository.create_apply_intent(account.id, vacancy.id, backend.id)
 
+            assert error.value.account_id == account.id
             assert error.value.vacancy_id == vacancy.id
-            assert session.scalar(select(func.count()).select_from(ApplicationModel)) == 1
-            assert session.scalar(select(func.count()).select_from(ApplicationEventModel)) == 1
+            assert error.value.resume_id == backend.id
+            assert session.scalar(select(func.count()).select_from(ApplicationModel)) == 2
+            assert session.scalar(select(func.count()).select_from(ApplicationEventModel)) == 2
+
+            other_account = AccountRepository(session).create("Other account")
+            other_resume = resumes.upsert(other_account.id, "resume-3", "Other resume")
+            with pytest.raises(ValueError, match="application account"):
+                repository.create_apply_intent(account.id, vacancy.id, other_resume.id)
 
         with database.sessions() as session:
             session.add(
                 ApplicationModel(
+                    account_id=account.id,
                     vacancy_id=vacancy.id,
-                    resume_hh_id="resume-2",
+                    resume_id=other_resume.id,
+                    state=ApplicationState.APPLYING,
+                )
+            )
+            with pytest.raises(IntegrityError):
+                session.commit()
+            session.rollback()
+
+            session.add(
+                ApplicationModel(
+                    account_id=account.id,
+                    vacancy_id=vacancy.id,
+                    resume_id=backend.id,
                     state=ApplicationState.APPLYING,
                 )
             )
@@ -106,6 +144,8 @@ def test_deleting_vacancy_removes_local_application_history(settings: Settings) 
 
     try:
         with database.sessions.begin() as session:
+            account = AccountRepository(session).create("Main account")
+            resume = ResumeRepository(session).upsert(account.id, "resume-1", "Developer")
             vacancy = VacancyRepository(session).upsert(
                 VacancyData(
                     hh_id="789",
@@ -113,7 +153,7 @@ def test_deleting_vacancy_removes_local_application_history(settings: Settings) 
                     source_url="https://hh.ru/vacancy/789",
                 )
             )
-            ApplicationRepository(session).create_apply_intent(vacancy.id, "resume-1")
+            ApplicationRepository(session).create_apply_intent(account.id, vacancy.id, resume.id)
 
         with database.sessions.begin() as session:
             model = session.scalar(select(VacancyModel).where(VacancyModel.id == vacancy.id))

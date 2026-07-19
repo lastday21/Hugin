@@ -21,8 +21,10 @@ from hugin.domain import (
     VacancyData,
 )
 from hugin.repositories import (
+    AccountRepository,
     ApplicationRepository,
     QueueTaskRepository,
+    ResumeRepository,
     SystemStateRepository,
     VacancyRepository,
 )
@@ -32,6 +34,8 @@ pytestmark = pytest.mark.integration
 
 
 def create_application(session: Session, hh_id: str, resume_hh_id: str) -> int:
+    account = AccountRepository(session).create(f"Account {hh_id}")
+    resume = ResumeRepository(session).upsert(account.id, resume_hh_id, f"Resume {hh_id}")
     vacancy = VacancyRepository(session).upsert(
         VacancyData(
             hh_id=hh_id,
@@ -39,7 +43,7 @@ def create_application(session: Session, hh_id: str, resume_hh_id: str) -> int:
             source_url=f"https://hh.ru/vacancy/{hh_id}",
         )
     )
-    return ApplicationRepository(session).create_apply_intent(vacancy.id, resume_hh_id).id
+    return ApplicationRepository(session).create_apply_intent(account.id, vacancy.id, resume.id).id
 
 
 def test_queue_respects_system_state_and_priority(settings: Settings) -> None:
@@ -175,7 +179,7 @@ def test_application_transition_appends_event_and_rejects_invalid_path(
             }
 
             with pytest.raises(InvalidStateTransitionError):
-                repository.transition_state(application_id, ApplicationState.QUEUED)
+                repository.transition_state(application_id, ApplicationState.APPLYING)
             with pytest.raises(ApplicationNotFoundError):
                 repository.transition_state(-1, ApplicationState.APPLIED)
     finally:

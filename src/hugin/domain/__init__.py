@@ -9,6 +9,15 @@ from hugin.domain.applications import (
     DuplicateApplicationError,
     EventPayload,
 )
+from hugin.domain.directions import (
+    AccountRecord,
+    ConfigPayload,
+    DirectionRecord,
+    DirectionVacancyRecord,
+    ResumeRecord,
+    SearchQueryRecord,
+    VacancyState,
+)
 from hugin.domain.state_machines import (
     InvalidStateTransitionError,
     ensure_application_transition,
@@ -27,15 +36,21 @@ from hugin.domain.tasks import (
 from hugin.domain.vacancies import VacancyData, VacancyRecord
 
 __all__ = [
+    "AccountRecord",
     "ApplicationEventRecord",
     "ApplicationEventType",
     "ApplicationNotFoundError",
     "ApplicationRecord",
     "ApplicationState",
+    "ConfigPayload",
+    "DirectionRecord",
+    "DirectionVacancyRecord",
     "DuplicateApplicationError",
     "DuplicateTaskError",
     "EventPayload",
     "InvalidStateTransitionError",
+    "ResumeRecord",
+    "SearchQueryRecord",
     "SystemState",
     "SystemStateNotFoundError",
     "SystemStateRecord",
@@ -44,6 +59,7 @@ __all__ = [
     "TaskState",
     "VacancyData",
     "VacancyRecord",
+    "VacancyState",
     "ensure_application_transition",
     "ensure_system_transition",
     "ensure_task_transition",

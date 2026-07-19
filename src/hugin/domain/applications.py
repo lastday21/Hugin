@@ -8,10 +8,6 @@ type EventPayload = dict[str, str | int | float | bool | None]
 
 
 class ApplicationState(StrEnum):
-    DISCOVERED = "DISCOVERED"
-    FILTERED = "FILTERED"
-    ANALYZED = "ANALYZED"
-    QUEUED = "QUEUED"
     APPLYING = "APPLYING"
     APPLIED = "APPLIED"
     VIEWED = "VIEWED"
@@ -30,8 +26,10 @@ class ApplicationEventType(StrEnum):
 @dataclass(frozen=True, slots=True)
 class ApplicationRecord:
     id: int
+    account_id: int
     vacancy_id: int
-    resume_hh_id: str
+    resume_id: int
+    direction_id: int | None
     state: ApplicationState
     created_at: datetime
     updated_at: datetime
@@ -47,9 +45,14 @@ class ApplicationEventRecord:
 
 
 class DuplicateApplicationError(ValueError):
-    def __init__(self, vacancy_id: int) -> None:
-        super().__init__(f"Application for vacancy {vacancy_id} already exists")
+    def __init__(self, account_id: int, vacancy_id: int, resume_id: int) -> None:
+        super().__init__(
+            f"Application for account {account_id}, vacancy {vacancy_id} "
+            f"and resume {resume_id} already exists"
+        )
+        self.account_id = account_id
         self.vacancy_id = vacancy_id
+        self.resume_id = resume_id
 
 
 class ApplicationNotFoundError(LookupError):
