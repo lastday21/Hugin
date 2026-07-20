@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import ClassVar
 
 from sqlalchemy.orm import Session
@@ -11,11 +12,21 @@ from hugin.repositories.directions import AccountRepository, DirectionRepository
 from hugin.repositories.vacancies import VacancyRepository
 
 
+class RuleCategory(StrEnum):
+    MATCH = "MATCH"
+    STRETCH = "STRETCH"
+    REJECTED = "REJECTED"
+
+
 @dataclass(frozen=True, slots=True)
 class RuleEvaluation:
     score: float
-    accepted: bool
+    category: RuleCategory
     reasons: tuple[str, ...]
+
+    @property
+    def accepted(self) -> bool:
+        return self.category is not RuleCategory.REJECTED
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,15 +44,18 @@ class PythonBackendRules:
         ("machine learning", "другое направление: машинное обучение"),
         ("ml ", "другое направление: машинное обучение"),
         ("ml-", "другое направление: машинное обучение"),
-        ("ai ", "другое направление: искусственный интеллект"),
-        ("ai-", "другое направление: искусственный интеллект"),
-        ("llm", "другое направление: языковые модели"),
-        ("nlp", "другое направление: обработка языка"),
         ("qa ", "другое направление: проверка программ"),
         ("qa-", "другое направление: проверка программ"),
         ("тестир", "другое направление: проверка программ"),
         ("fullstack", "другое направление: полная разработка"),
         ("mobile", "другое направление: мобильная разработка"),
+    )
+    _stretch_specializations: ClassVar[tuple[str, ...]] = (
+        "ai agent",
+        "ai engineer",
+        "llm engineer",
+        "nlp engineer",
+        "rag engineer",
     )
     _seniority_markers: ClassVar[tuple[str, ...]] = ("senior",)
     _useful_skills: ClassVar[tuple[str, ...]] = (
@@ -67,6 +81,7 @@ class PythonBackendRules:
         reasons: list[str] = []
         rejected: list[str] = []
         score = 0.0
+        stretch = any(marker in title for marker in self._stretch_specializations)
 
         for marker, reason in self._excluded_specializations:
             if marker in title:
@@ -86,6 +101,9 @@ class PythonBackendRules:
         if "backend" in title or "back-end" in title or "бэкенд" in title:
             score += 25
             reasons.append("серверная разработка указана в названии")
+        elif "backend" in description or "back-end" in description or "бэкенд" in description:
+            score += 10
+            reasons.append("серверная разработка указана в описании")
         if any(marker in title for marker in ("разработчик", "developer", "программист")):
             score += 15
             reasons.append("роль разработчика указана в названии")
@@ -107,12 +125,20 @@ class PythonBackendRules:
             reasons.append("подходящие технологии: " + ", ".join(matched_skills))
 
         score = min(score, 100)
-        if score < self.threshold and not rejected:
+        if stretch and not rejected:
+            reasons.append("профильная работа по LLM или NLP; требуется дополнительная подготовка")
+        elif score < self.threshold and not rejected:
             rejected.append(f"оценка ниже порога {self.threshold:.0f}")
         reasons.extend(rejected)
+        if rejected:
+            category = RuleCategory.REJECTED
+        elif stretch:
+            category = RuleCategory.STRETCH
+        else:
+            category = RuleCategory.MATCH
         return RuleEvaluation(
             score=score,
-            accepted=not rejected,
+            category=category,
             reasons=tuple(reasons),
         )
 
@@ -205,6 +231,7 @@ class VacancyAnalysisService:
             score=evaluation.score,
             details={
                 "accepted": evaluation.accepted,
+                "category": evaluation.category.value,
                 "reasons": list(evaluation.reasons),
                 "threshold": self._rules.threshold,
             },

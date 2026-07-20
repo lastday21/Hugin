@@ -11,7 +11,7 @@ from hugin.database import create_database, upgrade_database
 from hugin.services.hh_login import HhCredentials, HhLoginService, LoginStatus
 from hugin.services.hh_profile import HhProfileSyncService
 from hugin.services.job_search import JobSearchSyncService
-from hugin.services.vacancy_analysis import VacancyAnalysisService
+from hugin.services.vacancy_analysis import RuleCategory, VacancyAnalysisService
 
 STATUS_MESSAGES = {
     LoginStatus.AUTHENTICATED: "Вход в hh.ru выполнен.",
@@ -186,12 +186,19 @@ def run(argv: Sequence[str] | None = None) -> int:
         finally:
             database.close()
 
-        accepted = sum(result.evaluation.accepted for result in analyzed)
+        matched = sum(result.evaluation.category is RuleCategory.MATCH for result in analyzed)
+        stretch = sum(result.evaluation.category is RuleCategory.STRETCH for result in analyzed)
+        rejected = len(analyzed) - matched - stretch
         print(f"Проверено вакансий: {len(analyzed)}.")
-        print(f"Подходят: {accepted}. Отклонены: {len(analyzed) - accepted}.")
+        print(f"Подходят: {matched}. Пограничные: {stretch}. Отклонены: {rejected}.")
         for analysis_result in analyzed:
             evaluation = analysis_result.evaluation
-            decision = "подходит" if evaluation.accepted else "отклонена"
+            decisions = {
+                RuleCategory.MATCH: "подходит",
+                RuleCategory.STRETCH: "условно подходит",
+                RuleCategory.REJECTED: "отклонена",
+            }
+            decision = decisions[evaluation.category]
             reasons = "; ".join(evaluation.reasons)
             print(
                 f"- {analysis_result.vacancy.title}: {decision}, {evaluation.score:.0f}. {reasons}"

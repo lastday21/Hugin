@@ -154,7 +154,9 @@ def test_job_search_sync_is_repeatable_and_does_not_create_applications(
                 VacancyState.SKIPPED,
             ]
             assert links[0].rules_details["accepted"] is True
+            assert links[0].rules_details["category"] == "MATCH"
             assert links[1].rules_details["accepted"] is False
+            assert links[1].rules_details["category"] == "REJECTED"
             assert session.scalar(select(func.count()).select_from(ApplicationModel)) == 0
             assert session.scalar(select(func.count()).select_from(ApplicationTaskModel)) == 0
 

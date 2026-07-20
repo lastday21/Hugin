@@ -13,6 +13,7 @@ from hugin.core.settings import Settings
 from hugin.domain.hh import HhProfileData, HhResumeData
 from hugin.domain.vacancies import VacancyData, VacancySearchResult
 from hugin.services.hh_login import HhCredentials, LoginStatus
+from hugin.services.vacancy_analysis import RuleCategory
 
 
 class FakeStore:
@@ -319,6 +320,7 @@ def test_analyze_loads_details_and_prints_rule_reasons(
     )
     evaluation = SimpleNamespace(
         accepted=True,
+        category=RuleCategory.MATCH,
         score=75.0,
         reasons=("Python указан в названии",),
     )
@@ -360,7 +362,7 @@ def test_analyze_loads_details_and_prints_rule_reasons(
 
     output = capsys.readouterr().out
     assert "Проверено вакансий: 1" in output
-    assert "Подходят: 1. Отклонены: 0" in output
+    assert "Подходят: 1. Пограничные: 0. Отклонены: 0" in output
     assert "Python указан в названии" in output
     assert FakeBrowser.created is not None
     assert FakeBrowser.created.details_read == ["https://hh.ru/vacancy/vacancy-1"]
