@@ -36,7 +36,9 @@ class Settings(BaseSettings):
     database_password: SecretStr = SecretStr("")
     database_connect_timeout: int = Field(default=5, ge=1, le=60)
     hh_login_url: str = "https://hh.ru/account/login?role=applicant"
-    hh_browser_timeout_ms: int = Field(default=15_000, ge=1_000, le=120_000)
+    hh_resumes_url: str = "https://hh.ru/applicant/resumes"
+    hh_search_url: str = "https://hh.ru/search/vacancy"
+    hh_browser_timeout_ms: int = Field(default=60_000, ge=1_000, le=120_000)
 
     def browser_profile_dir(self, account_id: int) -> Path:
         if account_id < 1:

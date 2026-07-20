@@ -7,7 +7,11 @@ from collections.abc import Sequence
 from hugin.adapters.credentials import WindowsCredentialStore
 from hugin.adapters.hh_browser import VisibleHhBrowser
 from hugin.core.settings import get_settings
+from hugin.database import create_database, upgrade_database
 from hugin.services.hh_login import HhCredentials, HhLoginService, LoginStatus
+from hugin.services.hh_profile import HhProfileSyncService
+from hugin.services.job_search import JobSearchSyncService
+from hugin.services.vacancy_analysis import VacancyAnalysisService
 
 STATUS_MESSAGES = {
     LoginStatus.AUTHENTICATED: "Вход в hh.ru выполнен.",
@@ -26,10 +30,27 @@ def build_parser() -> argparse.ArgumentParser:
     for name, help_text in (
         ("save", "сохранить логин и пароль в защищённом хранилище Windows"),
         ("login", "открыть видимый браузер и войти"),
+        ("sync", "загрузить аккаунт и резюме в базу"),
         ("delete", "удалить сохранённые данные"),
     ):
         command = subparsers.add_parser(name, help=help_text)
         command.add_argument("--account-id", type=positive_int, default=1)
+
+    search = subparsers.add_parser("search", help="загрузить вакансии по направлению")
+    search.add_argument("--account-id", type=positive_int, default=1)
+    search.add_argument("--direction", required=True, help="название направления")
+    search.add_argument("--resume", required=True, help="точное название резюме")
+    search.add_argument("--query", required=True, help="поисковая фраза")
+    search.add_argument("--area", default="113", help="идентификатор региона hh.ru")
+    search.add_argument("--page", type=non_negative_int, default=0, help="номер страницы")
+
+    analyze = subparsers.add_parser(
+        "analyze",
+        help="загрузить подробности и проверить найденные вакансии",
+    )
+    analyze.add_argument("--account-id", type=positive_int, default=1)
+    analyze.add_argument("--direction", required=True, help="название направления")
+    analyze.add_argument("--limit", type=positive_int, default=20, help="число вакансий")
     return parser
 
 
@@ -37,6 +58,13 @@ def positive_int(value: str) -> int:
     parsed = int(value)
     if parsed < 1:
         raise argparse.ArgumentTypeError("значение должно быть положительным")
+    return parsed
+
+
+def non_negative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("значение не должно быть отрицательным")
     return parsed
 
 
@@ -60,12 +88,15 @@ def run(argv: Sequence[str] | None = None) -> int:
     browser = VisibleHhBrowser(
         settings.browser_profile_dir(arguments.account_id),
         settings.hh_login_url,
+        settings.hh_resumes_url,
+        settings.hh_search_url,
         settings.hh_browser_timeout_ms,
     )
     with browser:
-        result = HhLoginService(store).authenticate(arguments.account_id, browser)
-        print(STATUS_MESSAGES[result.status])
-        if result.status in {
+        login_result = HhLoginService(store).authenticate(arguments.account_id, browser)
+        print(STATUS_MESSAGES[login_result.status])
+        authenticated = login_result.authenticated
+        if login_result.status in {
             LoginStatus.CONFIRMATION_REQUIRED,
             LoginStatus.CAPTCHA_REQUIRED,
             LoginStatus.MANUAL_ACTION_REQUIRED,
@@ -73,8 +104,114 @@ def run(argv: Sequence[str] | None = None) -> int:
             input("После завершения входа нажмите Enter: ")
             if browser.is_authenticated():
                 print(STATUS_MESSAGES[LoginStatus.AUTHENTICATED])
-                return 0
-        return 0 if result.authenticated else 2
+                authenticated = True
+        if not authenticated:
+            return 2
+        if arguments.command == "login":
+            return 0
+        profile = browser.read_profile()
+        if arguments.command == "search":
+            search_filters: dict[str, object] = {"order_by": "publication_time"}
+            search_result = browser.search_vacancies(
+                arguments.query,
+                area=arguments.area,
+                filters=search_filters,
+                page_number=arguments.page,
+            )
+        if arguments.command == "analyze":
+            upgrade_database(settings)
+            database = create_database(settings)
+            try:
+                with database.sessions.begin() as session:
+                    HhProfileSyncService(session).synchronize(profile)
+                    pending = VacancyAnalysisService(session).pending(
+                        account_external_id=profile.external_id,
+                        direction_name=arguments.direction,
+                        limit=arguments.limit,
+                    )
+            finally:
+                database.close()
+
+            vacancy_details = []
+            failures: list[tuple[str, str]] = []
+            for vacancy in pending:
+                try:
+                    vacancy_details.append(browser.read_vacancy_details(vacancy.source_url))
+                except RuntimeError as error:
+                    failures.append((vacancy.title, str(error)))
+
+    upgrade_database(settings)
+    if arguments.command == "search":
+        database = create_database(settings)
+        try:
+            with database.sessions.begin() as session:
+                HhProfileSyncService(session).synchronize(profile)
+                synchronized_search = JobSearchSyncService(session).synchronize(
+                    account_external_id=profile.external_id,
+                    direction_name=arguments.direction,
+                    resume_title=arguments.resume,
+                    query=arguments.query,
+                    area=arguments.area,
+                    filters=search_filters,
+                    vacancies=search_result.vacancies,
+                )
+        finally:
+            database.close()
+
+        print(
+            f"Направление: {synchronized_search.direction.name} "
+            f"(№ {synchronized_search.direction.id})."
+        )
+        print(f"По запросу найдено на hh.ru: {search_result.found}.")
+        print(f"Загружено из текущей страницы: {len(synchronized_search.vacancies)}.")
+        for vacancy in synchronized_search.vacancies[:10]:
+            employer = f" — {vacancy.employer_name}" if vacancy.employer_name else ""
+            print(f"- {vacancy.title}{employer}")
+        return 0
+
+    if arguments.command == "analyze":
+        database = create_database(settings)
+        try:
+            with database.sessions.begin() as session:
+                analysis_service = VacancyAnalysisService(session)
+                analysis_service.synchronize(
+                    account_external_id=profile.external_id,
+                    direction_name=arguments.direction,
+                    vacancies=tuple(vacancy_details),
+                )
+                analyzed = analysis_service.reanalyze(
+                    account_external_id=profile.external_id,
+                    direction_name=arguments.direction,
+                )
+        finally:
+            database.close()
+
+        accepted = sum(result.evaluation.accepted for result in analyzed)
+        print(f"Проверено вакансий: {len(analyzed)}.")
+        print(f"Подходят: {accepted}. Отклонены: {len(analyzed) - accepted}.")
+        for analysis_result in analyzed:
+            evaluation = analysis_result.evaluation
+            decision = "подходит" if evaluation.accepted else "отклонена"
+            reasons = "; ".join(evaluation.reasons)
+            print(
+                f"- {analysis_result.vacancy.title}: {decision}, {evaluation.score:.0f}. {reasons}"
+            )
+        for title, failure_message in failures:
+            print(f"- Пропущена вакансия «{title}»: {failure_message}")
+        return 0
+
+    database = create_database(settings)
+    try:
+        with database.sessions.begin() as session:
+            synchronized = HhProfileSyncService(session).synchronize(profile)
+    finally:
+        database.close()
+
+    print(f"Аккаунт в базе: {synchronized.account.label} (№ {synchronized.account.id}).")
+    print(f"Загружено резюме: {len(synchronized.resumes)}.")
+    for resume in synchronized.resumes:
+        print(f"- {resume.title} ({resume.hh_id})")
+    return 0
 
 
 def main() -> None:

@@ -11,6 +11,7 @@ def test_default_api_is_local_only() -> None:
 
     assert settings.api_host == "127.0.0.1"
     assert settings.api_port == 8000
+    assert settings.hh_browser_timeout_ms == 60_000
     assert settings.data_dir.is_absolute()
 
 

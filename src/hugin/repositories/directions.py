@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -20,6 +22,7 @@ from hugin.domain.directions import (
     SearchQueryRecord,
     VacancyState,
 )
+from hugin.domain.hh import HhResumeData
 from hugin.domain.time import as_utc
 
 
@@ -77,6 +80,7 @@ def _direction_vacancy_record(model: DirectionVacancyModel) -> DirectionVacancyR
         vacancy_id=model.vacancy_id,
         state=model.state,
         rules_score=model.rules_score,
+        rules_details=dict(model.rules_details),
         ai_score=model.ai_score,
         fit_score=model.fit_score,
         first_seen_at=as_utc(model.first_seen_at),
@@ -93,6 +97,24 @@ class AccountRepository:
         self._session.add(model)
         self._session.flush()
         return _account_record(model)
+
+    def upsert(self, label: str, external_id: str) -> AccountRecord:
+        model = self._session.scalar(
+            select(HhAccountModel).where(HhAccountModel.external_id == external_id)
+        )
+        if model is None:
+            model = HhAccountModel(external_id=external_id)
+            self._session.add(model)
+        model.label = label
+        model.is_active = True
+        self._session.flush()
+        return _account_record(model)
+
+    def get_by_external_id(self, external_id: str) -> AccountRecord | None:
+        model = self._session.scalar(
+            select(HhAccountModel).where(HhAccountModel.external_id == external_id)
+        )
+        return _account_record(model) if model is not None else None
 
 
 class ResumeRepository:
@@ -112,6 +134,59 @@ class ResumeRepository:
         model.title = title
         self._session.flush()
         return _resume_record(model)
+
+    def synchronize(
+        self,
+        account_id: int,
+        resumes: Sequence[HhResumeData],
+    ) -> list[ResumeRecord]:
+        existing = list(
+            self._session.scalars(
+                select(ResumeModel)
+                .where(ResumeModel.account_id == account_id)
+                .order_by(ResumeModel.id)
+            )
+        )
+        by_hh_id = {resume.hh_id: resume for resume in existing}
+        active_ids = {resume.hh_id for resume in resumes}
+
+        for model in existing:
+            model.is_active = model.hh_id in active_ids
+
+        synchronized: list[ResumeModel] = []
+        for resume in resumes:
+            stored_model = by_hh_id.get(resume.hh_id)
+            if stored_model is None:
+                stored_model = ResumeModel(account_id=account_id, hh_id=resume.hh_id)
+                self._session.add(stored_model)
+            stored_model.title = resume.title
+            stored_model.is_active = True
+            synchronized.append(stored_model)
+
+        self._session.flush()
+        return [_resume_record(model) for model in synchronized]
+
+    def list_by_account_id(self, account_id: int) -> list[ResumeRecord]:
+        models = self._session.scalars(
+            select(ResumeModel).where(ResumeModel.account_id == account_id).order_by(ResumeModel.id)
+        )
+        return [_resume_record(model) for model in models]
+
+    def get_active_by_title(self, account_id: int, title: str) -> ResumeRecord:
+        models = list(
+            self._session.scalars(
+                select(ResumeModel).where(
+                    ResumeModel.account_id == account_id,
+                    ResumeModel.title == title,
+                    ResumeModel.is_active.is_(True),
+                )
+            )
+        )
+        if not models:
+            raise LookupError(f"Активное резюме «{title}» не найдено")
+        if len(models) > 1:
+            raise RuntimeError(f"Найдено несколько активных резюме «{title}»")
+        return _resume_record(models[0])
 
 
 class DirectionRepository:
@@ -136,6 +211,40 @@ class DirectionRepository:
         self._session.flush()
         return _direction_record(model)
 
+    def upsert(
+        self,
+        account_id: int,
+        name: str,
+        *,
+        description: str | None = None,
+        scoring_config: ConfigPayload | None = None,
+    ) -> DirectionRecord:
+        model = self._session.scalar(
+            select(CareerDirectionModel).where(
+                CareerDirectionModel.account_id == account_id,
+                CareerDirectionModel.name == name,
+            )
+        )
+        if model is None:
+            model = CareerDirectionModel(account_id=account_id, name=name)
+            self._session.add(model)
+        if description is not None:
+            model.description = description
+        if scoring_config is not None:
+            model.scoring_config = dict(scoring_config)
+        model.is_active = True
+        self._session.flush()
+        return _direction_record(model)
+
+    def get_by_account_and_name(self, account_id: int, name: str) -> DirectionRecord | None:
+        model = self._session.scalar(
+            select(CareerDirectionModel).where(
+                CareerDirectionModel.account_id == account_id,
+                CareerDirectionModel.name == name,
+            )
+        )
+        return _direction_record(model) if model is not None else None
+
     def add_query(
         self,
         direction_id: int,
@@ -151,6 +260,33 @@ class DirectionRepository:
             filters=dict(filters or {}),
         )
         self._session.add(model)
+        self._session.flush()
+        return _query_record(model)
+
+    def upsert_query(
+        self,
+        direction_id: int,
+        query: str,
+        *,
+        area: str = "",
+        filters: ConfigPayload | None = None,
+    ) -> SearchQueryRecord:
+        model = self._session.scalar(
+            select(DirectionSearchQueryModel).where(
+                DirectionSearchQueryModel.direction_id == direction_id,
+                DirectionSearchQueryModel.query == query,
+                DirectionSearchQueryModel.area == area,
+            )
+        )
+        if model is None:
+            model = DirectionSearchQueryModel(
+                direction_id=direction_id,
+                query=query,
+                area=area,
+            )
+            self._session.add(model)
+        model.filters = dict(filters or {})
+        model.is_active = True
         self._session.flush()
         return _query_record(model)
 
@@ -190,4 +326,24 @@ class DirectionRepository:
             )
             self._session.add(model)
             self._session.flush()
+        return _direction_vacancy_record(model)
+
+    def apply_rules(
+        self,
+        direction_id: int,
+        vacancy_id: int,
+        *,
+        state: VacancyState,
+        score: float,
+        details: ConfigPayload,
+    ) -> DirectionVacancyRecord:
+        if not 0 <= score <= 100:
+            raise ValueError("score must be between 0 and 100")
+        model = self._session.get(DirectionVacancyModel, (direction_id, vacancy_id))
+        if model is None:
+            raise LookupError("direction vacancy was not found")
+        model.state = state
+        model.rules_score = score
+        model.rules_details = dict(details)
+        self._session.flush()
         return _direction_vacancy_record(model)

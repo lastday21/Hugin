@@ -8,6 +8,7 @@ from playwright.sync_api import Locator, Page, TimeoutError
 
 from hugin.adapters import hh_browser as browser_module
 from hugin.adapters.hh_browser import VisibleHhBrowser
+from hugin.domain.hh import HhProfileData, HhResumeData
 from hugin.services.hh_login import HhCredentials, LoginStatus
 
 
@@ -46,7 +47,7 @@ class FakeLocator:
         self.filled.append(value)
 
     def wait_for(self, *, state: str, timeout: int) -> None:
-        assert state == "visible"
+        assert state in {"attached", "visible"}
         assert timeout > 0
         if self.wait_error:
             raise TimeoutError("wait")
@@ -57,6 +58,10 @@ class FakeLocator:
     def is_visible(self) -> bool:
         return self.visible
 
+    @property
+    def first(self) -> FakeLocator:
+        return self
+
 
 class FakePage:
     def __init__(self, url: str = "https://hh.ru/account/login?role=applicant") -> None:
@@ -65,6 +70,9 @@ class FakePage:
         self.goto_calls: list[tuple[str, str]] = []
         self.timeout: int | None = None
         self.navigation_timeout: int | None = None
+        self.profile_payload: object = None
+        self.search_payload: object = None
+        self.details_payload: object = None
 
     def locator(self, selector: str) -> FakeLocator:
         return self.locators.setdefault(selector, FakeLocator(0))
@@ -82,9 +90,24 @@ class FakePage:
     def wait_for_timeout(self, timeout: int) -> None:
         assert timeout == 1_000
 
+    def evaluate(self, expression: str) -> object:
+        if "ResumeProfileFront-InitialState" in expression:
+            return self.profile_payload
+        if "vacancy-serp__vacancy" in expression:
+            return self.search_payload
+        if "vacancy-description" in expression:
+            return self.details_payload
+        raise AssertionError("unexpected browser script")
+
 
 def make_browser(page: FakePage, tmp_path: Path) -> VisibleHhBrowser:
-    browser = VisibleHhBrowser(tmp_path, "https://hh.ru/account/login?role=applicant", 5_000)
+    browser = VisibleHhBrowser(
+        tmp_path,
+        "https://hh.ru/account/login?role=applicant",
+        "https://hh.ru/applicant/resumes",
+        "https://hh.ru/search/vacancy",
+        5_000,
+    )
     browser._page = cast(Page, page)
     return browser
 
@@ -125,6 +148,129 @@ def test_browser_opens_login_page_and_detects_session(tmp_path: Path) -> None:
     assert browser.is_authenticated()
     page.url = "https://not-hh.ru/applicant/resumes"
     assert not browser.is_authenticated()
+
+
+def test_profile_and_resumes_are_read_from_page(tmp_path: Path) -> None:
+    page = FakePage()
+    page.profile_payload = {
+        "externalId": "12345",
+        "firstName": "Иван",
+        "lastName": "Иванов",
+        "resumes": [
+            {
+                "title": "Python-разработчик",
+                "href": "https://ufa.hh.ru/resume/first-resume?hhtmFrom=resume_list",
+            },
+            {
+                "title": "Инженер",
+                "href": "https://hh.ru/resume/second-resume",
+            },
+        ],
+    }
+    browser = make_browser(page, tmp_path)
+
+    profile = browser.read_profile()
+
+    assert profile == HhProfileData(
+        external_id="12345",
+        label="Иван Иванов",
+        resumes=(
+            HhResumeData(hh_id="first-resume", title="Python-разработчик"),
+            HhResumeData(hh_id="second-resume", title="Инженер"),
+        ),
+    )
+    assert page.goto_calls == [("https://hh.ru/applicant/resumes", "domcontentloaded")]
+
+
+def test_profile_rejects_resume_link_from_another_site(tmp_path: Path) -> None:
+    page = FakePage()
+    page.profile_payload = {
+        "externalId": "12345",
+        "firstName": "",
+        "lastName": "",
+        "resumes": [
+            {
+                "title": "Поддельное резюме",
+                "href": "https://example.com/resume/not-hh",
+            }
+        ],
+    }
+
+    with pytest.raises(RuntimeError, match="за пределы"):
+        make_browser(page, tmp_path).read_profile()
+
+
+def test_vacancies_are_read_from_search_page(tmp_path: Path) -> None:
+    page = FakePage()
+    page.search_payload = {
+        "header": "Найдено 1 234 вакансии «Python backend»",
+        "vacancies": [
+            {
+                "title": "Python-разработчик",
+                "href": "https://ufa.hh.ru/vacancy/123?query=Python",
+                "employer": "Компания",
+            },
+            {
+                "title": "Backend-разработчик",
+                "href": "https://hh.ru/vacancy/456",
+                "employer": "",
+            },
+        ],
+    }
+    browser = make_browser(page, tmp_path)
+
+    result = browser.search_vacancies(
+        " Python backend ",
+        area="113",
+        filters={"order_by": "publication_time", "schedule": ["remote", "fullDay"]},
+        page_number=2,
+    )
+
+    assert result.found == 1234
+    assert [vacancy.hh_id for vacancy in result.vacancies] == ["123", "456"]
+    assert result.vacancies[0].source_url == "https://ufa.hh.ru/vacancy/123"
+    assert result.vacancies[0].employer_name == "Компания"
+    assert result.vacancies[1].employer_name is None
+    search_url, wait_until = page.goto_calls[-1]
+    assert wait_until == "domcontentloaded"
+    assert "text=Python+backend" in search_url
+    assert "area=113" in search_url
+    assert "page=2" in search_url
+    assert "schedule=remote" in search_url
+    assert "schedule=fullDay" in search_url
+
+
+def test_search_rejects_unknown_filter(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="не поддерживается"):
+        make_browser(FakePage(), tmp_path).search_vacancies(
+            "Python",
+            filters={"unexpected": "value"},
+        )
+
+
+def test_vacancy_details_are_read_from_page(tmp_path: Path) -> None:
+    page = FakePage()
+    page.details_payload = {
+        "title": "Python-разработчик",
+        "employer": "Компания",
+        "experience": "1\N{EN DASH}3 года",
+        "employment": "Полная занятость",
+        "workFormat": "Формат работы: удалённо",
+        "description": "Разработка серверной части на Python.",
+        "skills": ["Python", "FastAPI", "PostgreSQL"],
+    }
+
+    vacancy = make_browser(page, tmp_path).read_vacancy_details(
+        "https://ufa.hh.ru/vacancy/123?from=search"
+    )
+
+    assert vacancy.hh_id == "123"
+    assert vacancy.source_url == "https://ufa.hh.ru/vacancy/123"
+    assert vacancy.title == "Python-разработчик"
+    assert vacancy.employer_name == "Компания"
+    assert vacancy.experience == "1\N{EN DASH}3 года"
+    assert vacancy.key_skills == ("Python", "FastAPI", "PostgreSQL")
+    assert vacancy.details_fetched_at is not None
 
 
 def test_email_and_password_are_filled(tmp_path: Path) -> None:
@@ -220,7 +366,13 @@ def test_missing_password_field_returns_current_state(tmp_path: Path) -> None:
 
 
 def test_browser_must_be_started(tmp_path: Path) -> None:
-    browser = VisibleHhBrowser(tmp_path, "https://hh.ru/account/login", 5_000)
+    browser = VisibleHhBrowser(
+        tmp_path,
+        "https://hh.ru/account/login",
+        "https://hh.ru/applicant/resumes",
+        "https://hh.ru/search/vacancy",
+        5_000,
+    )
 
     with pytest.raises(RuntimeError, match="не запущен"):
         browser.open_login()
@@ -278,7 +430,13 @@ def test_context_starts_visible_persistent_browser(
     chromium = FakeChromium(context)
     playwright = FakePlaywright(chromium)
     monkeypatch.setattr(browser_module, "sync_playwright", lambda: FakeStarter(playwright))
-    browser = VisibleHhBrowser(tmp_path / "profile", "https://hh.ru/account/login", 4_000)
+    browser = VisibleHhBrowser(
+        tmp_path / "profile",
+        "https://hh.ru/account/login",
+        "https://hh.ru/applicant/resumes",
+        "https://hh.ru/search/vacancy",
+        4_000,
+    )
 
     with browser:
         assert page.timeout == 4_000
@@ -298,6 +456,12 @@ def test_failed_browser_start_stops_playwright(
     monkeypatch.setattr(browser_module, "sync_playwright", lambda: FakeStarter(playwright))
 
     with pytest.raises(RuntimeError, match="cannot start"):
-        VisibleHhBrowser(tmp_path, "https://hh.ru/account/login", 4_000).__enter__()
+        VisibleHhBrowser(
+            tmp_path,
+            "https://hh.ru/account/login",
+            "https://hh.ru/applicant/resumes",
+            "https://hh.ru/search/vacancy",
+            4_000,
+        ).__enter__()
 
     assert playwright.stopped

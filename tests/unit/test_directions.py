@@ -1,20 +1,170 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 import pytest
 from sqlalchemy import func, select
 
 from hugin.core.settings import Settings
 from hugin.database import create_database, upgrade_database
-from hugin.database.models import DirectionResumeModel, DirectionVacancyModel
+from hugin.database.models import (
+    ApplicationModel,
+    ApplicationTaskModel,
+    CareerDirectionModel,
+    DirectionResumeModel,
+    DirectionSearchQueryModel,
+    DirectionVacancyModel,
+)
 from hugin.domain import VacancyData, VacancyState
+from hugin.domain.hh import HhProfileData, HhResumeData
 from hugin.repositories import (
     AccountRepository,
     DirectionRepository,
     ResumeRepository,
     VacancyRepository,
 )
+from hugin.services.hh_profile import HhProfileSyncService
+from hugin.services.job_search import JobSearchSyncService
+from hugin.services.vacancy_analysis import VacancyAnalysisService
 
 pytestmark = pytest.mark.integration
+
+
+def test_hh_profile_sync_updates_account_and_resumes(settings: Settings) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+
+    try:
+        with database.sessions.begin() as session:
+            service = HhProfileSyncService(session)
+            created = service.synchronize(
+                HhProfileData(
+                    external_id="account-123",
+                    label="Иван Иванов",
+                    resumes=(
+                        HhResumeData("resume-1", "Python-разработчик"),
+                        HhResumeData("resume-2", "Инженер"),
+                    ),
+                )
+            )
+            updated = service.synchronize(
+                HhProfileData(
+                    external_id="account-123",
+                    label="Иван Петров",
+                    resumes=(
+                        HhResumeData("resume-2", "Ведущий инженер"),
+                        HhResumeData("resume-3", "Руководитель"),
+                    ),
+                )
+            )
+
+            assert updated.account.id == created.account.id
+            assert updated.account.label == "Иван Петров"
+            assert [resume.hh_id for resume in updated.resumes] == ["resume-2", "resume-3"]
+            stored = ResumeRepository(session).list_by_account_id(updated.account.id)
+            assert [(resume.hh_id, resume.title, resume.is_active) for resume in stored] == [
+                ("resume-1", "Python-разработчик", False),
+                ("resume-2", "Ведущий инженер", True),
+                ("resume-3", "Руководитель", True),
+            ]
+    finally:
+        database.close()
+
+
+def test_job_search_sync_is_repeatable_and_does_not_create_applications(
+    settings: Settings,
+) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+
+    try:
+        with database.sessions.begin() as session:
+            profile = HhProfileSyncService(session).synchronize(
+                HhProfileData(
+                    external_id="account-123",
+                    label="Иван Иванов",
+                    resumes=(HhResumeData("resume-1", "Python-разработчик"),),
+                )
+            )
+            assert profile.account.id > 0
+            service = JobSearchSyncService(session)
+            created = service.synchronize(
+                account_external_id="account-123",
+                direction_name="Python backend",
+                resume_title="Python-разработчик",
+                query="Python backend",
+                area="113",
+                filters={"order_by": "publication_time"},
+                vacancies=(VacancyData("100", "Python developer", "https://hh.ru/vacancy/100"),),
+            )
+            updated = service.synchronize(
+                account_external_id="account-123",
+                direction_name="Python backend",
+                resume_title="Python-разработчик",
+                query="Python backend",
+                area="113",
+                filters={"order_by": "publication_time"},
+                vacancies=(
+                    VacancyData("100", "Python backend", "https://hh.ru/vacancy/100"),
+                    VacancyData("200", "Backend developer", "https://hh.ru/vacancy/200"),
+                ),
+            )
+
+            assert updated.direction.id == created.direction.id
+            assert updated.query.id == created.query.id
+            assert [vacancy.hh_id for vacancy in updated.vacancies] == ["100", "200"]
+            assert session.scalar(select(func.count()).select_from(CareerDirectionModel)) == 1
+            assert session.scalar(select(func.count()).select_from(DirectionSearchQueryModel)) == 1
+            assert session.scalar(select(func.count()).select_from(DirectionResumeModel)) == 1
+            assert session.scalar(select(func.count()).select_from(DirectionVacancyModel)) == 2
+            assert session.scalar(select(func.count()).select_from(ApplicationModel)) == 0
+            assert session.scalar(select(func.count()).select_from(ApplicationTaskModel)) == 0
+
+            analyzed = VacancyAnalysisService(session).synchronize(
+                account_external_id="account-123",
+                direction_name="Python backend",
+                vacancies=(
+                    VacancyData(
+                        "100",
+                        "Python backend разработчик",
+                        "https://hh.ru/vacancy/100",
+                        description="FastAPI, PostgreSQL, Docker",
+                        experience="1-3 года",
+                        key_skills=("Python", "FastAPI"),
+                        details_fetched_at=datetime.now(UTC),
+                    ),
+                    VacancyData(
+                        "200",
+                        "Продуктовый аналитик",
+                        "https://hh.ru/vacancy/200",
+                        description="Python и SQL",
+                        details_fetched_at=datetime.now(UTC),
+                    ),
+                ),
+            )
+
+            assert [result.evaluation.accepted for result in analyzed] == [True, False]
+            links = list(
+                session.scalars(
+                    select(DirectionVacancyModel).order_by(DirectionVacancyModel.vacancy_id)
+                )
+            )
+            assert [link.state for link in links] == [
+                VacancyState.FILTERED,
+                VacancyState.SKIPPED,
+            ]
+            assert links[0].rules_details["accepted"] is True
+            assert links[1].rules_details["accepted"] is False
+            assert session.scalar(select(func.count()).select_from(ApplicationModel)) == 0
+            assert session.scalar(select(func.count()).select_from(ApplicationTaskModel)) == 0
+
+            repeated = VacancyAnalysisService(session).reanalyze(
+                account_external_id="account-123",
+                direction_name="Python backend",
+            )
+            assert [result.vacancy.hh_id for result in repeated] == ["100", "200"]
+    finally:
+        database.close()
 
 
 def test_directions_support_multiple_resumes_and_queries(settings: Settings) -> None:

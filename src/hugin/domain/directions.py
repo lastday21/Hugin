@@ -66,6 +66,7 @@ class DirectionVacancyRecord:
     vacancy_id: int
     state: VacancyState
     rules_score: float | None
+    rules_details: ConfigPayload
     ai_score: float | None
     fit_score: float | None
     first_seen_at: datetime

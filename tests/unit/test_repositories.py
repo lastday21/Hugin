@@ -30,6 +30,7 @@ def test_vacancy_upsert_preserves_identity_and_updates_data(settings: Settings) 
     upgrade_database(settings)
     database = create_database(settings)
     published_at = datetime(2026, 7, 18, 10, 0, tzinfo=UTC)
+    details_fetched_at = datetime(2026, 7, 20, 10, 0, tzinfo=UTC)
 
     try:
         with database.sessions.begin() as session:
@@ -41,6 +42,10 @@ def test_vacancy_upsert_preserves_identity_and_updates_data(settings: Settings) 
                     source_url="https://hh.ru/vacancy/123",
                     employer_name="Example",
                     published_at=published_at,
+                    description="Python backend service",
+                    experience="1-3 года",
+                    key_skills=("Python", "FastAPI"),
+                    details_fetched_at=details_fetched_at,
                 )
             )
             updated = repository.upsert(
@@ -55,6 +60,9 @@ def test_vacancy_upsert_preserves_identity_and_updates_data(settings: Settings) 
 
             assert updated.id == created.id
             assert updated.title == "Senior Python developer"
+            assert updated.description == "Python backend service"
+            assert updated.key_skills == ("Python", "FastAPI")
+            assert updated.details_fetched_at == details_fetched_at
             assert repository.get_by_hh_id("123") == updated
             assert repository.get_by_hh_id("missing") is None
     finally:

@@ -174,6 +174,12 @@ class VacancyModel(Base):
     source_url: Mapped[str] = mapped_column(Text, nullable=False)
     employer_name: Mapped[str | None] = mapped_column(String(255))
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    description: Mapped[str | None] = mapped_column(Text)
+    experience: Mapped[str | None] = mapped_column(String(128))
+    employment: Mapped[str | None] = mapped_column(String(255))
+    work_format: Mapped[str | None] = mapped_column(String(255))
+    key_skills: Mapped[list[str]] = mapped_column(JSONB, default=list, nullable=False)
+    details_fetched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
     )
@@ -222,6 +228,7 @@ class DirectionVacancyModel(Base):
         nullable=False,
     )
     rules_score: Mapped[float | None] = mapped_column(Float)
+    rules_details: Mapped[ConfigPayload] = mapped_column(JSONB, default=dict, nullable=False)
     ai_score: Mapped[float | None] = mapped_column(Float)
     fit_score: Mapped[float | None] = mapped_column(Float)
     first_seen_at: Mapped[datetime] = mapped_column(
