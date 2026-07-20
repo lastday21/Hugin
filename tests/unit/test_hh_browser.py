@@ -4,11 +4,11 @@ from pathlib import Path
 from typing import cast
 
 import pytest
-from playwright.sync_api import Locator, Page, TimeoutError
+from playwright.sync_api import Error, Locator, Page, TimeoutError
 
 from hugin.adapters import hh_browser as browser_module
 from hugin.adapters.hh_browser import VisibleHhBrowser
-from hugin.domain.hh import HhProfileData, HhResumeData
+from hugin.domain.hh import HhApplyStatus, HhProfileData, HhResumeData, HhResumeDetails
 from hugin.services.hh_login import HhCredentials, LoginStatus
 
 
@@ -20,11 +20,17 @@ class FakeLocator:
         checked: bool = False,
         visible: bool = False,
         wait_error: bool = False,
+        enabled: bool = True,
+        text: str = "",
+        href: str | None = None,
     ) -> None:
         self._count = count
         self.checked = checked
         self.visible = visible
         self.wait_error = wait_error
+        self.enabled = enabled
+        self.text = text
+        self.href = href
         self.clicked = 0
         self.no_wait_after: list[bool] = []
         self.filled: list[str] = []
@@ -58,6 +64,15 @@ class FakeLocator:
     def is_visible(self) -> bool:
         return self.visible
 
+    def is_enabled(self) -> bool:
+        return self.enabled
+
+    def inner_text(self) -> str:
+        return self.text
+
+    def get_attribute(self, name: str) -> str | None:
+        return self.href if name == "href" else None
+
     @property
     def first(self) -> FakeLocator:
         return self
@@ -73,13 +88,19 @@ class FakePage:
         self.profile_payload: object = None
         self.search_payload: object = None
         self.details_payload: object = None
+        self.resume_payload: object = None
+        self.application_payload: object = None
+        self.response = FakeResponse()
+        self.goto_error: Error | None = None
 
     def locator(self, selector: str) -> FakeLocator:
         return self.locators.setdefault(selector, FakeLocator(0))
 
     def goto(self, url: str, *, wait_until: str) -> None:
-        self.url = url
         self.goto_calls.append((url, wait_until))
+        if self.goto_error is not None:
+            raise self.goto_error
+        self.url = url
 
     def set_default_timeout(self, timeout: int) -> None:
         self.timeout = timeout
@@ -88,7 +109,7 @@ class FakePage:
         self.navigation_timeout = timeout
 
     def wait_for_timeout(self, timeout: int) -> None:
-        assert timeout == 1_000
+        assert timeout in {500, 1_000, 1_500}
 
     def evaluate(self, expression: str) -> object:
         if "ResumeProfileFront-InitialState" in expression:
@@ -97,7 +118,46 @@ class FakePage:
             return self.search_payload
         if "vacancy-description" in expression:
             return self.details_payload
+        if "resume-block-title-position" in expression:
+            return self.resume_payload
+        if "task-question" in expression:
+            return self.application_payload
         raise AssertionError("unexpected browser script")
+
+    def expect_response(self, predicate: object, *, timeout: int) -> FakeResponseInfo:
+        assert timeout > 0
+        assert callable(predicate)
+        assert predicate(self.response)
+        return FakeResponseInfo(self.response)
+
+
+class FakeRequest:
+    method = "POST"
+
+
+class FakeResponse:
+    def __init__(self) -> None:
+        self.request = FakeRequest()
+        self.url = "https://hh.ru/applicant/vacancy_response?vacancyId=123"
+        self.status = 200
+        self.text_error: Error | None = None
+        self.body = '{"success":true}'
+
+    def text(self) -> str:
+        if self.text_error is not None:
+            raise self.text_error
+        return self.body
+
+
+class FakeResponseInfo:
+    def __init__(self, response: FakeResponse) -> None:
+        self.value = response
+
+    def __enter__(self) -> FakeResponseInfo:
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        return None
 
 
 def make_browser(page: FakePage, tmp_path: Path) -> VisibleHhBrowser:
@@ -148,6 +208,16 @@ def test_browser_opens_login_page_and_detects_session(tmp_path: Path) -> None:
     assert browser.is_authenticated()
     page.url = "https://not-hh.ru/applicant/resumes"
     assert not browser.is_authenticated()
+
+
+def test_aborted_login_redirect_is_accepted_for_authenticated_page(tmp_path: Path) -> None:
+    page = FakePage("https://ufa.hh.ru/applicant/resumes")
+    page.goto_error = Error("net::ERR_ABORTED")
+    browser = make_browser(page, tmp_path)
+
+    browser.open_login()
+
+    assert browser.is_authenticated()
 
 
 def test_profile_and_resumes_are_read_from_page(tmp_path: Path) -> None:
@@ -271,6 +341,141 @@ def test_vacancy_details_are_read_from_page(tmp_path: Path) -> None:
     assert vacancy.experience == "1\N{EN DASH}3 года"
     assert vacancy.key_skills == ("Python", "FastAPI", "PostgreSQL")
     assert vacancy.details_fetched_at is not None
+
+
+def test_resume_details_are_read_without_contacts(tmp_path: Path) -> None:
+    page = FakePage()
+    page.resume_payload = {
+        "title": "Python backend разработчик",
+        "experience": "Backend-разработчик на FastAPI",
+        "skills": "Python PostgreSQL Docker",
+        "education": "Высшее образование",
+    }
+
+    details = make_browser(page, tmp_path).read_resume_details("abc123")
+
+    assert details == HhResumeDetails(
+        hh_id="abc123",
+        title="Python backend разработчик",
+        experience="Backend-разработчик на FastAPI",
+        skills="Python PostgreSQL Docker",
+        education="Высшее образование",
+    )
+
+
+def test_application_with_questions_is_not_submitted(tmp_path: Path) -> None:
+    page = FakePage("https://hh.ru/applicant/resumes")
+    page.application_payload = {
+        "questions": ["Укажите Telegram"],
+        "warnings": [],
+        "resumeTitle": "Python backend разработчик",
+        "bodyText": "Форма отклика",
+    }
+
+    result = make_browser(page, tmp_path).apply_to_vacancy(
+        "https://hh.ru/vacancy/123",
+        expected_resume_title="Python backend разработчик",
+        cover_letter="Письмо",
+    )
+
+    assert result.status is HhApplyStatus.QUESTIONS_REQUIRED
+    assert result.questions == ("Укажите Telegram",)
+
+
+def test_application_is_submitted_with_cover_letter(tmp_path: Path) -> None:
+    page = FakePage("https://hh.ru/applicant/resumes")
+    page.application_payload = {
+        "questions": [],
+        "warnings": ["Город не указан"],
+        "resumeTitle": "Python backend разработчик",
+        "bodyText": "Форма отклика",
+    }
+    letter_selector = '[data-qa="vacancy-response-popup-form-letter-input"]'
+    toggle_selector = '[data-qa="vacancy-response-letter-toggle"]'
+    submit_selector = '[data-qa="vacancy-response-submit-popup"]'
+    page.locators[letter_selector] = FakeLocator(0)
+    page.locators[toggle_selector] = FakeLocator()
+    page.locators[submit_selector] = FakeLocator()
+    page.locators["body"] = FakeLocator(text="Отклик отправлен")
+
+    result = make_browser(page, tmp_path).apply_to_vacancy(
+        "https://hh.ru/vacancy/123",
+        expected_resume_title="Python backend разработчик",
+        cover_letter="Содержательное письмо",
+    )
+
+    assert result.status is HhApplyStatus.APPLIED
+    assert result.warnings == ("Город не указан",)
+    assert page.locators[toggle_selector].clicked == 1
+    assert page.locators[letter_selector].filled == ["Содержательное письмо"]
+    assert page.locators[submit_selector].clicked == 1
+
+
+def test_application_stops_when_confirmation_cannot_be_read(tmp_path: Path) -> None:
+    page = FakePage("https://hh.ru/applicant/resumes")
+    page.application_payload = {
+        "questions": [],
+        "warnings": [],
+        "resumeTitle": "Python backend разработчик",
+        "bodyText": "Форма отклика",
+    }
+    page.locators['[data-qa="vacancy-response-popup-form-letter-input"]'] = FakeLocator()
+    page.locators['[data-qa="vacancy-response-submit-popup"]'] = FakeLocator()
+    page.response.text_error = Error("response body unavailable")
+
+    result = make_browser(page, tmp_path).apply_to_vacancy(
+        "https://hh.ru/vacancy/123",
+        expected_resume_title="Python backend разработчик",
+        cover_letter="Письмо",
+    )
+
+    assert result.status is HhApplyStatus.UNKNOWN_RESULT
+    assert result.confirmation == "HTTP 200: "
+
+
+def test_application_is_verified_in_negotiations(tmp_path: Path) -> None:
+    page = FakePage("https://hh.ru/applicant/resumes")
+    page.application_payload = {
+        "questions": [],
+        "warnings": [],
+        "resumeTitle": "Python backend разработчик",
+        "bodyText": "Форма отклика",
+    }
+    page.response.body = "{}"
+    page.locators['[data-qa="vacancy-response-popup-form-letter-input"]'] = FakeLocator()
+    page.locators['[data-qa="vacancy-response-submit-popup"]'] = FakeLocator()
+    page.locators["body"] = FakeLocator(text="Форма отклика")
+    page.locators['a[href*="/vacancy/"]'] = FakeLocator(href="/vacancy/123")
+
+    result = make_browser(page, tmp_path).apply_to_vacancy(
+        "https://hh.ru/vacancy/123",
+        expected_resume_title="Python backend разработчик",
+        cover_letter="Письмо",
+    )
+
+    assert result.status is HhApplyStatus.APPLIED
+    assert "подтверждено в списке откликов" in result.confirmation
+
+
+def test_repeat_application_form_is_not_submitted(tmp_path: Path) -> None:
+    page = FakePage("https://hh.ru/applicant/resumes")
+    page.application_payload = {
+        "questions": [],
+        "warnings": [],
+        "resumeTitle": "Другое резюме",
+        "bodyText": "Форма отклика",
+    }
+    submit = FakeLocator(text="Откликнуться повторно")
+    page.locators['[data-qa="vacancy-response-submit-popup"]'] = submit
+
+    result = make_browser(page, tmp_path).apply_to_vacancy(
+        "https://hh.ru/vacancy/123",
+        expected_resume_title="Python backend разработчик",
+        cover_letter="Письмо",
+    )
+
+    assert result.status is HhApplyStatus.ALREADY_APPLIED
+    assert submit.clicked == 0
 
 
 def test_email_and_password_are_filled(tmp_path: Path) -> None:

@@ -56,6 +56,12 @@ class VacancyRepository:
         model = self._session.scalar(select(VacancyModel).where(VacancyModel.hh_id == hh_id))
         return _to_record(model) if model is not None else None
 
+    def get(self, vacancy_id: int) -> VacancyRecord:
+        model = self._session.get(VacancyModel, vacancy_id)
+        if model is None:
+            raise LookupError("vacancy was not found")
+        return _to_record(model)
+
     def list_pending_for_direction(
         self,
         direction_id: int,

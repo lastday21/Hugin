@@ -12,6 +12,7 @@ def test_default_api_is_local_only() -> None:
     assert settings.api_host == "127.0.0.1"
     assert settings.api_port == 8000
     assert settings.hh_browser_timeout_ms == 60_000
+    assert settings.hh_apply_daily_limit == 10
     assert settings.data_dir.is_absolute()
 
 
@@ -70,3 +71,8 @@ def test_cached_settings_read_environment(monkeypatch: pytest.MonkeyPatch) -> No
 def test_port_outside_tcp_range_is_rejected() -> None:
     with pytest.raises(ValidationError):
         Settings(api_port=65536)
+
+
+def test_apply_delay_range_is_validated() -> None:
+    with pytest.raises(ValidationError, match="Максимальная задержка"):
+        Settings(hh_apply_delay_min_seconds=30, hh_apply_delay_max_seconds=10)

@@ -2,12 +2,18 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import random
+import time
 from collections.abc import Sequence
+from datetime import UTC, datetime
 
 from hugin.adapters.credentials import WindowsCredentialStore
 from hugin.adapters.hh_browser import VisibleHhBrowser
-from hugin.core.settings import get_settings
+from hugin.core.settings import Settings, get_settings
 from hugin.database import create_database, upgrade_database
+from hugin.domain.hh import HhApplyResult, HhApplyStatus, HhProfileData
+from hugin.services.application_automation import ApplicationAutomationService
+from hugin.services.cover_letter import CoverLetterBuilder
 from hugin.services.hh_login import HhCredentials, HhLoginService, LoginStatus
 from hugin.services.hh_profile import HhProfileSyncService
 from hugin.services.job_search import JobSearchSyncService
@@ -51,6 +57,16 @@ def build_parser() -> argparse.ArgumentParser:
     analyze.add_argument("--account-id", type=positive_int, default=1)
     analyze.add_argument("--direction", required=True, help="название направления")
     analyze.add_argument("--limit", type=positive_int, default=20, help="число вакансий")
+
+    apply = subparsers.add_parser("apply", help="автоматически отправить подходящие отклики")
+    apply.add_argument("--account-id", type=positive_int, default=1)
+    apply.add_argument("--direction", required=True, help="название направления")
+    apply.add_argument("--limit", type=positive_int, default=5, help="не более откликов за запуск")
+    apply.add_argument(
+        "--exclude-stretch",
+        action="store_true",
+        help="не отправлять пограничные вакансии",
+    )
     return parser
 
 
@@ -139,6 +155,8 @@ def run(argv: Sequence[str] | None = None) -> int:
                     vacancy_details.append(browser.read_vacancy_details(vacancy.source_url))
                 except RuntimeError as error:
                     failures.append((vacancy.title, str(error)))
+        if arguments.command == "apply":
+            return _run_applications(arguments, settings, browser, profile)
 
     upgrade_database(settings)
     if arguments.command == "search":
@@ -219,6 +237,105 @@ def run(argv: Sequence[str] | None = None) -> int:
     for resume in synchronized.resumes:
         print(f"- {resume.title} ({resume.hh_id})")
     return 0
+
+
+def _run_applications(
+    arguments: argparse.Namespace,
+    settings: Settings,
+    browser: VisibleHhBrowser,
+    profile: HhProfileData,
+) -> int:
+    upgrade_database(settings)
+    database = create_database(settings)
+    blocking = False
+    sent = 0
+    try:
+        with database.sessions.begin() as session:
+            HhProfileSyncService(session).synchronize(profile)
+            service = ApplicationAutomationService(session)
+            service.resume_after_authentication()
+            prepared = service.prepare(
+                account_external_id=profile.external_id,
+                direction_name=arguments.direction,
+                include_stretch=not arguments.exclude_stretch,
+            )
+            day_start = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+            sent_today = service.applied_since(prepared.account_id, day_start)
+
+        resume_details = browser.read_resume_details(prepared.resume.hh_id)
+        available_today = max(settings.hh_apply_daily_limit - sent_today, 0)
+        run_limit = min(arguments.limit, available_today)
+        print(
+            f"Подготовлено новых заданий: {prepared.created}. "
+            f"Уже существовало: {prepared.existing}."
+        )
+        print(f"Сегодня уже отправлено: {sent_today}. Ограничение на этот запуск: {run_limit}.")
+        if run_limit == 0:
+            print("Дневное ограничение исчерпано, новые отклики не отправлены.")
+            return 0
+
+        letter_builder = CoverLetterBuilder()
+        while sent < run_limit:
+            with database.sessions.begin() as session:
+                job = ApplicationAutomationService(session).claim_next(prepared.direction_id)
+            if job is None:
+                break
+            raw_category = job.direction_vacancy.rules_details.get("category")
+            category = RuleCategory(str(raw_category))
+            letter = letter_builder.build(job.vacancy, resume_details, category)
+            try:
+                result = browser.apply_to_vacancy(
+                    job.vacancy.source_url,
+                    expected_resume_title=job.resume.title,
+                    cover_letter=letter,
+                )
+            except Exception as error:
+                result = HhApplyResult(
+                    HhApplyStatus.UNKNOWN_RESULT,
+                    job.vacancy.source_url,
+                    f"Ошибка выполнения: {type(error).__name__}",
+                )
+            with database.sessions.begin() as session:
+                recorded = ApplicationAutomationService(session).record_result(job, result)
+            status_text = _apply_status_text(result.status)
+            print(f"- {job.vacancy.title}: {status_text}.")
+            if result.questions:
+                print(f"  Вопросов работодателя без надёжных ответов: {len(result.questions)}.")
+            if recorded.sent:
+                sent += 1
+            if recorded.blocking:
+                blocking = True
+                break
+            if recorded.sent and sent < run_limit:
+                delay = random.uniform(
+                    settings.hh_apply_delay_min_seconds,
+                    settings.hh_apply_delay_max_seconds,
+                )
+                time.sleep(delay)
+    finally:
+        database.close()
+
+    print(f"Новых подтверждённых откликов: {sent}.")
+    if blocking:
+        print("Работа остановлена: требуется проверить состояние hh.ru.")
+        return 3
+    return 0
+
+
+def _apply_status_text(status: HhApplyStatus) -> str:
+    messages = {
+        HhApplyStatus.APPLIED: "отклик подтверждён",
+        HhApplyStatus.ALREADY_APPLIED: "отклик уже был отправлен",
+        HhApplyStatus.QUESTIONS_REQUIRED: "пропущена из-за вопросов работодателя",
+        HhApplyStatus.VACANCY_CLOSED: "вакансия закрыта",
+        HhApplyStatus.AUTH_REQUIRED: "требуется повторный вход",
+        HhApplyStatus.CAPTCHA_REQUIRED: "требуется проверка",
+        HhApplyStatus.ACCOUNT_WARNING: "получено предупреждение аккаунта",
+        HhApplyStatus.RESUME_MISMATCH: "выбрано неверное резюме",
+        HhApplyStatus.RETRYABLE_ERROR: "страница временно недоступна",
+        HhApplyStatus.UNKNOWN_RESULT: "результат отправки не подтверждён",
+    }
+    return messages[status]
 
 
 def main() -> None:

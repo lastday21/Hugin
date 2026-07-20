@@ -5,12 +5,19 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace, TracebackType
+from typing import ClassVar
 
 import pytest
 
 from hugin import hh_cli
 from hugin.core.settings import Settings
-from hugin.domain.hh import HhProfileData, HhResumeData
+from hugin.domain.hh import (
+    HhApplyResult,
+    HhApplyStatus,
+    HhProfileData,
+    HhResumeData,
+    HhResumeDetails,
+)
 from hugin.domain.vacancies import VacancyData, VacancySearchResult
 from hugin.services.hh_login import HhCredentials, LoginStatus
 from hugin.services.vacancy_analysis import RuleCategory
@@ -54,6 +61,7 @@ class FakeBrowser:
         self.timeout_ms = timeout_ms
         self.opened = False
         self.details_read: list[str] = []
+        self.applications: list[tuple[str, str, str]] = []
         FakeBrowser.created = self
 
     def __enter__(self) -> FakeBrowser:
@@ -116,6 +124,25 @@ class FakeBrowser:
             source_url=source_url,
             description="Python backend",
         )
+
+    def read_resume_details(self, resume_id: str) -> HhResumeDetails:
+        return HhResumeDetails(
+            hh_id=resume_id,
+            title="Python backend разработчик",
+            experience="FastAPI PostgreSQL",
+            skills="Python Docker",
+            education="Высшее",
+        )
+
+    def apply_to_vacancy(
+        self,
+        source_url: str,
+        *,
+        expected_resume_title: str,
+        cover_letter: str,
+    ) -> HhApplyResult:
+        self.applications.append((source_url, expected_resume_title, cover_letter))
+        return HhApplyResult(HhApplyStatus.APPLIED, source_url, "успешно")
 
 
 class FakeDatabase:
@@ -366,6 +393,151 @@ def test_analyze_loads_details_and_prints_rule_reasons(
     assert "Python указан в названии" in output
     assert FakeBrowser.created is not None
     assert FakeBrowser.created.details_read == ["https://hh.ru/vacancy/vacancy-1"]
+
+
+def test_apply_runs_queue_and_records_confirmed_result(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    FakeBrowser.authenticated = True
+    install_fakes(monkeypatch, tmp_path, FakeStore())
+    database = FakeDatabase()
+    job = SimpleNamespace(
+        vacancy=SimpleNamespace(
+            source_url="https://hh.ru/vacancy/100",
+            title="Python developer",
+        ),
+        resume=SimpleNamespace(title="Python backend разработчик"),
+        direction_vacancy=SimpleNamespace(rules_details={"category": "MATCH"}),
+    )
+
+    class FakeAutomationService:
+        jobs: ClassVar[list[SimpleNamespace]] = [job]
+
+        def __init__(self, session: object) -> None:
+            assert session is not None
+
+        def resume_after_authentication(self) -> None:
+            return None
+
+        def prepare(self, **kwargs: object) -> SimpleNamespace:
+            assert kwargs["include_stretch"] is True
+            return SimpleNamespace(
+                account_id=1,
+                direction_id=3,
+                resume=SimpleNamespace(hh_id="resume-1"),
+                created=1,
+                existing=0,
+            )
+
+        def applied_since(self, account_id: int, since: object) -> int:
+            assert account_id == 1
+            assert since is not None
+            return 0
+
+        def claim_next(self, direction_id: int) -> SimpleNamespace | None:
+            assert direction_id == 3
+            return self.jobs.pop(0) if self.jobs else None
+
+        def record_result(self, queued_job: object, result: HhApplyResult) -> SimpleNamespace:
+            assert queued_job is job
+            assert result.status is HhApplyStatus.APPLIED
+            return SimpleNamespace(sent=True, blocking=False)
+
+    monkeypatch.setattr(hh_cli, "upgrade_database", lambda settings: None)
+    monkeypatch.setattr(hh_cli, "create_database", lambda settings: database)
+    monkeypatch.setattr(
+        hh_cli,
+        "HhProfileSyncService",
+        lambda session: SimpleNamespace(synchronize=lambda profile: None),
+    )
+    monkeypatch.setattr(hh_cli, "ApplicationAutomationService", FakeAutomationService)
+    monkeypatch.setattr(
+        hh_cli,
+        "CoverLetterBuilder",
+        lambda: SimpleNamespace(build=lambda vacancy, resume, category: "Письмо"),
+    )
+
+    assert hh_cli.run(["apply", "--direction", "Python backend", "--limit", "1"]) == 0
+
+    output = capsys.readouterr().out
+    assert "Новых подтверждённых откликов: 1" in output
+    assert "Python developer: отклик подтверждён" in output
+    assert FakeBrowser.created is not None
+    assert FakeBrowser.created.applications == [
+        (
+            "https://hh.ru/vacancy/100",
+            "Python backend разработчик",
+            "Письмо",
+        )
+    ]
+
+
+def test_apply_stops_queue_when_browser_result_is_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    FakeBrowser.authenticated = True
+    install_fakes(monkeypatch, tmp_path, FakeStore())
+    database = FakeDatabase()
+    job = SimpleNamespace(
+        vacancy=SimpleNamespace(
+            source_url="https://hh.ru/vacancy/100",
+            title="Python developer",
+        ),
+        resume=SimpleNamespace(title="Python backend разработчик"),
+        direction_vacancy=SimpleNamespace(rules_details={"category": "MATCH"}),
+    )
+
+    class FakeAutomationService:
+        jobs: ClassVar[list[SimpleNamespace]] = [job]
+
+        def __init__(self, session: object) -> None:
+            assert session is not None
+
+        def resume_after_authentication(self) -> None:
+            return None
+
+        def prepare(self, **kwargs: object) -> SimpleNamespace:
+            return SimpleNamespace(
+                account_id=1,
+                direction_id=3,
+                resume=SimpleNamespace(hh_id="resume-1"),
+                created=1,
+                existing=0,
+            )
+
+        def applied_since(self, account_id: int, since: object) -> int:
+            return 0
+
+        def claim_next(self, direction_id: int) -> SimpleNamespace | None:
+            return self.jobs.pop(0) if self.jobs else None
+
+        def record_result(self, queued_job: object, result: HhApplyResult) -> SimpleNamespace:
+            assert result.status is HhApplyStatus.UNKNOWN_RESULT
+            assert result.confirmation == "Ошибка выполнения: RuntimeError"
+            return SimpleNamespace(sent=False, blocking=True)
+
+    def fail_application(*args: object, **kwargs: object) -> HhApplyResult:
+        raise RuntimeError("неопределённый сбой браузера")
+
+    monkeypatch.setattr(hh_cli, "upgrade_database", lambda settings: None)
+    monkeypatch.setattr(hh_cli, "create_database", lambda settings: database)
+    monkeypatch.setattr(
+        hh_cli,
+        "HhProfileSyncService",
+        lambda session: SimpleNamespace(synchronize=lambda profile: None),
+    )
+    monkeypatch.setattr(hh_cli, "ApplicationAutomationService", FakeAutomationService)
+    monkeypatch.setattr(
+        hh_cli,
+        "CoverLetterBuilder",
+        lambda: SimpleNamespace(build=lambda vacancy, resume, category: "Письмо"),
+    )
+    monkeypatch.setattr(FakeBrowser, "apply_to_vacancy", fail_application)
+
+    assert hh_cli.run(["apply", "--direction", "Python backend", "--limit", "1"]) == 3
 
 
 def test_main_uses_process_exit(monkeypatch: pytest.MonkeyPatch) -> None:

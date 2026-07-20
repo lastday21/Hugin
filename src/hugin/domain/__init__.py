@@ -18,6 +18,7 @@ from hugin.domain.directions import (
     SearchQueryRecord,
     VacancyState,
 )
+from hugin.domain.hh import HhApplyResult, HhApplyStatus, HhResumeDetails
 from hugin.domain.state_machines import (
     InvalidStateTransitionError,
     ensure_application_transition,
@@ -48,6 +49,9 @@ __all__ = [
     "DuplicateApplicationError",
     "DuplicateTaskError",
     "EventPayload",
+    "HhApplyResult",
+    "HhApplyStatus",
+    "HhResumeDetails",
     "InvalidStateTransitionError",
     "ResumeRecord",
     "SearchQueryRecord",

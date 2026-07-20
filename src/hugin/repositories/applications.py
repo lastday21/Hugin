@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from sqlalchemy import select
+from datetime import datetime
+
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from hugin.database.models import (
@@ -115,6 +117,27 @@ class ApplicationRepository:
             )
         )
         return _application_record(model) if model is not None else None
+
+    def get(self, application_id: int) -> ApplicationRecord:
+        model = self._session.get(ApplicationModel, application_id)
+        if model is None:
+            raise ApplicationNotFoundError(application_id)
+        return _application_record(model)
+
+    def count_applied_since(self, account_id: int, since: datetime) -> int:
+        return (
+            self._session.scalar(
+                select(func.count())
+                .select_from(ApplicationEventModel)
+                .join(ApplicationModel)
+                .where(
+                    ApplicationModel.account_id == account_id,
+                    ApplicationEventModel.event_type == ApplicationEventType.APPLIED,
+                    ApplicationEventModel.created_at >= since,
+                )
+            )
+            or 0
+        )
 
     def list_by_vacancy_id(self, vacancy_id: int) -> list[ApplicationRecord]:
         models = self._session.scalars(

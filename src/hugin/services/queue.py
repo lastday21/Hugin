@@ -13,7 +13,15 @@ class QueueService:
         self._tasks = QueueTaskRepository(session)
         self._system = SystemStateRepository(session)
 
-    def claim_next(self, now: datetime | None = None) -> TaskRecord | None:
+    def claim_next(
+        self,
+        now: datetime | None = None,
+        *,
+        direction_id: int | None = None,
+    ) -> TaskRecord | None:
         if self._system.get().state is not SystemState.RUNNING:
             return None
-        return self._tasks.claim_next(now or datetime.now(UTC))
+        return self._tasks.claim_next(
+            now or datetime.now(UTC),
+            direction_id=direction_id,
+        )

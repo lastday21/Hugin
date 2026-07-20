@@ -172,6 +172,12 @@ class ResumeRepository:
         )
         return [_resume_record(model) for model in models]
 
+    def get(self, resume_id: int) -> ResumeRecord:
+        model = self._session.get(ResumeModel, resume_id)
+        if model is None:
+            raise LookupError("resume was not found")
+        return _resume_record(model)
+
     def get_active_by_title(self, account_id: int, title: str) -> ResumeRecord:
         models = list(
             self._session.scalars(
@@ -326,6 +332,40 @@ class DirectionRepository:
             )
             self._session.add(model)
             self._session.flush()
+        return _direction_vacancy_record(model)
+
+    def get_tracked_vacancy(
+        self,
+        direction_id: int,
+        vacancy_id: int,
+    ) -> DirectionVacancyRecord:
+        model = self._session.get(DirectionVacancyModel, (direction_id, vacancy_id))
+        if model is None:
+            raise LookupError("direction vacancy was not found")
+        return _direction_vacancy_record(model)
+
+    def list_tracked_vacancies(self, direction_id: int) -> list[DirectionVacancyRecord]:
+        models = self._session.scalars(
+            select(DirectionVacancyModel)
+            .where(DirectionVacancyModel.direction_id == direction_id)
+            .order_by(
+                DirectionVacancyModel.rules_score.desc().nulls_last(),
+                DirectionVacancyModel.vacancy_id,
+            )
+        )
+        return [_direction_vacancy_record(model) for model in models]
+
+    def set_vacancy_state(
+        self,
+        direction_id: int,
+        vacancy_id: int,
+        state: VacancyState,
+    ) -> DirectionVacancyRecord:
+        model = self._session.get(DirectionVacancyModel, (direction_id, vacancy_id))
+        if model is None:
+            raise LookupError("direction vacancy was not found")
+        model.state = state
+        self._session.flush()
         return _direction_vacancy_record(model)
 
     def apply_rules(

@@ -5,8 +5,13 @@ from datetime import UTC, datetime
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
-from hugin.database.models import ApplicationEventModel, ApplicationTaskModel, SystemStateModel
-from hugin.domain.applications import ApplicationEventType
+from hugin.database.models import (
+    ApplicationEventModel,
+    ApplicationModel,
+    ApplicationTaskModel,
+    SystemStateModel,
+)
+from hugin.domain.applications import ApplicationEventType, EventPayload
 from hugin.domain.state_machines import ensure_system_transition, ensure_task_transition
 from hugin.domain.tasks import (
     DuplicateTaskError,
@@ -77,10 +82,16 @@ class QueueTaskRepository:
             raise TaskNotFoundError(task_id)
         return _task_record(task)
 
-    def claim_next(self, now: datetime | None = None) -> TaskRecord | None:
+    def claim_next(
+        self,
+        now: datetime | None = None,
+        *,
+        direction_id: int | None = None,
+    ) -> TaskRecord | None:
         selected_at = as_utc(now or datetime.now(UTC))
-        task_id = self._session.scalar(
+        statement = (
             select(ApplicationTaskModel.id)
+            .join(ApplicationModel)
             .where(
                 ApplicationTaskModel.state.in_(READY_STATES),
                 ApplicationTaskModel.scheduled_at <= selected_at,
@@ -92,6 +103,9 @@ class QueueTaskRepository:
             )
             .limit(1)
         )
+        if direction_id is not None:
+            statement = statement.where(ApplicationModel.direction_id == direction_id)
+        task_id = self._session.scalar(statement)
         if task_id is None:
             return None
 
@@ -117,6 +131,7 @@ class QueueTaskRepository:
         *,
         scheduled_at: datetime | None = None,
         error_code: str | None = None,
+        event_payload: EventPayload | None = None,
     ) -> TaskRecord:
         task = self._session.get(ApplicationTaskModel, task_id)
         if task is None:
@@ -131,11 +146,13 @@ class QueueTaskRepository:
         if scheduled_at is not None:
             task.scheduled_at = as_utc(scheduled_at)
         if target is TaskState.UNKNOWN_RESULT:
+            payload: EventPayload = dict(event_payload or {})
+            payload.update({"task_id": task.id, "error_code": error_code})
             self._session.add(
                 ApplicationEventModel(
                     application_id=task.application_id,
                     event_type=ApplicationEventType.UNKNOWN_RESULT,
-                    payload={"task_id": task.id, "error_code": error_code},
+                    payload=payload,
                 )
             )
         self._session.flush()
