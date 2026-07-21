@@ -20,6 +20,7 @@ from hugin.domain.content import (
     InvitationState,
     MessageDirection,
     NotificationChannel,
+    ProfileQuestionState,
     RecruiterMessageState,
     ResumeMappingRole,
     ScreeningFormState,
@@ -34,6 +35,15 @@ from hugin.domain.directions import (
     VacancyState,
 )
 from hugin.domain.hh import HhApplyResult, HhApplyStatus, HhResumeDetails
+from hugin.domain.resumes import (
+    ParsedResumeProfile,
+    ProfileFactReview,
+    ProfileQuestionCandidate,
+    ResumeDocument,
+    ResumeFactCandidate,
+    ResumeImportResult,
+    ResumeSourceType,
+)
 from hugin.domain.state_machines import (
     InvalidStateTransitionError,
     ensure_application_transition,
@@ -78,9 +88,17 @@ __all__ = [
     "InvitationState",
     "MessageDirection",
     "NotificationChannel",
+    "ParsedResumeProfile",
+    "ProfileFactReview",
+    "ProfileQuestionCandidate",
+    "ProfileQuestionState",
     "RecruiterMessageState",
+    "ResumeDocument",
+    "ResumeFactCandidate",
+    "ResumeImportResult",
     "ResumeMappingRole",
     "ResumeRecord",
+    "ResumeSourceType",
     "ScreeningFormState",
     "SearchQueryRecord",
     "SystemState",

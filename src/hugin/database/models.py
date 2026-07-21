@@ -36,6 +36,7 @@ from hugin.domain.content import (
     InvitationState,
     MessageDirection,
     NotificationChannel,
+    ProfileQuestionState,
     RecruiterMessageState,
     ResumeMappingRole,
     ScreeningFormState,
@@ -142,6 +143,14 @@ class ResumeModel(Base):
     __table_args__ = (
         UniqueConstraint("account_id", "hh_id", name="uq_resumes_account_hh_id"),
         UniqueConstraint("account_id", "id", name="uq_resumes_account_id_id"),
+        CheckConstraint(
+            "source_size_bytes IS NULL OR source_size_bytes > 0",
+            name="ck_resumes_source_size_bytes",
+        ),
+        CheckConstraint(
+            "source_page_count IS NULL OR source_page_count > 0",
+            name="ck_resumes_source_page_count",
+        ),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -152,6 +161,10 @@ class ResumeModel(Base):
     title: Mapped[str] = mapped_column(String(255), nullable=False)
     source_type: Mapped[str | None] = mapped_column(String(32))
     source_reference: Mapped[str | None] = mapped_column(Text)
+    source_original_name: Mapped[str | None] = mapped_column(String(255))
+    source_sha256: Mapped[str | None] = mapped_column(String(64), index=True)
+    source_size_bytes: Mapped[int | None] = mapped_column(Integer)
+    source_page_count: Mapped[int | None] = mapped_column(Integer)
     content_text: Mapped[str | None] = mapped_column(Text)
     imported_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
@@ -463,10 +476,52 @@ class CandidateProfileModel(Base):
     account_id: Mapped[int] = mapped_column(
         ForeignKey("hh_accounts.id", ondelete="RESTRICT"), nullable=False, index=True
     )
+    active_resume_id: Mapped[int | None] = mapped_column(
+        ForeignKey(
+            "resumes.id",
+            name="fk_candidate_profiles_active_resume",
+            ondelete="SET NULL",
+        ),
+        index=True,
+    )
     display_name: Mapped[str] = mapped_column(String(255), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
     )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+    )
+
+
+class ProfileQuestionModel(Base):
+    __tablename__ = "profile_questions"
+    __table_args__ = (
+        UniqueConstraint("profile_id", "key", name="uq_profile_questions_profile_key"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    profile_id: Mapped[int] = mapped_column(
+        ForeignKey("candidate_profiles.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    key: Mapped[str] = mapped_column(String(128), nullable=False)
+    question_text: Mapped[str] = mapped_column(Text, nullable=False)
+    answer_text: Mapped[str | None] = mapped_column(Text)
+    state: Mapped[ProfileQuestionState] = mapped_column(
+        Enum(
+            ProfileQuestionState,
+            name="profile_question_state",
+            native_enum=False,
+            create_constraint=True,
+            length=16,
+            values_callable=enum_values,
+        ),
+        default=ProfileQuestionState.PENDING,
+        nullable=False,
+    )
+    requested_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    answered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
     )
@@ -747,6 +802,9 @@ class ScreeningAnswerModel(Base):
 
 class AnswerTemplateModel(Base):
     __tablename__ = "answer_templates"
+    __table_args__ = (
+        UniqueConstraint("profile_id", "key", name="uq_answer_templates_profile_key"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     profile_id: Mapped[int] = mapped_column(

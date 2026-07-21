@@ -7,6 +7,12 @@ class ConfirmationState(StrEnum):
     REJECTED = "REJECTED"
 
 
+class ProfileQuestionState(StrEnum):
+    PENDING = "PENDING"
+    ANSWERED = "ANSWERED"
+    DISMISSED = "DISMISSED"
+
+
 class ResumeMappingRole(StrEnum):
     PRIMARY = "PRIMARY"
     RESERVE = "RESERVE"

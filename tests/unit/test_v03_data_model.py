@@ -65,6 +65,7 @@ def test_v03_schema_persists_required_entities(settings: Settings) -> None:
         "invitations",
         "notifications",
         "prompt_versions",
+        "profile_questions",
         "recruiter_message_facts",
         "recruiter_messages",
         "screening_answers",
