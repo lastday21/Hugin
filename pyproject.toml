@@ -7,6 +7,7 @@ requires-python = ">=3.12,<3.13"
 dependencies = [
     "alembic>=1.16,<2",
     "fastapi>=0.116,<1",
+    "keyring>=25.6,<26",
     "psycopg[binary]>=3.2,<4",
     "pydantic-settings>=2.10,<3",
     "pypdf>=6.14,<7",
@@ -17,7 +18,6 @@ dependencies = [
 
 [project.optional-dependencies]
 browser = [
-    "keyring>=25.6,<26",
     "playwright>=1.52,<2",
 ]
 
@@ -26,6 +26,7 @@ hugin = "hugin.__main__:main"
 hugin-db = "hugin.database.cli:main"
 hugin-hh = "hugin.hh_cli:main"
 hugin-resume = "hugin.resume_cli:main"
+hugin-resume-improve = "hugin.resume_improvement_cli:main"
 
 [dependency-groups]
 dev = [
@@ -45,6 +46,22 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/hugin"]
 
+[tool.hatch.build.targets.sdist]
+include = [
+    "/src",
+    "/tests",
+    "/README.md",
+    "/pyproject.toml",
+    "/uv.lock",
+    "/.env.example",
+    "/.dockerignore",
+    "/.pre-commit-config.yaml",
+    "/.python-version",
+    "/compose.yaml",
+    "/Dockerfile",
+    "/Makefile",
+]
+
 [tool.ruff]
 line-length = 100
 target-version = "py312"
@@ -54,7 +71,12 @@ select = ["B", "E", "F", "I", "RUF", "SIM", "UP"]
 
 [tool.ruff.lint.per-file-ignores]
 "src/hugin/adapters/resume_documents.py" = ["RUF001"]
+"src/hugin/adapters/yandex_ai.py" = ["RUF001"]
+"src/hugin/adapters/yandex_credentials.py" = ["RUF001"]
 "src/hugin/resume_cli.py" = ["RUF001"]
+"src/hugin/resume_improvement_cli.py" = ["RUF001"]
+"src/hugin/services/resume_improvement.py" = ["RUF001"]
+"src/hugin/services/resume_prompts.py" = ["RUF001"]
 "src/hugin/services/resume_profile.py" = ["RUF001"]
 "tests/unit/test_resume_*.py" = ["RUF001"]
 

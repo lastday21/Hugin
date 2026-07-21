@@ -272,6 +272,7 @@ source = { editable = "." }
 dependencies = [
     { name = "alembic" },
     { name = "fastapi" },
+    { name = "keyring" },
     { name = "psycopg", extra = ["binary"] },
     { name = "pydantic-settings" },
     { name = "pypdf" },
@@ -282,7 +283,6 @@ dependencies = [
 
 [package.optional-dependencies]
 browser = [
-    { name = "keyring" },
     { name = "playwright" },
 ]
 
@@ -301,7 +301,7 @@ dev = [
 requires-dist = [
     { name = "alembic", specifier = ">=1.16,<2" },
     { name = "fastapi", specifier = ">=0.116,<1" },
-    { name = "keyring", marker = "extra == 'browser'", specifier = ">=25.6,<26" },
+    { name = "keyring", specifier = ">=25.6,<26" },
     { name = "playwright", marker = "extra == 'browser'", specifier = ">=1.52,<2" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.2,<4" },
     { name = "pydantic-settings", specifier = ">=2.10,<3" },

@@ -42,6 +42,11 @@ class Settings(BaseSettings):
     hh_apply_daily_limit: int = Field(default=25, ge=25)
     hh_apply_delay_min_seconds: int = Field(default=30, ge=0, le=300)
     hh_apply_delay_max_seconds: int = Field(default=60, ge=0, le=300)
+    yandex_ai_api_key: SecretStr = SecretStr("")
+    yandex_ai_folder_id: str = ""
+    yandex_ai_model: str = "yandexgpt/latest"
+    yandex_ai_base_url: str = "https://ai.api.cloud.yandex.net/v1"
+    yandex_ai_timeout_seconds: int = Field(default=120, ge=1, le=300)
 
     @model_validator(mode="after")
     def validate_apply_delay(self) -> Settings:
