@@ -150,8 +150,8 @@ def test_job_search_sync_is_repeatable_and_does_not_create_applications(
                 )
             )
             assert [link.state for link in links] == [
-                VacancyState.FILTERED,
-                VacancyState.SKIPPED,
+                VacancyState.ANALYZED,
+                VacancyState.FILTERED_OUT,
             ]
             assert links[0].rules_details["accepted"] is True
             assert links[0].rules_details["category"] == "MATCH"

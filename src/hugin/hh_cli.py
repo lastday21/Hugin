@@ -5,13 +5,13 @@ import getpass
 import random
 import time
 from collections.abc import Sequence
-from datetime import UTC, datetime
 
 from hugin.adapters.credentials import WindowsCredentialStore
 from hugin.adapters.hh_browser import VisibleHhBrowser
 from hugin.core.settings import Settings, get_settings
 from hugin.database import create_database, upgrade_database
 from hugin.domain.hh import HhApplyResult, HhApplyStatus, HhProfileData
+from hugin.domain.time import local_day_start_utc
 from hugin.services.application_automation import ApplicationAutomationService
 from hugin.services.cover_letter import CoverLetterBuilder
 from hugin.services.hh_login import HhCredentials, HhLoginService, LoginStatus
@@ -259,7 +259,7 @@ def _run_applications(
                 direction_name=arguments.direction,
                 include_stretch=not arguments.exclude_stretch,
             )
-            day_start = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+            day_start = local_day_start_utc()
             sent_today = service.applied_since(prepared.account_id, day_start)
 
         resume_details = browser.read_resume_details(prepared.resume.hh_id)
@@ -326,7 +326,7 @@ def _apply_status_text(status: HhApplyStatus) -> str:
     messages = {
         HhApplyStatus.APPLIED: "отклик подтверждён",
         HhApplyStatus.ALREADY_APPLIED: "отклик уже был отправлен",
-        HhApplyStatus.QUESTIONS_REQUIRED: "пропущена из-за вопросов работодателя",
+        HhApplyStatus.QUESTIONS_REQUIRED: "требуется заполнить анкету",
         HhApplyStatus.VACANCY_CLOSED: "вакансия закрыта",
         HhApplyStatus.AUTH_REQUIRED: "требуется повторный вход",
         HhApplyStatus.CAPTCHA_REQUIRED: "требуется проверка",

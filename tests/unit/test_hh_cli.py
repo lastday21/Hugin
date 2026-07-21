@@ -474,7 +474,7 @@ def test_apply_runs_queue_and_records_confirmed_result(
     ]
 
 
-def test_apply_stops_queue_when_browser_result_is_unknown(
+def test_apply_keeps_queue_available_when_one_result_is_unknown(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -517,7 +517,7 @@ def test_apply_stops_queue_when_browser_result_is_unknown(
         def record_result(self, queued_job: object, result: HhApplyResult) -> SimpleNamespace:
             assert result.status is HhApplyStatus.UNKNOWN_RESULT
             assert result.confirmation == "Ошибка выполнения: RuntimeError"
-            return SimpleNamespace(sent=False, blocking=True)
+            return SimpleNamespace(sent=False, blocking=False)
 
     def fail_application(*args: object, **kwargs: object) -> HhApplyResult:
         raise RuntimeError("неопределённый сбой браузера")
@@ -537,7 +537,7 @@ def test_apply_stops_queue_when_browser_result_is_unknown(
     )
     monkeypatch.setattr(FakeBrowser, "apply_to_vacancy", fail_application)
 
-    assert hh_cli.run(["apply", "--direction", "Python backend", "--limit", "1"]) == 3
+    assert hh_cli.run(["apply", "--direction", "Python backend", "--limit", "1"]) == 0
 
 
 def test_main_uses_process_exit(monkeypatch: pytest.MonkeyPatch) -> None:

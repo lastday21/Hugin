@@ -88,7 +88,7 @@ class ApplicationAutomationService:
         existing = 0
         for tracked in self._directions.list_tracked_vacancies(direction.id):
             category = tracked.rules_details.get("category")
-            if tracked.state is not VacancyState.FILTERED or category not in allowed:
+            if tracked.state is not VacancyState.ANALYZED or category not in allowed:
                 continue
             current = self._applications.get_by_key(account.id, tracked.vacancy_id, resume.id)
             if current is not None:
@@ -159,8 +159,16 @@ class ApplicationAutomationService:
             self._tasks.transition(job.task.id, TaskState.COMPLETED)
             return RecordedApplyResult(blocking=False, sent=result.status is HhApplyStatus.APPLIED)
 
-        if result.status in {HhApplyStatus.QUESTIONS_REQUIRED, HhApplyStatus.VACANCY_CLOSED}:
+        if result.status is HhApplyStatus.QUESTIONS_REQUIRED:
             payload["question_count"] = len(result.questions)
+            self._tasks.transition(
+                job.task.id,
+                TaskState.INPUT_REQUIRED,
+                error_code=result.status.value,
+            )
+            return RecordedApplyResult(blocking=False, sent=False)
+
+        if result.status is HhApplyStatus.VACANCY_CLOSED:
             self._applications.transition_state(
                 job.application.id,
                 ApplicationState.CLOSED,
@@ -180,8 +188,7 @@ class ApplicationAutomationService:
                 error_code=result.status.value,
                 event_payload=payload,
             )
-            self._transition_system(SystemState.PAUSED)
-            return RecordedApplyResult(blocking=True, sent=False)
+            return RecordedApplyResult(blocking=False, sent=False)
 
         system_states = {
             HhApplyStatus.AUTH_REQUIRED: SystemState.AUTH_REQUIRED,
@@ -221,8 +228,6 @@ class ApplicationAutomationService:
             },
         )
         self._tasks.transition(task.id, TaskState.COMPLETED)
-        if self._system.get().state is SystemState.PAUSED:
-            self._system.transition(SystemState.RUNNING)
         return RecordedApplyResult(blocking=False, sent=True)
 
     def _transition_system(self, target: SystemState) -> None:

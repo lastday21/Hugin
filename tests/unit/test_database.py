@@ -42,7 +42,7 @@ def test_migration_reaches_baseline(settings: Settings) -> None:
         database.close()
 
     upgrade_database(settings)
-    assert current_revision(settings) == "0005_vacancy_details"
+    assert current_revision(settings) == "0006_v03_states"
     check_database_schema(settings)
 
     downgrade_database(settings)
@@ -58,7 +58,7 @@ def test_database_cli_manages_schema(
 
     assert cli.main(["upgrade"]) == 0
     assert cli.main(["current"]) == 0
-    assert capsys.readouterr().out.strip() == "0005_vacancy_details"
+    assert capsys.readouterr().out.strip() == "0006_v03_states"
     assert cli.main(["check"]) == 0
     assert cli.main(["downgrade"]) == 0
 
@@ -99,6 +99,6 @@ def test_direction_migration_preserves_existing_application(settings: Settings) 
             ).one()
 
         assert row == ("Imported data", "legacy-resume", "APPLYING")
-        assert current_revision(settings) == "0005_vacancy_details"
+        assert current_revision(settings) == "0006_v03_states"
     finally:
         migrated.close()

@@ -11,16 +11,6 @@ from hugin.services.vacancy_analysis import PythonBackendRules, RuleCategory
     [
         (
             VacancyData(
-                "1",
-                "Senior Python developer",
-                "https://hh.ru/vacancy/1",
-                description="Python backend",
-                experience="Опыт 3\N{EN DASH}6 лет",
-            ),
-            "уровень Senior",
-        ),
-        (
-            VacancyData(
                 "2",
                 "Продуктовый аналитик",
                 "https://hh.ru/vacancy/2",
@@ -81,6 +71,36 @@ def test_three_to_six_years_is_not_a_rejection_for_non_senior_role() -> None:
     assert result.accepted
     assert result.category is RuleCategory.MATCH
     assert any("пожелание" in reason for reason in result.reasons)
+
+
+def test_senior_marker_is_a_risk_but_not_a_rejection() -> None:
+    result = PythonBackendRules().evaluate(
+        VacancyData(
+            "senior",
+            "Senior Python developer",
+            "https://hh.ru/vacancy/senior",
+            description="Python backend",
+            experience="Опыт 3\N{EN DASH}6 лет",
+        )
+    )
+
+    assert result.accepted
+    assert any("без анализа обязанностей" in reason for reason in result.reasons)
+
+
+def test_low_soft_score_does_not_reject_related_vacancy() -> None:
+    result = PythonBackendRules().evaluate(
+        VacancyData(
+            "low-score",
+            "Инженер автоматизации",
+            "https://hh.ru/vacancy/low-score",
+            description="Писать небольшие инструменты на Python",
+        )
+    )
+
+    assert result.score < PythonBackendRules.soft_boundary
+    assert result.accepted
+    assert any("только на порядок очереди" in reason for reason in result.reasons)
 
 
 def test_leading_role_is_not_rejected() -> None:

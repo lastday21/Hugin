@@ -9,9 +9,9 @@ type ConfigPayload = dict[str, object]
 
 class VacancyState(StrEnum):
     DISCOVERED = "DISCOVERED"
-    FILTERED = "FILTERED"
     ANALYZED = "ANALYZED"
     QUEUED = "QUEUED"
+    FILTERED_OUT = "FILTERED_OUT"
     SKIPPED = "SKIPPED"
     CLOSED = "CLOSED"
 

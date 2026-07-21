@@ -37,7 +37,7 @@ class VacancyAnalysisResult:
 
 
 class PythonBackendRules:
-    threshold: ClassVar[float] = 50
+    soft_boundary: ClassVar[float] = 50
     _excluded_specializations: ClassVar[tuple[tuple[str, str], ...]] = (
         ("аналитик", "другое направление: аналитика"),
         ("analyst", "другое направление: аналитика"),
@@ -88,7 +88,9 @@ class PythonBackendRules:
                 rejected.append(reason)
                 break
         if any(marker in title for marker in self._seniority_markers):
-            rejected.append("в названии явно указан уровень Senior")
+            reasons.append(
+                "уровень Senior учтён как риск, но не блокирует отклик без анализа обязанностей"
+            )
         if "python" not in complete_text:
             rejected.append("Python не указан в названии, описании или навыках")
 
@@ -124,11 +126,13 @@ class PythonBackendRules:
             score += min(len(matched_skills) * 2, 12)
             reasons.append("подходящие технологии: " + ", ".join(matched_skills))
 
-        score = min(score, 100)
+        score = min(max(score, 0), 100)
         if stretch and not rejected:
             reasons.append("профильная работа по LLM или NLP; требуется дополнительная подготовка")
-        elif score < self.threshold and not rejected:
-            rejected.append(f"оценка ниже порога {self.threshold:.0f}")
+        elif score < self.soft_boundary and not rejected:
+            reasons.append(
+                f"мягкая оценка ниже {self.soft_boundary:.0f}; это влияет только на порядок очереди"
+            )
         reasons.extend(rejected)
         if rejected:
             category = RuleCategory.REJECTED
@@ -223,7 +227,7 @@ class VacancyAnalysisService:
         vacancy: VacancyData,
     ) -> VacancyAnalysisResult:
         evaluation = self._rules.evaluate(vacancy)
-        state = VacancyState.FILTERED if evaluation.accepted else VacancyState.SKIPPED
+        state = VacancyState.ANALYZED if evaluation.accepted else VacancyState.FILTERED_OUT
         self._directions.apply_rules(
             direction_id,
             stored.id,
@@ -233,7 +237,7 @@ class VacancyAnalysisService:
                 "accepted": evaluation.accepted,
                 "category": evaluation.category.value,
                 "reasons": list(evaluation.reasons),
-                "threshold": self._rules.threshold,
+                "soft_boundary": self._rules.soft_boundary,
             },
         )
         return VacancyAnalysisResult(stored, evaluation, state)
