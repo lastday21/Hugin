@@ -17,6 +17,7 @@ def test_default_api_is_local_only() -> None:
     assert settings.hh_apply_daily_limit == 25
     assert settings.hh_apply_delay_min_seconds == 30
     assert settings.hh_apply_delay_max_seconds == 60
+    assert settings.yandex_ai_model == "aliceai-llm/latest"
     assert settings.data_dir.is_absolute()
 
 

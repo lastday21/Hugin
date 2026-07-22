@@ -11,7 +11,7 @@ from typing import Protocol, cast
 class YandexAICredentials:
     api_key: str
     folder_id: str
-    model: str = "yandexgpt/latest"
+    model: str = "aliceai-llm/latest"
 
     def __repr__(self) -> str:
         return (

@@ -31,6 +31,7 @@ from hugin.services.resume_prompts import (
     ResumeBlockKind,
     ResumePromptContext,
     ResumeQuestionAnswer,
+    ResumeQuestionAssessment,
     build_questions_prompt,
     build_rewrite_prompt,
     parse_question_assessments,
@@ -359,11 +360,7 @@ class ResumeImprovementService:
                 target_role=role,
                 vacancy_context=vacancy_context,
             )
-            assessment_response = self._model.complete(
-                SYSTEM_PROMPT,
-                build_questions_prompt(context),
-            )
-            assessments = parse_question_assessments(assessment_response)
+            assessments = self._assess_questions(context)
             questions = select_missing_questions(assessments)
             answers = tuple(
                 self._answer(block, question, answer_provider) for question in questions
@@ -414,6 +411,22 @@ class ResumeImprovementService:
             blocks=improved_blocks,
             source_unchanged=source_unchanged,
         )
+
+    def _assess_questions(
+        self,
+        context: ResumePromptContext,
+    ) -> tuple[ResumeQuestionAssessment, ...]:
+        prompt = build_questions_prompt(context)
+        response = self._model.complete(SYSTEM_PROMPT, prompt)
+        try:
+            return parse_question_assessments(response)
+        except ValueError:
+            retry_prompt = (
+                f"{prompt}\n\n"
+                "Предыдущий ответ имел неверный формат. Верни только корректный JSON-массив "
+                "из пяти объектов без разметки и пояснений."
+            )
+            return parse_question_assessments(self._model.complete(SYSTEM_PROMPT, retry_prompt))
 
     def _active_resume(self, account_id: int) -> tuple[CandidateProfileModel, ResumeModel]:
         profile = self._session.scalar(

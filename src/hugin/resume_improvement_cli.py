@@ -28,9 +28,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="сохранить настройки YandexGPT в защищенном хранилище Windows",
     )
     configure.add_argument("--folder-id", required=True, help="идентификатор каталога Yandex Cloud")
-    configure.add_argument("--model", default="yandexgpt/latest", help="модель YandexGPT")
+    configure.add_argument("--model", default="aliceai-llm/latest", help="облачная модель")
 
-    subparsers.add_parser("test", help="проверить подключение к YandexGPT")
+    subparsers.add_parser("test", help="проверить подключение к облачной модели")
     subparsers.add_parser("delete-config", help="удалить сохраненный ключ YandexGPT")
 
     run = subparsers.add_parser("run", help="создать отдельный улучшенный DOCX-черновик")
@@ -68,7 +68,7 @@ def run(argv: Sequence[str] | None = None) -> int:
                 SYSTEM_PROMPT,
                 "Ответь одним словом: готово",
             )
-            print(f"YandexGPT доступен, модель {client.model_name}: {response}")
+            print(f"Облачная модель доступна: {client.model_name}: {response}")
             return 0
 
         upgrade_database(settings)

@@ -19,6 +19,7 @@ from hugin.services.resume_improvement import (
     ResumeImprovementService,
     ResumeNarrativeBlock,
 )
+from hugin.services.resume_prompts import ResumeBlockKind, ResumePromptContext
 
 SOURCE_TEXT = """Иван Иванов
 ivan@example.com
@@ -164,6 +165,33 @@ def test_answer_and_vacancy_limit_validation(tmp_path: Path) -> None:
         service.improve(1, lambda *_args: "ответ", vacancy_limit=0)
 
 
+def test_question_assessment_retries_once_after_invalid_json(tmp_path: Path) -> None:
+    class RetryModel:
+        model_name = "retry-model"
+
+        def __init__(self) -> None:
+            self.responses = iter(("не json", question_response()))
+            self.prompts: list[str] = []
+
+        def complete(self, _system_prompt: str, user_prompt: str) -> str:
+            self.prompts.append(user_prompt)
+            return next(self.responses)
+
+    model = RetryModel()
+    service = ResumeImprovementService(cast(Session, object()), tmp_path, model)
+    context = ResumePromptContext(
+        kind=ResumeBlockKind.PROJECT,
+        source_block="Разработал алгоритм и проверил точность.",
+        target_role="Python-разработчик",
+    )
+
+    assessments = service._assess_questions(context)
+
+    assert len(assessments) == 5
+    assert len(model.prompts) == 2
+    assert "Предыдущий ответ имел неверный формат" in model.prompts[1]
+
+
 @pytest.mark.integration
 def test_service_creates_separate_draft_without_changing_source(
     settings: Settings,
@@ -221,8 +249,8 @@ def test_service_creates_separate_draft_without_changing_source(
             assert "Реализовал API обработки заказов" in document_text
             report = json.loads(result.report_path.read_text(encoding="utf-8"))
             assert report["source_resume_id"] == resume.id
-            assert report["question_prompt_version"] == "resume_questions_v2"
-            assert report["rewrite_prompt_version"] == "resume_rewrite_v1"
+            assert report["question_prompt_version"] == "resume_questions_v3"
+            assert report["rewrite_prompt_version"] == "resume_rewrite_v4"
             assert report["blocks"][0]["answers"] == [
                 "Работало в опытной эксплуатации, точный объем не фиксировался.",
                 "Работало в опытной эксплуатации, точный объем не фиксировался.",
