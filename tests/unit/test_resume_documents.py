@@ -71,6 +71,21 @@ def test_docx_is_read_and_profile_is_extracted(tmp_path: Path) -> None:
     assert "portfolio" not in missing
 
 
+def test_repeated_inline_skills_heading_is_extracted() -> None:
+    extractor = ResumeProfileExtractor()
+    lines = [
+        "Навыки",
+        "Знание языков Русский — Родной",
+        "Английский — B1 — Средний",
+        "Навыки Python FastAPI SQL Docker Git PostgreSQL Redis",
+        "Опыт вождения",
+        "Права категории B",
+    ]
+
+    assert extractor._section(lines, "skills") == ("Python FastAPI SQL Docker Git PostgreSQL Redis")
+    assert extractor._languages(lines) == "Русский — Родной\nАнглийский — B1 — Средний"
+
+
 def test_pdf_with_cyrillic_name_is_read(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     path = tmp_path / "Резюме программиста.pdf"
     path.write_bytes(b"test-pdf")

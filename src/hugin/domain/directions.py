@@ -16,6 +16,25 @@ class VacancyState(StrEnum):
     CLOSED = "CLOSED"
 
 
+class WorkFormat(StrEnum):
+    REMOTE = "REMOTE"
+    ON_SITE = "ON_SITE"
+    HYBRID = "HYBRID"
+
+
+class EmploymentForm(StrEnum):
+    FULL = "FULL"
+    PART = "PART"
+    PROJECT = "PROJECT"
+    FLY_IN_FLY_OUT = "FLY_IN_FLY_OUT"
+
+
+@dataclass(frozen=True, slots=True)
+class SearchRegion:
+    area: str
+    name: str
+
+
 @dataclass(frozen=True, slots=True)
 class AccountRecord:
     id: int
@@ -45,6 +64,11 @@ class SearchQueryRecord:
     query: str
     area: str
     filters: ConfigPayload
+    regions: tuple[SearchRegion, ...]
+    work_formats: tuple[WorkFormat, ...]
+    schedule_minutes: int
+    last_run_at: datetime | None
+    next_run_at: datetime | None
     is_active: bool
     created_at: datetime
 

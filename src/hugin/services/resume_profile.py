@@ -56,6 +56,11 @@ COMMON_QUESTIONS = (
         re.compile(r"график работы\s*:", re.IGNORECASE),
     ),
     _CommonQuestion(
+        "employment",
+        "Какие виды занятости вам подходят: полная, частичная или проектная?",
+        re.compile(r"тип занятости\s*:", re.IGNORECASE),
+    ),
+    _CommonQuestion(
         "relocation",
         "Готовы ли вы к переезду?",
         re.compile(r"(?:не\s+)?готов\w*\s+к\s+переезду", re.IGNORECASE),
@@ -201,17 +206,18 @@ class ResumeProfileExtractor:
 
     def _section(self, lines: list[str], category: str) -> str | None:
         heading = self._section_starts[category]
-        try:
-            start = next(index for index, line in enumerate(lines) if line.startswith(heading))
-        except StopIteration:
+        starts = [index for index, line in enumerate(lines) if line.startswith(heading)]
+        if not starts:
             return None
+        start = starts[-1]
         following = [
             index
             for index, line in enumerate(lines[start + 1 :], start + 1)
             if any(line.startswith(value) for value in self._section_starts.values())
         ]
         end = following[0] if following else len(lines)
-        content = "\n".join(lines[start + 1 : end]).strip()
+        first_line = lines[start].removeprefix(heading).strip()
+        content = "\n".join([first_line, *lines[start + 1 : end]]).strip()
         return content or None
 
     @staticmethod
@@ -221,7 +227,7 @@ class ResumeProfileExtractor:
                 continue
             values = [line.removeprefix("Знание языков").strip()]
             for following in lines[index + 1 :]:
-                if following == "Навыки":
+                if following.startswith("Навыки"):
                     break
                 values.append(following)
             return "\n".join(value for value in values if value) or None

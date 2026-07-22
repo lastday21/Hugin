@@ -151,6 +151,7 @@ ALLOWED_SEARCH_FILTERS = frozenset(
     {
         "currency",
         "employment",
+        "employment_form",
         "excluded_text",
         "experience",
         "label",

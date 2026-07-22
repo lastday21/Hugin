@@ -126,7 +126,7 @@ class DirectionSearchQueryModel(Base):
     query: Mapped[str] = mapped_column(String(512), nullable=False)
     area: Mapped[str] = mapped_column(String(64), default="", nullable=False)
     filters: Mapped[ConfigPayload] = mapped_column(JSONB, default=dict, nullable=False)
-    regions: Mapped[list[str]] = mapped_column(JSONB, default=list, nullable=False)
+    regions: Mapped[list[ConfigPayload]] = mapped_column(JSONB, default=list, nullable=False)
     work_formats: Mapped[list[str]] = mapped_column(JSONB, default=list, nullable=False)
     schedule_minutes: Mapped[int] = mapped_column(Integer, default=120, nullable=False)
     last_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

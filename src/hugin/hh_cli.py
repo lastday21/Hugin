@@ -10,13 +10,22 @@ from hugin.adapters.credentials import WindowsCredentialStore
 from hugin.adapters.hh_browser import VisibleHhBrowser
 from hugin.core.settings import Settings, get_settings
 from hugin.database import create_database, upgrade_database
+from hugin.domain.directions import EmploymentForm, SearchRegion, WorkFormat
 from hugin.domain.hh import HhApplyResult, HhApplyStatus, HhProfileData
+from hugin.domain.resumes import ProfileQuestionCandidate
 from hugin.domain.time import local_day_start_utc
 from hugin.services.application_automation import ApplicationAutomationService
+from hugin.services.career_directions import (
+    COMMON_REGIONS,
+    CareerDirectionService,
+    DirectionSearchSettings,
+    VacancySearchTask,
+)
 from hugin.services.cover_letter import CoverLetterBuilder
 from hugin.services.hh_login import HhCredentials, HhLoginService, LoginStatus
 from hugin.services.hh_profile import HhProfileSyncService
 from hugin.services.job_search import JobSearchSyncService
+from hugin.services.resume_profile import ProfileQuestionService
 from hugin.services.vacancy_analysis import RuleCategory, VacancyAnalysisService
 
 STATUS_MESSAGES = {
@@ -45,10 +54,74 @@ def build_parser() -> argparse.ArgumentParser:
     search = subparsers.add_parser("search", help="загрузить вакансии по направлению")
     search.add_argument("--account-id", type=positive_int, default=1)
     search.add_argument("--direction", required=True, help="название направления")
-    search.add_argument("--resume", required=True, help="точное название резюме")
-    search.add_argument("--query", required=True, help="поисковая фраза")
-    search.add_argument("--area", default="113", help="идентификатор региона hh.ru")
+    search.add_argument(
+        "--resume",
+        help="точное название резюме; по умолчанию используется активное ИТ-резюме",
+    )
+    search.add_argument(
+        "--query",
+        action="append",
+        help="разовый поисковый запрос; без него используются настройки направления",
+    )
+    search.add_argument(
+        "--area",
+        action="append",
+        help="регион для разового поиска; без него используется Россия (113)",
+    )
     search.add_argument("--page", type=non_negative_int, default=0, help="номер страницы")
+
+    configure = subparsers.add_parser(
+        "configure-search",
+        help="настроить направление, запросы, города и условия поиска",
+    )
+    configure.add_argument("--account-id", type=positive_int, default=1)
+    configure.add_argument("--direction", required=True, help="название направления")
+    configure.add_argument(
+        "--query",
+        action="append",
+        help="поисковая фраза; можно указать несколько раз",
+    )
+    configure.add_argument(
+        "--city",
+        action="append",
+        type=search_region,
+        default=[],
+        help="город из встроенного списка или в виде Название=код_hh",
+    )
+    configure.add_argument(
+        "--format",
+        dest="work_formats",
+        action="append",
+        type=work_format,
+        help="удалённо, офис или гибрид; без параметра берётся из резюме",
+    )
+    configure.add_argument(
+        "--employment",
+        dest="employment_forms",
+        action="append",
+        type=employment_form,
+        help="полная, частичная, проект или вахта; без параметра берётся из резюме",
+    )
+    configure.add_argument("--minimum-salary", type=positive_int)
+    configure.add_argument("--desired-salary", type=positive_int)
+    configure.add_argument(
+        "--remote-russia",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="для удалённой работы искать по всей России",
+    )
+    configure.add_argument(
+        "--schedule-minutes",
+        type=positive_int,
+        default=120,
+        help="интервал поиска в минутах",
+    )
+
+    show_search = subparsers.add_parser("show-search", help="показать настройки направления")
+    show_search.add_argument("--account-id", type=positive_int, default=1)
+    show_search.add_argument("--direction", required=True, help="название направления")
+
+    subparsers.add_parser("cities", help="показать города, для которых код hh.ru уже известен")
 
     analyze = subparsers.add_parser(
         "analyze",
@@ -84,8 +157,61 @@ def non_negative_int(value: str) -> int:
     return parsed
 
 
+def search_region(value: str) -> SearchRegion:
+    normalized = " ".join(value.strip().split())
+    known = COMMON_REGIONS.get(normalized.casefold())
+    if known is not None:
+        return known
+    if "=" not in normalized:
+        raise argparse.ArgumentTypeError(
+            "неизвестный город; используйте команду cities или формат Название=код_hh"
+        )
+    name, area = (part.strip() for part in normalized.rsplit("=", 1))
+    if not name or not area.isdigit():
+        raise argparse.ArgumentTypeError("город нужно указать в формате Название=код_hh")
+    return SearchRegion(area, name)
+
+
+def work_format(value: str) -> WorkFormat:
+    aliases = {
+        "удаленно": WorkFormat.REMOTE,
+        "удалённо": WorkFormat.REMOTE,
+        "офис": WorkFormat.ON_SITE,
+        "гибрид": WorkFormat.HYBRID,
+    }
+    try:
+        return aliases[value.strip().casefold()]
+    except KeyError as error:
+        raise argparse.ArgumentTypeError("формат: удалённо, офис или гибрид") from error
+
+
+def employment_form(value: str) -> EmploymentForm:
+    aliases = {
+        "полная": EmploymentForm.FULL,
+        "частичная": EmploymentForm.PART,
+        "проект": EmploymentForm.PROJECT,
+        "вахта": EmploymentForm.FLY_IN_FLY_OUT,
+    }
+    try:
+        return aliases[value.strip().casefold()]
+    except KeyError as error:
+        raise argparse.ArgumentTypeError(
+            "занятость: полная, частичная, проект или вахта"
+        ) from error
+
+
 def run(argv: Sequence[str] | None = None) -> int:
     arguments = build_parser().parse_args(argv)
+
+    if arguments.command == "cities":
+        unique = {region.area: region for region in COMMON_REGIONS.values()}
+        for region in sorted(unique.values(), key=lambda item: item.name):
+            print(f"{region.name}: {region.area}")
+        return 0
+
+    if arguments.command in {"configure-search", "show-search"}:
+        return _run_search_settings(arguments)
+
     store = WindowsCredentialStore()
 
     if arguments.command == "save":
@@ -101,6 +227,9 @@ def run(argv: Sequence[str] | None = None) -> int:
         return 0
 
     settings = get_settings()
+    search_tasks: tuple[VacancySearchTask, ...] = ()
+    if arguments.command == "search":
+        search_tasks = _search_tasks(arguments, settings)
     browser = VisibleHhBrowser(
         settings.browser_profile_dir(arguments.account_id),
         settings.hh_login_url,
@@ -127,12 +256,17 @@ def run(argv: Sequence[str] | None = None) -> int:
             return 0
         profile = browser.read_profile()
         if arguments.command == "search":
-            search_filters: dict[str, object] = {"order_by": "publication_time"}
-            search_result = browser.search_vacancies(
-                arguments.query,
-                area=arguments.area,
-                filters=search_filters,
-                page_number=arguments.page,
+            search_runs = tuple(
+                (
+                    task,
+                    browser.search_vacancies(
+                        task.query,
+                        area=task.area,
+                        filters=task.filters,
+                        page_number=arguments.page,
+                    ),
+                )
+                for task in search_tasks
             )
         if arguments.command == "analyze":
             upgrade_database(settings)
@@ -164,25 +298,42 @@ def run(argv: Sequence[str] | None = None) -> int:
         try:
             with database.sessions.begin() as session:
                 HhProfileSyncService(session).synchronize(profile)
-                synchronized_search = JobSearchSyncService(session).synchronize(
-                    account_external_id=profile.external_id,
-                    direction_name=arguments.direction,
-                    resume_title=arguments.resume,
-                    query=arguments.query,
-                    area=arguments.area,
-                    filters=search_filters,
-                    vacancies=search_result.vacancies,
+                synchronized_runs = tuple(
+                    (
+                        task,
+                        search_result,
+                        JobSearchSyncService(session).synchronize(
+                            account_external_id=profile.external_id,
+                            direction_name=arguments.direction,
+                            resume_title=arguments.resume,
+                            query=task.query,
+                            area=task.area,
+                            region=task.region_name,
+                            search_query_id=task.search_query_id,
+                            filters=task.filters,
+                            vacancies=search_result.vacancies,
+                        ),
+                    )
+                    for task, search_result in search_runs
                 )
         finally:
             database.close()
 
-        print(
-            f"Направление: {synchronized_search.direction.name} "
-            f"(№ {synchronized_search.direction.id})."
-        )
-        print(f"По запросу найдено на hh.ru: {search_result.found}.")
-        print(f"Загружено из текущей страницы: {len(synchronized_search.vacancies)}.")
-        for vacancy in synchronized_search.vacancies[:10]:
+        first = synchronized_runs[0][2]
+        print(f"Направление: {first.direction.name} (№ {first.direction.id}).")
+        print(f"Выполнено вариантов поиска: {len(synchronized_runs)}.")
+        for task, search_result, synced_run in synchronized_runs:
+            print(
+                f"- {task.query}; {task.region_name}: найдено {search_result.found}, "
+                f"загружено {len(synced_run.vacancies)}"
+            )
+        unique_vacancies = {
+            vacancy.id: vacancy
+            for _, _, synced_run in synchronized_runs
+            for vacancy in synced_run.vacancies
+        }
+        print(f"Уникальных вакансий в базе: {len(unique_vacancies)}.")
+        for vacancy in tuple(unique_vacancies.values())[:10]:
             employer = f" — {vacancy.employer_name}" if vacancy.employer_name else ""
             print(f"- {vacancy.title}{employer}")
         return 0
@@ -237,6 +388,133 @@ def run(argv: Sequence[str] | None = None) -> int:
     for resume in synchronized.resumes:
         print(f"- {resume.title} ({resume.hh_id})")
     return 0
+
+
+def _run_search_settings(arguments: argparse.Namespace) -> int:
+    settings = get_settings()
+    upgrade_database(settings)
+    database = create_database(settings)
+    try:
+        with database.sessions.begin() as session:
+            service = CareerDirectionService(session)
+            if arguments.command == "configure-search":
+                configured = service.configure(
+                    account_id=arguments.account_id,
+                    direction_name=arguments.direction,
+                    queries=tuple(arguments.query) if arguments.query else None,
+                    regions=tuple(arguments.city),
+                    work_formats=(
+                        tuple(arguments.work_formats)
+                        if arguments.work_formats is not None
+                        else None
+                    ),
+                    employment_forms=(
+                        tuple(arguments.employment_forms)
+                        if arguments.employment_forms is not None
+                        else None
+                    ),
+                    minimum_salary=arguments.minimum_salary,
+                    desired_salary=arguments.desired_salary,
+                    remote_all_russia=arguments.remote_russia,
+                    schedule_minutes=arguments.schedule_minutes,
+                )
+            else:
+                configured = service.get(arguments.account_id, arguments.direction)
+            pending_questions = ProfileQuestionService(session).list_pending(arguments.account_id)
+    finally:
+        database.close()
+
+    _print_search_settings(configured)
+    _print_pending_questions(pending_questions)
+    return 0
+
+
+def _search_tasks(
+    arguments: argparse.Namespace,
+    settings: Settings,
+) -> tuple[VacancySearchTask, ...]:
+    if arguments.query:
+        areas = arguments.area or ["113"]
+        return tuple(
+            VacancySearchTask(
+                search_query_id=None,
+                query=query,
+                area=area,
+                region_name="Россия" if area == "113" else f"регион {area}",
+                filters={"order_by": "publication_time"},
+            )
+            for query in arguments.query
+            for area in areas
+        )
+    if arguments.area:
+        raise ValueError("Параметр --area можно использовать только вместе с --query")
+
+    upgrade_database(settings)
+    database = create_database(settings)
+    try:
+        with database.sessions.begin() as session:
+            tasks = CareerDirectionService(session).build_search_tasks(
+                arguments.account_id,
+                arguments.direction,
+            )
+    finally:
+        database.close()
+    if not tasks:
+        raise LookupError("В настройках направления не получилось собрать ни одного поиска")
+    return tasks
+
+
+def _print_search_settings(settings: DirectionSearchSettings) -> None:
+    format_names = {
+        WorkFormat.REMOTE: "удалённо",
+        WorkFormat.ON_SITE: "офис",
+        WorkFormat.HYBRID: "гибрид",
+    }
+    employment_names = {
+        EmploymentForm.FULL: "полная",
+        EmploymentForm.PART: "частичная",
+        EmploymentForm.PROJECT: "проект",
+        EmploymentForm.FLY_IN_FLY_OUT: "вахта",
+    }
+    regions = {region.area: region.name for query in settings.queries for region in query.regions}
+    print(f"Направление: {settings.direction.name} (№ {settings.direction.id})")
+    print(f"Активное резюме: {settings.resume.title}")
+    print("Запросы: " + "; ".join(query.query for query in settings.queries))
+    print("Города: " + (", ".join(regions.values()) or "не указаны"))
+    print(
+        "Форматы: "
+        + (", ".join(format_names[value] for value in settings.work_formats) or "без ограничения")
+    )
+    print(
+        "Занятость: "
+        + (
+            ", ".join(employment_names[value] for value in settings.employment_forms)
+            or "без ограничения"
+        )
+    )
+    minimum = settings.minimum_salary or "не указана"
+    desired = settings.desired_salary or "не указана"
+    print(f"Зарплата: минимум {minimum}, желаемая {desired} {settings.salary_currency}")
+    print(
+        "Удалённый поиск по всей России: "
+        + ("включён" if settings.remote_all_russia else "выключен")
+    )
+    print(
+        "Навыки: берутся из подтверждённых данных активного резюме "
+        f"({len(settings.skills_from_resume)} блоков)"
+    )
+
+
+def _print_pending_questions(questions: tuple[ProfileQuestionCandidate, ...]) -> None:
+    if not questions:
+        return
+    print("В резюме не найдены некоторые ответы:")
+    for question in questions:
+        print(f"- {question.key}: {question.question}")
+    print(
+        "Их можно сохранить командой hugin-resume answer --key КЛЮЧ. "
+        "Без ответа поиск продолжится без соответствующего ограничения."
+    )
 
 
 def _run_applications(

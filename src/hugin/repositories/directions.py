@@ -6,12 +6,14 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from hugin.database.models import (
+    CandidateProfileModel,
     CareerDirectionModel,
     DirectionResumeModel,
     DirectionSearchQueryModel,
     DirectionVacancyModel,
     HhAccountModel,
     ResumeModel,
+    VacancyDiscoveryModel,
 )
 from hugin.domain.directions import (
     AccountRecord,
@@ -20,7 +22,9 @@ from hugin.domain.directions import (
     DirectionVacancyRecord,
     ResumeRecord,
     SearchQueryRecord,
+    SearchRegion,
     VacancyState,
+    WorkFormat,
 )
 from hugin.domain.hh import HhResumeData
 from hugin.domain.time import as_utc
@@ -51,12 +55,25 @@ def _direction_record(model: CareerDirectionModel) -> DirectionRecord:
 
 
 def _query_record(model: DirectionSearchQueryModel) -> SearchQueryRecord:
+    regions = tuple(
+        SearchRegion(
+            area=str(region.get("area", "")),
+            name=str(region.get("name", region.get("area", ""))),
+        )
+        for region in model.regions
+        if isinstance(region, dict) and region.get("area")
+    )
     return SearchQueryRecord(
         id=model.id,
         direction_id=model.direction_id,
         query=model.query,
         area=model.area,
         filters=dict(model.filters),
+        regions=regions,
+        work_formats=tuple(WorkFormat(value) for value in model.work_formats),
+        schedule_minutes=model.schedule_minutes,
+        last_run_at=as_utc(model.last_run_at) if model.last_run_at is not None else None,
+        next_run_at=as_utc(model.next_run_at) if model.next_run_at is not None else None,
         is_active=model.is_active,
         created_at=as_utc(model.created_at),
     )
@@ -115,6 +132,12 @@ class AccountRepository:
             select(HhAccountModel).where(HhAccountModel.external_id == external_id)
         )
         return _account_record(model) if model is not None else None
+
+    def get(self, account_id: int) -> AccountRecord:
+        model = self._session.get(HhAccountModel, account_id)
+        if model is None:
+            raise LookupError("Аккаунт hh.ru не найден")
+        return _account_record(model)
 
 
 class ResumeRepository:
@@ -194,6 +217,22 @@ class ResumeRepository:
             raise RuntimeError(f"Найдено несколько активных резюме «{title}»")
         return _resume_record(models[0])
 
+    def get_profile_active(self, account_id: int) -> ResumeRecord:
+        model = self._session.scalar(
+            select(ResumeModel)
+            .join(CandidateProfileModel, CandidateProfileModel.active_resume_id == ResumeModel.id)
+            .where(
+                CandidateProfileModel.account_id == account_id,
+                ResumeModel.account_id == account_id,
+                ResumeModel.is_active.is_(True),
+            )
+        )
+        if model is None:
+            raise LookupError(
+                "Активное ИТ-резюме не найдено; сначала импортируйте и подтвердите резюме"
+            )
+        return _resume_record(model)
+
 
 class DirectionRepository:
     def __init__(self, session: Session) -> None:
@@ -258,12 +297,18 @@ class DirectionRepository:
         *,
         area: str = "",
         filters: ConfigPayload | None = None,
+        regions: Sequence[SearchRegion] = (),
+        work_formats: Sequence[WorkFormat] = (),
+        schedule_minutes: int = 120,
     ) -> SearchQueryRecord:
         model = DirectionSearchQueryModel(
             direction_id=direction_id,
             query=query,
             area=area,
             filters=dict(filters or {}),
+            regions=[{"area": region.area, "name": region.name} for region in regions],
+            work_formats=[work_format.value for work_format in work_formats],
+            schedule_minutes=schedule_minutes,
         )
         self._session.add(model)
         self._session.flush()
@@ -276,6 +321,9 @@ class DirectionRepository:
         *,
         area: str = "",
         filters: ConfigPayload | None = None,
+        regions: Sequence[SearchRegion] | None = None,
+        work_formats: Sequence[WorkFormat] | None = None,
+        schedule_minutes: int | None = None,
     ) -> SearchQueryRecord:
         model = self._session.scalar(
             select(DirectionSearchQueryModel).where(
@@ -292,9 +340,50 @@ class DirectionRepository:
             )
             self._session.add(model)
         model.filters = dict(filters or {})
+        if regions is not None:
+            model.regions = [{"area": region.area, "name": region.name} for region in regions]
+        if work_formats is not None:
+            model.work_formats = [work_format.value for work_format in work_formats]
+        if schedule_minutes is not None:
+            if schedule_minutes < 5:
+                raise ValueError("Интервал поиска должен быть не меньше 5 минут")
+            model.schedule_minutes = schedule_minutes
         model.is_active = True
         self._session.flush()
         return _query_record(model)
+
+    def get_query(self, query_id: int) -> SearchQueryRecord:
+        model = self._session.get(DirectionSearchQueryModel, query_id)
+        if model is None:
+            raise LookupError("Настройка поискового запроса не найдена")
+        return _query_record(model)
+
+    def list_configured_queries(self, direction_id: int) -> list[SearchQueryRecord]:
+        models = self._session.scalars(
+            select(DirectionSearchQueryModel)
+            .where(
+                DirectionSearchQueryModel.direction_id == direction_id,
+                DirectionSearchQueryModel.area == "",
+                DirectionSearchQueryModel.is_active.is_(True),
+            )
+            .order_by(DirectionSearchQueryModel.id)
+        )
+        return [_query_record(model) for model in models]
+
+    def disable_other_configured_queries(
+        self,
+        direction_id: int,
+        active_query_ids: set[int],
+    ) -> None:
+        models = self._session.scalars(
+            select(DirectionSearchQueryModel).where(
+                DirectionSearchQueryModel.direction_id == direction_id,
+                DirectionSearchQueryModel.area == "",
+            )
+        )
+        for model in models:
+            model.is_active = model.id in active_query_ids
+        self._session.flush()
 
     def attach_resume(self, direction_id: int, resume_id: int, priority: int = 0) -> None:
         if priority < 0:
@@ -333,6 +422,37 @@ class DirectionRepository:
             self._session.add(model)
             self._session.flush()
         return _direction_vacancy_record(model)
+
+    def record_discovery(
+        self,
+        *,
+        direction_id: int,
+        search_query_id: int,
+        vacancy_id: int,
+        query_text: str,
+        region: str,
+    ) -> None:
+        model = self._session.scalar(
+            select(VacancyDiscoveryModel).where(
+                VacancyDiscoveryModel.vacancy_id == vacancy_id,
+                VacancyDiscoveryModel.direction_id == direction_id,
+                VacancyDiscoveryModel.query_text == query_text,
+                VacancyDiscoveryModel.region == region,
+            )
+        )
+        if model is None:
+            self._session.add(
+                VacancyDiscoveryModel(
+                    vacancy_id=vacancy_id,
+                    direction_id=direction_id,
+                    search_query_id=search_query_id,
+                    query_text=query_text,
+                    region=region,
+                )
+            )
+        else:
+            model.search_query_id = search_query_id
+        self._session.flush()
 
     def get_tracked_vacancy(
         self,

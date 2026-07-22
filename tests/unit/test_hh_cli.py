@@ -1,16 +1,18 @@
 from __future__ import annotations
 
+import argparse
 import getpass
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace, TracebackType
-from typing import ClassVar
+from typing import ClassVar, cast
 
 import pytest
 
 from hugin import hh_cli
 from hugin.core.settings import Settings
+from hugin.domain.directions import EmploymentForm, SearchRegion, WorkFormat
 from hugin.domain.hh import (
     HhApplyResult,
     HhApplyStatus,
@@ -18,7 +20,9 @@ from hugin.domain.hh import (
     HhResumeData,
     HhResumeDetails,
 )
+from hugin.domain.resumes import ProfileQuestionCandidate
 from hugin.domain.vacancies import VacancyData, VacancySearchResult
+from hugin.services.career_directions import DirectionSearchSettings, VacancySearchTask
 from hugin.services.hh_login import HhCredentials, LoginStatus
 from hugin.services.vacancy_analysis import RuleCategory
 
@@ -284,7 +288,13 @@ def test_search_loads_vacancies_without_applications(
     database = FakeDatabase()
     synchronized = SimpleNamespace(
         direction=SimpleNamespace(id=3, name="Python backend"),
-        vacancies=(SimpleNamespace(title="Python-разработчик", employer_name="Компания"),),
+        vacancies=(
+            SimpleNamespace(
+                id=1,
+                title="Python-разработчик",
+                employer_name="Компания",
+            ),
+        ),
     )
     monkeypatch.setattr(hh_cli, "upgrade_database", lambda settings: None)
     monkeypatch.setattr(hh_cli, "create_database", lambda settings: database)
@@ -316,7 +326,9 @@ def test_search_loads_vacancies_without_applications(
 
     output = capsys.readouterr().out
     assert "Python backend (№ 3)" in output
-    assert "По запросу найдено на hh.ru: 25" in output
+    assert "Выполнено вариантов поиска: 1" in output
+    assert "найдено 25, загружено 1" in output
+    assert "Уникальных вакансий в базе: 1" in output
     assert "Python-разработчик — Компания" in output
     assert database.closed
 
@@ -329,6 +341,222 @@ def test_positive_account_id_parser() -> None:
     assert hh_cli.non_negative_int("0") == 0
     with pytest.raises(Exception, match="отрицательным"):
         hh_cli.non_negative_int("-1")
+
+
+def test_search_setting_value_parsers() -> None:
+    assert hh_cli.search_region("  Москва ") == SearchRegion("1", "Москва")
+    assert hh_cli.search_region("Иннополис=1652") == SearchRegion("1652", "Иннополис")
+    with pytest.raises(Exception, match="неизвестный город"):
+        hh_cli.search_region("Иннополис")
+    with pytest.raises(Exception, match="формате"):
+        hh_cli.search_region("Иннополис=нет")
+
+    assert hh_cli.work_format("удаленно") is WorkFormat.REMOTE
+    assert hh_cli.work_format("офис") is WorkFormat.ON_SITE
+    assert hh_cli.work_format("гибрид") is WorkFormat.HYBRID
+    with pytest.raises(Exception, match="формат"):
+        hh_cli.work_format("поле")
+
+    assert hh_cli.employment_form("полная") is EmploymentForm.FULL
+    assert hh_cli.employment_form("частичная") is EmploymentForm.PART
+    assert hh_cli.employment_form("проект") is EmploymentForm.PROJECT
+    assert hh_cli.employment_form("вахта") is EmploymentForm.FLY_IN_FLY_OUT
+    with pytest.raises(Exception, match="занятость"):
+        hh_cli.employment_form("любая")
+
+
+def test_cities_command_prints_known_cities(capsys: pytest.CaptureFixture[str]) -> None:
+    assert hh_cli.run(["cities"]) == 0
+    output = capsys.readouterr().out
+    assert "Москва: 1" in output
+    assert "Екатеринбург: 3" in output
+
+
+def test_configure_and_show_search_settings_without_browser(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    database = FakeDatabase()
+    configured = SimpleNamespace(name="configured")
+    calls: list[tuple[str, object]] = []
+
+    class FakeDirectionService:
+        def __init__(self, session: object) -> None:
+            calls.append(("session", session))
+
+        def configure(self, **kwargs: object) -> object:
+            calls.append(("configure", kwargs))
+            return configured
+
+        def get(self, account_id: int, direction_name: str) -> object:
+            calls.append(("get", (account_id, direction_name)))
+            return configured
+
+    class FakeProfileQuestionService:
+        def __init__(self, session: object) -> None:
+            pass
+
+        def list_pending(self, account_id: int) -> tuple[ProfileQuestionCandidate, ...]:
+            assert account_id == 1
+            return (ProfileQuestionCandidate("salary", "Какая зарплата?"),)
+
+    install_fakes(monkeypatch, tmp_path, FakeStore())
+    monkeypatch.setattr(hh_cli, "upgrade_database", lambda settings: None)
+    monkeypatch.setattr(hh_cli, "create_database", lambda settings: database)
+    monkeypatch.setattr(hh_cli, "CareerDirectionService", FakeDirectionService)
+    monkeypatch.setattr(hh_cli, "ProfileQuestionService", FakeProfileQuestionService)
+    monkeypatch.setattr(
+        hh_cli,
+        "_print_search_settings",
+        lambda value: calls.append(("print", value)),
+    )
+    monkeypatch.setattr(
+        hh_cli,
+        "_print_pending_questions",
+        lambda value: calls.append(("questions", value)),
+    )
+
+    assert (
+        hh_cli.run(
+            [
+                "configure-search",
+                "--direction",
+                "ИТ",
+                "--query",
+                "Python",
+                "--city",
+                "Москва",
+                "--format",
+                "удалённо",
+                "--employment",
+                "полная",
+                "--minimum-salary",
+                "180000",
+                "--desired-salary",
+                "220000",
+                "--remote-russia",
+            ]
+        )
+        == 0
+    )
+    assert hh_cli.run(["show-search", "--direction", "ИТ"]) == 0
+    configure_call = next(value for name, value in calls if name == "configure")
+    assert isinstance(configure_call, dict)
+    assert configure_call["regions"] == (SearchRegion("1", "Москва"),)
+    assert configure_call["work_formats"] == (WorkFormat.REMOTE,)
+    assert configure_call["employment_forms"] == (EmploymentForm.FULL,)
+    assert ("get", (1, "ИТ")) in calls
+    assert any(name == "questions" for name, _ in calls)
+    assert database.closed
+
+
+def test_search_tasks_support_manual_and_saved_modes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = Settings(environment="test")
+    manual = hh_cli._search_tasks(
+        argparse.Namespace(
+            query=["Python", "FastAPI"],
+            area=["1", "3"],
+        ),
+        settings,
+    )
+    assert [(task.query, task.area) for task in manual] == [
+        ("Python", "1"),
+        ("Python", "3"),
+        ("FastAPI", "1"),
+        ("FastAPI", "3"),
+    ]
+    default_area = hh_cli._search_tasks(
+        argparse.Namespace(query=["Python"], area=None),
+        settings,
+    )
+    assert default_area[0].region_name == "Россия"
+    with pytest.raises(ValueError, match="--query"):
+        hh_cli._search_tasks(argparse.Namespace(query=None, area=["1"]), settings)
+
+    database = FakeDatabase()
+    saved_task = VacancySearchTask(1, "Python", "3", "Екатеринбург", {})
+
+    class FakeDirectionService:
+        def __init__(self, session: object) -> None:
+            pass
+
+        def build_search_tasks(
+            self, account_id: int, direction_name: str
+        ) -> tuple[VacancySearchTask, ...]:
+            assert (account_id, direction_name) == (2, "ИТ")
+            return (saved_task,)
+
+    monkeypatch.setattr(hh_cli, "upgrade_database", lambda value: None)
+    monkeypatch.setattr(hh_cli, "create_database", lambda value: database)
+    monkeypatch.setattr(hh_cli, "CareerDirectionService", FakeDirectionService)
+    saved = hh_cli._search_tasks(
+        argparse.Namespace(query=None, area=None, account_id=2, direction="ИТ"),
+        settings,
+    )
+    assert saved == (saved_task,)
+    assert database.closed
+
+
+def test_print_search_settings(capsys: pytest.CaptureFixture[str]) -> None:
+    value = SimpleNamespace(
+        direction=SimpleNamespace(name="ИТ", id=4),
+        resume=SimpleNamespace(title="Python-разработчик"),
+        queries=(
+            SimpleNamespace(
+                query="Python",
+                regions=(SearchRegion("1", "Москва"),),
+            ),
+        ),
+        work_formats=(WorkFormat.REMOTE, WorkFormat.HYBRID),
+        employment_forms=(EmploymentForm.FULL,),
+        minimum_salary=180_000,
+        desired_salary=220_000,
+        salary_currency="RUB",
+        remote_all_russia=True,
+        skills_from_resume=("Python",),
+    )
+    hh_cli._print_search_settings(cast(DirectionSearchSettings, value))
+    output = capsys.readouterr().out
+    assert "Города: Москва" in output
+    assert "Форматы: удалённо, гибрид" in output
+    assert "Занятость: полная" in output
+    assert "минимум 180000, желаемая 220000 RUB" in output
+    assert "включён" in output
+    assert "1 блоков" in output
+
+    empty = SimpleNamespace(
+        direction=SimpleNamespace(name="ИТ", id=4),
+        resume=SimpleNamespace(title="Python-разработчик"),
+        queries=(SimpleNamespace(query="Python", regions=()),),
+        work_formats=(),
+        employment_forms=(),
+        minimum_salary=None,
+        desired_salary=None,
+        salary_currency="RUB",
+        remote_all_russia=False,
+        skills_from_resume=(),
+    )
+    hh_cli._print_search_settings(cast(DirectionSearchSettings, empty))
+    empty_output = capsys.readouterr().out
+    assert "Города: не указаны" in empty_output
+    assert "Форматы: без ограничения" in empty_output
+    assert "Занятость: без ограничения" in empty_output
+    assert "выключен" in empty_output
+
+
+def test_print_pending_questions(capsys: pytest.CaptureFixture[str]) -> None:
+    hh_cli._print_pending_questions(())
+    assert capsys.readouterr().out == ""
+
+    hh_cli._print_pending_questions(
+        (ProfileQuestionCandidate("salary_expectation", "Какая зарплата?"),)
+    )
+    output = capsys.readouterr().out
+    assert "резюме не найдены" in output
+    assert "salary_expectation: Какая зарплата?" in output
+    assert "поиск продолжится без соответствующего ограничения" in output
 
 
 def test_analyze_loads_details_and_prints_rule_reasons(

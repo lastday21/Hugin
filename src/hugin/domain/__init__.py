@@ -30,9 +30,12 @@ from hugin.domain.directions import (
     ConfigPayload,
     DirectionRecord,
     DirectionVacancyRecord,
+    EmploymentForm,
     ResumeRecord,
     SearchQueryRecord,
+    SearchRegion,
     VacancyState,
+    WorkFormat,
 )
 from hugin.domain.hh import HhApplyResult, HhApplyStatus, HhResumeDetails
 from hugin.domain.resumes import (
@@ -78,6 +81,7 @@ __all__ = [
     "DirectionVacancyRecord",
     "DuplicateApplicationError",
     "DuplicateTaskError",
+    "EmploymentForm",
     "EventPayload",
     "HhApplyResult",
     "HhApplyStatus",
@@ -101,6 +105,7 @@ __all__ = [
     "ResumeSourceType",
     "ScreeningFormState",
     "SearchQueryRecord",
+    "SearchRegion",
     "SystemState",
     "SystemStateNotFoundError",
     "SystemStateRecord",
@@ -110,6 +115,7 @@ __all__ = [
     "VacancyData",
     "VacancyRecord",
     "VacancyState",
+    "WorkFormat",
     "ensure_application_transition",
     "ensure_system_transition",
     "ensure_task_transition",
