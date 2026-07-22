@@ -37,7 +37,16 @@ from hugin.domain.directions import (
     VacancyState,
     WorkFormat,
 )
-from hugin.domain.hh import HhApplyResult, HhApplyStatus, HhResumeDetails
+from hugin.domain.hh import (
+    HhApplyResult,
+    HhApplyStatus,
+    HhFormReviewResult,
+    HhFormReviewStatus,
+    HhResumeDetails,
+    HhScreeningField,
+    HhScreeningForm,
+    screening_form_hash,
+)
 from hugin.domain.resumes import (
     ParsedResumeProfile,
     ProfileFactReview,
@@ -93,7 +102,11 @@ __all__ = [
     "EventPayload",
     "HhApplyResult",
     "HhApplyStatus",
+    "HhFormReviewResult",
+    "HhFormReviewStatus",
     "HhResumeDetails",
+    "HhScreeningField",
+    "HhScreeningForm",
     "IncidentSeverity",
     "IncidentState",
     "InvalidStateTransitionError",
@@ -130,4 +143,5 @@ __all__ = [
     "ensure_application_transition",
     "ensure_system_transition",
     "ensure_task_transition",
+    "screening_form_hash",
 ]

@@ -31,6 +31,7 @@ from hugin.repositories.directions import (
 from hugin.repositories.tasks import QueueTaskRepository, SystemStateRepository
 from hugin.repositories.vacancies import VacancyRepository
 from hugin.services.queue import QueueService
+from hugin.services.screening_forms import ScreeningDraftService
 from hugin.services.vacancy_analysis import RuleCategory
 
 
@@ -256,11 +257,20 @@ class ApplicationAutomationService:
             )
 
         if result.status is HhApplyStatus.QUESTIONS_REQUIRED:
-            payload["question_count"] = len(result.questions)
+            draft_service = ScreeningDraftService(self._session)
+            draft = (
+                draft_service.capture(job.application.id, result.screening_form)
+                if result.screening_form is not None
+                else draft_service.capture_questions(job.application.id, result.questions)
+            )
+            payload["question_count"] = len(draft.questions)
+            payload["answered_count"] = len(draft.answers)
+            payload["screening_form_state"] = draft.state.value
             self._tasks.transition(
                 job.task.id,
                 TaskState.INPUT_REQUIRED,
                 error_code=result.status.value,
+                event_payload=payload,
             )
             return RecordedApplyResult(blocking=False, sent=False)
 

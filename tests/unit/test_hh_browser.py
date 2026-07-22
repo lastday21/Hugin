@@ -10,7 +10,16 @@ from playwright.sync_api import Error, Locator, Page, TimeoutError
 
 from hugin.adapters import hh_browser as browser_module
 from hugin.adapters.hh_browser import VisibleHhBrowser
-from hugin.domain.hh import HhApplyStatus, HhProfileData, HhResumeData, HhResumeDetails
+from hugin.domain.hh import (
+    HhApplyStatus,
+    HhFormReviewStatus,
+    HhProfileData,
+    HhResumeData,
+    HhResumeDetails,
+    HhScreeningField,
+    HhScreeningForm,
+    screening_form_hash,
+)
 from hugin.services.hh_login import HhCredentials, LoginStatus
 
 
@@ -92,17 +101,22 @@ class FakePage:
         self.details_payload: object = None
         self.resume_payload: object = None
         self.application_payload: object = None
+        self.fill_payload: object = None
+        self.fill_result: object = {"filled": [], "skipped": []}
         self.response = FakeResponse()
+        self.goto_response: FakeResponse | None = None
+        self.goto_final_url: str | None = None
         self.goto_error: Error | None = None
 
     def locator(self, selector: str) -> FakeLocator:
         return self.locators.setdefault(selector, FakeLocator(0))
 
-    def goto(self, url: str, *, wait_until: str) -> None:
+    def goto(self, url: str, *, wait_until: str) -> FakeResponse | None:
         self.goto_calls.append((url, wait_until))
         if self.goto_error is not None:
             raise self.goto_error
-        self.url = url
+        self.url = self.goto_final_url or url
+        return self.goto_response
 
     def set_default_timeout(self, timeout: int) -> None:
         self.timeout = timeout
@@ -113,7 +127,10 @@ class FakePage:
     def wait_for_timeout(self, timeout: int) -> None:
         assert timeout in {500, 1_000, 1_500}
 
-    def evaluate(self, expression: str) -> object:
+    def evaluate(self, expression: str, argument: object = None) -> object:
+        if expression == browser_module.FILL_APPLICATION_FORM_SCRIPT:
+            self.fill_payload = argument
+            return self.fill_result
         if "ResumeProfileFront-InitialState" in expression:
             return self.profile_payload
         if "vacancy-serp__vacancy" in expression:
@@ -434,6 +451,324 @@ def test_application_with_questions_is_not_submitted(tmp_path: Path) -> None:
 
     assert result.status is HhApplyStatus.QUESTIONS_REQUIRED
     assert result.questions == ("Укажите Telegram",)
+
+
+def test_screening_form_is_parsed_with_field_constraints(tmp_path: Path) -> None:
+    page = FakePage("https://hh.ru/applicant/resumes")
+    page.application_payload = {
+        "fields": [
+            {
+                "key": "name:telegram",
+                "question": "Укажите Telegram",
+                "fieldType": "text",
+                "isRequired": True,
+                "options": [],
+                "maxLength": 100,
+                "formatHint": "@username",
+                "hasAttachment": False,
+                "hasExternalAction": False,
+                "hasTestAssignment": False,
+            }
+        ],
+        "warnings": [],
+        "resumeTitle": "Python backend разработчик",
+        "bodyText": "Форма отклика",
+    }
+
+    result = make_browser(page, tmp_path).apply_to_vacancy(
+        "https://hh.ru/vacancy/123",
+        expected_resume_title="Python backend разработчик",
+        cover_letter="Письмо",
+    )
+
+    assert result.status is HhApplyStatus.QUESTIONS_REQUIRED
+    assert result.screening_form == HhScreeningForm(
+        fields=(
+            HhScreeningField(
+                key="name:telegram",
+                question="Укажите Telegram",
+                field_type="text",
+                is_required=True,
+                max_length=100,
+                format_hint="@username",
+            ),
+        )
+    )
+
+
+def test_saved_form_answers_are_refilled_without_submit(tmp_path: Path) -> None:
+    page = FakePage("https://hh.ru/applicant/resumes")
+    form = HhScreeningForm(
+        fields=(
+            HhScreeningField(
+                key="name:telegram",
+                question="Укажите Telegram",
+                field_type="text",
+                is_required=True,
+            ),
+        )
+    )
+    page.application_payload = {
+        "fields": [
+            {
+                "key": "name:telegram",
+                "question": "Укажите Telegram",
+                "fieldType": "text",
+                "isRequired": True,
+                "options": [],
+                "maxLength": None,
+            }
+        ],
+        "warnings": [],
+        "resumeTitle": "Python backend разработчик",
+        "bodyText": "Форма отклика",
+    }
+    page.fill_result = {"filled": ["name:telegram"], "skipped": []}
+    page.locators['[data-qa*="captcha"], iframe[src*="captcha"]'] = FakeLocator(0)
+    submit = FakeLocator()
+    page.locators['[data-qa="vacancy-response-submit-popup"]'] = submit
+
+    result = make_browser(page, tmp_path).open_screening_form(
+        "https://hh.ru/vacancy/123",
+        expected_resume_title="Python backend разработчик",
+        expected_version_hash=screening_form_hash(form),
+        answers={"name:telegram": "@timur"},
+    )
+
+    assert result.status is HhFormReviewStatus.READY
+    assert result.filled_keys == ("name:telegram",)
+    assert page.fill_payload == [{"key": "name:telegram", "value": "@timur"}]
+    assert submit.clicked == 0
+
+
+def test_saved_form_refills_cover_letter_and_reports_skipped_answer(tmp_path: Path) -> None:
+    page = FakePage("https://hh.ru/applicant/resumes")
+    form = HhScreeningForm(
+        fields=(HhScreeningField("name:telegram", "Укажите Telegram", "text", True),)
+    )
+    page.application_payload = {
+        "fields": [
+            {
+                "key": "name:telegram",
+                "question": "Укажите Telegram",
+                "fieldType": "text",
+                "isRequired": True,
+                "options": [],
+                "maxLength": None,
+            }
+        ],
+        "warnings": [],
+        "resumeTitle": "Python backend разработчик",
+        "bodyText": "Форма отклика",
+    }
+    page.fill_result = {"filled": [], "skipped": ["name:telegram"]}
+    page.locators['[data-qa*="captcha"], iframe[src*="captcha"]'] = FakeLocator(0)
+    letter = FakeLocator()
+    page.locators['[data-qa="vacancy-response-popup-form-letter-input"]'] = letter
+
+    result = make_browser(page, tmp_path).open_screening_form(
+        "https://hh.ru/vacancy/123",
+        expected_resume_title="Python backend разработчик",
+        expected_version_hash=screening_form_hash(form),
+        answers={"name:telegram": "@timur"},
+        cover_letter="Здравствуйте!",
+    )
+
+    assert result.status is HhFormReviewStatus.READY
+    assert result.skipped_keys == ("name:telegram",)
+    assert letter.filled == ["Здравствуйте!"]
+
+
+@pytest.mark.parametrize(
+    ("url", "body_text", "resume_title", "fields", "captcha", "expected_status"),
+    (
+        (
+            "https://hh.ru/account/login",
+            "Форма отклика",
+            "Python",
+            True,
+            False,
+            HhFormReviewStatus.AUTH_REQUIRED,
+        ),
+        (
+            "https://hh.ru/applicant/resumes",
+            "Форма отклика",
+            "Python",
+            True,
+            True,
+            HhFormReviewStatus.CAPTCHA_REQUIRED,
+        ),
+        (
+            "https://hh.ru/applicant/resumes",
+            "Вакансия закрыта",
+            "Python",
+            True,
+            False,
+            HhFormReviewStatus.VACANCY_CLOSED,
+        ),
+        (
+            "https://hh.ru/applicant/resumes",
+            "Вы уже откликались",
+            "Python",
+            True,
+            False,
+            HhFormReviewStatus.ALREADY_APPLIED,
+        ),
+        (
+            "https://hh.ru/applicant/resumes",
+            "Форма отклика",
+            "Другое резюме",
+            True,
+            False,
+            HhFormReviewStatus.RESUME_MISMATCH,
+        ),
+        (
+            "https://hh.ru/applicant/resumes",
+            "Форма отклика",
+            "Python",
+            False,
+            False,
+            HhFormReviewStatus.UNAVAILABLE,
+        ),
+    ),
+)
+def test_form_review_stops_on_unsafe_page_state(
+    tmp_path: Path,
+    url: str,
+    body_text: str,
+    resume_title: str,
+    fields: bool,
+    captcha: bool,
+    expected_status: HhFormReviewStatus,
+) -> None:
+    page = FakePage(url)
+    page.goto_final_url = url
+    page.application_payload = {
+        "fields": (
+            [
+                {
+                    "key": "name:telegram",
+                    "question": "Укажите Telegram",
+                    "fieldType": "text",
+                    "isRequired": True,
+                    "options": [],
+                    "maxLength": None,
+                }
+            ]
+            if fields
+            else []
+        ),
+        "warnings": [],
+        "resumeTitle": resume_title,
+        "bodyText": body_text,
+    }
+    page.locators['[data-qa*="captcha"], iframe[src*="captcha"]'] = FakeLocator(visible=captcha)
+    form = HhScreeningForm(
+        fields=(HhScreeningField("name:telegram", "Укажите Telegram", "text", True),)
+    )
+
+    result = make_browser(page, tmp_path).open_screening_form(
+        "https://hh.ru/vacancy/123",
+        expected_resume_title="Python",
+        expected_version_hash=screening_form_hash(form),
+        answers={},
+    )
+
+    assert result.status is expected_status
+    assert page.fill_payload is None
+
+
+def test_form_review_handles_navigation_timeout_and_rate_limit(tmp_path: Path) -> None:
+    timed_out = FakePage("https://hh.ru/applicant/resumes")
+    timed_out.goto_error = TimeoutError("wait")
+    timeout_result = make_browser(timed_out, tmp_path).open_screening_form(
+        "https://hh.ru/vacancy/123",
+        expected_resume_title="Python",
+        expected_version_hash="version",
+        answers={},
+    )
+    assert timeout_result.status is HhFormReviewStatus.UNAVAILABLE
+
+    limited = FakePage("https://hh.ru/applicant/resumes")
+    limited.goto_response = FakeResponse()
+    limited.goto_response.status = 429
+    limit_result = make_browser(limited, tmp_path).open_screening_form(
+        "https://hh.ru/vacancy/123",
+        expected_resume_title="Python",
+        expected_version_hash="version",
+        answers={},
+    )
+    assert limit_result.status is HhFormReviewStatus.UNAVAILABLE
+    assert "ограничил" in limit_result.message
+
+
+@pytest.mark.parametrize(
+    "fill_result",
+    (None, {"filled": "bad", "skipped": []}, {"filled": [], "skipped": "bad"}),
+)
+def test_form_review_rejects_invalid_fill_result(
+    tmp_path: Path,
+    fill_result: object,
+) -> None:
+    page = FakePage("https://hh.ru/applicant/resumes")
+    form = HhScreeningForm(
+        fields=(HhScreeningField("name:telegram", "Укажите Telegram", "text", True),)
+    )
+    page.application_payload = {
+        "fields": [
+            {
+                "key": "name:telegram",
+                "question": "Укажите Telegram",
+                "fieldType": "text",
+                "isRequired": True,
+                "options": [],
+                "maxLength": None,
+            }
+        ],
+        "warnings": [],
+        "resumeTitle": "Python",
+        "bodyText": "Форма отклика",
+    }
+    page.fill_result = fill_result
+    page.locators['[data-qa*="captcha"], iframe[src*="captcha"]'] = FakeLocator(0)
+
+    with pytest.raises(RuntimeError):
+        make_browser(page, tmp_path).open_screening_form(
+            "https://hh.ru/vacancy/123",
+            expected_resume_title="Python",
+            expected_version_hash=screening_form_hash(form),
+            answers={"name:telegram": "@timur"},
+        )
+
+
+def test_changed_form_is_not_refilled(tmp_path: Path) -> None:
+    page = FakePage("https://hh.ru/applicant/resumes")
+    page.application_payload = {
+        "fields": [
+            {
+                "key": "name:new-question",
+                "question": "Новый вопрос",
+                "fieldType": "textarea",
+                "isRequired": True,
+                "options": [],
+                "maxLength": None,
+            }
+        ],
+        "warnings": [],
+        "resumeTitle": "Python backend разработчик",
+        "bodyText": "Форма отклика",
+    }
+    page.locators['[data-qa*="captcha"], iframe[src*="captcha"]'] = FakeLocator(0)
+
+    result = make_browser(page, tmp_path).open_screening_form(
+        "https://hh.ru/vacancy/123",
+        expected_resume_title="Python backend разработчик",
+        expected_version_hash="old-version",
+        answers={"name:old-question": "Старый ответ"},
+    )
+
+    assert result.status is HhFormReviewStatus.FORM_CHANGED
+    assert page.fill_payload is None
 
 
 def test_application_is_submitted_with_cover_letter(tmp_path: Path) -> None:

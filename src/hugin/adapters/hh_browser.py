@@ -28,9 +28,14 @@ from playwright.sync_api import (
 from hugin.domain.hh import (
     HhApplyResult,
     HhApplyStatus,
+    HhFormReviewResult,
+    HhFormReviewStatus,
     HhProfileData,
     HhResumeData,
     HhResumeDetails,
+    HhScreeningField,
+    HhScreeningForm,
+    screening_form_hash,
 )
 from hugin.domain.vacancies import VacancyAvailability, VacancyData, VacancySearchResult
 from hugin.services.hh_login import HhCredentials, LoginStatus
@@ -184,10 +189,63 @@ RESUME_DETAILS_SCRIPT = """
 """
 
 APPLICATION_FORM_SCRIPT = """
-() => ({
-    questions: Array.from(document.querySelectorAll('[data-qa="task-question"]')).map(
-        (node) => (node.innerText || '').trim().replace(/\\s+/g, ' ')
-    ).filter(Boolean),
+() => {
+const clean = (value) => (value || '').trim().replace(/\\s+/g, ' ');
+const questionNodes = Array.from(document.querySelectorAll('[data-qa="task-question"]'));
+const fieldFromNode = (node, position) => {
+    const controls = Array.from(node.querySelectorAll(
+        'textarea, select, input:not([type="hidden"]), [role="combobox"]'
+    ));
+    const control = controls[0] || null;
+    const question = clean(
+        node.querySelector('label, legend, [data-qa*="question-title"]')?.textContent ||
+        node.innerText
+    );
+    const qa = clean(control?.getAttribute('data-qa'));
+    const name = clean(control?.getAttribute('name'));
+    const id = clean(control?.getAttribute('id'));
+    const key = (
+        qa ? `${position}:qa:${qa}` : name ? `${position}:name:${name}` :
+        id ? `${position}:id:${id}` :
+        `question:${position}:${question.toLocaleLowerCase('ru-RU')}`
+    ).slice(0, 255);
+    const tag = (control?.tagName || '').toLocaleLowerCase('en-US');
+    const inputType = clean(control?.getAttribute('type')).toLocaleLowerCase('en-US');
+    let fieldType = tag === 'textarea' ? 'textarea' : tag === 'select' ? 'select' : inputType;
+    if (!fieldType && control?.getAttribute('role') === 'combobox') fieldType = 'combobox';
+    if (!fieldType) fieldType = control ? 'text' : 'unknown';
+    const optionControls = Array.from(node.querySelectorAll('input[type="radio"]'));
+    const options = tag === 'select'
+        ? Array.from(control.options || []).map(
+            (option) => clean(option.textContent || option.value)
+        )
+            .filter(Boolean)
+        : optionControls.map((option) => clean(
+            option.closest('label')?.innerText || option.value
+        )).filter(Boolean);
+    if (optionControls.length) fieldType = 'radio';
+    const maxLengthValue = Number.parseInt(control?.getAttribute('maxlength') || '', 10);
+    const normalized = question.toLocaleLowerCase('ru-RU');
+    return {
+        key,
+        question,
+        fieldType,
+        isRequired: Boolean(
+            control?.required || control?.getAttribute('aria-required') === 'true' ||
+            /(^|\\s)\\*(\\s|$)/.test(question)
+        ),
+        options,
+        maxLength: Number.isFinite(maxLengthValue) && maxLengthValue > 0 ? maxLengthValue : null,
+        formatHint: clean(
+            control?.getAttribute('placeholder') || control?.getAttribute('inputmode')
+        ),
+        hasAttachment: Boolean(node.querySelector('input[type="file"]')),
+        hasExternalAction: Boolean(node.querySelector('a[href]')),
+        hasTestAssignment: normalized.includes('тестов') || normalized.includes('испытательн'),
+    };
+};
+return ({
+    fields: questionNodes.map(fieldFromNode).filter((field) => field.question),
     warnings: Array.from(document.querySelectorAll('[data-qa="response-reject-warning"]')).map(
         (node) => (node.innerText || '').trim().replace(/\\s+/g, ' ')
     ).filter(Boolean),
@@ -195,7 +253,82 @@ APPLICATION_FORM_SCRIPT = """
         document.querySelector('[data-qa="resume-title"]')?.textContent || ''
     ).trim(),
     bodyText: (document.body.innerText || '').trim(),
-})
+});
+}
+"""
+
+FILL_APPLICATION_FORM_SCRIPT = """
+(answers) => {
+const clean = (value) => (value || '').trim().replace(/\\s+/g, ' ');
+const normalized = (value) => clean(value).toLocaleLowerCase('ru-RU');
+const nodes = Array.from(document.querySelectorAll('[data-qa="task-question"]'));
+const controls = nodes.map((node, position) => {
+    const items = Array.from(node.querySelectorAll(
+        'textarea, select, input:not([type="hidden"]), [role="combobox"]'
+    ));
+    const control = items[0] || null;
+    const question = clean(
+        node.querySelector('label, legend, [data-qa*="question-title"]')?.textContent ||
+        node.innerText
+    );
+    const qa = clean(control?.getAttribute('data-qa'));
+    const name = clean(control?.getAttribute('name'));
+    const id = clean(control?.getAttribute('id'));
+    const key = (
+        qa ? `${position}:qa:${qa}` : name ? `${position}:name:${name}` :
+        id ? `${position}:id:${id}` :
+        `question:${position}:${question.toLocaleLowerCase('ru-RU')}`
+    ).slice(0, 255);
+    return {key, node, control};
+});
+const setValue = (control, value) => {
+    const prototype = control instanceof HTMLTextAreaElement
+        ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    const setter = Object.getOwnPropertyDescriptor(prototype, 'value')?.set;
+    if (setter) setter.call(control, value); else control.value = value;
+    control.dispatchEvent(new Event('input', {bubbles: true}));
+    control.dispatchEvent(new Event('change', {bubbles: true}));
+};
+const filled = [];
+const skipped = [];
+for (const answer of answers) {
+    const item = controls.find((candidate) => candidate.key === answer.key);
+    const value = clean(answer.value);
+    if (!item?.control || !value || item.node.querySelector('input[type="file"]')) {
+        skipped.push(answer.key);
+        continue;
+    }
+    const control = item.control;
+    const tag = control.tagName.toLocaleLowerCase('en-US');
+    const type = clean(control.getAttribute('type')).toLocaleLowerCase('en-US');
+    if (tag === 'select') {
+        const option = Array.from(control.options).find(
+            (candidate) => normalized(candidate.value) === normalized(value) ||
+                normalized(candidate.textContent) === normalized(value)
+        );
+        if (!option) { skipped.push(answer.key); continue; }
+        control.value = option.value;
+        control.dispatchEvent(new Event('change', {bubbles: true}));
+    } else if (type === 'radio') {
+        const radio = Array.from(item.node.querySelectorAll('input[type="radio"]')).find(
+            (candidate) => normalized(candidate.value) === normalized(value) ||
+                normalized(candidate.closest('label')?.innerText) === normalized(value)
+        );
+        if (!radio) { skipped.push(answer.key); continue; }
+        radio.click();
+    } else if (type === 'checkbox') {
+        const shouldCheck = ['да', 'true', '1', 'согласен'].includes(normalized(value));
+        if (control.checked !== shouldCheck) control.click();
+    } else if (control.getAttribute('role') === 'combobox') {
+        skipped.push(answer.key);
+        continue;
+    } else {
+        setValue(control, value);
+    }
+    filled.push(answer.key);
+}
+return {filled, skipped};
+}
 """
 
 ALLOWED_SEARCH_FILTERS = frozenset(
@@ -219,10 +352,17 @@ ALLOWED_SEARCH_FILTERS = frozenset(
 
 @dataclass(frozen=True, slots=True)
 class _ApplicationSnapshot:
-    questions: tuple[str, ...]
-    warnings: tuple[str, ...]
+    screening_form: HhScreeningForm
     resume_title: str
     body_text: str
+
+    @property
+    def questions(self) -> tuple[str, ...]:
+        return tuple(field.question for field in self.screening_form.fields)
+
+    @property
+    def warnings(self) -> tuple[str, ...]:
+        return self.screening_form.warnings
 
 
 class VisibleHhBrowser:
@@ -478,22 +618,7 @@ class VisibleHhBrowser:
     ) -> HhApplyResult:
         vacancy_id, normalized_url = self._vacancy_id_and_url(source_url)
         parsed = urlparse(normalized_url)
-        response_url = urlunparse(
-            (
-                parsed.scheme,
-                parsed.netloc,
-                "/applicant/vacancy_response",
-                "",
-                urlencode(
-                    {
-                        "vacancyId": vacancy_id,
-                        "startedWithQuestion": "false",
-                        "hhtmFrom": "vacancy",
-                    }
-                ),
-                "",
-            )
-        )
+        response_url = self._application_response_url(source_url)
         page = self._require_page()
         try:
             initial_response = page.goto(response_url, wait_until="domcontentloaded")
@@ -534,6 +659,7 @@ class VisibleHhBrowser:
                 page.url,
                 questions=initial.questions,
                 warnings=initial.warnings,
+                screening_form=initial.screening_form,
             )
         if initial.resume_title != expected_resume_title.strip():
             return HhApplyResult(
@@ -626,6 +752,99 @@ class VisibleHhBrowser:
             page.url,
             confirmation,
             warnings=initial.warnings,
+        )
+
+    def open_screening_form(
+        self,
+        source_url: str,
+        *,
+        expected_resume_title: str,
+        expected_version_hash: str,
+        answers: dict[str, str],
+        cover_letter: str = "",
+    ) -> HhFormReviewResult:
+        page = self._require_page()
+        try:
+            response = page.goto(
+                self._application_response_url(source_url),
+                wait_until="domcontentloaded",
+            )
+            page.wait_for_timeout(1_500)
+        except PlaywrightTimeoutError:
+            return HhFormReviewResult(HhFormReviewStatus.UNAVAILABLE, page.url)
+        if response is not None and response.status == 429:
+            return HhFormReviewResult(
+                HhFormReviewStatus.UNAVAILABLE,
+                page.url,
+                message="hh.ru временно ограничил обращения",
+            )
+
+        snapshot = self._application_snapshot(page)
+        body_text = snapshot.body_text
+        if not self.is_authenticated():
+            return HhFormReviewResult(HhFormReviewStatus.AUTH_REQUIRED, page.url)
+        if self._any_visible(page, '[data-qa*="captcha"], iframe[src*="captcha"]'):
+            return HhFormReviewResult(HhFormReviewStatus.CAPTCHA_REQUIRED, page.url)
+        if self._contains_any(body_text, "вакансия в архиве", "вакансия закрыта"):
+            return HhFormReviewResult(HhFormReviewStatus.VACANCY_CLOSED, page.url)
+        if self._contains_any(body_text, "вы уже откликались", "отклик уже отправлен"):
+            return HhFormReviewResult(HhFormReviewStatus.ALREADY_APPLIED, page.url)
+        if snapshot.resume_title != expected_resume_title.strip():
+            return HhFormReviewResult(
+                HhFormReviewStatus.RESUME_MISMATCH,
+                page.url,
+                current_form=snapshot.screening_form,
+                message=(
+                    f"Ожидалось резюме «{expected_resume_title}», выбрано «{snapshot.resume_title}»"
+                ),
+            )
+        if not snapshot.screening_form.fields:
+            return HhFormReviewResult(
+                HhFormReviewStatus.UNAVAILABLE,
+                page.url,
+                current_form=snapshot.screening_form,
+                message="Анкета работодателя не найдена",
+            )
+        if screening_form_hash(snapshot.screening_form) != expected_version_hash:
+            return HhFormReviewResult(
+                HhFormReviewStatus.FORM_CHANGED,
+                page.url,
+                current_form=snapshot.screening_form,
+                message="Состав анкеты изменился; старые ответы не подставлены",
+            )
+
+        if cover_letter.strip():
+            letter = page.locator('[data-qa="vacancy-response-popup-form-letter-input"]')
+            if letter.count() == 0:
+                toggle = page.locator('[data-qa="vacancy-response-letter-toggle"]')
+                if toggle.count() == 1:
+                    toggle.click()
+                    letter = page.locator('[data-qa="vacancy-response-popup-form-letter-input"]')
+            if letter.count() == 1:
+                letter.first.wait_for(state="visible", timeout=self._timeout_ms)
+                letter.first.fill(cover_letter.strip())
+
+        payload = [{"key": key, "value": value} for key, value in answers.items() if value.strip()]
+        fill_result = page.evaluate(FILL_APPLICATION_FORM_SCRIPT, payload)
+        if not isinstance(fill_result, dict):
+            raise RuntimeError("hh.ru вернул некорректный результат заполнения анкеты")
+        raw_filled = fill_result.get("filled", [])
+        raw_skipped = fill_result.get("skipped", [])
+        if not isinstance(raw_filled, list) or not all(
+            isinstance(value, str) for value in raw_filled
+        ):
+            raise RuntimeError("hh.ru вернул некорректный список заполненных полей")
+        if not isinstance(raw_skipped, list) or not all(
+            isinstance(value, str) for value in raw_skipped
+        ):
+            raise RuntimeError("hh.ru вернул некорректный список пропущенных полей")
+        return HhFormReviewResult(
+            HhFormReviewStatus.READY,
+            page.url,
+            current_form=snapshot.screening_form,
+            filled_keys=tuple(raw_filled),
+            skipped_keys=tuple(raw_skipped),
+            message="Анкета заполнена, но не отправлена",
         )
 
     @staticmethod
@@ -761,21 +980,85 @@ class VisibleHhBrowser:
         payload = page.evaluate(APPLICATION_FORM_SCRIPT)
         if not isinstance(payload, dict):
             raise RuntimeError("hh.ru вернул некорректную форму отклика")
+        raw_fields = payload.get("fields")
         raw_questions = payload.get("questions")
         raw_warnings = payload.get("warnings")
-        if not isinstance(raw_questions, list) or not all(
-            isinstance(item, str) for item in raw_questions
+        if (
+            raw_fields is None
+            and isinstance(raw_questions, list)
+            and all(isinstance(item, str) for item in raw_questions)
+        ):
+            raw_fields = [
+                {
+                    "key": f"question:{position}:{question.casefold()[:220]}",
+                    "question": question,
+                    "fieldType": "unknown",
+                    "isRequired": True,
+                    "options": [],
+                    "maxLength": None,
+                }
+                for position, question in enumerate(raw_questions)
+            ]
+        if not isinstance(raw_fields, list) or not all(
+            isinstance(item, dict) for item in raw_fields
         ):
             raise RuntimeError("hh.ru вернул некорректные вопросы работодателя")
         if not isinstance(raw_warnings, list) or not all(
             isinstance(item, str) for item in raw_warnings
         ):
             raise RuntimeError("hh.ru вернул некорректные предупреждения")
-        return _ApplicationSnapshot(
-            questions=tuple(item.strip() for item in raw_questions if item.strip()),
+        fields: list[HhScreeningField] = []
+        for raw_field in raw_fields:
+            raw_options = raw_field.get("options", [])
+            if not isinstance(raw_options, list) or not all(
+                isinstance(option, str) for option in raw_options
+            ):
+                raise RuntimeError("hh.ru вернул некорректные варианты ответа")
+            raw_max_length = raw_field.get("maxLength")
+            if raw_max_length is not None and not isinstance(raw_max_length, int):
+                raise RuntimeError("hh.ru вернул некорректное ограничение длины")
+            fields.append(
+                HhScreeningField(
+                    key=self._required_string(raw_field, "key", "ключа вопроса"),
+                    question=self._required_string(raw_field, "question", "текста вопроса"),
+                    field_type=self._required_string(raw_field, "fieldType", "типа вопроса"),
+                    is_required=raw_field.get("isRequired") is True,
+                    options=tuple(option.strip() for option in raw_options if option.strip()),
+                    max_length=raw_max_length,
+                    format_hint=self._optional_string(raw_field, "formatHint"),
+                    has_attachment=raw_field.get("hasAttachment") is True,
+                    has_external_action=raw_field.get("hasExternalAction") is True,
+                    has_test_assignment=raw_field.get("hasTestAssignment") is True,
+                )
+            )
+        screening_form = HhScreeningForm(
+            fields=tuple(fields),
             warnings=tuple(item.strip() for item in raw_warnings if item.strip()),
+        )
+        return _ApplicationSnapshot(
+            screening_form=screening_form,
             resume_title=self._optional_string(payload, "resumeTitle"),
             body_text=self._optional_string(payload, "bodyText"),
+        )
+
+    def _application_response_url(self, source_url: str) -> str:
+        vacancy_id, normalized_url = self._vacancy_id_and_url(source_url)
+        parsed = urlparse(normalized_url)
+        return urlunparse(
+            (
+                parsed.scheme,
+                parsed.netloc,
+                "/applicant/vacancy_response",
+                "",
+                urlencode(
+                    {
+                        "vacancyId": vacancy_id,
+                        "startedWithQuestion": "false",
+                        "hhtmFrom": "vacancy",
+                    }
+                ),
+                "",
+            )
         )
 
     @staticmethod
