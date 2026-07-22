@@ -80,8 +80,7 @@ def test_collection_tracks_changes_discoveries_duplicates_and_rejected(
             assert results[1].state is VacancyState.ANALYZED
             assert results[1].vacancy.duplicate_of_id == results[0].vacancy.id
             assert any(
-                "обрабатывается отдельно" in reason
-                for reason in results[1].evaluation.reasons
+                "обрабатывается отдельно" in reason for reason in results[1].evaluation.reasons
             )
 
             directions.record_discovery(
