@@ -61,3 +61,4 @@ class HhApplyResult:
     confirmation: str = ""
     questions: tuple[str, ...] = ()
     warnings: tuple[str, ...] = ()
+    retry_after_seconds: int | None = None

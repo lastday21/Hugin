@@ -40,6 +40,16 @@ class TaskRecord:
 @dataclass(frozen=True, slots=True)
 class SystemStateRecord:
     state: SystemState
+    next_apply_at: datetime | None
+    updated_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class ApplicationPolicyRecord:
+    timezone_name: str
+    daily_limit: int
+    delay_min_seconds: int
+    delay_max_seconds: int
     updated_at: datetime
 
 

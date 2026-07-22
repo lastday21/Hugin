@@ -54,6 +54,7 @@ from hugin.domain.state_machines import (
     ensure_task_transition,
 )
 from hugin.domain.tasks import (
+    ApplicationPolicyRecord,
     DuplicateTaskError,
     SystemState,
     SystemStateNotFoundError,
@@ -76,6 +77,7 @@ __all__ = [
     "ApplicationEventRecord",
     "ApplicationEventType",
     "ApplicationNotFoundError",
+    "ApplicationPolicyRecord",
     "ApplicationRecord",
     "ApplicationState",
     "CompanyRuleType",

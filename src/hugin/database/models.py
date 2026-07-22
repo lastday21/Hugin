@@ -482,6 +482,7 @@ class SystemStateModel(Base):
         default=SystemState.RUNNING,
         nullable=False,
     )
+    next_apply_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
     )

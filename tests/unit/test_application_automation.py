@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -76,6 +76,14 @@ def test_automation_prepares_claims_and_records_results(settings: Settings) -> N
             )
             assert prepared.created == 2
             assert prepared.resume == resume
+            repeated = service.prepare_for_account_id(
+                account_id=account.id,
+                direction_name="Python backend",
+                include_stretch=True,
+            )
+            assert repeated.created == 0
+            assert repeated.existing == 2
+            assert service.recover_interrupted() == 0
 
             first = service.claim_next(direction.id)
             assert first is not None
@@ -101,13 +109,36 @@ def test_automation_prepares_claims_and_records_results(settings: Settings) -> N
             recorded = service.record_result(
                 second,
                 HhApplyResult(HhApplyStatus.APPLIED, second.vacancy.source_url, "успешно"),
+                apply_delay=timedelta(seconds=45),
             )
             assert recorded.sent
+            assert recorded.next_apply_at is not None
             assert (
                 ApplicationRepository(session).get(second.application.id).state
                 is ApplicationState.APPLIED
             )
             assert QueueTaskRepository(session).get(second.task.id).state is TaskState.COMPLETED
+            assert service.applied_since(account.id, datetime(2026, 1, 1, tzinfo=UTC)) == 1
+            SystemStateRepository(session).set_next_apply_at(None)
+
+            already_vacancy = vacancies.upsert(
+                VacancyData("already", "Python", "https://hh.ru/vacancy/already")
+            )
+            directions.track_vacancy(direction.id, already_vacancy.id)
+            already_application = ApplicationRepository(session).create_apply_intent(
+                account.id,
+                already_vacancy.id,
+                resume.id,
+                direction.id,
+            )
+            QueueTaskRepository(session).enqueue(already_application.id, 55)
+            already_job = service.claim_next(direction.id)
+            assert already_job is not None
+            already = service.record_result(
+                already_job,
+                HhApplyResult(HhApplyStatus.ALREADY_APPLIED, already_vacancy.source_url),
+            )
+            assert not already.sent
             assert service.applied_since(account.id, datetime(2026, 1, 1, tzinfo=UTC)) == 1
 
             uncertain_vacancy = vacancies.upsert(
@@ -205,5 +236,49 @@ def test_automation_prepares_claims_and_records_results(settings: Settings) -> N
             assert SystemStateRepository(session).get().state is SystemState.AUTH_REQUIRED
             service.resume_after_authentication()
             assert SystemStateRepository(session).get().state is SystemState.RUNNING
+    finally:
+        database.close()
+
+
+def test_retry_after_schedules_task_and_all_new_applications(settings: Settings) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    now = datetime.now(UTC) - timedelta(seconds=1)
+
+    try:
+        with database.sessions.begin() as session:
+            account = AccountRepository(session).create("Иван", "retry-account")
+            resume = ResumeRepository(session).upsert(account.id, "resume-1", "Python")
+            direction = DirectionRepository(session).create(account.id, "ИТ")
+            vacancy = VacancyRepository(session).upsert(
+                VacancyData("retry", "Python", "https://hh.ru/vacancy/retry")
+            )
+            directions = DirectionRepository(session)
+            directions.track_vacancy(direction.id, vacancy.id)
+            application = ApplicationRepository(session).create_apply_intent(
+                account.id,
+                vacancy.id,
+                resume.id,
+                direction.id,
+            )
+            QueueTaskRepository(session).enqueue(application.id, 50, now)
+            service = ApplicationAutomationService(session)
+            job = service.claim_next(direction.id)
+            assert job is not None
+
+            recorded = service.record_result(
+                job,
+                HhApplyResult(
+                    HhApplyStatus.RETRYABLE_ERROR,
+                    vacancy.source_url,
+                    retry_after_seconds=120,
+                ),
+                now=now,
+            )
+
+            expected = now + timedelta(seconds=120)
+            assert recorded.next_apply_at == expected
+            assert QueueTaskRepository(session).get(job.task.id).scheduled_at == expected
+            assert SystemStateRepository(session).get().next_apply_at == expected
     finally:
         database.close()

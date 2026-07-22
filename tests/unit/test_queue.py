@@ -33,7 +33,13 @@ from hugin.services import QueueService
 pytestmark = pytest.mark.integration
 
 
-def create_application(session: Session, hh_id: str, resume_hh_id: str) -> int:
+def create_application(
+    session: Session,
+    hh_id: str,
+    resume_hh_id: str,
+    *,
+    published_at: datetime | None = None,
+) -> int:
     account = AccountRepository(session).create(f"Account {hh_id}")
     resume = ResumeRepository(session).upsert(account.id, resume_hh_id, f"Resume {hh_id}")
     vacancy = VacancyRepository(session).upsert(
@@ -41,6 +47,7 @@ def create_application(session: Session, hh_id: str, resume_hh_id: str) -> int:
             hh_id=hh_id,
             title=f"Vacancy {hh_id}",
             source_url=f"https://hh.ru/vacancy/{hh_id}",
+            published_at=published_at,
         )
     )
     return ApplicationRepository(session).create_apply_intent(account.id, vacancy.id, resume.id).id
@@ -123,6 +130,115 @@ def test_unknown_result_requires_reconciliation_before_retry(settings: Settings)
 
             with pytest.raises(InvalidStateTransitionError):
                 repository.transition(task.id, TaskState.RUNNING)
+    finally:
+        database.close()
+
+
+def test_queue_prefers_fresher_vacancy_before_rule_score(settings: Settings) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    now = datetime(2026, 7, 22, 12, 0, tzinfo=UTC)
+
+    try:
+        with database.sessions.begin() as session:
+            older = create_application(
+                session,
+                "freshness-old",
+                "resume-old",
+                published_at=now - timedelta(days=3),
+            )
+            newer = create_application(
+                session,
+                "freshness-new",
+                "resume-new",
+                published_at=now - timedelta(hours=1),
+            )
+            repository = QueueTaskRepository(session)
+            repository.enqueue(older, 100, now)
+            expected = repository.enqueue(newer, 20, now)
+
+            claimed = repository.claim_next(now)
+
+            assert claimed is not None
+            assert claimed.id == expected.id
+    finally:
+        database.close()
+
+
+def test_queue_policy_gate_and_manual_pause_are_persistent(settings: Settings) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    now = datetime(2026, 7, 22, 12, 0, tzinfo=UTC)
+
+    try:
+        with database.sessions.begin() as session:
+            application_id = create_application(session, "policy", "resume-policy")
+            QueueTaskRepository(session).enqueue(application_id, 70, now)
+            queue = QueueService(session)
+
+            policy = queue.configure(
+                timezone_name="UTC+05:00",
+                daily_limit=30,
+                delay_min_seconds=35,
+                delay_max_seconds=55,
+            )
+            assert policy.daily_limit == 30
+            assert policy.delay_min_seconds == 35
+            assert policy.delay_max_seconds == 55
+            assert queue.policy().daily_limit == 30
+            assert queue.policy("Europe/Moscow").timezone_name == "Europe/Moscow"
+
+            SystemStateRepository(session).set_next_apply_at(now + timedelta(seconds=40))
+            assert queue.claim_next(now) is None
+            assert queue.claim_next(now + timedelta(seconds=40)) is not None
+
+            assert queue.pause().state is SystemState.PAUSED
+            assert queue.pause().state is SystemState.PAUSED
+            assert queue.resume().state is SystemState.RUNNING
+            assert queue.resume().state is SystemState.RUNNING
+            status = queue.status()
+            assert status.policy.timezone_name == "Europe/Moscow"
+            assert status.task_counts[TaskState.RUNNING] == 1
+
+            with pytest.raises(ValueError, match="меньше 25"):
+                queue.configure(timezone_name="UTC+05:00", daily_limit=24)
+            with pytest.raises(ValueError, match="Некорректный интервал"):
+                queue.configure(
+                    timezone_name="UTC+05:00",
+                    delay_min_seconds=60,
+                    delay_max_seconds=30,
+                )
+
+            SystemStateRepository(session).transition(SystemState.AUTH_REQUIRED)
+            with pytest.raises(ValueError, match="защитным состоянием"):
+                queue.pause()
+            with pytest.raises(ValueError, match="защитное состояние"):
+                queue.resume()
+    finally:
+        database.close()
+
+
+def test_running_task_is_recovered_without_automatic_retry(settings: Settings) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    now = datetime(2026, 7, 22, 12, 0, tzinfo=UTC)
+
+    try:
+        with database.sessions.begin() as session:
+            application_id = create_application(session, "interrupted", "resume-1")
+            repository = QueueTaskRepository(session)
+            task = repository.enqueue(application_id, 50, now)
+            assert repository.claim_next(now) is not None
+
+            recovered = repository.recover_running()
+
+            assert [item.id for item in recovered] == [task.id]
+            assert recovered[0].state is TaskState.UNKNOWN_RESULT
+            assert recovered[0].last_error_code == "INTERRUPTED_DURING_APPLY"
+            assert repository.claim_next(now + timedelta(hours=1)) is None
+            event = ApplicationRepository(session).list_events(application_id)[-1]
+            assert event.event_type is ApplicationEventType.UNKNOWN_RESULT
+            assert event.payload["recovery"] == "startup"
     finally:
         database.close()
 

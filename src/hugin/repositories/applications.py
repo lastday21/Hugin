@@ -134,6 +134,8 @@ class ApplicationRepository:
                     ApplicationModel.account_id == account_id,
                     ApplicationEventModel.event_type == ApplicationEventType.APPLIED,
                     ApplicationEventModel.created_at >= since,
+                    ApplicationEventModel.payload["hh_status"].as_string()
+                    == ApplicationState.APPLIED.value,
                 )
             )
             or 0

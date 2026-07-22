@@ -10,9 +10,14 @@ from hugin.domain.applications import (
     ApplicationState,
     EventPayload,
 )
-from hugin.domain.directions import DirectionVacancyRecord, ResumeRecord, VacancyState
+from hugin.domain.directions import (
+    AccountRecord,
+    DirectionVacancyRecord,
+    ResumeRecord,
+    VacancyState,
+)
 from hugin.domain.hh import HhApplyResult, HhApplyStatus
-from hugin.domain.tasks import SystemState, TaskRecord, TaskState
+from hugin.domain.tasks import ApplicationPolicyRecord, SystemState, TaskRecord, TaskState
 from hugin.domain.vacancies import VacancyRecord
 from hugin.repositories.applications import ApplicationRepository
 from hugin.repositories.directions import (
@@ -48,6 +53,7 @@ class ApplyJob:
 class RecordedApplyResult:
     blocking: bool
     sent: bool
+    next_apply_at: datetime | None = None
 
 
 class ApplicationAutomationService:
@@ -71,6 +77,23 @@ class ApplicationAutomationService:
         account = self._accounts.get_by_external_id(account_external_id)
         if account is None:
             raise LookupError("Аккаунт hh.ru не найден в базе")
+        return self._prepare(account, direction_name, include_stretch)
+
+    def prepare_for_account_id(
+        self,
+        *,
+        account_id: int,
+        direction_name: str,
+        include_stretch: bool,
+    ) -> PreparationResult:
+        return self._prepare(self._accounts.get(account_id), direction_name, include_stretch)
+
+    def _prepare(
+        self,
+        account: AccountRecord,
+        direction_name: str,
+        include_stretch: bool,
+    ) -> PreparationResult:
         direction = self._directions.get_by_account_and_name(account.id, direction_name)
         if direction is None:
             raise LookupError(f"Направление «{direction_name}» не найдено")
@@ -88,11 +111,33 @@ class ApplicationAutomationService:
         existing = 0
         for tracked in self._directions.list_tracked_vacancies(direction.id):
             category = tracked.rules_details.get("category")
-            if tracked.state is not VacancyState.ANALYZED or category not in allowed:
+            if (
+                tracked.state not in {VacancyState.ANALYZED, VacancyState.QUEUED}
+                or category not in allowed
+            ):
                 continue
             current = self._applications.get_by_key(account.id, tracked.vacancy_id, resume.id)
             if current is not None:
-                existing += 1
+                task = self._tasks.get_by_application_id(current.id)
+                if task is None and current.state is ApplicationState.APPLYING:
+                    self._tasks.enqueue(current.id, self._priority(tracked))
+                    self._directions.set_vacancy_state(
+                        direction.id,
+                        tracked.vacancy_id,
+                        VacancyState.QUEUED,
+                    )
+                    created += 1
+                else:
+                    if task is not None and task.state not in {
+                        TaskState.COMPLETED,
+                        TaskState.SKIPPED,
+                    }:
+                        self._directions.set_vacancy_state(
+                            direction.id,
+                            tracked.vacancy_id,
+                            VacancyState.QUEUED,
+                        )
+                    existing += 1
                 continue
             application = self._applications.create_apply_intent(
                 account.id,
@@ -100,10 +145,7 @@ class ApplicationAutomationService:
                 resume.id,
                 direction.id,
             )
-            priority = tracked.rules_score or 0
-            if category == RuleCategory.STRETCH.value:
-                priority = max(priority - 20, 0)
-            self._tasks.enqueue(application.id, priority)
+            self._tasks.enqueue(application.id, self._priority(tracked))
             self._directions.set_vacancy_state(
                 direction.id,
                 tracked.vacancy_id,
@@ -111,6 +153,19 @@ class ApplicationAutomationService:
             )
             created += 1
         return PreparationResult(account.id, direction.id, resume, created, existing)
+
+    @staticmethod
+    def _priority(tracked: DirectionVacancyRecord) -> float:
+        priority = tracked.rules_score or 0
+        if tracked.rules_details.get("category") == RuleCategory.STRETCH.value:
+            return max(priority - 20, 0)
+        return priority
+
+    def recover_interrupted(self) -> int:
+        return len(self._tasks.recover_running())
+
+    def policy(self, timezone_name: str) -> ApplicationPolicyRecord:
+        return self._queue.policy(timezone_name)
 
     def claim_next(self, direction_id: int) -> ApplyJob | None:
         task = self._queue.claim_next(direction_id=direction_id)
@@ -144,12 +199,17 @@ class ApplicationAutomationService:
         result: HhApplyResult,
         *,
         retry_delay: timedelta = timedelta(minutes=15),
+        apply_delay: timedelta | None = None,
+        now: datetime | None = None,
     ) -> RecordedApplyResult:
+        selected_at = now or datetime.now(UTC)
         payload: EventPayload = {
             "hh_status": result.status.value,
             "confirmation": result.confirmation[:1000],
             "final_url": result.final_url[:1000],
         }
+        if result.retry_after_seconds is not None:
+            payload["retry_after_seconds"] = result.retry_after_seconds
         if result.status in {HhApplyStatus.APPLIED, HhApplyStatus.ALREADY_APPLIED}:
             self._applications.transition_state(
                 job.application.id,
@@ -157,7 +217,15 @@ class ApplicationAutomationService:
                 payload,
             )
             self._tasks.transition(job.task.id, TaskState.COMPLETED)
-            return RecordedApplyResult(blocking=False, sent=result.status is HhApplyStatus.APPLIED)
+            sent = result.status is HhApplyStatus.APPLIED
+            next_apply_at = selected_at + apply_delay if sent and apply_delay is not None else None
+            if next_apply_at is not None:
+                self._system.set_next_apply_at(next_apply_at)
+            return RecordedApplyResult(
+                blocking=False,
+                sent=sent,
+                next_apply_at=next_apply_at,
+            )
 
         if result.status is HhApplyStatus.QUESTIONS_REQUIRED:
             payload["question_count"] = len(result.questions)
@@ -196,16 +264,29 @@ class ApplicationAutomationService:
             HhApplyStatus.ACCOUNT_WARNING: SystemState.ACCOUNT_WARNING,
             HhApplyStatus.RESUME_MISMATCH: SystemState.PAUSED,
         }
+        effective_retry_delay = (
+            timedelta(seconds=result.retry_after_seconds)
+            if result.status is HhApplyStatus.RETRYABLE_ERROR
+            and result.retry_after_seconds is not None
+            else retry_delay
+        )
+        retry_at = selected_at + effective_retry_delay
         self._tasks.transition(
             job.task.id,
             TaskState.RETRY_SCHEDULED,
-            scheduled_at=datetime.now(UTC) + retry_delay,
+            scheduled_at=retry_at,
             error_code=result.status.value,
         )
+        if result.status is HhApplyStatus.RETRYABLE_ERROR:
+            self._system.set_next_apply_at(retry_at)
         target_state = system_states.get(result.status)
         if target_state is not None:
             self._transition_system(target_state)
-        return RecordedApplyResult(blocking=target_state is not None, sent=False)
+        return RecordedApplyResult(
+            blocking=target_state is not None,
+            sent=False,
+            next_apply_at=(retry_at if result.status is HhApplyStatus.RETRYABLE_ERROR else None),
+        )
 
     def confirm_unknown_as_applied(
         self,
