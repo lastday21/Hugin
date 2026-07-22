@@ -93,5 +93,7 @@ class DirectionVacancyRecord:
     rules_details: ConfigPayload
     ai_score: float | None
     fit_score: float | None
+    rules_version: str | None
+    analyzed_at: datetime | None
     first_seen_at: datetime
     updated_at: datetime

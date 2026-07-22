@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from datetime import UTC, datetime
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -100,6 +101,8 @@ def _direction_vacancy_record(model: DirectionVacancyModel) -> DirectionVacancyR
         rules_details=dict(model.rules_details),
         ai_score=model.ai_score,
         fit_score=model.fit_score,
+        rules_version=model.rules_version,
+        analyzed_at=as_utc(model.analyzed_at) if model.analyzed_at is not None else None,
         first_seen_at=as_utc(model.first_seen_at),
         updated_at=as_utc(model.updated_at),
     )
@@ -496,6 +499,7 @@ class DirectionRepository:
         state: VacancyState,
         score: float,
         details: ConfigPayload,
+        rules_version: str = "legacy",
     ) -> DirectionVacancyRecord:
         if not 0 <= score <= 100:
             raise ValueError("score must be between 0 and 100")
@@ -504,6 +508,35 @@ class DirectionRepository:
             raise LookupError("direction vacancy was not found")
         model.state = state
         model.rules_score = score
+        model.fit_score = score
         model.rules_details = dict(details)
+        model.rules_version = rules_version
+        model.analyzed_at = datetime.now(UTC)
+        self._session.flush()
+        return _direction_vacancy_record(model)
+
+    def restore_rejected(self, direction_id: int, vacancy_id: int) -> DirectionVacancyRecord:
+        model = self._session.get(DirectionVacancyModel, (direction_id, vacancy_id))
+        if model is None:
+            raise LookupError("Вакансия не относится к выбранному направлению")
+        if model.state not in {VacancyState.FILTERED_OUT, VacancyState.SKIPPED}:
+            raise ValueError("Вакансия не находится в списке отклонённых")
+        details = dict(model.rules_details)
+        reasons = details.get("reasons", [])
+        normalized_reasons = (
+            [str(reason) for reason in reasons] if isinstance(reasons, list) else []
+        )
+        normalized_reasons.append("решение изменено пользователем")
+        details.update(
+            {
+                "accepted": True,
+                "category": "MATCH",
+                "manual_override": "ACCEPT",
+                "reasons": normalized_reasons,
+            }
+        )
+        model.state = VacancyState.ANALYZED
+        model.rules_details = details
+        model.updated_at = datetime.now(UTC)
         self._session.flush()
         return _direction_vacancy_record(model)

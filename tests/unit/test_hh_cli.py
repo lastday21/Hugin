@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace, TracebackType
 from typing import ClassVar, cast
@@ -12,7 +15,7 @@ import pytest
 
 from hugin import hh_cli
 from hugin.core.settings import Settings
-from hugin.domain.directions import EmploymentForm, SearchRegion, WorkFormat
+from hugin.domain.directions import EmploymentForm, SearchRegion, VacancyState, WorkFormat
 from hugin.domain.hh import (
     HhApplyResult,
     HhApplyStatus,
@@ -21,7 +24,7 @@ from hugin.domain.hh import (
     HhResumeDetails,
 )
 from hugin.domain.resumes import ProfileQuestionCandidate
-from hugin.domain.vacancies import VacancyData, VacancySearchResult
+from hugin.domain.vacancies import VacancyAvailability, VacancyData, VacancySearchResult
 from hugin.services.career_directions import DirectionSearchSettings, VacancySearchTask
 from hugin.services.hh_login import HhCredentials, LoginStatus
 from hugin.services.vacancy_analysis import RuleCategory
@@ -372,6 +375,29 @@ def test_cities_command_prints_known_cities(capsys: pytest.CaptureFixture[str]) 
     assert "Екатеринбург: 3" in output
 
 
+def test_main_allows_unrepresentable_vacancy_characters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[object] = []
+
+    class FakeOutput:
+        def reconfigure(self, **kwargs: object) -> None:
+            calls.append(kwargs)
+
+    monkeypatch.setattr(sys, "stdout", FakeOutput())
+    monkeypatch.setattr(hh_cli, "run", lambda: 0)
+
+    with pytest.raises(SystemExit) as error:
+        hh_cli.main()
+
+    assert error.value.code == 0
+    assert calls == [{"errors": "replace"}]
+
+
+def test_display_text_normalizes_typographic_dashes_and_spaces() -> None:
+    assert hh_cli._display_text("Python\u2011developer\u00a0API") == "Python-developer API"
+
+
 def test_configure_and_show_search_settings_without_browser(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -447,6 +473,106 @@ def test_configure_and_show_search_settings_without_browser(
     assert configure_call["employment_forms"] == (EmploymentForm.FULL,)
     assert ("get", (1, "ИТ")) in calls
     assert any(name == "questions" for name, _ in calls)
+    assert database.closed
+
+
+def test_rejected_card_and_restore_commands_work_without_browser(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    database = FakeDatabase()
+    vacancy = SimpleNamespace(
+        hh_id="123",
+        title="Python-разработчик",
+        employer_name="Компания",
+        source_url="https://hh.ru/vacancy/123",
+        availability=VacancyAvailability.ACTIVE,
+        region="Москва",
+        address="ул. Примерная, 1",
+        salary_from=Decimal("120000"),
+        salary_to=Decimal("180000"),
+        salary_currency="RUR",
+        work_format="Удалённо",
+        employment="Полная занятость",
+        schedule="5/2",
+        experience="1-3 года",
+        key_skills=("Python", "FastAPI"),
+        duplicate_of_id=None,
+        description="Разработка API",
+    )
+    tracking = SimpleNamespace(
+        state=VacancyState.FILTERED_OUT,
+        rules_score=42.0,
+        rules_details={"reasons": ["причина отклонения"]},
+    )
+    entry = SimpleNamespace(
+        vacancy=vacancy,
+        tracking=tracking,
+        discoveries=(
+            SimpleNamespace(
+                query_text="Python",
+                region="Москва",
+                discovered_at=datetime(2026, 7, 22, tzinfo=UTC),
+            ),
+        ),
+        changes=(SimpleNamespace(),),
+    )
+    calls: list[tuple[str, object]] = []
+
+    class FakeReviewService:
+        def __init__(self, session: object) -> None:
+            assert session is not None
+
+        def list_rejected(self, **kwargs: object) -> tuple[SimpleNamespace, ...]:
+            calls.append(("list", kwargs))
+            return (entry,)
+
+        def get_card(self, **kwargs: object) -> SimpleNamespace:
+            calls.append(("card", kwargs))
+            return entry
+
+        def restore(self, **kwargs: object) -> SimpleNamespace:
+            calls.append(("restore", kwargs))
+            return entry
+
+    install_fakes(monkeypatch, tmp_path, FakeStore())
+    monkeypatch.setattr(hh_cli, "upgrade_database", lambda settings: None)
+    monkeypatch.setattr(hh_cli, "create_database", lambda settings: database)
+    monkeypatch.setattr(hh_cli, "VacancyReviewService", FakeReviewService)
+
+    assert (
+        hh_cli.run(
+            [
+                "rejected",
+                "--direction",
+                "ИТ",
+                "--company",
+                "Компания",
+                "--region",
+                "Москва",
+                "--reason",
+                "причина",
+                "--sort",
+                "score",
+            ]
+        )
+        == 0
+    )
+    rejected_output = capsys.readouterr().out
+    assert "Отклонённых вакансий: 1" in rejected_output
+    assert "123: Python-разработчик" in rejected_output
+
+    assert hh_cli.run(["vacancy", "--direction", "ИТ", "--vacancy-id", "123"]) == 0
+    card_output = capsys.readouterr().out
+    assert "Зарплата: 120000" in card_output
+    assert "180000 RUR" in card_output
+    assert "Найдена по:" in card_output
+    assert "Описание:" in card_output
+
+    assert hh_cli.run(["restore", "--direction", "ИТ", "--vacancy-id", "123"]) == 0
+    assert "возвращена в обработку" in capsys.readouterr().out
+    assert [name for name, _ in calls] == ["list", "card", "restore"]
     assert database.closed
 
 
@@ -581,7 +707,7 @@ def test_analyze_loads_details_and_prints_rule_reasons(
     )
     analyzed = (
         SimpleNamespace(
-            vacancy=SimpleNamespace(title="Python-разработчик"),
+            vacancy=SimpleNamespace(title="Python-разработчик", duplicate_of_id=None),
             evaluation=evaluation,
         ),
     )

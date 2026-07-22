@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import getpass
 import random
+import sys
 import time
 from collections.abc import Sequence
 
@@ -27,6 +28,7 @@ from hugin.services.hh_profile import HhProfileSyncService
 from hugin.services.job_search import JobSearchSyncService
 from hugin.services.resume_profile import ProfileQuestionService
 from hugin.services.vacancy_analysis import RuleCategory, VacancyAnalysisService
+from hugin.services.vacancy_review import VacancyReviewEntry, VacancyReviewService
 
 STATUS_MESSAGES = {
     LoginStatus.AUTHENTICATED: "Вход в hh.ru выполнен.",
@@ -35,6 +37,16 @@ STATUS_MESSAGES = {
     LoginStatus.CAPTCHA_REQUIRED: "Пройдите проверку в открытом окне.",
     LoginStatus.INVALID_CREDENTIALS: "hh.ru отклонил логин или пароль.",
     LoginStatus.MANUAL_ACTION_REQUIRED: "Завершите вход в открытом окне.",
+}
+
+DISPLAY_TRANSLATION: dict[int, str] = {
+    ord("\u00a0"): " ",
+    ord("\u2010"): "-",
+    ord("\u2011"): "-",
+    ord("\u2012"): "-",
+    ord("\u2013"): "-",
+    ord("\u2014"): "-",
+    ord("\u202f"): " ",
 }
 
 
@@ -69,6 +81,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="регион для разового поиска; без него используется Россия (113)",
     )
     search.add_argument("--page", type=non_negative_int, default=0, help="номер страницы")
+    search.add_argument(
+        "--pages",
+        type=positive_int,
+        default=1,
+        help="сколько последовательных страниц обойти",
+    )
 
     configure = subparsers.add_parser(
         "configure-search",
@@ -130,6 +148,25 @@ def build_parser() -> argparse.ArgumentParser:
     analyze.add_argument("--account-id", type=positive_int, default=1)
     analyze.add_argument("--direction", required=True, help="название направления")
     analyze.add_argument("--limit", type=positive_int, default=20, help="число вакансий")
+
+    rejected = subparsers.add_parser("rejected", help="показать отклонённые вакансии")
+    rejected.add_argument("--account-id", type=positive_int, default=1)
+    rejected.add_argument("--direction", required=True, help="название направления")
+    rejected.add_argument("--limit", type=positive_int, default=50)
+    rejected.add_argument("--company", help="часть названия компании")
+    rejected.add_argument("--region", help="часть названия города или региона")
+    rejected.add_argument("--reason", help="часть причины отклонения")
+    rejected.add_argument("--sort", choices=("newest", "score", "company"), default="newest")
+
+    vacancy = subparsers.add_parser("vacancy", help="показать сохранённую карточку вакансии")
+    vacancy.add_argument("--account-id", type=positive_int, default=1)
+    vacancy.add_argument("--direction", required=True, help="название направления")
+    vacancy.add_argument("--vacancy-id", required=True, help="идентификатор вакансии hh.ru")
+
+    restore = subparsers.add_parser("restore", help="вернуть отклонённую вакансию в обработку")
+    restore.add_argument("--account-id", type=positive_int, default=1)
+    restore.add_argument("--direction", required=True, help="название направления")
+    restore.add_argument("--vacancy-id", required=True, help="идентификатор вакансии hh.ru")
 
     apply = subparsers.add_parser("apply", help="автоматически отправить подходящие отклики")
     apply.add_argument("--account-id", type=positive_int, default=1)
@@ -211,6 +248,8 @@ def run(argv: Sequence[str] | None = None) -> int:
 
     if arguments.command in {"configure-search", "show-search"}:
         return _run_search_settings(arguments)
+    if arguments.command in {"rejected", "vacancy", "restore"}:
+        return _run_vacancy_review(arguments)
 
     store = WindowsCredentialStore()
 
@@ -256,18 +295,18 @@ def run(argv: Sequence[str] | None = None) -> int:
             return 0
         profile = browser.read_profile()
         if arguments.command == "search":
-            search_runs = tuple(
-                (
-                    task,
-                    browser.search_vacancies(
+            search_runs = []
+            for task in search_tasks:
+                for page_number in range(arguments.page, arguments.page + arguments.pages):
+                    search_result = browser.search_vacancies(
                         task.query,
                         area=task.area,
                         filters=task.filters,
-                        page_number=arguments.page,
-                    ),
-                )
-                for task in search_tasks
-            )
+                        page_number=page_number,
+                    )
+                    search_runs.append((task, search_result))
+                    if not search_result.vacancies:
+                        break
         if arguments.command == "analyze":
             upgrade_database(settings)
             database = create_database(settings)
@@ -321,7 +360,8 @@ def run(argv: Sequence[str] | None = None) -> int:
 
         first = synchronized_runs[0][2]
         print(f"Направление: {first.direction.name} (№ {first.direction.id}).")
-        print(f"Выполнено вариантов поиска: {len(synchronized_runs)}.")
+        print(f"Выполнено вариантов поиска: {len(search_tasks)}.")
+        print(f"Обработано страниц поиска: {len(synchronized_runs)}.")
         for task, search_result, synced_run in synchronized_runs:
             print(
                 f"- {task.query}; {task.region_name}: найдено {search_result.found}, "
@@ -334,8 +374,8 @@ def run(argv: Sequence[str] | None = None) -> int:
         }
         print(f"Уникальных вакансий в базе: {len(unique_vacancies)}.")
         for vacancy in tuple(unique_vacancies.values())[:10]:
-            employer = f" — {vacancy.employer_name}" if vacancy.employer_name else ""
-            print(f"- {vacancy.title}{employer}")
+            employer = f" — {_display_text(vacancy.employer_name)}" if vacancy.employer_name else ""
+            print(f"- {_display_text(vacancy.title)}{employer}")
         return 0
 
     if arguments.command == "analyze":
@@ -357,9 +397,13 @@ def run(argv: Sequence[str] | None = None) -> int:
 
         matched = sum(result.evaluation.category is RuleCategory.MATCH for result in analyzed)
         stretch = sum(result.evaluation.category is RuleCategory.STRETCH for result in analyzed)
+        duplicates = sum(result.vacancy.duplicate_of_id is not None for result in analyzed)
         rejected = len(analyzed) - matched - stretch
         print(f"Проверено вакансий: {len(analyzed)}.")
-        print(f"Подходят: {matched}. Пограничные: {stretch}. Отклонены: {rejected}.")
+        print(
+            f"Подходят: {matched}. Пограничные: {stretch}. "
+            f"Отклонены: {rejected}. Из них похожих публикаций: {duplicates}."
+        )
         for analysis_result in analyzed:
             evaluation = analysis_result.evaluation
             decisions = {
@@ -370,7 +414,8 @@ def run(argv: Sequence[str] | None = None) -> int:
             decision = decisions[evaluation.category]
             reasons = "; ".join(evaluation.reasons)
             print(
-                f"- {analysis_result.vacancy.title}: {decision}, {evaluation.score:.0f}. {reasons}"
+                f"- {_display_text(analysis_result.vacancy.title)}: "
+                f"{decision}, {evaluation.score:.0f}. {reasons}"
             )
         for title, failure_message in failures:
             print(f"- Пропущена вакансия «{title}»: {failure_message}")
@@ -427,6 +472,110 @@ def _run_search_settings(arguments: argparse.Namespace) -> int:
     _print_search_settings(configured)
     _print_pending_questions(pending_questions)
     return 0
+
+
+def _run_vacancy_review(arguments: argparse.Namespace) -> int:
+    settings = get_settings()
+    upgrade_database(settings)
+    database = create_database(settings)
+    try:
+        with database.sessions.begin() as session:
+            service = VacancyReviewService(session)
+            if arguments.command == "rejected":
+                entries = service.list_rejected(
+                    account_id=arguments.account_id,
+                    direction_name=arguments.direction,
+                    limit=arguments.limit,
+                    company=arguments.company,
+                    region=arguments.region,
+                    reason=arguments.reason,
+                    sort=arguments.sort,
+                )
+            elif arguments.command == "restore":
+                entry = service.restore(
+                    account_id=arguments.account_id,
+                    direction_name=arguments.direction,
+                    hh_id=arguments.vacancy_id,
+                )
+                entries = (entry,)
+            else:
+                entry = service.get_card(
+                    account_id=arguments.account_id,
+                    direction_name=arguments.direction,
+                    hh_id=arguments.vacancy_id,
+                )
+                entries = (entry,)
+    finally:
+        database.close()
+
+    if arguments.command == "rejected":
+        print(f"Отклонённых вакансий: {len(entries)}.")
+        for entry in entries:
+            reasons = "; ".join(_rule_reasons(entry))
+            employer = entry.vacancy.employer_name or "компания не указана"
+            region = entry.vacancy.region or "регион не указан"
+            score = entry.tracking.rules_score or 0
+            print(
+                f"- {entry.vacancy.hh_id}: {_display_text(entry.vacancy.title)} — "
+                f"{_display_text(employer)}; {_display_text(region)}; "
+                f"оценка {score:.0f}; {reasons}"
+            )
+        return 0
+
+    if arguments.command == "restore":
+        print(
+            f"Вакансия {entries[0].vacancy.hh_id} возвращена в обработку. "
+            "Решение пользователя сохранено."
+        )
+        return 0
+
+    _print_vacancy_card(entries[0])
+    return 0
+
+
+def _rule_reasons(entry: VacancyReviewEntry) -> tuple[str, ...]:
+    raw = entry.tracking.rules_details.get("reasons", [])
+    return tuple(str(value) for value in raw) if isinstance(raw, list) else ()
+
+
+def _print_vacancy_card(entry: VacancyReviewEntry) -> None:
+    vacancy = entry.vacancy
+    title = _display_text(vacancy.title)
+    employer = _display_text(vacancy.employer_name or "компания не указана")
+    print(f"{title} — {employer}")
+    print(f"hh.ru: {vacancy.source_url}")
+    print(f"Состояние: {entry.tracking.state.value}; доступность: {vacancy.availability.value}")
+    print(
+        f"Регион: {_display_text(vacancy.region or 'не указан')}; "
+        f"адрес: {_display_text(vacancy.address or 'не указан')}"
+    )
+    salary_from = str(vacancy.salary_from) if vacancy.salary_from is not None else "—"
+    salary_to = str(vacancy.salary_to) if vacancy.salary_to is not None else "—"
+    print(f"Зарплата: {salary_from}–{salary_to} {vacancy.salary_currency or ''}".rstrip())
+    print(
+        "Условия: "
+        f"{_display_text(vacancy.work_format or 'формат не указан')}; "
+        f"{_display_text(vacancy.employment or 'занятость не указана')}; "
+        f"{_display_text(vacancy.schedule or 'график не указан')}"
+    )
+    print(f"Опыт: {_display_text(vacancy.experience or 'не указан')}")
+    print("Навыки: " + _display_text(", ".join(vacancy.key_skills) or "не указаны"))
+    print("Причины решения: " + ("; ".join(_rule_reasons(entry)) or "ещё не проверена"))
+    if vacancy.duplicate_of_id is not None:
+        print(f"Повтор основной вакансии в базе: № {vacancy.duplicate_of_id}")
+    print("Найдена по:")
+    for discovery in entry.discoveries:
+        print(
+            f"- {discovery.query_text}; {discovery.region}; {discovery.discovered_at.isoformat()}"
+        )
+    print(f"Изменений сохранено: {len(entry.changes)}.")
+    if vacancy.description:
+        print("Описание:")
+        print(_display_text(vacancy.description))
+
+
+def _display_text(value: object) -> str:
+    return str(value).translate(DISPLAY_TRANSLATION)
 
 
 def _search_tasks(
@@ -617,6 +766,9 @@ def _apply_status_text(status: HhApplyStatus) -> str:
 
 
 def main() -> None:
+    reconfigure = getattr(sys.stdout, "reconfigure", None)
+    if callable(reconfigure):
+        reconfigure(errors="replace")
     raise SystemExit(run())
 
 

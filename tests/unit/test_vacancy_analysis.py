@@ -1,9 +1,16 @@
 from __future__ import annotations
 
+from decimal import Decimal
+
 import pytest
 
-from hugin.domain.vacancies import VacancyData
-from hugin.services.vacancy_analysis import PythonBackendRules, RuleCategory
+from hugin.domain.directions import SearchRegion, WorkFormat
+from hugin.domain.vacancies import VacancyAvailability, VacancyData
+from hugin.services.vacancy_analysis import (
+    PythonBackendRules,
+    RuleCategory,
+    RuleContext,
+)
 
 
 @pytest.mark.parametrize(
@@ -149,3 +156,104 @@ def test_ai_agent_engineer_is_a_stretch_match() -> None:
     assert result.accepted
     assert result.category is RuleCategory.STRETCH
     assert any("дополнительная подготовка" in reason for reason in result.reasons)
+
+
+def test_rule_components_use_known_settings_without_zero_for_unknown_values() -> None:
+    result = PythonBackendRules().evaluate(
+        VacancyData(
+            "settings",
+            "Python backend разработчик",
+            "https://hh.ru/vacancy/settings",
+            description="Разработка API на FastAPI и PostgreSQL.",
+            work_format="Удалённо",
+            region="Москва",
+            salary_from=Decimal("140000"),
+            salary_currency="RUR",
+            key_skills=("Python", "FastAPI", "PostgreSQL"),
+        ),
+        RuleContext(
+            skills=("Python, FastAPI, PostgreSQL, Docker",),
+            work_formats=(WorkFormat.REMOTE,),
+            regions=(SearchRegion("1", "Москва"),),
+            desired_salary=120000,
+        ),
+    )
+
+    assert result.accepted
+    assert {component.name for component in result.components} >= {
+        "role",
+        "skills",
+        "format",
+        "salary",
+        "region",
+        "description",
+    }
+    assert all(component.score > 0 for component in result.components)
+
+
+@pytest.mark.parametrize(
+    ("vacancy", "reason"),
+    [
+        (
+            VacancyData(
+                "closed",
+                "Python разработчик",
+                "https://hh.ru/vacancy/closed",
+                description="Python",
+                availability=VacancyAvailability.ARCHIVED,
+            ),
+            "недоступна",
+        ),
+        (
+            VacancyData(
+                "scam",
+                "Python разработчик",
+                "https://hh.ru/vacancy/scam",
+                description="Для начала нужно оплатить обучение и прислать код из СМС.",
+            ),
+            "подозрительное требование",
+        ),
+    ],
+)
+def test_closed_and_suspicious_vacancies_are_rejected(
+    vacancy: VacancyData,
+    reason: str,
+) -> None:
+    result = PythonBackendRules().evaluate(vacancy)
+
+    assert result.category is RuleCategory.REJECTED
+    assert any(reason in item for item in result.reasons)
+
+
+def test_mandatory_work_format_conflict_is_rejected() -> None:
+    result = PythonBackendRules().evaluate(
+        VacancyData(
+            "office",
+            "Python разработчик",
+            "https://hh.ru/vacancy/office",
+            description="Python backend",
+            work_format="Только офис",
+        ),
+        RuleContext(work_formats=(WorkFormat.REMOTE,)),
+    )
+
+    assert result.category is RuleCategory.REJECTED
+    assert any("формат работы" in reason for reason in result.reasons)
+
+
+def test_mandatory_relocation_outside_selected_cities_is_rejected() -> None:
+    result = PythonBackendRules().evaluate(
+        VacancyData(
+            "relocation",
+            "Python разработчик",
+            "https://hh.ru/vacancy/relocation",
+            description=(
+                "Python backend. Обязательным условием является релокация "
+                "в Республику Татарстан, город Елабуга."
+            ),
+        ),
+        RuleContext(regions=(SearchRegion("1", "Москва"), SearchRegion("2", "Санкт-Петербург"))),
+    )
+
+    assert result.category is RuleCategory.REJECTED
+    assert any("переезд" in reason for reason in result.reasons)

@@ -10,6 +10,7 @@ from hugin.services.vacancy_analysis import (
     RuleCategory,
     VacancyAnalysisService,
 )
+from hugin.services.vacancy_review import VacancyReviewService
 
 __all__ = [
     "ApplicationAutomationService",
@@ -20,4 +21,5 @@ __all__ = [
     "QueueService",
     "RuleCategory",
     "VacancyAnalysisService",
+    "VacancyReviewService",
 ]
