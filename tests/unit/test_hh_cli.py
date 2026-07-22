@@ -24,6 +24,7 @@ from hugin.domain.hh import (
     HhResumeDetails,
 )
 from hugin.domain.resumes import ProfileQuestionCandidate
+from hugin.domain.tasks import SystemState, TaskState
 from hugin.domain.vacancies import VacancyAvailability, VacancyData, VacancySearchResult
 from hugin.services.career_directions import DirectionSearchSettings, VacancySearchTask
 from hugin.services.hh_login import HhCredentials, LoginStatus
@@ -476,6 +477,71 @@ def test_configure_and_show_search_settings_without_browser(
     assert database.closed
 
 
+def test_queue_settings_pause_and_status_work_without_browser(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    database = FakeDatabase()
+    calls: list[tuple[str, object]] = []
+    policy = SimpleNamespace(
+        daily_limit=30,
+        delay_min_seconds=35,
+        delay_max_seconds=55,
+        timezone_name="UTC+05:00",
+    )
+    system = SimpleNamespace(state=SystemState.PAUSED, next_apply_at=None)
+    status = SimpleNamespace(
+        policy=policy,
+        system=system,
+        task_counts={TaskState.PENDING: 4},
+    )
+
+    class FakeQueueService:
+        def __init__(self, session: object) -> None:
+            assert session is not None
+
+        def configure(self, **kwargs: object) -> SimpleNamespace:
+            calls.append(("configure", kwargs))
+            return policy
+
+        def pause(self) -> SimpleNamespace:
+            calls.append(("pause", None))
+            return system
+
+        def policy(self, timezone_name: str) -> SimpleNamespace:
+            calls.append(("policy", timezone_name))
+            return policy
+
+        def status(self) -> SimpleNamespace:
+            return status
+
+    install_fakes(monkeypatch, tmp_path, FakeStore())
+    monkeypatch.setattr(hh_cli, "upgrade_database", lambda settings: None)
+    monkeypatch.setattr(hh_cli, "create_database", lambda settings: database)
+    monkeypatch.setattr(hh_cli, "QueueService", FakeQueueService)
+
+    assert (
+        hh_cli.run(
+            [
+                "configure-queue",
+                "--daily-limit",
+                "30",
+                "--delay-min",
+                "35",
+                "--delay-max",
+                "55",
+            ]
+        )
+        == 0
+    )
+    assert "Суточное ограничение: 30" in capsys.readouterr().out
+    assert hh_cli.run(["pause"]) == 0
+    assert "Очередь: приостановлена" in capsys.readouterr().out
+    assert [name for name, _ in calls] == ["configure", "pause"]
+    assert database.closed
+
+
 def test_rejected_card_and_restore_commands_work_without_browser(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -536,10 +602,20 @@ def test_rejected_card_and_restore_commands_work_without_browser(
             calls.append(("restore", kwargs))
             return entry
 
+    class FakeAutomationService:
+        def __init__(self, session: object) -> None:
+            assert session is not None
+
+        def prepare_for_account_id(self, **kwargs: object) -> SimpleNamespace:
+            assert kwargs["account_id"] == 1
+            assert kwargs["direction_name"] == "ИТ"
+            return SimpleNamespace(created=1)
+
     install_fakes(monkeypatch, tmp_path, FakeStore())
     monkeypatch.setattr(hh_cli, "upgrade_database", lambda settings: None)
     monkeypatch.setattr(hh_cli, "create_database", lambda settings: database)
     monkeypatch.setattr(hh_cli, "VacancyReviewService", FakeReviewService)
+    monkeypatch.setattr(hh_cli, "ApplicationAutomationService", FakeAutomationService)
 
     assert (
         hh_cli.run(
@@ -571,7 +647,7 @@ def test_rejected_card_and_restore_commands_work_without_browser(
     assert "Описание:" in card_output
 
     assert hh_cli.run(["restore", "--direction", "ИТ", "--vacancy-id", "123"]) == 0
-    assert "возвращена в обработку" in capsys.readouterr().out
+    assert "возвращена в очередь" in capsys.readouterr().out
     assert [name for name, _ in calls] == ["list", "card", "restore"]
     assert database.closed
 
@@ -730,6 +806,14 @@ def test_analyze_loads_details_and_prints_rule_reasons(
             assert kwargs["direction_name"] == "Python backend"
             return analyzed
 
+    class FakeAutomationService:
+        def __init__(self, session: object) -> None:
+            assert session is not None
+
+        def prepare(self, **kwargs: object) -> SimpleNamespace:
+            assert kwargs["include_stretch"] is True
+            return SimpleNamespace(created=1, existing=0)
+
     monkeypatch.setattr(hh_cli, "upgrade_database", lambda settings: None)
     monkeypatch.setattr(hh_cli, "create_database", lambda settings: database)
     monkeypatch.setattr(
@@ -738,12 +822,14 @@ def test_analyze_loads_details_and_prints_rule_reasons(
         lambda session: SimpleNamespace(synchronize=lambda profile: None),
     )
     monkeypatch.setattr(hh_cli, "VacancyAnalysisService", FakeAnalysisService)
+    monkeypatch.setattr(hh_cli, "ApplicationAutomationService", FakeAutomationService)
 
     assert hh_cli.run(["analyze", "--direction", "Python backend"]) == 0
 
     output = capsys.readouterr().out
     assert "Проверено вакансий: 1" in output
     assert "Подходят: 1. Пограничные: 0. Отклонены: 0" in output
+    assert "Добавлено в очередь: 1" in output
     assert "Python указан в названии" in output
     assert FakeBrowser.created is not None
     assert FakeBrowser.created.details_read == ["https://hh.ru/vacancy/vacancy-1"]
@@ -775,6 +861,17 @@ def test_apply_runs_queue_and_records_confirmed_result(
         def resume_after_authentication(self) -> None:
             return None
 
+        def recover_interrupted(self) -> int:
+            return 0
+
+        def policy(self, timezone_name: str) -> SimpleNamespace:
+            assert timezone_name
+            return SimpleNamespace(
+                daily_limit=25,
+                delay_min_seconds=30,
+                delay_max_seconds=60,
+            )
+
         def prepare(self, **kwargs: object) -> SimpleNamespace:
             assert kwargs["include_stretch"] is True
             return SimpleNamespace(
@@ -794,10 +891,16 @@ def test_apply_runs_queue_and_records_confirmed_result(
             assert direction_id == 3
             return self.jobs.pop(0) if self.jobs else None
 
-        def record_result(self, queued_job: object, result: HhApplyResult) -> SimpleNamespace:
+        def record_result(
+            self,
+            queued_job: object,
+            result: HhApplyResult,
+            **kwargs: object,
+        ) -> SimpleNamespace:
             assert queued_job is job
             assert result.status is HhApplyStatus.APPLIED
-            return SimpleNamespace(sent=True, blocking=False)
+            assert kwargs["apply_delay"] is not None
+            return SimpleNamespace(sent=True, blocking=False, next_apply_at=None)
 
     monkeypatch.setattr(hh_cli, "upgrade_database", lambda settings: None)
     monkeypatch.setattr(hh_cli, "create_database", lambda settings: database)
@@ -853,6 +956,16 @@ def test_apply_keeps_queue_available_when_one_result_is_unknown(
         def resume_after_authentication(self) -> None:
             return None
 
+        def recover_interrupted(self) -> int:
+            return 1
+
+        def policy(self, timezone_name: str) -> SimpleNamespace:
+            return SimpleNamespace(
+                daily_limit=25,
+                delay_min_seconds=30,
+                delay_max_seconds=60,
+            )
+
         def prepare(self, **kwargs: object) -> SimpleNamespace:
             return SimpleNamespace(
                 account_id=1,
@@ -868,10 +981,16 @@ def test_apply_keeps_queue_available_when_one_result_is_unknown(
         def claim_next(self, direction_id: int) -> SimpleNamespace | None:
             return self.jobs.pop(0) if self.jobs else None
 
-        def record_result(self, queued_job: object, result: HhApplyResult) -> SimpleNamespace:
+        def record_result(
+            self,
+            queued_job: object,
+            result: HhApplyResult,
+            **kwargs: object,
+        ) -> SimpleNamespace:
             assert result.status is HhApplyStatus.UNKNOWN_RESULT
             assert result.confirmation == "Ошибка выполнения: RuntimeError"
-            return SimpleNamespace(sent=False, blocking=False)
+            assert kwargs["apply_delay"] is None
+            return SimpleNamespace(sent=False, blocking=False, next_apply_at=None)
 
     def fail_application(*args: object, **kwargs: object) -> HhApplyResult:
         raise RuntimeError("неопределённый сбой браузера")

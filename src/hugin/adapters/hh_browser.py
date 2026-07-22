@@ -4,6 +4,8 @@ import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
+from email.utils import parsedate_to_datetime
+from math import ceil
 from pathlib import Path
 from types import TracebackType
 from urllib.parse import urlencode, urlparse, urlunparse
@@ -13,6 +15,7 @@ from playwright.sync_api import (
     Locator,
     Page,
     Playwright,
+    Response,
     sync_playwright,
 )
 from playwright.sync_api import (
@@ -493,10 +496,16 @@ class VisibleHhBrowser:
         )
         page = self._require_page()
         try:
-            page.goto(response_url, wait_until="domcontentloaded")
+            initial_response = page.goto(response_url, wait_until="domcontentloaded")
             page.wait_for_timeout(1_500)
         except PlaywrightTimeoutError:
             return HhApplyResult(HhApplyStatus.RETRYABLE_ERROR, page.url)
+        if initial_response is not None and initial_response.status == 429:
+            return HhApplyResult(
+                HhApplyStatus.RETRYABLE_ERROR,
+                page.url,
+                retry_after_seconds=self._retry_after_seconds(initial_response),
+            )
 
         initial = self._application_snapshot(page)
         body_text = initial.body_text
@@ -569,6 +578,14 @@ class VisibleHhBrowser:
         except PlaywrightError:
             confirmation = self._response_confirmation(response.status, "")
             final_body = ""
+        if response.status == 429:
+            return HhApplyResult(
+                HhApplyStatus.RETRYABLE_ERROR,
+                page.url,
+                confirmation,
+                warnings=initial.warnings,
+                retry_after_seconds=self._retry_after_seconds(response),
+            )
         if self._contains_any(final_body, "вы уже откликались", "отклик уже отправлен"):
             return HhApplyResult(
                 HhApplyStatus.ALREADY_APPLIED,
@@ -610,6 +627,25 @@ class VisibleHhBrowser:
             confirmation,
             warnings=initial.warnings,
         )
+
+    @staticmethod
+    def _retry_after_seconds(response: Response) -> int | None:
+        try:
+            value = response.header_value("retry-after")
+        except PlaywrightError:
+            return None
+        if not value:
+            return None
+        stripped = value.strip()
+        if stripped.isdigit():
+            return min(int(stripped), 86_400)
+        try:
+            retry_at = parsedate_to_datetime(stripped)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=UTC)
+        return min(max(ceil((retry_at - datetime.now(UTC)).total_seconds()), 0), 86_400)
 
     def _vacancy_in_negotiations(
         self,

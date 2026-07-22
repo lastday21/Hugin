@@ -142,6 +142,7 @@ class FakeResponse:
         self.request = FakeRequest()
         self.url = "https://hh.ru/applicant/vacancy_response?vacancyId=123"
         self.status = 200
+        self.headers: dict[str, str] = {}
         self.text_error: Error | None = None
         self.body = '{"success":true}'
 
@@ -149,6 +150,9 @@ class FakeResponse:
         if self.text_error is not None:
             raise self.text_error
         return self.body
+
+    def header_value(self, name: str) -> str | None:
+        return self.headers.get(name.casefold())
 
 
 class FakeResponseInfo:
@@ -459,6 +463,30 @@ def test_application_is_submitted_with_cover_letter(tmp_path: Path) -> None:
     assert page.locators[toggle_selector].clicked == 1
     assert page.locators[letter_selector].filled == ["Содержательное письмо"]
     assert page.locators[submit_selector].clicked == 1
+
+
+def test_application_respects_retry_after_header(tmp_path: Path) -> None:
+    page = FakePage("https://hh.ru/applicant/resumes")
+    page.application_payload = {
+        "questions": [],
+        "warnings": [],
+        "resumeTitle": "Python backend разработчик",
+        "bodyText": "Форма отклика",
+    }
+    page.response.status = 429
+    page.response.headers["retry-after"] = "120"
+    page.locators['[data-qa="vacancy-response-popup-form-letter-input"]'] = FakeLocator()
+    page.locators['[data-qa="vacancy-response-submit-popup"]'] = FakeLocator()
+    page.locators["body"] = FakeLocator(text="Слишком много запросов")
+
+    result = make_browser(page, tmp_path).apply_to_vacancy(
+        "https://hh.ru/vacancy/123",
+        expected_resume_title="Python backend разработчик",
+        cover_letter="Письмо",
+    )
+
+    assert result.status is HhApplyStatus.RETRYABLE_ERROR
+    assert result.retry_after_seconds == 120
 
 
 def test_application_stops_when_confirmation_cannot_be_read(tmp_path: Path) -> None:

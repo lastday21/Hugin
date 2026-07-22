@@ -6,6 +6,7 @@ import random
 import sys
 import time
 from collections.abc import Sequence
+from datetime import UTC, datetime, timedelta
 
 from hugin.adapters.credentials import WindowsCredentialStore
 from hugin.adapters.hh_browser import VisibleHhBrowser
@@ -14,7 +15,7 @@ from hugin.database import create_database, upgrade_database
 from hugin.domain.directions import EmploymentForm, SearchRegion, WorkFormat
 from hugin.domain.hh import HhApplyResult, HhApplyStatus, HhProfileData
 from hugin.domain.resumes import ProfileQuestionCandidate
-from hugin.domain.time import local_day_start_utc
+from hugin.domain.time import local_day_start_utc, local_timezone_name
 from hugin.services.application_automation import ApplicationAutomationService
 from hugin.services.career_directions import (
     COMMON_REGIONS,
@@ -26,6 +27,7 @@ from hugin.services.cover_letter import CoverLetterBuilder
 from hugin.services.hh_login import HhCredentials, HhLoginService, LoginStatus
 from hugin.services.hh_profile import HhProfileSyncService
 from hugin.services.job_search import JobSearchSyncService
+from hugin.services.queue import QueueService
 from hugin.services.resume_profile import ProfileQuestionService
 from hugin.services.vacancy_analysis import RuleCategory, VacancyAnalysisService
 from hugin.services.vacancy_review import VacancyReviewEntry, VacancyReviewService
@@ -168,6 +170,17 @@ def build_parser() -> argparse.ArgumentParser:
     restore.add_argument("--direction", required=True, help="название направления")
     restore.add_argument("--vacancy-id", required=True, help="идентификатор вакансии hh.ru")
 
+    configure_queue = subparsers.add_parser(
+        "configure-queue",
+        help="сохранить суточное ограничение и интервалы",
+    )
+    configure_queue.add_argument("--daily-limit", type=positive_int)
+    configure_queue.add_argument("--delay-min", type=non_negative_int)
+    configure_queue.add_argument("--delay-max", type=non_negative_int)
+    subparsers.add_parser("queue-status", help="показать состояние очереди")
+    subparsers.add_parser("pause", help="приостановить новые отклики")
+    subparsers.add_parser("resume", help="продолжить обработку очереди")
+
     apply = subparsers.add_parser("apply", help="автоматически отправить подходящие отклики")
     apply.add_argument("--account-id", type=positive_int, default=1)
     apply.add_argument("--direction", required=True, help="название направления")
@@ -250,6 +263,8 @@ def run(argv: Sequence[str] | None = None) -> int:
         return _run_search_settings(arguments)
     if arguments.command in {"rejected", "vacancy", "restore"}:
         return _run_vacancy_review(arguments)
+    if arguments.command in {"configure-queue", "queue-status", "pause", "resume"}:
+        return _run_queue_control(arguments)
 
     store = WindowsCredentialStore()
 
@@ -392,6 +407,11 @@ def run(argv: Sequence[str] | None = None) -> int:
                     account_external_id=profile.external_id,
                     direction_name=arguments.direction,
                 )
+                queued = ApplicationAutomationService(session).prepare(
+                    account_external_id=profile.external_id,
+                    direction_name=arguments.direction,
+                    include_stretch=True,
+                )
         finally:
             database.close()
 
@@ -403,6 +423,9 @@ def run(argv: Sequence[str] | None = None) -> int:
         print(
             f"Подходят: {matched}. Пограничные: {stretch}. "
             f"Отклонены: {rejected}. Из них похожих публикаций: {duplicates}."
+        )
+        print(
+            f"Добавлено в очередь: {queued.created}. Уже находилось в обработке: {queued.existing}."
         )
         for analysis_result in analyzed:
             evaluation = analysis_result.evaluation
@@ -474,6 +497,57 @@ def _run_search_settings(arguments: argparse.Namespace) -> int:
     return 0
 
 
+def _run_queue_control(arguments: argparse.Namespace) -> int:
+    settings = get_settings()
+    upgrade_database(settings)
+    database = create_database(settings)
+    try:
+        with database.sessions.begin() as session:
+            service = QueueService(session)
+            if arguments.command == "configure-queue":
+                service.configure(
+                    timezone_name=local_timezone_name(),
+                    daily_limit=arguments.daily_limit,
+                    delay_min_seconds=arguments.delay_min,
+                    delay_max_seconds=arguments.delay_max,
+                )
+            elif arguments.command == "pause":
+                service.pause()
+            elif arguments.command == "resume":
+                service.resume()
+            else:
+                service.policy(local_timezone_name())
+            status = service.status()
+    finally:
+        database.close()
+
+    state_names = {
+        "RUNNING": "работает",
+        "PAUSED": "приостановлена",
+        "AUTH_REQUIRED": "требуется вход",
+        "CAPTCHA_REQUIRED": "требуется проверка",
+        "ACCOUNT_WARNING": "предупреждение аккаунта",
+    }
+    print(f"Очередь: {state_names[status.system.state.value]}.")
+    print(
+        f"Суточное ограничение: {status.policy.daily_limit}. "
+        f"Интервал: {status.policy.delay_min_seconds}-"
+        f"{status.policy.delay_max_seconds} секунд."
+    )
+    print(f"Часовой пояс: {status.policy.timezone_name}.")
+    if status.system.next_apply_at is not None:
+        print(f"Следующий отклик не раньше: {status.system.next_apply_at.isoformat()}.")
+    if status.task_counts:
+        counts = ", ".join(
+            f"{state.value}: {count}"
+            for state, count in sorted(status.task_counts.items(), key=lambda item: item[0].value)
+        )
+        print(f"Задания: {counts}.")
+    else:
+        print("Заданий пока нет.")
+    return 0
+
+
 def _run_vacancy_review(arguments: argparse.Namespace) -> int:
     settings = get_settings()
     upgrade_database(settings)
@@ -496,6 +570,11 @@ def _run_vacancy_review(arguments: argparse.Namespace) -> int:
                     account_id=arguments.account_id,
                     direction_name=arguments.direction,
                     hh_id=arguments.vacancy_id,
+                )
+                prepared = ApplicationAutomationService(session).prepare_for_account_id(
+                    account_id=arguments.account_id,
+                    direction_name=arguments.direction,
+                    include_stretch=True,
                 )
                 entries = (entry,)
             else:
@@ -524,8 +603,8 @@ def _run_vacancy_review(arguments: argparse.Namespace) -> int:
 
     if arguments.command == "restore":
         print(
-            f"Вакансия {entries[0].vacancy.hh_id} возвращена в обработку. "
-            "Решение пользователя сохранено."
+            f"Вакансия {entries[0].vacancy.hh_id} возвращена в очередь. "
+            f"Новых заданий: {prepared.created}. Решение пользователя сохранено."
         )
         return 0
 
@@ -681,6 +760,8 @@ def _run_applications(
             HhProfileSyncService(session).synchronize(profile)
             service = ApplicationAutomationService(session)
             service.resume_after_authentication()
+            recovered = service.recover_interrupted()
+            policy = service.policy(local_timezone_name())
             prepared = service.prepare(
                 account_external_id=profile.external_id,
                 direction_name=arguments.direction,
@@ -690,12 +771,17 @@ def _run_applications(
             sent_today = service.applied_since(prepared.account_id, day_start)
 
         resume_details = browser.read_resume_details(prepared.resume.hh_id)
-        available_today = max(settings.hh_apply_daily_limit - sent_today, 0)
+        available_today = max(policy.daily_limit - sent_today, 0)
         run_limit = min(arguments.limit, available_today)
         print(
             f"Подготовлено новых заданий: {prepared.created}. "
             f"Уже существовало: {prepared.existing}."
         )
+        if recovered:
+            print(
+                f"После прошлого прерывания требуют сверки: {recovered}. "
+                "Остальная очередь продолжит работу."
+            )
         print(f"Сегодня уже отправлено: {sent_today}. Ограничение на этот запуск: {run_limit}.")
         if run_limit == 0:
             print("Дневное ограничение исчерпано, новые отклики не отправлены.")
@@ -722,8 +808,20 @@ def _run_applications(
                     job.vacancy.source_url,
                     f"Ошибка выполнения: {type(error).__name__}",
                 )
+            apply_delay = None
+            if result.status is HhApplyStatus.APPLIED:
+                apply_delay = timedelta(
+                    seconds=random.uniform(
+                        policy.delay_min_seconds,
+                        policy.delay_max_seconds,
+                    )
+                )
             with database.sessions.begin() as session:
-                recorded = ApplicationAutomationService(session).record_result(job, result)
+                recorded = ApplicationAutomationService(session).record_result(
+                    job,
+                    result,
+                    apply_delay=apply_delay,
+                )
             status_text = _apply_status_text(result.status)
             print(f"- {job.vacancy.title}: {status_text}.")
             if result.questions:
@@ -733,12 +831,13 @@ def _run_applications(
             if recorded.blocking:
                 blocking = True
                 break
-            if recorded.sent and sent < run_limit:
-                delay = random.uniform(
-                    settings.hh_apply_delay_min_seconds,
-                    settings.hh_apply_delay_max_seconds,
+            if recorded.sent and sent < run_limit and recorded.next_apply_at is not None:
+                wait_seconds = max(
+                    (recorded.next_apply_at - datetime.now(UTC)).total_seconds(),
+                    0,
                 )
-                time.sleep(delay)
+                print(f"  Пауза до следующего отклика: {wait_seconds:.0f} секунд.")
+                time.sleep(wait_seconds)
     finally:
         database.close()
 
