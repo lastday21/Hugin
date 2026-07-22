@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 from types import TracebackType
 from urllib.parse import urlencode, urlparse, urlunparse
@@ -28,7 +29,7 @@ from hugin.domain.hh import (
     HhResumeData,
     HhResumeDetails,
 )
-from hugin.domain.vacancies import VacancyData, VacancySearchResult
+from hugin.domain.vacancies import VacancyAvailability, VacancyData, VacancySearchResult
 from hugin.services.hh_login import HhCredentials, LoginStatus
 
 PROFILE_SNAPSHOT_SCRIPT = """
@@ -85,12 +86,35 @@ VACANCY_SEARCH_SCRIPT = """
                 '[data-qa="vacancy-serp__vacancy-employer"]'
             )?.textContent || ''
         ).trim(),
+        region: (
+            card.querySelector('[data-qa="vacancy-serp__vacancy-address"]')?.textContent || ''
+        ).trim(),
+        salary: (
+            card.querySelector('[data-qa="vacancy-serp__vacancy-compensation"]')?.textContent || ''
+        ).trim(),
+        publishedAt: card.querySelector('time[datetime]')?.getAttribute('datetime') || '',
     })),
 })
 """
 
 VACANCY_DETAILS_SCRIPT = """
-() => ({
+() => {
+const description = document.querySelector('[data-qa="vacancy-description"]');
+const bodyText = (document.body.innerText || '').trim();
+const normalizedBody = bodyText.toLocaleLowerCase('ru-RU');
+const externalLinks = Array.from(description?.querySelectorAll('a[href]') || []).filter((link) => {
+    try {
+        const host = new URL(link.href, window.location.href).hostname;
+        return host !== 'hh.ru' && !host.endsWith('.hh.ru');
+    } catch {
+        return false;
+    }
+});
+let availability = 'ACTIVE';
+if (normalizedBody.includes('вакансия в архиве')) availability = 'ARCHIVED';
+else if (normalizedBody.includes('вакансия закрыта')) availability = 'CLOSED';
+else if (normalizedBody.includes('вакансия недоступна')) availability = 'UNAVAILABLE';
+return ({
     title: (
         document.querySelector('[data-qa="vacancy-title"]')?.textContent || ''
     ).trim(),
@@ -107,12 +131,36 @@ VACANCY_DETAILS_SCRIPT = """
         document.querySelector('[data-qa="work-formats-text"]')?.textContent || ''
     ).trim(),
     description: (
-        document.querySelector('[data-qa="vacancy-description"]')?.innerText || ''
+        description?.innerText || ''
     ).trim(),
     skills: Array.from(document.querySelectorAll('[data-qa="skills-element"]'))
         .map((element) => (element.textContent || '').trim())
         .filter(Boolean),
-})
+    region: (
+        document.querySelector('[data-qa="vacancy-view-location"]')?.textContent || ''
+    ).trim(),
+    address: (
+        document.querySelector('[data-qa="vacancy-view-raw-address"]')?.textContent || ''
+    ).trim(),
+    salary: (
+        document.querySelector('[data-qa="vacancy-salary"]')?.textContent || ''
+    ).trim(),
+    schedule: (
+        document.querySelector('[data-qa="vacancy-view-employment-mode"]')?.textContent || ''
+    ).trim(),
+    publishedAt: (
+        document.querySelector('[data-qa="vacancy-creation-time"] time[datetime]')
+            ?.getAttribute('datetime') ||
+        document.querySelector('time[datetime]')?.getAttribute('datetime') || ''
+    ),
+    hasCoverLetter: normalizedBody.includes('сопроводительн') && normalizedBody.includes('письм'),
+    hasScreeningForm: normalizedBody.includes('вопросы работодателя') ||
+        Boolean(document.querySelector('[data-qa="task-question"]')),
+    hasExternalLink: externalLinks.length > 0,
+    hasTestAssignment: normalizedBody.includes('тестовое задание') ||
+        normalizedBody.includes('испытательное задание'),
+    availability,
+})}
 """
 
 RESUME_DETAILS_SCRIPT = """
@@ -312,6 +360,7 @@ class VisibleHhBrowser:
             title = self._required_string(raw_vacancy, "title", "названия вакансии")
             href = self._required_string(raw_vacancy, "href", "ссылки на вакансию")
             employer = self._optional_string(raw_vacancy, "employer") or None
+            salary = self._salary(self._optional_string(raw_vacancy, "salary"))
             vacancy_id, source_url = self._vacancy_id_and_url(href)
             vacancies.append(
                 VacancyData(
@@ -319,6 +368,12 @@ class VisibleHhBrowser:
                     title=title,
                     source_url=source_url,
                     employer_name=employer,
+                    region=self._optional_string(raw_vacancy, "region") or None,
+                    salary_from=salary[0],
+                    salary_to=salary[1],
+                    salary_currency=salary[2],
+                    salary_gross=salary[3],
+                    published_at=self._date_time(self._optional_string(raw_vacancy, "publishedAt")),
                 )
             )
 
@@ -348,17 +403,42 @@ class VisibleHhBrowser:
         ):
             raise RuntimeError("hh.ru вернул некорректный список навыков")
 
+        description = self._optional_string(payload, "description") or None
+        responsibilities, required, preferred = self._description_sections(description or "")
+        salary = self._salary(self._optional_string(payload, "salary"))
+        raw_availability = self._optional_string(payload, "availability") or "ACTIVE"
+        try:
+            availability = VacancyAvailability(raw_availability)
+        except ValueError as error:
+            raise RuntimeError("hh.ru вернул некорректное состояние вакансии") from error
+
         return VacancyData(
             hh_id=vacancy_id,
             title=self._required_string(payload, "title", "названия вакансии"),
             source_url=normalized_url,
             employer_name=self._optional_string(payload, "employer") or None,
-            description=self._optional_string(payload, "description") or None,
+            description=description,
             experience=self._optional_string(payload, "experience") or None,
             employment=self._optional_string(payload, "employment") or None,
             work_format=self._optional_string(payload, "workFormat") or None,
             key_skills=tuple(skill.strip() for skill in raw_skills if skill.strip()),
             details_fetched_at=datetime.now(UTC),
+            region=self._optional_string(payload, "region") or None,
+            address=self._optional_string(payload, "address") or None,
+            salary_from=salary[0],
+            salary_to=salary[1],
+            salary_currency=salary[2],
+            salary_gross=salary[3],
+            schedule=self._optional_string(payload, "schedule") or None,
+            responsibilities=responsibilities,
+            required_qualifications=required,
+            preferred_qualifications=preferred,
+            has_cover_letter=payload.get("hasCoverLetter") is True,
+            has_screening_form=payload.get("hasScreeningForm") is True,
+            has_external_link=payload.get("hasExternalLink") is True,
+            has_test_assignment=payload.get("hasTestAssignment") is True,
+            availability=availability,
+            published_at=self._date_time(self._optional_string(payload, "publishedAt")),
         )
 
     def read_resume_details(self, resume_id: str) -> HhResumeDetails:
@@ -673,6 +753,90 @@ class VisibleHhBrowser:
     def _optional_string(payload: dict[object, object], key: str) -> str:
         value = payload.get(key)
         return value.strip() if isinstance(value, str) else ""
+
+    @staticmethod
+    def _date_time(value: str) -> datetime | None:
+        if not value:
+            return None
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError as error:
+            raise RuntimeError("hh.ru вернул некорректную дату вакансии") from error
+        return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
+
+    @staticmethod
+    def _salary(value: str) -> tuple[Decimal | None, Decimal | None, str | None, bool | None]:
+        if not value:
+            return None, None, None, None
+        normalized = re.sub(r"\s+", " ", value.replace("\u00a0", " ")).strip()
+        amounts = [
+            Decimal(re.sub(r"\D", "", match))
+            for match in re.findall(r"\d[\d\s]*", normalized)
+            if re.sub(r"\D", "", match)
+        ]
+        salary_from: Decimal | None = None
+        salary_to: Decimal | None = None
+        if len(amounts) >= 2:
+            salary_from, salary_to = amounts[0], amounts[1]
+        elif amounts:
+            if re.search(r"\bдо\s+\d", normalized, re.IGNORECASE):
+                salary_to = amounts[0]
+            else:
+                salary_from = amounts[0]
+        folded = normalized.casefold()
+        currency = None
+        currencies = (("₽", "RUR"), ("руб", "RUR"), ("$", "USD"), ("€", "EUR"), ("₸", "KZT"))
+        for marker, code in currencies:
+            if marker in folded:
+                currency = code
+                break
+        gross = None
+        if "на руки" in folded:
+            gross = False
+        elif "до вычета" in folded:
+            gross = True
+        return salary_from, salary_to, currency, gross
+
+    @staticmethod
+    def _description_sections(description: str) -> tuple[str | None, str | None, str | None]:
+        if not description:
+            return None, None, None
+        groups: dict[str, list[str]] = {"responsibilities": [], "required": [], "preferred": []}
+        current: str | None = None
+        headings = (
+            (
+                "responsibilities",
+                ("обязанности", "задачи", "что предстоит", "чем предстоит заниматься"),
+            ),
+            (
+                "required",
+                ("требования", "мы ожидаем", "что требуется", "что ждём", "нам важно"),
+            ),
+            ("preferred", ("будет плюсом", "желательно", "преимуществом будет")),
+        )
+        for raw_line in description.splitlines():
+            line = raw_line.strip(" \t•-–—")
+            if not line:
+                continue
+            folded = line.casefold().rstrip(":")
+            matched = next(
+                (
+                    name
+                    for name, markers in headings
+                    if any(folded.startswith(marker) for marker in markers)
+                ),
+                None,
+            )
+            if matched is not None:
+                current = matched
+                continue
+            if current is not None:
+                groups[current].append(line)
+        return (
+            "\n".join(groups["responsibilities"]) or None,
+            "\n".join(groups["required"]) or None,
+            "\n".join(groups["preferred"]) or None,
+        )
 
     @staticmethod
     def _contains_any(text: str, *needles: str) -> bool:

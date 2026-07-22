@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 from typing import cast
 
@@ -328,6 +330,16 @@ def test_vacancy_details_are_read_from_page(tmp_path: Path) -> None:
         "workFormat": "Формат работы: удалённо",
         "description": "Разработка серверной части на Python.",
         "skills": ["Python", "FastAPI", "PostgreSQL"],
+        "region": "Москва",
+        "address": "ул. Примерная, 1",
+        "salary": "от 120 000 до 180 000 ₽ на руки",
+        "schedule": "5/2",
+        "publishedAt": "2026-07-21T10:30:00+03:00",
+        "hasCoverLetter": True,
+        "hasScreeningForm": True,
+        "hasExternalLink": False,
+        "hasTestAssignment": True,
+        "availability": "ACTIVE",
     }
 
     vacancy = make_browser(page, tmp_path).read_vacancy_details(
@@ -340,7 +352,45 @@ def test_vacancy_details_are_read_from_page(tmp_path: Path) -> None:
     assert vacancy.employer_name == "Компания"
     assert vacancy.experience == "1\N{EN DASH}3 года"
     assert vacancy.key_skills == ("Python", "FastAPI", "PostgreSQL")
+    assert vacancy.region == "Москва"
+    assert vacancy.address == "ул. Примерная, 1"
+    assert vacancy.salary_from == Decimal("120000")
+    assert vacancy.salary_to == Decimal("180000")
+    assert vacancy.salary_currency == "RUR"
+    assert vacancy.salary_gross is False
+    assert vacancy.has_cover_letter
+    assert vacancy.has_screening_form
+    assert vacancy.has_test_assignment
+    assert vacancy.published_at == datetime(2026, 7, 21, 7, 30, tzinfo=UTC)
     assert vacancy.details_fetched_at is not None
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("", (None, None, None, None)),
+        (
+            "до 200 000 ₽ до вычета налогов",
+            (None, Decimal("200000"), "RUR", True),
+        ),
+        ("от 1 500 $", (Decimal("1500"), None, "USD", None)),
+    ],
+)
+def test_salary_text_is_normalized(
+    value: str,
+    expected: tuple[Decimal | None, Decimal | None, str | None, bool | None],
+) -> None:
+    assert VisibleHhBrowser._salary(value) == expected
+
+
+def test_description_is_split_into_vacancy_sections() -> None:
+    responsibilities, required, preferred = VisibleHhBrowser._description_sections(
+        "Обязанности:\nРазрабатывать API\nТребования:\nPython\nБудет плюсом:\nDocker"
+    )
+
+    assert responsibilities == "Разрабатывать API"
+    assert required == "Python"
+    assert preferred == "Docker"
 
 
 def test_resume_details_are_read_without_contacts(tmp_path: Path) -> None:

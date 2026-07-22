@@ -62,7 +62,13 @@ from hugin.domain.tasks import (
     TaskRecord,
     TaskState,
 )
-from hugin.domain.vacancies import VacancyData, VacancyRecord
+from hugin.domain.vacancies import (
+    VacancyAvailability,
+    VacancyChangeRecord,
+    VacancyData,
+    VacancyDiscoveryRecord,
+    VacancyRecord,
+)
 
 __all__ = [
     "AccountRecord",
@@ -112,7 +118,10 @@ __all__ = [
     "TaskNotFoundError",
     "TaskRecord",
     "TaskState",
+    "VacancyAvailability",
+    "VacancyChangeRecord",
     "VacancyData",
+    "VacancyDiscoveryRecord",
     "VacancyRecord",
     "VacancyState",
     "WorkFormat",

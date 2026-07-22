@@ -43,6 +43,7 @@ from hugin.domain.content import (
 )
 from hugin.domain.directions import ConfigPayload, VacancyState
 from hugin.domain.tasks import SystemState, TaskState
+from hugin.domain.vacancies import VacancyAvailability
 
 
 def utc_now() -> datetime:
@@ -245,6 +246,21 @@ class VacancyModel(Base):
     has_screening_form: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     has_external_link: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     has_test_assignment: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    availability: Mapped[VacancyAvailability] = mapped_column(
+        Enum(
+            VacancyAvailability,
+            name="vacancy_availability",
+            native_enum=False,
+            create_constraint=True,
+            length=16,
+            values_callable=enum_values,
+        ),
+        default=VacancyAvailability.ACTIVE,
+        nullable=False,
+    )
+    duplicate_of_id: Mapped[int | None] = mapped_column(
+        ForeignKey("vacancies.id", ondelete="SET NULL"), index=True
+    )
     key_skills: Mapped[list[str]] = mapped_column(JSONB, default=list, nullable=False)
     details_fetched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
@@ -257,6 +273,9 @@ class VacancyModel(Base):
         back_populates="vacancy", cascade="all, delete-orphan"
     )
     applications: Mapped[list[ApplicationModel]] = relationship(
+        back_populates="vacancy", cascade="all, delete-orphan"
+    )
+    change_events: Mapped[list[VacancyChangeModel]] = relationship(
         back_populates="vacancy", cascade="all, delete-orphan"
     )
 
@@ -628,6 +647,21 @@ class VacancyDiscoveryModel(Base):
     discovered_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
     )
+
+
+class VacancyChangeModel(Base):
+    __tablename__ = "vacancy_changes"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    vacancy_id: Mapped[int] = mapped_column(
+        ForeignKey("vacancies.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    event_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    changes: Mapped[ConfigPayload] = mapped_column(JSONB, default=dict, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    vacancy: Mapped[VacancyModel] = relationship(back_populates="change_events")
 
 
 class PromptVersionModel(Base):
