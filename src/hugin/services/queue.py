@@ -37,6 +37,7 @@ class QueueService:
         now: datetime | None = None,
         *,
         direction_id: int | None = None,
+        require_ready_cover_letter: bool = False,
     ) -> TaskRecord | None:
         selected_at = now or datetime.now(UTC)
         system = self._system.get()
@@ -47,6 +48,7 @@ class QueueService:
         return self._tasks.claim_next(
             selected_at,
             direction_id=direction_id,
+            require_ready_cover_letter=require_ready_cover_letter,
         )
 
     def policy(self, timezone_name: str | None = None) -> ApplicationPolicyRecord:

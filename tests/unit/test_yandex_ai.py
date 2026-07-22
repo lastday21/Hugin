@@ -59,6 +59,7 @@ def test_yandex_client_streams_private_completion(monkeypatch: pytest.MonkeyPatc
     body = json.loads(request.data.decode())
     assert body["model"] == "gpt://folder-id/yandexgpt/latest"
     assert body["stream"] is True
+    assert body["temperature"] == 0.1
     assert body["messages"][1]["content"] == "Пользовательский запрос"
 
 
@@ -90,6 +91,12 @@ def test_yandex_client_requires_configuration(
 def test_yandex_client_rejects_invalid_timeout(timeout: int) -> None:
     with pytest.raises(ValueError, match="ожидания"):
         YandexAIClient("key", "folder", timeout_seconds=timeout)
+
+
+@pytest.mark.parametrize("temperature", [-0.1, 2.1])
+def test_yandex_client_rejects_invalid_temperature(temperature: float) -> None:
+    with pytest.raises(ValueError, match="Температура"):
+        YandexAIClient("key", "folder", temperature=temperature)
 
 
 def test_yandex_client_preserves_full_model_uri(monkeypatch: pytest.MonkeyPatch) -> None:

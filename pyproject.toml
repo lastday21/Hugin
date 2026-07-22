@@ -27,6 +27,7 @@ hugin-db = "hugin.database.cli:main"
 hugin-hh = "hugin.hh_cli:main"
 hugin-resume = "hugin.resume_cli:main"
 hugin-resume-improve = "hugin.resume_improvement_cli:main"
+hugin-letters = "hugin.cover_letter_cli:main"
 
 [dependency-groups]
 dev = [
@@ -75,17 +76,21 @@ select = ["B", "E", "F", "I", "RUF", "SIM", "UP"]
 "src/hugin/adapters/yandex_ai.py" = ["RUF001"]
 "src/hugin/adapters/yandex_credentials.py" = ["RUF001"]
 "src/hugin/hh_cli.py" = ["RUF001"]
+"src/hugin/cover_letter_cli.py" = ["RUF001"]
 "src/hugin/resume_cli.py" = ["RUF001"]
 "src/hugin/resume_improvement_cli.py" = ["RUF001"]
 "src/hugin/services/resume_improvement.py" = ["RUF001"]
 "src/hugin/services/resume_prompts.py" = ["RUF001"]
 "src/hugin/services/resume_profile.py" = ["RUF001"]
 "src/hugin/services/career_directions.py" = ["RUF001"]
+"src/hugin/services/cover_letter.py" = ["RUF001"]
 "src/hugin/services/vacancy_analysis.py" = ["RUF001"]
 "src/hugin/services/vacancy_duplicates.py" = ["RUF001"]
 "src/hugin/services/vacancy_review.py" = ["RUF001"]
 "tests/unit/test_resume_*.py" = ["RUF001"]
 "tests/unit/test_hh_browser.py" = ["RUF001"]
+"tests/unit/test_cover_letter.py" = ["RUF001"]
+"tests/unit/test_cover_letter_cli.py" = ["RUF001"]
 "tests/unit/test_vacancy_*.py" = ["RUF001"]
 
 [tool.ruff.format]

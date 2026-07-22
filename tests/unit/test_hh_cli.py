@@ -850,6 +850,7 @@ def test_apply_runs_queue_and_records_confirmed_result(
         ),
         resume=SimpleNamespace(title="Python backend разработчик"),
         direction_vacancy=SimpleNamespace(rules_details={"category": "MATCH"}),
+        cover_letter="Письмо",
     )
 
     class FakeAutomationService:
@@ -887,8 +888,14 @@ def test_apply_runs_queue_and_records_confirmed_result(
             assert since is not None
             return 0
 
-        def claim_next(self, direction_id: int) -> SimpleNamespace | None:
+        def claim_next(
+            self,
+            direction_id: int,
+            *,
+            require_cover_letter: bool = False,
+        ) -> SimpleNamespace | None:
             assert direction_id == 3
+            assert require_cover_letter
             return self.jobs.pop(0) if self.jobs else None
 
         def record_result(
@@ -910,11 +917,6 @@ def test_apply_runs_queue_and_records_confirmed_result(
         lambda session: SimpleNamespace(synchronize=lambda profile: None),
     )
     monkeypatch.setattr(hh_cli, "ApplicationAutomationService", FakeAutomationService)
-    monkeypatch.setattr(
-        hh_cli,
-        "CoverLetterBuilder",
-        lambda: SimpleNamespace(build=lambda vacancy, resume, category: "Письмо"),
-    )
 
     assert hh_cli.run(["apply", "--direction", "Python backend", "--limit", "1"]) == 0
 
@@ -945,6 +947,7 @@ def test_apply_keeps_queue_available_when_one_result_is_unknown(
         ),
         resume=SimpleNamespace(title="Python backend разработчик"),
         direction_vacancy=SimpleNamespace(rules_details={"category": "MATCH"}),
+        cover_letter="Письмо",
     )
 
     class FakeAutomationService:
@@ -978,7 +981,13 @@ def test_apply_keeps_queue_available_when_one_result_is_unknown(
         def applied_since(self, account_id: int, since: object) -> int:
             return 0
 
-        def claim_next(self, direction_id: int) -> SimpleNamespace | None:
+        def claim_next(
+            self,
+            direction_id: int,
+            *,
+            require_cover_letter: bool = False,
+        ) -> SimpleNamespace | None:
+            assert require_cover_letter
             return self.jobs.pop(0) if self.jobs else None
 
         def record_result(
@@ -1003,11 +1012,6 @@ def test_apply_keeps_queue_available_when_one_result_is_unknown(
         lambda session: SimpleNamespace(synchronize=lambda profile: None),
     )
     monkeypatch.setattr(hh_cli, "ApplicationAutomationService", FakeAutomationService)
-    monkeypatch.setattr(
-        hh_cli,
-        "CoverLetterBuilder",
-        lambda: SimpleNamespace(build=lambda vacancy, resume, category: "Письмо"),
-    )
     monkeypatch.setattr(FakeBrowser, "apply_to_vacancy", fail_application)
 
     assert hh_cli.run(["apply", "--direction", "Python backend", "--limit", "1"]) == 0

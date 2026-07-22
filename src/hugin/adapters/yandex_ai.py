@@ -17,12 +17,14 @@ class YandexAIClient:
         model: str = "yandexgpt/latest",
         base_url: str = "https://ai.api.cloud.yandex.net/v1",
         timeout_seconds: int = 120,
+        temperature: float = 0.1,
     ) -> None:
         self._api_key = api_key.strip()
         self._folder_id = folder_id.strip()
         self._model = model.strip()
         self._base_url = base_url.rstrip("/")
         self._timeout_seconds = timeout_seconds
+        self._temperature = temperature
         if not self._api_key:
             raise ValueError("Не указан ключ Yandex AI Studio")
         if not self._folder_id:
@@ -31,6 +33,8 @@ class YandexAIClient:
             raise ValueError("Не указана модель YandexGPT")
         if not 1 <= timeout_seconds <= 300:
             raise ValueError("Время ожидания YandexGPT должно быть от 1 до 300 секунд")
+        if not 0 <= temperature <= 2:
+            raise ValueError("Температура YandexGPT должна быть от 0 до 2")
 
     @property
     def model_name(self) -> str:
@@ -44,6 +48,7 @@ class YandexAIClient:
                 {"role": "user", "content": user_prompt},
             ],
             "stream": True,
+            "temperature": self._temperature,
         }
         request = urllib.request.Request(
             f"{self._base_url}/chat/completions",

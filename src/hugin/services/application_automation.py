@@ -3,13 +3,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from hugin.database.models import CoverLetterModel
 from hugin.domain.applications import (
     ApplicationRecord,
     ApplicationState,
     EventPayload,
 )
+from hugin.domain.content import CoverLetterState
 from hugin.domain.directions import (
     AccountRecord,
     DirectionVacancyRecord,
@@ -47,6 +50,7 @@ class ApplyJob:
     vacancy: VacancyRecord
     resume: ResumeRecord
     direction_vacancy: DirectionVacancyRecord
+    cover_letter: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,6 +62,7 @@ class RecordedApplyResult:
 
 class ApplicationAutomationService:
     def __init__(self, session: Session) -> None:
+        self._session = session
         self._accounts = AccountRepository(session)
         self._directions = DirectionRepository(session)
         self._resumes = ResumeRepository(session)
@@ -167,13 +172,33 @@ class ApplicationAutomationService:
     def policy(self, timezone_name: str) -> ApplicationPolicyRecord:
         return self._queue.policy(timezone_name)
 
-    def claim_next(self, direction_id: int) -> ApplyJob | None:
-        task = self._queue.claim_next(direction_id=direction_id)
+    def claim_next(
+        self,
+        direction_id: int,
+        *,
+        require_cover_letter: bool = False,
+    ) -> ApplyJob | None:
+        task = self._queue.claim_next(
+            direction_id=direction_id,
+            require_ready_cover_letter=require_cover_letter,
+        )
         if task is None:
             return None
         application = self._applications.get(task.application_id)
         if application.direction_id is None:
             raise RuntimeError("Направление отклика отсутствует")
+        cover_letter = self._session.scalar(
+            select(CoverLetterModel.text)
+            .where(
+                CoverLetterModel.application_id == application.id,
+                CoverLetterModel.state == CoverLetterState.READY,
+                CoverLetterModel.text.is_not(None),
+            )
+            .order_by(CoverLetterModel.id.desc())
+            .limit(1)
+        )
+        if require_cover_letter and not cover_letter:
+            raise RuntimeError("Готовое сопроводительное письмо отсутствует")
         return ApplyJob(
             task=task,
             application=application,
@@ -183,6 +208,7 @@ class ApplicationAutomationService:
                 application.direction_id,
                 application.vacancy_id,
             ),
+            cover_letter=cover_letter,
         )
 
     def applied_since(self, account_id: int, since: datetime) -> int:
@@ -216,6 +242,8 @@ class ApplicationAutomationService:
                 ApplicationState.APPLIED,
                 payload,
             )
+            if result.status is HhApplyStatus.APPLIED:
+                self._mark_cover_letter_sent(job.application.id, selected_at)
             self._tasks.transition(job.task.id, TaskState.COMPLETED)
             sent = result.status is HhApplyStatus.APPLIED
             next_apply_at = selected_at + apply_delay if sent and apply_delay is not None else None
@@ -308,8 +336,25 @@ class ApplicationAutomationService:
                 "final_url": final_url[:1000],
             },
         )
+        self._mark_cover_letter_sent(application.id, datetime.now(UTC))
         self._tasks.transition(task.id, TaskState.COMPLETED)
         return RecordedApplyResult(blocking=False, sent=True)
+
+    def _mark_cover_letter_sent(self, application_id: int, sent_at: datetime) -> None:
+        letter = self._session.scalar(
+            select(CoverLetterModel)
+            .where(
+                CoverLetterModel.application_id == application_id,
+                CoverLetterModel.state == CoverLetterState.READY,
+                CoverLetterModel.text.is_not(None),
+            )
+            .order_by(CoverLetterModel.id.desc())
+            .limit(1)
+        )
+        if letter is not None:
+            letter.state = CoverLetterState.SENT
+            letter.sent_at = sent_at
+            self._session.flush()
 
     def _transition_system(self, target: SystemState) -> None:
         if self._system.get().state is SystemState.RUNNING:

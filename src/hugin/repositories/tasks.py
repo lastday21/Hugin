@@ -10,10 +10,12 @@ from hugin.database.models import (
     ApplicationModel,
     ApplicationSettingsModel,
     ApplicationTaskModel,
+    CoverLetterModel,
     SystemStateModel,
     VacancyModel,
 )
 from hugin.domain.applications import ApplicationEventType, EventPayload
+from hugin.domain.content import CoverLetterState
 from hugin.domain.state_machines import ensure_system_transition, ensure_task_transition
 from hugin.domain.tasks import (
     ApplicationPolicyRecord,
@@ -112,6 +114,7 @@ class QueueTaskRepository:
         now: datetime | None = None,
         *,
         direction_id: int | None = None,
+        require_ready_cover_letter: bool = False,
     ) -> TaskRecord | None:
         selected_at = as_utc(now or datetime.now(UTC))
         statement = (
@@ -132,6 +135,16 @@ class QueueTaskRepository:
         )
         if direction_id is not None:
             statement = statement.where(ApplicationModel.direction_id == direction_id)
+        if require_ready_cover_letter:
+            statement = statement.where(
+                select(CoverLetterModel.id)
+                .where(
+                    CoverLetterModel.application_id == ApplicationModel.id,
+                    CoverLetterModel.state == CoverLetterState.READY,
+                    CoverLetterModel.text.is_not(None),
+                )
+                .exists()
+            )
         task_id = self._session.scalar(statement)
         if task_id is None:
             return None

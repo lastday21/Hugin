@@ -708,9 +708,14 @@ class CoverLetterModel(Base):
     prompt_version_id: Mapped[int | None] = mapped_column(
         ForeignKey("prompt_versions.id", ondelete="SET NULL")
     )
+    reused_from_id: Mapped[int | None] = mapped_column(
+        ForeignKey("cover_letters.id", ondelete="SET NULL"), index=True
+    )
     text: Mapped[str | None] = mapped_column(Text)
     instruction_version: Mapped[str] = mapped_column(String(64), nullable=False)
     model_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    context_hash: Mapped[str] = mapped_column(String(64), default="", nullable=False)
+    failure_reason: Mapped[str | None] = mapped_column(String(512))
     state: Mapped[CoverLetterState] = mapped_column(
         Enum(
             CoverLetterState,
@@ -725,6 +730,9 @@ class CoverLetterModel(Base):
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
     )
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 

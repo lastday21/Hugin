@@ -23,7 +23,6 @@ from hugin.services.career_directions import (
     DirectionSearchSettings,
     VacancySearchTask,
 )
-from hugin.services.cover_letter import CoverLetterBuilder
 from hugin.services.hh_login import HhCredentials, HhLoginService, LoginStatus
 from hugin.services.hh_profile import HhProfileSyncService
 from hugin.services.job_search import JobSearchSyncService
@@ -770,7 +769,6 @@ def _run_applications(
             day_start = local_day_start_utc()
             sent_today = service.applied_since(prepared.account_id, day_start)
 
-        resume_details = browser.read_resume_details(prepared.resume.hh_id)
         available_today = max(policy.daily_limit - sent_today, 0)
         run_limit = min(arguments.limit, available_today)
         print(
@@ -787,20 +785,21 @@ def _run_applications(
             print("Дневное ограничение исчерпано, новые отклики не отправлены.")
             return 0
 
-        letter_builder = CoverLetterBuilder()
         while sent < run_limit:
             with database.sessions.begin() as session:
-                job = ApplicationAutomationService(session).claim_next(prepared.direction_id)
+                job = ApplicationAutomationService(session).claim_next(
+                    prepared.direction_id,
+                    require_cover_letter=True,
+                )
             if job is None:
                 break
-            raw_category = job.direction_vacancy.rules_details.get("category")
-            category = RuleCategory(str(raw_category))
-            letter = letter_builder.build(job.vacancy, resume_details, category)
+            if not job.cover_letter:
+                raise RuntimeError("Готовое сопроводительное письмо отсутствует")
             try:
                 result = browser.apply_to_vacancy(
                     job.vacancy.source_url,
                     expected_resume_title=job.resume.title,
-                    cover_letter=letter,
+                    cover_letter=job.cover_letter,
                 )
             except Exception as error:
                 result = HhApplyResult(
