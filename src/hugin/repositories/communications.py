@@ -1,0 +1,481 @@
+# ruff: noqa: RUF001
+
+from __future__ import annotations
+
+from datetime import datetime
+from typing import cast
+
+from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.orm import Session
+
+from hugin.database.models import (
+    ApplicationModel,
+    InvitationModel,
+    NotificationModel,
+    RecruiterMessageModel,
+)
+from hugin.domain.communications import (
+    CommunicationNotFoundError,
+    CommunicationStateError,
+    InvitationRecord,
+    MessageSendOutcome,
+    NotificationRecord,
+    RecruiterMessageRecord,
+    StaleMessageDraftError,
+)
+from hugin.domain.content import (
+    DeliveryState,
+    InvitationState,
+    MessageDirection,
+    NotificationChannel,
+    RecruiterMessageState,
+)
+from hugin.domain.directions import ConfigPayload
+from hugin.domain.time import as_utc
+
+
+def _optional_utc(value: datetime | None) -> datetime | None:
+    return as_utc(value) if value is not None else None
+
+
+def _message_record(model: RecruiterMessageModel) -> RecruiterMessageRecord:
+    return RecruiterMessageRecord(
+        id=model.id,
+        application_id=model.application_id,
+        hh_id=model.hh_id,
+        direction=model.direction,
+        body=model.body,
+        state=model.state,
+        content_hash=model.content_hash,
+        content_version=model.version,
+        read_at=_optional_utc(model.read_at),
+        confirmed_at=_optional_utc(model.confirmed_at),
+        sent_at=_optional_utc(model.sent_at),
+        received_at=_optional_utc(model.received_at),
+        created_at=as_utc(model.created_at),
+    )
+
+
+def _invitation_record(model: InvitationModel) -> InvitationRecord:
+    return InvitationRecord(
+        id=model.id,
+        application_id=model.application_id,
+        hh_id=model.hh_id,
+        title=model.title,
+        details=model.details,
+        interview_at=_optional_utc(model.interview_at),
+        booking_url=model.booking_url,
+        state=model.state,
+        seen_at=_optional_utc(model.seen_at),
+        created_at=as_utc(model.created_at),
+        updated_at=as_utc(model.updated_at),
+    )
+
+
+def _notification_record(model: NotificationModel) -> NotificationRecord:
+    return NotificationRecord(
+        id=model.id,
+        application_id=model.application_id,
+        incident_id=model.incident_id,
+        deduplication_key=model.deduplication_key,
+        event_type=model.event_type,
+        channel=model.channel,
+        state=model.state,
+        payload=cast(ConfigPayload, dict(model.payload)),
+        scheduled_at=as_utc(model.scheduled_at),
+        sent_at=_optional_utc(model.sent_at),
+        error_code=model.error_code,
+        created_at=as_utc(model.created_at),
+    )
+
+
+class CommunicationRepository:
+    def __init__(self, session: Session) -> None:
+        self._session = session
+
+    def list_messages_for_account(
+        self,
+        account_id: int,
+    ) -> tuple[RecruiterMessageRecord, ...]:
+        models = self._session.scalars(
+            select(RecruiterMessageModel)
+            .join(
+                ApplicationModel,
+                ApplicationModel.id == RecruiterMessageModel.application_id,
+            )
+            .where(ApplicationModel.account_id == account_id)
+            .order_by(RecruiterMessageModel.created_at.desc(), RecruiterMessageModel.id.desc())
+        )
+        return tuple(_message_record(model) for model in models)
+
+    def save_incoming(
+        self,
+        *,
+        application_id: int,
+        hh_id: str,
+        body: str,
+        received_at: datetime,
+    ) -> RecruiterMessageRecord:
+        self._require_application(application_id)
+        statement = (
+            insert(RecruiterMessageModel)
+            .values(
+                application_id=application_id,
+                hh_id=hh_id,
+                direction=MessageDirection.INCOMING,
+                body=body,
+                state=RecruiterMessageState.RECEIVED,
+                version=1,
+                received_at=as_utc(received_at),
+            )
+            .on_conflict_do_nothing(
+                constraint="uq_recruiter_messages_application_hh_id",
+            )
+            .returning(RecruiterMessageModel.id)
+        )
+        message_id = self._session.scalar(statement)
+        if message_id is None:
+            model = self._session.scalar(
+                select(RecruiterMessageModel).where(
+                    RecruiterMessageModel.application_id == application_id,
+                    RecruiterMessageModel.hh_id == hh_id,
+                )
+            )
+            if model is None:
+                raise RuntimeError("Не удалось получить сохранённое входящее сообщение")
+            if model.direction is not MessageDirection.INCOMING or model.body != body:
+                raise CommunicationStateError(
+                    "Идентификатор входящего сообщения уже связан с другим содержимым"
+                )
+            return _message_record(model)
+        model = self._session.get(RecruiterMessageModel, message_id)
+        if model is None:
+            raise RuntimeError("Не удалось получить новое входящее сообщение")
+        return _message_record(model)
+
+    def mark_incoming_read(
+        self,
+        account_id: int,
+        message_id: int,
+        read_at: datetime,
+    ) -> RecruiterMessageRecord:
+        model = self._message_model(account_id, message_id, for_update=True)
+        if model.direction is not MessageDirection.INCOMING:
+            raise CommunicationStateError("Прочитанным можно отметить только входящее сообщение")
+        if model.read_at is None:
+            model.read_at = as_utc(read_at)
+            self._session.flush()
+        return _message_record(model)
+
+    def create_outgoing_draft(
+        self,
+        *,
+        application_id: int,
+        body: str,
+        content_hash: str,
+    ) -> RecruiterMessageRecord:
+        self._require_application(application_id)
+        model = RecruiterMessageModel(
+            application_id=application_id,
+            direction=MessageDirection.OUTGOING,
+            body=body,
+            content_hash=content_hash,
+            version=1,
+            state=RecruiterMessageState.REVIEW_REQUIRED,
+        )
+        self._session.add(model)
+        self._session.flush()
+        return _message_record(model)
+
+    def edit_outgoing_draft(
+        self,
+        *,
+        account_id: int,
+        message_id: int,
+        body: str,
+        content_hash: str,
+    ) -> RecruiterMessageRecord:
+        model = self._message_model(account_id, message_id, for_update=True)
+        self._require_outgoing(model)
+        if model.state in {
+            RecruiterMessageState.SENT,
+            RecruiterMessageState.UNKNOWN_RESULT,
+        }:
+            raise CommunicationStateError(
+                "Отправленную версию или сообщение с неизвестным результатом нельзя менять"
+            )
+        if model.body == body and model.content_hash == content_hash:
+            return _message_record(model)
+        model.body = body
+        model.content_hash = content_hash
+        model.version += 1
+        model.state = RecruiterMessageState.REVIEW_REQUIRED
+        model.confirmed_at = None
+        model.sent_at = None
+        self._session.flush()
+        return _message_record(model)
+
+    def confirm_outgoing_draft(
+        self,
+        *,
+        account_id: int,
+        message_id: int,
+        content_version: int,
+        content_hash: str,
+        confirmed_at: datetime,
+    ) -> RecruiterMessageRecord:
+        model = self._message_model(account_id, message_id, for_update=True)
+        self._require_outgoing(model)
+        self._require_exact_version(model, content_version, content_hash)
+        if model.state in {
+            RecruiterMessageState.CONFIRMED,
+            RecruiterMessageState.SENT,
+            RecruiterMessageState.FAILED,
+            RecruiterMessageState.UNKNOWN_RESULT,
+        }:
+            return _message_record(model)
+        if model.state not in {
+            RecruiterMessageState.DRAFT,
+            RecruiterMessageState.REVIEW_REQUIRED,
+        }:
+            raise CommunicationStateError("Черновик нельзя подтвердить в текущем состоянии")
+        model.state = RecruiterMessageState.CONFIRMED
+        model.confirmed_at = as_utc(confirmed_at)
+        self._session.flush()
+        return _message_record(model)
+
+    def record_send_outcome(
+        self,
+        *,
+        account_id: int,
+        message_id: int,
+        content_version: int,
+        content_hash: str,
+        outcome: MessageSendOutcome,
+        external_id: str | None,
+        finished_at: datetime,
+    ) -> RecruiterMessageRecord:
+        model = self._message_model(account_id, message_id, for_update=True)
+        self._require_outgoing(model)
+        self._require_exact_version(model, content_version, content_hash)
+        if model.state is not RecruiterMessageState.CONFIRMED:
+            return _message_record(model)
+        states = {
+            MessageSendOutcome.SENT: RecruiterMessageState.SENT,
+            MessageSendOutcome.FAILED: RecruiterMessageState.FAILED,
+            MessageSendOutcome.UNKNOWN_RESULT: RecruiterMessageState.UNKNOWN_RESULT,
+        }
+        model.state = states[outcome]
+        if outcome is MessageSendOutcome.SENT:
+            model.sent_at = as_utc(finished_at)
+            if external_id:
+                model.hh_id = external_id
+        self._session.flush()
+        return _message_record(model)
+
+    def get_message(
+        self,
+        account_id: int,
+        message_id: int,
+    ) -> RecruiterMessageRecord:
+        return _message_record(self._message_model(account_id, message_id))
+
+    def lock_message_for_send(
+        self,
+        account_id: int,
+        message_id: int,
+    ) -> RecruiterMessageRecord:
+        return _message_record(
+            self._message_model(
+                account_id,
+                message_id,
+                for_update=True,
+            )
+        )
+
+    def list_invitations_for_account(
+        self,
+        account_id: int,
+    ) -> tuple[InvitationRecord, ...]:
+        models = self._session.scalars(
+            select(InvitationModel)
+            .join(
+                ApplicationModel,
+                ApplicationModel.id == InvitationModel.application_id,
+            )
+            .where(ApplicationModel.account_id == account_id)
+            .order_by(InvitationModel.created_at.desc(), InvitationModel.id.desc())
+        )
+        return tuple(_invitation_record(model) for model in models)
+
+    def save_invitation(
+        self,
+        *,
+        application_id: int,
+        hh_id: str,
+        title: str,
+        details: str | None,
+        interview_at: datetime | None,
+        booking_url: str | None,
+        updated_at: datetime,
+    ) -> InvitationRecord:
+        self._require_application(application_id)
+        selected_at = as_utc(updated_at)
+        statement = (
+            insert(InvitationModel)
+            .values(
+                application_id=application_id,
+                hh_id=hh_id,
+                title=title,
+                details=details,
+                interview_at=as_utc(interview_at) if interview_at is not None else None,
+                booking_url=booking_url,
+                state=InvitationState.RECEIVED,
+                updated_at=selected_at,
+            )
+            .on_conflict_do_update(
+                constraint="uq_invitations_application_hh_id",
+                set_={
+                    "title": title,
+                    "details": details,
+                    "interview_at": (as_utc(interview_at) if interview_at is not None else None),
+                    "booking_url": booking_url,
+                    "updated_at": selected_at,
+                },
+            )
+            .returning(InvitationModel.id)
+        )
+        invitation_id = self._session.scalar(statement)
+        if invitation_id is None:
+            raise RuntimeError("Не удалось сохранить приглашение")
+        model = self._session.get(InvitationModel, invitation_id)
+        if model is None:
+            raise RuntimeError("Не удалось получить сохранённое приглашение")
+        self._session.refresh(model)
+        return _invitation_record(model)
+
+    def mark_invitation_seen(
+        self,
+        account_id: int,
+        invitation_id: int,
+        seen_at: datetime,
+    ) -> InvitationRecord:
+        model = self._invitation_model(account_id, invitation_id, for_update=True)
+        if model.seen_at is None:
+            model.seen_at = as_utc(seen_at)
+            self._session.flush()
+        return _invitation_record(model)
+
+    def enqueue_notification(
+        self,
+        *,
+        deduplication_key: str,
+        event_type: str,
+        channel: NotificationChannel,
+        payload: ConfigPayload,
+        scheduled_at: datetime,
+        application_id: int | None = None,
+        incident_id: int | None = None,
+    ) -> NotificationRecord:
+        statement = (
+            insert(NotificationModel)
+            .values(
+                application_id=application_id,
+                incident_id=incident_id,
+                deduplication_key=deduplication_key,
+                event_type=event_type,
+                channel=channel,
+                state=DeliveryState.PENDING,
+                payload=dict(payload),
+                scheduled_at=as_utc(scheduled_at),
+            )
+            .on_conflict_do_nothing(
+                constraint="uq_notifications_deduplication_key",
+            )
+            .returning(NotificationModel.id)
+        )
+        notification_id = self._session.scalar(statement)
+        if notification_id is None:
+            model = self._session.scalar(
+                select(NotificationModel).where(
+                    NotificationModel.deduplication_key == deduplication_key
+                )
+            )
+            if model is None:
+                raise RuntimeError("Не удалось получить сохранённое уведомление")
+            return _notification_record(model)
+        model = self._session.get(NotificationModel, notification_id)
+        if model is None:
+            raise RuntimeError("Не удалось получить новое уведомление")
+        return _notification_record(model)
+
+    def _message_model(
+        self,
+        account_id: int,
+        message_id: int,
+        *,
+        for_update: bool = False,
+    ) -> RecruiterMessageModel:
+        statement = (
+            select(RecruiterMessageModel)
+            .join(
+                ApplicationModel,
+                ApplicationModel.id == RecruiterMessageModel.application_id,
+            )
+            .where(
+                RecruiterMessageModel.id == message_id,
+                ApplicationModel.account_id == account_id,
+            )
+        )
+        if for_update:
+            statement = statement.with_for_update()
+        model = self._session.scalar(statement)
+        if model is None:
+            raise CommunicationNotFoundError("Сообщение не найдено")
+        return model
+
+    def _invitation_model(
+        self,
+        account_id: int,
+        invitation_id: int,
+        *,
+        for_update: bool = False,
+    ) -> InvitationModel:
+        statement = (
+            select(InvitationModel)
+            .join(
+                ApplicationModel,
+                ApplicationModel.id == InvitationModel.application_id,
+            )
+            .where(
+                InvitationModel.id == invitation_id,
+                ApplicationModel.account_id == account_id,
+            )
+        )
+        if for_update:
+            statement = statement.with_for_update()
+        model = self._session.scalar(statement)
+        if model is None:
+            raise CommunicationNotFoundError("Приглашение не найдено")
+        return model
+
+    def _require_application(self, application_id: int) -> None:
+        if self._session.get(ApplicationModel, application_id) is None:
+            raise CommunicationNotFoundError("Отклик не найден")
+
+    @staticmethod
+    def _require_outgoing(model: RecruiterMessageModel) -> None:
+        if model.direction is not MessageDirection.OUTGOING:
+            raise CommunicationStateError("Действие доступно только для исходящего черновика")
+
+    @staticmethod
+    def _require_exact_version(
+        model: RecruiterMessageModel,
+        content_version: int,
+        content_hash: str,
+    ) -> None:
+        if model.version != content_version or model.content_hash != content_hash:
+            raise StaleMessageDraftError(
+                "Черновик изменился. Проверьте актуальную версию перед подтверждением"
+            )

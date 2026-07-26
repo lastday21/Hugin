@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from decimal import Decimal
 from enum import StrEnum
+from uuid import uuid4
 
 from sqlalchemy import (
     JSON,
@@ -25,6 +26,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from hugin.database.base import Base
 from hugin.domain.applications import ApplicationEventType, ApplicationState, EventPayload
+from hugin.domain.automation import AutomationJobKind, AutomationJobState
 from hugin.domain.content import (
     AnswerSource,
     CompanyRuleType,
@@ -137,6 +139,77 @@ class DirectionSearchQueryModel(Base):
         DateTime(timezone=True), default=utc_now, nullable=False
     )
     direction: Mapped[CareerDirectionModel] = relationship(back_populates="queries")
+
+
+class AutomationJobModel(Base):
+    __tablename__ = "automation_jobs"
+    __table_args__ = (
+        CheckConstraint(
+            "interval_seconds >= 1",
+            name="ck_automation_jobs_interval_seconds",
+        ),
+        CheckConstraint(
+            "consecutive_failures >= 0",
+            name="ck_automation_jobs_consecutive_failures",
+        ),
+        CheckConstraint(
+            "(kind = 'SEARCH' AND search_query_id IS NOT NULL) "
+            "OR (kind IN ('MESSAGES', 'STATUSES') AND search_query_id IS NULL)",
+            name="ck_automation_jobs_scope",
+        ),
+        Index("ix_automation_jobs_due", "state", "next_run_at"),
+    )
+
+    key: Mapped[str] = mapped_column(String(128), primary_key=True)
+    kind: Mapped[AutomationJobKind] = mapped_column(
+        Enum(
+            AutomationJobKind,
+            name="automation_job_kind",
+            native_enum=False,
+            create_constraint=True,
+            length=16,
+            values_callable=enum_values,
+        ),
+        nullable=False,
+    )
+    state: Mapped[AutomationJobState] = mapped_column(
+        Enum(
+            AutomationJobState,
+            name="automation_job_state",
+            native_enum=False,
+            create_constraint=True,
+            length=16,
+            values_callable=enum_values,
+        ),
+        default=AutomationJobState.WAITING,
+        nullable=False,
+    )
+    account_id: Mapped[int] = mapped_column(
+        ForeignKey("hh_accounts.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    search_query_id: Mapped[int | None] = mapped_column(
+        ForeignKey("direction_search_queries.id", ondelete="CASCADE"),
+        unique=True,
+        index=True,
+    )
+    interval_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
+    next_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_success_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    consecutive_failures: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    last_error_code: Mapped[str | None] = mapped_column(String(64))
+    last_error_message: Mapped[str | None] = mapped_column(Text)
+    last_result: Mapped[ConfigPayload] = mapped_column(JSONB, default=dict, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+    )
 
 
 class ResumeModel(Base):
@@ -876,6 +949,10 @@ class RecruiterMessageModel(Base):
             "hh_id",
             name="uq_recruiter_messages_application_hh_id",
         ),
+        CheckConstraint(
+            "version >= 1",
+            name="ck_recruiter_messages_version",
+        ),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -895,6 +972,8 @@ class RecruiterMessageModel(Base):
         nullable=False,
     )
     body: Mapped[str] = mapped_column(Text, nullable=False)
+    content_hash: Mapped[str | None] = mapped_column(String(64))
+    version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
     state: Mapped[RecruiterMessageState] = mapped_column(
         Enum(
             RecruiterMessageState,
@@ -909,6 +988,7 @@ class RecruiterMessageModel(Base):
     confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     received_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    read_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
     )
@@ -940,6 +1020,7 @@ class InvitationModel(Base):
     details: Mapped[str | None] = mapped_column(Text)
     interview_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     booking_url: Mapped[str | None] = mapped_column(Text)
+    seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     state: Mapped[InvitationState] = mapped_column(
         Enum(
             InvitationState,
@@ -1002,6 +1083,12 @@ class IncidentModel(Base):
 
 class NotificationModel(Base):
     __tablename__ = "notifications"
+    __table_args__ = (
+        UniqueConstraint(
+            "deduplication_key",
+            name="uq_notifications_deduplication_key",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     application_id: Mapped[int | None] = mapped_column(
@@ -1009,6 +1096,11 @@ class NotificationModel(Base):
     )
     incident_id: Mapped[int | None] = mapped_column(
         ForeignKey("incidents.id", ondelete="CASCADE"), index=True
+    )
+    deduplication_key: Mapped[str] = mapped_column(
+        String(128),
+        default=lambda: f"local:{uuid4().hex}",
+        nullable=False,
     )
     event_type: Mapped[str] = mapped_column(String(64), nullable=False)
     channel: Mapped[NotificationChannel] = mapped_column(

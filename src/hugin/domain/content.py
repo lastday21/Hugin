@@ -58,6 +58,7 @@ class RecruiterMessageState(StrEnum):
     CONFIRMED = "CONFIRMED"
     SENT = "SENT"
     FAILED = "FAILED"
+    UNKNOWN_RESULT = "UNKNOWN_RESULT"
 
 
 class InvitationState(StrEnum):
