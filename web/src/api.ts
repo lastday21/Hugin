@@ -1,9 +1,16 @@
 import type {
+  Communications,
   Dashboard,
+  DirectionOptions,
+  DirectionSettings,
+  DirectionSummary,
   FormDraft,
+  Profile,
   QueueItem,
   QueueSettings,
   RejectedVacancy,
+  ResumePreview,
+  SentApplication,
   VacancyCard,
 } from "./types";
 
@@ -13,13 +20,14 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const controller = new AbortController();
   const timeout = window.setTimeout(() => controller.abort(), 12_000);
   try {
+    const headers = new Headers(init?.headers);
+    if (!(init?.body instanceof FormData) && !headers.has("Content-Type")) {
+      headers.set("Content-Type", "application/json");
+    }
     const response = await fetch(path, {
       ...init,
       signal: init?.signal ?? controller.signal,
-      headers: {
-        "Content-Type": "application/json",
-        ...init?.headers,
-      },
+      headers,
     });
     if (!response.ok) {
       const payload = (await response.json().catch(() => ({}))) as { detail?: string };
@@ -38,17 +46,44 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
 export async function loadWorkspace(): Promise<{
   dashboard: Dashboard;
+  directionOptions: DirectionOptions;
+  profile: Profile;
   queue: QueueItem[];
   forms: FormDraft[];
   rejected: RejectedVacancy[];
+  sent: SentApplication[];
+  communications: Communications;
 }> {
-  const [dashboard, queue, forms, rejected] = await Promise.all([
+  const [
+    dashboard,
+    directionOptions,
+    profile,
+    queue,
+    forms,
+    rejected,
+    sent,
+    communications,
+  ] =
+    await Promise.all([
     request<Dashboard>(`/api/dashboard?account_id=${ACCOUNT_ID}`),
+    request<DirectionOptions>("/api/directions/options"),
+    request<Profile>(`/api/profile?account_id=${ACCOUNT_ID}`),
     request<QueueItem[]>(`/api/queue?account_id=${ACCOUNT_ID}`),
     request<FormDraft[]>(`/api/forms?account_id=${ACCOUNT_ID}`),
     request<RejectedVacancy[]>(`/api/rejected?account_id=${ACCOUNT_ID}`),
+    request<SentApplication[]>(`/api/sent?account_id=${ACCOUNT_ID}`),
+    request<Communications>(`/api/communications?account_id=${ACCOUNT_ID}`),
   ]);
-  return { dashboard, queue, forms, rejected };
+  return {
+    dashboard,
+    directionOptions,
+    profile,
+    queue,
+    forms,
+    rejected,
+    sent,
+    communications,
+  };
 }
 
 export function loadVacancy(vacancyId: string): Promise<VacancyCard> {
@@ -66,6 +101,18 @@ export async function changeQueueState(action: "pause" | "resume"): Promise<stri
   return result.state;
 }
 
+export async function reconcileApplication(
+  taskId: number,
+  status: "APPLIED" | "NOT_FOUND",
+): Promise<void> {
+  const session = await request<{ key: string }>("/api/session");
+  await request(`/api/queue/${taskId}/reconcile?account_id=${ACCOUNT_ID}`, {
+    method: "POST",
+    headers: { "X-Hugin-Session": session.key },
+    body: JSON.stringify({ status }),
+  });
+}
+
 export async function updateQueueSettings(
   values: QueueSettings,
 ): Promise<QueueSettings> {
@@ -75,4 +122,156 @@ export async function updateQueueSettings(
     headers: { "X-Hugin-Session": session.key },
     body: JSON.stringify(values),
   });
+}
+
+export async function updateDirection(
+  directionId: number,
+  values: DirectionSettings,
+): Promise<DirectionSummary> {
+  const session = await request<{ key: string }>("/api/session");
+  return request<DirectionSummary>(
+    `/api/directions/${directionId}?account_id=${ACCOUNT_ID}`,
+    {
+      method: "PUT",
+      headers: { "X-Hugin-Session": session.key },
+      body: JSON.stringify(values),
+    },
+  );
+}
+
+export async function previewResume(file: File): Promise<ResumePreview> {
+  const session = await request<{ key: string }>("/api/session");
+  const body = new FormData();
+  body.append("file", file);
+  return request<ResumePreview>(`/api/profile/resume/preview?account_id=${ACCOUNT_ID}`, {
+    method: "POST",
+    headers: { "X-Hugin-Session": session.key },
+    body,
+  });
+}
+
+export async function importResume(token: string): Promise<Profile> {
+  const session = await request<{ key: string }>("/api/session");
+  return request<Profile>(`/api/profile/resume/import?account_id=${ACCOUNT_ID}`, {
+    method: "POST",
+    headers: { "X-Hugin-Session": session.key },
+    body: JSON.stringify({ token }),
+  });
+}
+
+export async function reviewProfileFact(
+  factId: number,
+  action: "confirm" | "reject",
+  permissions?: {
+    allow_in_letters: boolean;
+    allow_in_forms: boolean;
+    allow_in_messages: boolean;
+  },
+): Promise<Profile> {
+  const session = await request<{ key: string }>("/api/session");
+  return request<Profile>(
+    `/api/profile/facts/${factId}/${action}?account_id=${ACCOUNT_ID}`,
+    {
+      method: "POST",
+      headers: { "X-Hugin-Session": session.key },
+      body: action === "confirm" ? JSON.stringify(permissions) : undefined,
+    },
+  );
+}
+
+export async function saveProfileAnswer(key: string, answer: string): Promise<Profile> {
+  const session = await request<{ key: string }>("/api/session");
+  return request<Profile>(
+    `/api/profile/questions/${encodeURIComponent(key)}?account_id=${ACCOUNT_ID}`,
+    {
+      method: "PUT",
+      headers: { "X-Hugin-Session": session.key },
+      body: JSON.stringify({ answer }),
+    },
+  );
+}
+
+export async function dismissProfileQuestion(key: string): Promise<Profile> {
+  const session = await request<{ key: string }>("/api/session");
+  return request<Profile>(
+    `/api/profile/questions/${encodeURIComponent(key)}/dismiss?account_id=${ACCOUNT_ID}`,
+    {
+      method: "POST",
+      headers: { "X-Hugin-Session": session.key },
+    },
+  );
+}
+
+export async function markConversationRead(applicationId: number): Promise<Communications> {
+  const session = await request<{ key: string }>("/api/session");
+  return request<Communications>(
+    `/api/communications/conversations/${applicationId}/read?account_id=${ACCOUNT_ID}`,
+    {
+      method: "POST",
+      headers: { "X-Hugin-Session": session.key },
+    },
+  );
+}
+
+export async function markInvitationSeen(invitationId: number): Promise<Communications> {
+  const session = await request<{ key: string }>("/api/session");
+  return request<Communications>(
+    `/api/communications/invitations/${invitationId}/seen?account_id=${ACCOUNT_ID}`,
+    {
+      method: "POST",
+      headers: { "X-Hugin-Session": session.key },
+    },
+  );
+}
+
+export async function saveReplyDraft(
+  applicationId: number,
+  body: string,
+): Promise<Communications> {
+  const session = await request<{ key: string }>("/api/session");
+  return request<Communications>(
+    `/api/communications/conversations/${applicationId}/draft?account_id=${ACCOUNT_ID}`,
+    {
+      method: "PUT",
+      headers: { "X-Hugin-Session": session.key },
+      body: JSON.stringify({ body }),
+    },
+  );
+}
+
+export async function confirmReply(
+  messageId: number,
+  contentHash: string,
+  contentVersion: number,
+): Promise<Communications> {
+  const session = await request<{ key: string }>("/api/session");
+  return request<Communications>(
+    `/api/communications/messages/${messageId}/confirm?account_id=${ACCOUNT_ID}`,
+    {
+      method: "POST",
+      headers: { "X-Hugin-Session": session.key },
+      body: JSON.stringify({
+        content_hash: contentHash,
+        content_version: contentVersion,
+      }),
+    },
+  );
+}
+
+export async function updateNotificationSettings(
+  windowsEnabled: boolean,
+  windowsEvents: string[],
+): Promise<Communications> {
+  const session = await request<{ key: string }>("/api/session");
+  return request<Communications>(
+    `/api/communications/notifications?account_id=${ACCOUNT_ID}`,
+    {
+      method: "PUT",
+      headers: { "X-Hugin-Session": session.key },
+      body: JSON.stringify({
+        windows_enabled: windowsEnabled,
+        windows_events: windowsEvents,
+      }),
+    },
+  );
 }

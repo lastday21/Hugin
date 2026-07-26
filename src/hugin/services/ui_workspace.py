@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 from sqlalchemy import func, select
@@ -11,8 +11,10 @@ from hugin.database.models import (
     ApplicationEventModel,
     ApplicationModel,
     ApplicationTaskModel,
+    AutomationJobModel,
     CareerDirectionModel,
     CoverLetterModel,
+    DirectionSearchQueryModel,
     DirectionVacancyModel,
     HhAccountModel,
     IncidentModel,
@@ -25,8 +27,16 @@ from hugin.database.models import (
     VacancyDiscoveryModel,
     VacancyModel,
 )
-from hugin.domain.content import CoverLetterState, IncidentState, ScreeningFormState
-from hugin.domain.directions import VacancyState
+from hugin.domain.applications import ApplicationEventType
+from hugin.domain.automation import AutomationJobKind, AutomationJobState
+from hugin.domain.content import (
+    CoverLetterState,
+    IncidentState,
+    InvitationState,
+    MessageDirection,
+    ScreeningFormState,
+)
+from hugin.domain.directions import DirectionScope, VacancyState
 from hugin.domain.tasks import TaskState
 from hugin.domain.time import local_day_start_utc
 from hugin.repositories.applications import ApplicationRepository
@@ -36,7 +46,34 @@ ACTIVE_QUEUE_STATES = (
     TaskState.PENDING,
     TaskState.RUNNING,
     TaskState.RETRY_SCHEDULED,
+    TaskState.REVIEW_REQUIRED,
+    TaskState.UNKNOWN_RESULT,
 )
+
+
+def _direction_scope(direction: CareerDirectionModel) -> DirectionScope:
+    value = direction.scoring_config.get("role_scope")
+    if isinstance(value, str):
+        try:
+            return DirectionScope(value)
+        except ValueError:
+            pass
+    normalized = direction.name.casefold().replace("-", " ")
+    if "python" in normalized and ("backend" in normalized or "бэкенд" in normalized):
+        return DirectionScope.PYTHON_BACKEND
+    return DirectionScope.IT_ADJACENT
+
+
+def _direction_name(direction: CareerDirectionModel) -> str:
+    if _direction_scope(direction) is DirectionScope.PYTHON_BACKEND:
+        return "Python backend"
+    return "Другое ИТ"
+
+
+@dataclass(frozen=True, slots=True)
+class UiRegion:
+    area: str
+    name: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,9 +81,18 @@ class UiDirection:
     id: int
     name: str
     description: str | None
+    role_scope: str
     is_active: bool
     queued: int
     rejected: int
+    queries: tuple[str, ...]
+    regions: tuple[UiRegion, ...]
+    work_formats: tuple[str, ...]
+    employment_forms: tuple[str, ...]
+    minimum_salary: int | None
+    desired_salary: int | None
+    remote_all_russia: bool
+    schedule_minutes: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,6 +120,7 @@ class UiDashboard:
     rejected_vacancies: int
     new_messages: int
     invitations: int
+    background: UiBackgroundStatus
     directions: tuple[UiDirection, ...]
     incidents: tuple[UiIncident, ...]
 
@@ -97,6 +144,16 @@ class UiQueueItem:
 
 
 @dataclass(frozen=True, slots=True)
+class UiBackgroundStatus:
+    state: str
+    last_success_at: datetime | None
+    next_search_at: datetime | None
+    next_messages_at: datetime | None
+    next_statuses_at: datetime | None
+    error: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class UiRejectedVacancy:
     vacancy_id: str
     title: str
@@ -106,6 +163,20 @@ class UiRejectedVacancy:
     direction: str
     score: float | None
     reasons: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class UiSentApplication:
+    application_id: int
+    vacancy_id: str
+    title: str
+    company: str
+    region: str
+    source_url: str
+    resume_title: str
+    direction: str
+    state: str
+    applied_at: datetime
 
 
 @dataclass(frozen=True, slots=True)
@@ -215,7 +286,11 @@ class UiWorkspaceService:
                 select(func.count())
                 .select_from(RecruiterMessageModel)
                 .join(ApplicationModel, ApplicationModel.id == RecruiterMessageModel.application_id)
-                .where(ApplicationModel.account_id == account_id)
+                .where(
+                    ApplicationModel.account_id == account_id,
+                    RecruiterMessageModel.direction == MessageDirection.INCOMING,
+                    RecruiterMessageModel.read_at.is_(None),
+                )
             )
             or 0
         )
@@ -224,7 +299,11 @@ class UiWorkspaceService:
                 select(func.count())
                 .select_from(InvitationModel)
                 .join(ApplicationModel, ApplicationModel.id == InvitationModel.application_id)
-                .where(ApplicationModel.account_id == account_id)
+                .where(
+                    ApplicationModel.account_id == account_id,
+                    InvitationModel.state != InvitationState.CLOSED,
+                    InvitationModel.seen_at.is_(None),
+                )
             )
             or 0
         )
@@ -259,9 +338,67 @@ class UiWorkspaceService:
             rejected_vacancies=rejected_vacancies,
             new_messages=new_messages,
             invitations=invitations,
+            background=self._background_status(account_id),
             directions=directions,
             incidents=incidents,
         )
+
+    def _background_status(self, account_id: int) -> UiBackgroundStatus:
+        jobs = tuple(
+            self._session.scalars(
+                select(AutomationJobModel)
+                .where(AutomationJobModel.account_id == account_id)
+                .order_by(AutomationJobModel.kind, AutomationJobModel.key)
+            )
+        )
+        if not jobs:
+            return UiBackgroundStatus("NOT_STARTED", None, None, None, None, None)
+
+        enabled = tuple(job for job in jobs if job.state is not AutomationJobState.DISABLED)
+        failures = tuple(
+            job
+            for job in enabled
+            if job.state in {AutomationJobState.BLOCKED, AutomationJobState.FAILED}
+        )
+        now = datetime.now(UTC)
+        overdue = any(
+            job.next_run_at is not None
+            and job.next_run_at < now - timedelta(minutes=2)
+            and job.state in {AutomationJobState.WAITING, AutomationJobState.FAILED}
+            for job in enabled
+        )
+        if failures:
+            state = "NEEDS_ATTENTION"
+        elif overdue:
+            state = "STOPPED"
+        else:
+            state = "RUNNING"
+        last_successes = tuple(
+            job.last_success_at for job in enabled if job.last_success_at is not None
+        )
+        return UiBackgroundStatus(
+            state=state,
+            last_success_at=max(last_successes) if last_successes else None,
+            next_search_at=self._next_job_time(enabled, AutomationJobKind.SEARCH),
+            next_messages_at=self._next_job_time(enabled, AutomationJobKind.MESSAGES),
+            next_statuses_at=self._next_job_time(enabled, AutomationJobKind.STATUSES),
+            error=(
+                next(
+                    (job.last_error_message for job in failures if job.last_error_message),
+                    None,
+                )
+            ),
+        )
+
+    @staticmethod
+    def _next_job_time(
+        jobs: tuple[AutomationJobModel, ...],
+        kind: AutomationJobKind,
+    ) -> datetime | None:
+        values = tuple(
+            job.next_run_at for job in jobs if job.kind is kind and job.next_run_at is not None
+        )
+        return min(values) if values else None
 
     def queue(self, account_id: int, limit: int = 100) -> tuple[UiQueueItem, ...]:
         self._account(account_id)
@@ -318,7 +455,9 @@ class UiWorkspaceService:
                 region=vacancy.region or "Регион не указан",
                 source_url=vacancy.source_url,
                 resume_title=resume.title,
-                direction=direction.name if direction is not None else "Без направления",
+                direction=_direction_name(direction)
+                if direction is not None
+                else "Без направления",
                 state=task.state.value,
                 priority=task.priority_score,
                 scheduled_at=task.scheduled_at,
@@ -363,11 +502,67 @@ class UiWorkspaceService:
                 company=vacancy.employer_name or "Компания не указана",
                 region=vacancy.region or "Регион не указан",
                 source_url=vacancy.source_url,
-                direction=direction.name,
+                direction=_direction_name(direction),
                 score=tracking.rules_score,
                 reasons=self._reasons(tracking.rules_details),
             )
             for vacancy, tracking, direction in rows
+        )
+
+    def sent(self, account_id: int, limit: int = 100) -> tuple[UiSentApplication, ...]:
+        self._account(account_id)
+        applied_at = (
+            select(func.max(ApplicationEventModel.created_at))
+            .where(
+                ApplicationEventModel.application_id == ApplicationModel.id,
+                ApplicationEventModel.event_type == ApplicationEventType.APPLIED,
+            )
+            .correlate(ApplicationModel)
+            .scalar_subquery()
+        )
+        rows = self._session.execute(
+            select(
+                ApplicationModel,
+                VacancyModel,
+                ResumeModel,
+                CareerDirectionModel,
+                applied_at,
+            )
+            .join(VacancyModel, VacancyModel.id == ApplicationModel.vacancy_id)
+            .join(ResumeModel, ResumeModel.id == ApplicationModel.resume_id)
+            .outerjoin(
+                CareerDirectionModel,
+                CareerDirectionModel.id == ApplicationModel.direction_id,
+            )
+            .where(
+                ApplicationModel.account_id == account_id,
+                select(ApplicationEventModel.id)
+                .where(
+                    ApplicationEventModel.application_id == ApplicationModel.id,
+                    ApplicationEventModel.event_type == ApplicationEventType.APPLIED,
+                )
+                .exists(),
+            )
+            .order_by(applied_at.desc(), ApplicationModel.id.desc())
+            .limit(limit)
+        )
+        return tuple(
+            UiSentApplication(
+                application_id=application.id,
+                vacancy_id=vacancy.hh_id,
+                title=vacancy.title,
+                company=vacancy.employer_name or "Компания не указана",
+                region=vacancy.region or "Регион не указан",
+                source_url=vacancy.source_url,
+                resume_title=resume.title,
+                direction=(
+                    _direction_name(direction) if direction is not None else "Без направления"
+                ),
+                state=application.state.value,
+                applied_at=stored_applied_at,
+            )
+            for application, vacancy, resume, direction, stored_applied_at in rows
+            if stored_applied_at is not None
         )
 
     def vacancy(self, account_id: int, hh_id: str) -> UiVacancyCard:
@@ -436,7 +631,7 @@ class UiWorkspaceService:
             experience=vacancy.experience or "Опыт не указан",
             skills=tuple(vacancy.key_skills),
             description=vacancy.description or "Описание пока не загружено",
-            direction=direction.name,
+            direction=_direction_name(direction),
             state=tracking.state.value,
             score=tracking.rules_score,
             reasons=self._reasons(tracking.rules_details),
@@ -471,13 +666,48 @@ class UiWorkspaceService:
             )
             or 0
         )
+        queries = tuple(
+            self._session.scalars(
+                select(DirectionSearchQueryModel)
+                .where(
+                    DirectionSearchQueryModel.direction_id == direction.id,
+                    DirectionSearchQueryModel.area == "",
+                    DirectionSearchQueryModel.is_active.is_(True),
+                )
+                .order_by(DirectionSearchQueryModel.id)
+            )
+        )
+        first_query = queries[0] if queries else None
+        regions = {
+            str(region.get("area")): UiRegion(
+                area=str(region.get("area")),
+                name=str(region.get("name")),
+            )
+            for query in queries
+            for region in query.regions
+            if region.get("area") and region.get("name")
+        }
+        raw_search = direction.scoring_config.get("search_settings")
+        search = raw_search if isinstance(raw_search, dict) else {}
+        employment_forms = tuple(
+            value for value in search.get("employment_forms", []) if isinstance(value, str)
+        )
         return UiDirection(
             id=direction.id,
-            name=direction.name,
+            name=_direction_name(direction),
             description=direction.description,
+            role_scope=_direction_scope(direction).value,
             is_active=direction.is_active,
             queued=queued,
             rejected=counts.get(VacancyState.FILTERED_OUT, 0),
+            queries=tuple(query.query for query in queries),
+            regions=tuple(regions.values()),
+            work_formats=tuple(first_query.work_formats) if first_query is not None else (),
+            employment_forms=employment_forms,
+            minimum_salary=self._optional_int(search.get("minimum_salary")),
+            desired_salary=self._optional_int(search.get("desired_salary")),
+            remote_all_russia=search.get("remote_all_russia") is True,
+            schedule_minutes=first_query.schedule_minutes if first_query is not None else 120,
         )
 
     def _questions(self, form_id: int) -> tuple[UiQuestion, ...]:
@@ -538,6 +768,12 @@ class UiWorkspaceService:
         if not isinstance(reasons, list):
             return ()
         return tuple(str(reason) for reason in reasons)
+
+    @staticmethod
+    def _optional_int(value: object) -> int | None:
+        if isinstance(value, bool) or not isinstance(value, int):
+            return None
+        return value
 
     @staticmethod
     def _salary(vacancy: VacancyModel) -> str:

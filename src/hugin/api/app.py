@@ -9,7 +9,9 @@ from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
 from hugin import __version__
+from hugin.api.routes.communications import router as communications_router
 from hugin.api.routes.health import router as health_router
+from hugin.api.routes.profile import router as profile_router
 from hugin.api.routes.workspace import router as workspace_router
 from hugin.core.settings import Settings, get_settings
 from hugin.database import create_database
@@ -40,7 +42,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     application.state.settings = resolved_settings
     application.state.database = database
     application.state.session_key = secrets.token_urlsafe(32)
+    application.include_router(communications_router)
     application.include_router(health_router)
+    application.include_router(profile_router)
     application.include_router(workspace_router)
     assets = web_directory()
     if assets.is_dir():

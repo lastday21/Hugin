@@ -5,13 +5,46 @@ export type SystemState =
   | "CAPTCHA_REQUIRED"
   | "ACCOUNT_WARNING";
 
+export type WorkFormat = "REMOTE" | "ON_SITE" | "HYBRID";
+export type EmploymentForm = "FULL" | "PART" | "PROJECT" | "FLY_IN_FLY_OUT";
+
+export interface SearchRegion {
+  area: string;
+  name: string;
+}
+
 export interface DirectionSummary {
   id: number;
   name: string;
   description: string | null;
+  role_scope: "PYTHON_BACKEND" | "IT_ADJACENT";
   is_active: boolean;
   queued: number;
   rejected: number;
+  queries: string[];
+  regions: SearchRegion[];
+  work_formats: WorkFormat[];
+  employment_forms: EmploymentForm[];
+  minimum_salary: number | null;
+  desired_salary: number | null;
+  remote_all_russia: boolean;
+  schedule_minutes: number;
+}
+
+export interface DirectionOptions {
+  regions: SearchRegion[];
+}
+
+export interface DirectionSettings {
+  is_active: boolean;
+  queries: string[];
+  regions: SearchRegion[];
+  work_formats: WorkFormat[];
+  employment_forms: EmploymentForm[];
+  minimum_salary: number | null;
+  desired_salary: number | null;
+  remote_all_russia: boolean;
+  schedule_minutes: number;
 }
 
 export interface Incident {
@@ -20,6 +53,15 @@ export interface Incident {
   severity: string;
   message: string;
   created_at: string;
+}
+
+export interface BackgroundStatus {
+  state: "NOT_STARTED" | "RUNNING" | "NEEDS_ATTENTION" | "STOPPED";
+  last_success_at: string | null;
+  next_search_at: string | null;
+  next_messages_at: string | null;
+  next_statuses_at: string | null;
+  error: string | null;
 }
 
 export interface Dashboard {
@@ -37,6 +79,7 @@ export interface Dashboard {
   rejected_vacancies: number;
   new_messages: number;
   invitations: number;
+  background: BackgroundStatus;
   directions: DirectionSummary[];
   incidents: Incident[];
 }
@@ -45,6 +88,69 @@ export interface QueueSettings {
   daily_limit: number;
   delay_min_seconds: number;
   delay_max_seconds: number;
+}
+
+export interface ProfileResume {
+  id: number;
+  hh_id: string;
+  title: string;
+  source_type: string | null;
+  source_original_name: string | null;
+  source_size_bytes: number | null;
+  source_page_count: number | null;
+  imported_at: string | null;
+}
+
+export interface ProfileFact {
+  id: number;
+  category: string;
+  content: string;
+  state: "PENDING" | "CONFIRMED" | "REJECTED";
+  allow_in_letters: boolean;
+  allow_in_forms: boolean;
+  allow_in_messages: boolean;
+}
+
+export interface ProfileQuestion {
+  key: string;
+  question: string;
+  answer: string | null;
+  state: "PENDING" | "ANSWERED" | "DISMISSED";
+}
+
+export interface AnswerTemplate {
+  key: string;
+  question: string;
+  answer: string;
+}
+
+export interface Profile {
+  account_label: string;
+  display_name: string;
+  active_resume: ProfileResume | null;
+  facts: ProfileFact[];
+  questions: ProfileQuestion[];
+  answers: AnswerTemplate[];
+}
+
+export interface ResumePreviewFact {
+  category: string;
+  content: string;
+}
+
+export interface ResumePreviewQuestion {
+  key: string;
+  question: string;
+}
+
+export interface ResumePreview {
+  token: string;
+  original_name: string;
+  source_type: string;
+  title: string;
+  page_count: number | null;
+  facts: ResumePreviewFact[];
+  questions: ResumePreviewQuestion[];
 }
 
 export interface QueueItem {
@@ -99,6 +205,72 @@ export interface RejectedVacancy {
   reasons: string[];
 }
 
+export interface SentApplication {
+  application_id: number;
+  vacancy_id: string;
+  title: string;
+  company: string;
+  region: string;
+  source_url: string;
+  resume_title: string;
+  direction: string;
+  state: string;
+  applied_at: string;
+}
+
+export interface RecruiterMessage {
+  id: number;
+  direction: "INCOMING" | "OUTGOING";
+  body: string;
+  state: string;
+  occurred_at: string;
+  read_at: string | null;
+  content_hash: string | null;
+  content_version: number;
+}
+
+export interface Conversation {
+  application_id: number;
+  vacancy_id: string;
+  vacancy_title: string;
+  company: string;
+  source_url: string;
+  unread_count: number;
+  needs_reply: boolean;
+  messages: RecruiterMessage[];
+}
+
+export interface CommunicationInvitation {
+  id: number;
+  application_id: number;
+  vacancy_id: string;
+  vacancy_title: string;
+  company: string;
+  source_url: string;
+  title: string;
+  details: string | null;
+  interview_at: string | null;
+  booking_url: string | null;
+  state: string;
+  seen_at: string | null;
+  created_at: string;
+}
+
+export interface Communications {
+  conversations: Conversation[];
+  invitations: CommunicationInvitation[];
+  unread_messages: number;
+  unseen_invitations: number;
+  notification_settings: NotificationSettings;
+}
+
+export interface NotificationSettings {
+  windows_enabled: boolean;
+  telegram_enabled: boolean;
+  email_enabled: boolean;
+  routing: Record<string, string[]>;
+}
+
 export interface VacancyQuestion {
   text: string;
   answer: string | null;
@@ -148,6 +320,7 @@ declare global {
     pywebview?: {
       api: {
         open_form: (vacancyId: string) => Promise<BridgeResult>;
+        open_invitation: (invitationId: number) => Promise<BridgeResult>;
         open_url: (url: string) => Promise<BridgeResult>;
       };
     };

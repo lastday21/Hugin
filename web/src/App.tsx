@@ -13,11 +13,14 @@ import {
   Home,
   Inbox,
   ListFilter,
+  MessageSquare,
   RefreshCw,
   RotateCcw,
   Search,
   Settings,
   SlidersHorizontal,
+  Upload,
+  UserRound,
   X,
 } from "lucide-react";
 import {
@@ -33,9 +36,21 @@ import {
 } from "react";
 import {
   changeQueueState,
+  dismissProfileQuestion,
+  importResume,
   loadVacancy,
   loadWorkspace,
+  markConversationRead,
+  markInvitationSeen,
+  previewResume,
+  reconcileApplication,
+  reviewProfileFact,
+  saveReplyDraft,
+  saveProfileAnswer,
+  updateNotificationSettings,
+  updateDirection,
   updateQueueSettings,
+  confirmReply,
 } from "./api";
 import {
   dashboardWidgetDefinitions,
@@ -45,25 +60,49 @@ import {
   type DashboardWidget,
 } from "./dashboardPreferences";
 import type {
+  Communications,
+  Conversation,
   Dashboard,
+  DirectionOptions,
+  DirectionSettings,
+  DirectionSummary,
+  EmploymentForm,
   FormDraft,
+  NotificationSettings,
+  Profile,
+  ProfileFact,
+  ProfileQuestion,
   QueueItem,
   QueueSettings,
   RejectedVacancy,
+  ResumePreview,
+  SearchRegion,
+  SentApplication,
   SystemState,
   VacancyCard,
+  WorkFormat,
 } from "./types";
 
-type View = "dashboard" | "vacancies" | "attention" | "settings";
-type VacancyTab = "queue" | "rejected";
+type View =
+  | "dashboard"
+  | "vacancies"
+  | "attention"
+  | "communications"
+  | "profile"
+  | "settings";
+type VacancyTab = "queue" | "sent" | "rejected";
 type AttentionTab = "input" | "review";
 type Toast = { kind: "success" | "error"; message: string };
 
 interface Workspace {
   dashboard: Dashboard;
+  directionOptions: DirectionOptions;
+  profile: Profile;
   queue: QueueItem[];
   forms: FormDraft[];
   rejected: RejectedVacancy[];
+  sent: SentApplication[];
+  communications: Communications;
 }
 
 const navigation: {
@@ -74,6 +113,8 @@ const navigation: {
   { id: "dashboard", label: "Главная", icon: Home },
   { id: "vacancies", label: "Вакансии", icon: BriefcaseBusiness },
   { id: "attention", label: "Требует внимания", icon: Bell },
+  { id: "communications", label: "Общение", icon: MessageSquare },
+  { id: "profile", label: "Профиль", icon: UserRound },
   { id: "settings", label: "Настройки", icon: Settings },
 ];
 
@@ -89,6 +130,14 @@ const viewTitles: Record<View, { title: string; description: string }> = {
   attention: {
     title: "Требует внимания",
     description: "Только то, где нужно ваше решение",
+  },
+  communications: {
+    title: "Общение",
+    description: "Сообщения работодателей и приглашения",
+  },
+  profile: {
+    title: "Профиль",
+    description: "Резюме, подтверждённые сведения и частые ответы",
   },
   settings: {
     title: "Настройки",
@@ -114,10 +163,16 @@ const stateNames: Record<string, string> = {
   FAILED: "Ошибка",
   SENT: "Отправлено",
   CONFIRMED: "Подтверждено",
+  RECEIVED: "Получено",
+  PREPARING: "Готовится",
+  SCHEDULED: "Запланировано",
   DRAFT: "Черновик",
   INVALIDATED: "Устарело",
   APPLY_INTENT: "Начат отклик",
   APPLIED: "Отклик отправлен",
+  VIEWED: "Резюме просмотрено",
+  INVITED: "Приглашение",
+  REJECTED: "Отказ",
   STATE_CHANGED: "Состояние изменено",
 };
 
@@ -311,6 +366,49 @@ export default function App() {
     [refresh],
   );
 
+  const applyDirectionSettings = useCallback(
+    (direction: DirectionSummary) => {
+      setWorkspace((current) =>
+        current
+          ? {
+              ...current,
+              dashboard: {
+                ...current.dashboard,
+                directions: current.dashboard.directions.map((item) =>
+                  item.id === direction.id ? direction : item,
+                ),
+              },
+            }
+          : current,
+      );
+      void refresh(false);
+    },
+    [refresh],
+  );
+
+  const applyProfile = useCallback((profile: Profile) => {
+    setWorkspace((current) => (current ? { ...current, profile } : current));
+  }, []);
+
+  const reconcileUnknown = useCallback(
+    async (taskId: number, status: "APPLIED" | "NOT_FOUND") => {
+      try {
+        await reconcileApplication(taskId, status);
+        await refresh(false);
+        showToast({
+          kind: "success",
+          message:
+            status === "APPLIED"
+              ? "Отклик добавлен в историю отправленных"
+              : "Отсутствие отклика сохранено; автоматического повтора не будет",
+        });
+      } catch (reason) {
+        showToast({ kind: "error", message: readableError(reason) });
+      }
+    },
+    [refresh, showToast],
+  );
+
   const toggleWidget = useCallback(
     (widget: DashboardWidget) => {
       setWidgets((current) => {
@@ -348,6 +446,10 @@ export default function App() {
   );
 
   const formsCount = workspace?.forms.length ?? 0;
+  const profileAttentionCount = workspace
+    ? workspace.profile.facts.filter((fact) => fact.state === "PENDING").length +
+      workspace.profile.questions.filter((question) => question.state === "PENDING").length
+    : 0;
   const accountLabel = workspace?.dashboard.account_label ?? "Аккаунт hh.ru";
   const currentTitle = viewTitles[view];
 
@@ -372,6 +474,11 @@ export default function App() {
                 ? workspace?.queue.length
                 : item.id === "attention"
                   ? formsCount
+                  : item.id === "communications"
+                    ? (workspace?.communications.unread_messages ?? 0) +
+                      (workspace?.communications.unseen_invitations ?? 0)
+                  : item.id === "profile"
+                    ? profileAttentionCount
                   : undefined;
             return (
               <button
@@ -475,21 +582,49 @@ export default function App() {
               {view === "vacancies" && (
                 <VacanciesView
                   queue={workspace.queue}
+                  sent={workspace.sent}
                   rejected={workspace.rejected}
                   loading={vacancyLoading}
                   onOpenVacancy={openVacancy}
+                  onReconcile={reconcileUnknown}
                 />
               )}
               {view === "attention" && (
                 <AttentionView forms={workspace.forms} onToast={showToast} />
               )}
+              {view === "communications" && (
+                <CommunicationsView
+                  communications={workspace.communications}
+                  onChanged={(communications) =>
+                    setWorkspace((current) =>
+                      current ? { ...current, communications } : current,
+                    )
+                  }
+                  onToast={showToast}
+                />
+              )}
+              {view === "profile" && (
+                <ProfileView
+                  profile={workspace.profile}
+                  onProfileChanged={applyProfile}
+                  onToast={showToast}
+                />
+              )}
               {view === "settings" && (
                 <SettingsView
                   dashboard={workspace.dashboard}
+                  directionOptions={workspace.directionOptions}
+                  notificationSettings={workspace.communications.notification_settings}
                   widgets={widgets}
                   onToggleWidget={toggleWidget}
                   onResetWidgets={resetWidgets}
                   onSettingsSaved={applyQueueSettings}
+                  onDirectionSaved={applyDirectionSettings}
+                  onNotificationsSaved={(communications) =>
+                    setWorkspace((current) =>
+                      current ? { ...current, communications } : current,
+                    )
+                  }
                   onToast={showToast}
                 />
               )}
@@ -650,6 +785,8 @@ function DashboardView({
         </div>
       </section>
 
+      <BackgroundStatusBar dashboard={dashboard} />
+
       {dashboard.incidents.length > 0 && (
         <section className="incident-list" aria-labelledby="incident-title">
           <div className="section-heading">
@@ -716,6 +853,47 @@ function DashboardView({
         </div>
       )}
     </div>
+  );
+}
+
+function BackgroundStatusBar({ dashboard }: { dashboard: Dashboard }) {
+  const background = dashboard.background;
+  const presentation = {
+    RUNNING: {
+      title: "Фоновые проверки работают",
+      description: background.next_messages_at
+        ? `Сообщения — ${formatDate(background.next_messages_at)}, статусы — ${formatDate(background.next_statuses_at)}`
+        : "Расписание создано и ожидает ближайшую проверку",
+      tone: "positive",
+    },
+    NOT_STARTED: {
+      title: "Фоновые проверки ещё не запущены",
+      description: "Они запустятся вместе с оконной программой Hugin",
+      tone: "muted",
+    },
+    NEEDS_ATTENTION: {
+      title: "Фоновым проверкам нужно внимание",
+      description: background.error ?? "Одна из проверок остановлена",
+      tone: "warning",
+    },
+    STOPPED: {
+      title: "Фоновые проверки не работают",
+      description: "Откройте оконную программу Hugin или обновите состояние",
+      tone: "danger",
+    },
+  }[background.state];
+
+  return (
+    <section className={`background-status ${presentation.tone}`} aria-label="Фоновые проверки">
+      <RefreshCw size={18} aria-hidden="true" />
+      <div>
+        <strong>{presentation.title}</strong>
+        <span>{presentation.description}</span>
+      </div>
+      {background.next_search_at && background.state === "RUNNING" && (
+        <small>Следующий поиск — {formatDate(background.next_search_at)}</small>
+      )}
+    </section>
   );
 }
 
@@ -940,19 +1118,25 @@ function DirectionsWidget({ dashboard }: { dashboard: Dashboard }) {
 
 function VacanciesView({
   queue,
+  sent,
   rejected,
   loading,
   onOpenVacancy,
+  onReconcile,
 }: {
   queue: QueueItem[];
+  sent: SentApplication[];
   rejected: RejectedVacancy[];
   loading: boolean;
   onOpenVacancy: (vacancyId: string) => Promise<void>;
+  onReconcile: (taskId: number, status: "APPLIED" | "NOT_FOUND") => Promise<void>;
 }) {
   const [tab, setTab] = useState<VacancyTab>("queue");
   const [search, setSearch] = useState("");
+  const [reconcilingTask, setReconcilingTask] = useState<number | null>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
   const queueTabRef = useRef<HTMLButtonElement>(null);
+  const sentTabRef = useRef<HTMLButtonElement>(null);
   const rejectedTabRef = useRef<HTMLButtonElement>(null);
   const normalizedSearch = search.trim().toLocaleLowerCase("ru-RU");
 
@@ -974,22 +1158,50 @@ function VacanciesView({
       ),
     [normalizedSearch, rejected],
   );
+  const filteredSent = useMemo(
+    () =>
+      sent.filter((item) =>
+        `${item.title} ${item.company} ${item.region} ${item.direction} ${item.resume_title}`
+          .toLocaleLowerCase("ru-RU")
+          .includes(normalizedSearch),
+      ),
+    [normalizedSearch, sent],
+  );
 
   function onTabKeyDown(event: ReactKeyboardEvent<HTMLButtonElement>): void {
     if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
     event.preventDefault();
+    const tabs: VacancyTab[] = ["queue", "sent", "rejected"];
+    const currentIndex = tabs.indexOf(tab);
     const nextTab =
       event.key === "Home"
-        ? "queue"
+        ? tabs[0]
         : event.key === "End"
-          ? "rejected"
-          : tab === "queue"
-            ? "rejected"
-            : "queue";
+          ? tabs[tabs.length - 1]
+          : event.key === "ArrowRight"
+            ? tabs[(currentIndex + 1) % tabs.length]
+            : tabs[(currentIndex - 1 + tabs.length) % tabs.length];
     setTab(nextTab);
-    window.requestAnimationFrame(() =>
-      (nextTab === "queue" ? queueTabRef : rejectedTabRef).current?.focus(),
-    );
+    const tabRefs: Record<VacancyTab, RefObject<HTMLButtonElement | null>> = {
+      queue: queueTabRef,
+      sent: sentTabRef,
+      rejected: rejectedTabRef,
+    };
+    window.requestAnimationFrame(() => tabRefs[nextTab].current?.focus());
+  }
+
+  async function reconcile(item: QueueItem, status: "APPLIED" | "NOT_FOUND"): Promise<void> {
+    const message =
+      status === "APPLIED"
+        ? `Подтвердить, что отклик на вакансию «${item.title}» есть в истории hh.ru?`
+        : `Подтвердить, что отклика на вакансию «${item.title}» нет в истории hh.ru? Автоматического повтора не будет.`;
+    if (!window.confirm(message)) return;
+    setReconcilingTask(item.task_id);
+    try {
+      await onReconcile(item.task_id, status);
+    } finally {
+      setReconcilingTask(null);
+    }
   }
 
   return (
@@ -1009,6 +1221,20 @@ function VacanciesView({
             onKeyDown={onTabKeyDown}
           >
             В очереди <span>{queue.length}</span>
+          </button>
+          <button
+            ref={sentTabRef}
+            id="sent-tab"
+            type="button"
+            role="tab"
+            aria-selected={tab === "sent"}
+            aria-controls="sent-panel"
+            tabIndex={tab === "sent" ? 0 : -1}
+            className={tab === "sent" ? "active" : undefined}
+            onClick={() => setTab("sent")}
+            onKeyDown={onTabKeyDown}
+          >
+            Отправлены <span>{sent.length}</span>
           </button>
           <button
             ref={rejectedTabRef}
@@ -1079,6 +1305,70 @@ function VacanciesView({
                     </span>
                     <small>{formatDate(item.scheduled_at)}</small>
                   </div>
+                  <div className="vacancy-actions">
+                    <button
+                      type="button"
+                      className="row-action"
+                      disabled={loading}
+                      onClick={() => void onOpenVacancy(item.vacancy_id)}
+                      aria-label={`Открыть вакансию «${item.title}»`}
+                    >
+                      Открыть
+                    </button>
+                    {item.state === "UNKNOWN_RESULT" && (
+                      <div className="reconciliation-actions">
+                        <button
+                          type="button"
+                          className="secondary-button"
+                          disabled={reconcilingTask === item.task_id}
+                          onClick={() => void reconcile(item, "APPLIED")}
+                        >
+                          Есть в истории
+                        </button>
+                        <button
+                          type="button"
+                          className="quiet-button"
+                          disabled={reconcilingTask === item.task_id}
+                          onClick={() => void reconcile(item, "NOT_FOUND")}
+                        >
+                          Не найден
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <SearchEmpty hasSearch={!!normalizedSearch} kind="queue" />
+          )}
+        </section>
+      ) : tab === "sent" ? (
+        <section
+          id="sent-panel"
+          role="tabpanel"
+          aria-labelledby="sent-tab"
+          className="vacancy-panel"
+        >
+          {filteredSent.length ? (
+            <ul className="vacancy-list">
+              {filteredSent.map((item) => (
+                <li className="vacancy-row" key={item.application_id}>
+                  <div className="vacancy-main">
+                    <strong>{item.title}</strong>
+                    <span>
+                      {item.company} · {item.region}
+                    </span>
+                    <small>
+                      {item.direction} · резюме «{item.resume_title}»
+                    </small>
+                  </div>
+                  <div className="vacancy-state">
+                    <span className={`status-pill ${stateTone(item.state)}`}>
+                      {stateNames[item.state] ?? "Состояние уточняется"}
+                    </span>
+                    <small>{formatDate(item.applied_at, true)}</small>
+                  </div>
                   <button
                     type="button"
                     className="row-action"
@@ -1092,7 +1382,7 @@ function VacanciesView({
               ))}
             </ul>
           ) : (
-            <SearchEmpty hasSearch={!!normalizedSearch} kind="queue" />
+            <SearchEmpty hasSearch={!!normalizedSearch} kind="sent" />
           )}
         </section>
       ) : (
@@ -1159,14 +1449,18 @@ function SearchEmpty({
           ? "Ничего не найдено"
           : kind === "queue"
             ? "Очередь пуста"
-            : "Отклонённых вакансий нет"
+            : kind === "sent"
+              ? "Отправленных откликов пока нет"
+              : "Отклонённых вакансий нет"
       }
       description={
         hasSearch
           ? "Попробуйте изменить запрос."
           : kind === "queue"
             ? "Новые подходящие вакансии появятся здесь."
-            : "Вакансии, которые не прошли правила отбора, появятся здесь."
+            : kind === "sent"
+              ? "Подтверждённые отклики и их дальнейшие состояния появятся здесь."
+              : "Вакансии, которые не прошли правила отбора, появятся здесь."
       }
     />
   );
@@ -1331,19 +1625,899 @@ function AttentionView({
   );
 }
 
+function CommunicationsView({
+  communications,
+  onChanged,
+  onToast,
+}: {
+  communications: Communications;
+  onChanged: (communications: Communications) => void;
+  onToast: (toast: Toast) => void;
+}) {
+  const [tab, setTab] = useState<"messages" | "invitations">("messages");
+  const [selectedApplicationId, setSelectedApplicationId] = useState<number | null>(
+    communications.conversations[0]?.application_id ?? null,
+  );
+  const [draft, setDraft] = useState("");
+  const [busy, setBusy] = useState(false);
+  const selected =
+    communications.conversations.find(
+      (conversation) => conversation.application_id === selectedApplicationId,
+    ) ?? communications.conversations[0];
+  const reply = selected ? latestEditableReply(selected) : undefined;
+
+  useEffect(() => {
+    if (!selectedApplicationId && communications.conversations[0]) {
+      setSelectedApplicationId(communications.conversations[0].application_id);
+    }
+  }, [communications.conversations, selectedApplicationId]);
+
+  useEffect(() => {
+    setDraft(reply?.body ?? "");
+  }, [reply?.body, reply?.id, selectedApplicationId]);
+
+  async function selectConversation(conversation: Conversation): Promise<void> {
+    setSelectedApplicationId(conversation.application_id);
+    if (!conversation.unread_count) return;
+    try {
+      onChanged(await markConversationRead(conversation.application_id));
+    } catch (reason) {
+      onToast({ kind: "error", message: readableError(reason) });
+    }
+  }
+
+  async function saveDraft(): Promise<void> {
+    if (!selected || !draft.trim() || busy) return;
+    setBusy(true);
+    try {
+      onChanged(await saveReplyDraft(selected.application_id, draft.trim()));
+      onToast({ kind: "success", message: "Черновик ответа сохранён" });
+    } catch (reason) {
+      onToast({ kind: "error", message: readableError(reason) });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function confirmDraft(): Promise<void> {
+    if (!reply?.content_hash || busy) return;
+    if (
+      !window.confirm(
+        "Подтвердить именно этот текст ответа? После изменения текста подтверждение будет снято.",
+      )
+    ) {
+      return;
+    }
+    setBusy(true);
+    try {
+      onChanged(
+        await confirmReply(reply.id, reply.content_hash, reply.content_version),
+      );
+      onToast({
+        kind: "success",
+        message: "Текст подтверждён. Автоматическая отправка не выполнялась.",
+      });
+    } catch (reason) {
+      onToast({ kind: "error", message: readableError(reason) });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function seeInvitation(invitationId: number): Promise<void> {
+    try {
+      onChanged(await markInvitationSeen(invitationId));
+    } catch (reason) {
+      onToast({ kind: "error", message: readableError(reason) });
+    }
+  }
+
+  async function openCommunicationUrl(url: string): Promise<void> {
+    try {
+      if (window.pywebview?.api) {
+        const result = await window.pywebview.api.open_url(url);
+        if (result.status !== "ok" && result.status !== "READY") {
+          throw new Error(result.message);
+        }
+      } else {
+        window.open(url, "_blank", "noopener,noreferrer");
+      }
+    } catch (reason) {
+      onToast({ kind: "error", message: readableError(reason) });
+    }
+  }
+
+  async function openInvitation(
+    invitationId: number,
+    bookingUrl: string | null,
+    sourceUrl: string,
+  ): Promise<void> {
+    if (!bookingUrl || !window.pywebview?.api) {
+      await openCommunicationUrl(bookingUrl ?? sourceUrl);
+      return;
+    }
+    try {
+      const result = await window.pywebview.api.open_invitation(invitationId);
+      if (result.status !== "ok" && result.status !== "READY") {
+        throw new Error(result.message);
+      }
+    } catch (reason) {
+      onToast({ kind: "error", message: readableError(reason) });
+    }
+  }
+
+  return (
+    <div className="page-stack">
+      <div className="list-toolbar">
+        <div className="tabs" role="tablist" aria-label="Разделы общения">
+          <button
+            id="messages-tab"
+            type="button"
+            role="tab"
+            aria-selected={tab === "messages"}
+            aria-controls="messages-panel"
+            className={tab === "messages" ? "active" : undefined}
+            onClick={() => setTab("messages")}
+          >
+            Сообщения <span>{communications.unread_messages}</span>
+          </button>
+          <button
+            id="invitations-tab"
+            type="button"
+            role="tab"
+            aria-selected={tab === "invitations"}
+            aria-controls="invitations-panel"
+            className={tab === "invitations" ? "active" : undefined}
+            onClick={() => setTab("invitations")}
+          >
+            Приглашения <span>{communications.unseen_invitations}</span>
+          </button>
+        </div>
+        <p className="communications-note">
+          Подтверждение сохраняет выбранный текст, но ничего не отправляет.
+        </p>
+      </div>
+
+      {tab === "messages" ? (
+        <section
+          id="messages-panel"
+          role="tabpanel"
+          aria-labelledby="messages-tab"
+          className="communications-layout"
+        >
+          {communications.conversations.length ? (
+            <>
+              <ul className="conversation-list" aria-label="Переписки">
+                {communications.conversations.map((conversation) => {
+                  const latest = conversation.messages.at(-1);
+                  return (
+                    <li key={conversation.application_id}>
+                      <button
+                        type="button"
+                        className={
+                          selected?.application_id === conversation.application_id
+                            ? "conversation-button active"
+                            : "conversation-button"
+                        }
+                        onClick={() => void selectConversation(conversation)}
+                      >
+                        <span className="conversation-heading">
+                          <strong>{conversation.company}</strong>
+                          {conversation.unread_count > 0 && (
+                            <span className="nav-badge">{conversation.unread_count}</span>
+                          )}
+                        </span>
+                        <span>{conversation.vacancy_title}</span>
+                        <small>{latest?.body ?? "Сообщений пока нет"}</small>
+                      </button>
+                    </li>
+                  );
+                })}
+              </ul>
+              {selected && (
+                <article className="conversation-panel" aria-label="Переписка">
+                  <header>
+                    <div>
+                      <span className="eyebrow">{selected.company}</span>
+                      <h2>{selected.vacancy_title}</h2>
+                    </div>
+                    <div className="conversation-header-actions">
+                      {selected.needs_reply && (
+                        <span className="status-pill warning">Нужен ответ</span>
+                      )}
+                      <button
+                        type="button"
+                        className="secondary-button"
+                        onClick={() => void openCommunicationUrl(selected.source_url)}
+                      >
+                        <ExternalLink size={16} aria-hidden="true" />
+                        Открыть на hh.ru
+                      </button>
+                    </div>
+                  </header>
+                  <ol className="message-thread">
+                    {selected.messages.map((message) => (
+                      <li
+                        className={
+                          message.direction === "INCOMING"
+                            ? "message-bubble incoming"
+                            : "message-bubble outgoing"
+                        }
+                        key={message.id}
+                      >
+                        <span>
+                          {message.direction === "INCOMING" ? "Работодатель" : "Вы"}
+                        </span>
+                        <p>{message.body}</p>
+                        <small>
+                          {formatDate(message.occurred_at, true)}
+                          {message.direction === "OUTGOING"
+                            ? ` · ${stateNames[message.state] ?? message.state}`
+                            : ""}
+                        </small>
+                      </li>
+                    ))}
+                  </ol>
+                  <div className="reply-editor">
+                    <label htmlFor="reply-draft">Черновик ответа</label>
+                    <textarea
+                      id="reply-draft"
+                      value={draft}
+                      rows={6}
+                      maxLength={5000}
+                      placeholder="Введите ответ работодателю"
+                      onChange={(event) => setDraft(event.target.value)}
+                    />
+                    <div className="reply-actions">
+                      <span>
+                        {reply?.state === "CONFIRMED"
+                          ? "Этот текст подтверждён, но не отправлен."
+                          : "Сначала сохраните текст, затем подтвердите его."}
+                      </span>
+                      <button
+                        type="button"
+                        className="secondary-button"
+                        disabled={busy || !draft.trim() || draft.trim() === reply?.body}
+                        onClick={() => void saveDraft()}
+                      >
+                        Сохранить
+                      </button>
+                      <button
+                        type="button"
+                        className="primary-button"
+                        disabled={
+                          busy ||
+                          !reply?.content_hash ||
+                          draft.trim() !== reply.body ||
+                          reply.state === "CONFIRMED"
+                        }
+                        onClick={() => void confirmDraft()}
+                      >
+                        Подтвердить текст
+                      </button>
+                    </div>
+                  </div>
+                </article>
+              )}
+            </>
+          ) : (
+            <EmptyState
+              icon={<MessageSquare size={26} />}
+              title="Сообщений пока нет"
+              description="Новые сообщения работодателей появятся здесь."
+            />
+          )}
+        </section>
+      ) : (
+        <section
+          id="invitations-panel"
+          role="tabpanel"
+          aria-labelledby="invitations-tab"
+          className="invitation-list"
+        >
+          {communications.invitations.length ? (
+            communications.invitations.map((invitation) => (
+              <article
+                className={invitation.seen_at ? "invitation-card" : "invitation-card unseen"}
+                key={invitation.id}
+              >
+                <div>
+                  <span className="eyebrow">{invitation.company}</span>
+                  <h2>{invitation.title}</h2>
+                  <p>{invitation.vacancy_title}</p>
+                  {invitation.details && <div>{invitation.details}</div>}
+                  {invitation.interview_at && (
+                    <strong>
+                      Встреча: {formatDate(invitation.interview_at, true)}
+                    </strong>
+                  )}
+                </div>
+                <div className="invitation-actions">
+                  {!invitation.seen_at && (
+                    <button
+                      type="button"
+                      className="secondary-button"
+                      onClick={() => void seeInvitation(invitation.id)}
+                    >
+                      Отметить просмотренным
+                    </button>
+                  )}
+                  <span className={`status-pill ${stateTone(invitation.state)}`}>
+                    {stateNames[invitation.state] ?? "Получено"}
+                  </span>
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    onClick={() =>
+                      void openInvitation(
+                        invitation.id,
+                        invitation.booking_url,
+                        invitation.source_url,
+                      )
+                    }
+                  >
+                    <ExternalLink size={16} aria-hidden="true" />
+                    {invitation.booking_url ? "Открыть запись" : "Открыть на hh.ru"}
+                  </button>
+                </div>
+              </article>
+            ))
+          ) : (
+            <EmptyState
+              icon={<Bell size={26} />}
+              title="Приглашений пока нет"
+              description="Приглашения на звонок или собеседование появятся здесь."
+            />
+          )}
+        </section>
+      )}
+    </div>
+  );
+}
+
+function latestEditableReply(conversation: Conversation) {
+  return [...conversation.messages]
+    .reverse()
+    .find(
+      (message) =>
+        message.direction === "OUTGOING" &&
+        ["DRAFT", "REVIEW_REQUIRED", "CONFIRMED"].includes(message.state),
+    );
+}
+
+const profileCategoryNames: Record<string, string> = {
+  full_name: "Имя",
+  desired_position: "Желаемая должность",
+  location: "Место проживания",
+  citizenship: "Гражданство",
+  employment: "Занятость",
+  work_format: "Формат работы",
+  mobility: "Переезд",
+  email: "Электронная почта",
+  phone: "Телефон",
+  telegram: "Telegram",
+  github: "GitHub",
+  work_experience: "Опыт работы",
+  education: "Образование",
+  courses: "Курсы",
+  skills: "Навыки",
+  about: "О себе",
+  languages: "Языки",
+  salary_expectation: "Зарплата",
+  available_from: "Дата выхода",
+  work_schedule: "График",
+  relocation: "Переезд",
+  business_trips: "Командировки",
+  english_level: "Английский язык",
+  work_authorization: "Разрешение на работу",
+  portfolio: "Портфолио",
+  job_search_reason: "Причина поиска",
+  test_assignment: "Проверочное задание",
+};
+
+function profileCategoryName(category: string): string {
+  return profileCategoryNames[category] ?? category.replaceAll("_", " ");
+}
+
+function formatFileSize(value: number | null): string {
+  if (value === null) return "Размер не указан";
+  if (value < 1024 * 1024) return `${Math.max(1, Math.round(value / 1024))} КБ`;
+  return `${(value / (1024 * 1024)).toFixed(1).replace(".", ",")} МБ`;
+}
+
+function ProfileView({
+  profile,
+  onProfileChanged,
+  onToast,
+}: {
+  profile: Profile;
+  onProfileChanged: (profile: Profile) => void;
+  onToast: (toast: Toast) => void;
+}) {
+  const inputRef = useRef<HTMLInputElement>(null);
+  const [preview, setPreview] = useState<ResumePreview | null>(null);
+  const [previewing, setPreviewing] = useState(false);
+  const [importing, setImporting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const pendingFacts = profile.facts.filter((fact) => fact.state === "PENDING");
+  const confirmedFacts = profile.facts.filter((fact) => fact.state === "CONFIRMED");
+  const rejectedFacts = profile.facts.filter((fact) => fact.state === "REJECTED");
+  const pendingQuestions = profile.questions.filter((question) => question.state === "PENDING");
+  const dismissedQuestions = profile.questions.filter(
+    (question) => question.state === "DISMISSED",
+  );
+
+  async function chooseResume(file: File | undefined): Promise<void> {
+    if (!file || previewing) return;
+    setPreviewing(true);
+    setError(null);
+    setPreview(null);
+    try {
+      setPreview(await previewResume(file));
+    } catch (reason) {
+      setError(readableError(reason));
+    } finally {
+      setPreviewing(false);
+      if (inputRef.current) inputRef.current.value = "";
+    }
+  }
+
+  async function confirmImport(): Promise<void> {
+    if (!preview || importing) return;
+    setImporting(true);
+    setError(null);
+    try {
+      const saved = await importResume(preview.token);
+      onProfileChanged(saved);
+      setPreview(null);
+      onToast({ kind: "success", message: "Резюме импортировано и ожидает проверки фактов" });
+    } catch (reason) {
+      setError(readableError(reason));
+    } finally {
+      setImporting(false);
+    }
+  }
+
+  return (
+    <div className="profile-layout">
+      <section className="profile-card resume-card" aria-labelledby="active-resume-title">
+        <div className="section-heading">
+          <div>
+            <span className="eyebrow">Основные данные</span>
+            <h2 id="active-resume-title">Активное резюме</h2>
+            <p>Исходный файл хранится только на этом компьютере.</p>
+          </div>
+          <button
+            type="button"
+            className="primary-button"
+            disabled={previewing || importing}
+            onClick={() => inputRef.current?.click()}
+          >
+            <Upload size={18} aria-hidden="true" />
+            {previewing
+              ? "Проверяем…"
+              : profile.active_resume
+                ? "Заменить файл"
+                : "Выбрать файл"}
+          </button>
+          <input
+            ref={inputRef}
+            className="visually-hidden"
+            type="file"
+            accept=".pdf,.docx,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            onChange={(event) => void chooseResume(event.target.files?.[0])}
+          />
+        </div>
+
+        {profile.active_resume ? (
+          <div className="resume-summary">
+            <span className="resume-file-icon" aria-hidden="true">
+              {profile.active_resume.source_type ?? "CV"}
+            </span>
+            <div>
+              <strong>{profile.active_resume.title}</strong>
+              <span>
+                {profile.active_resume.source_original_name ?? "Файл ещё не импортирован"}
+              </span>
+              <small>
+                {formatFileSize(profile.active_resume.source_size_bytes)}
+                {profile.active_resume.source_page_count
+                  ? ` · ${plural(profile.active_resume.source_page_count, "страница", "страницы", "страниц")}`
+                  : ""}
+                {profile.active_resume.imported_at
+                  ? ` · импортировано ${formatDate(profile.active_resume.imported_at, true)}`
+                  : ""}
+              </small>
+            </div>
+          </div>
+        ) : (
+          <EmptyState
+            icon={<UserRound size={26} />}
+            title="Резюме ещё не импортировано"
+            description="Выберите PDF или DOCX. Сначала программа покажет, что именно она нашла."
+          />
+        )}
+
+        {preview && (
+          <div className="resume-preview" role="region" aria-label="Проверка нового резюме">
+            <div className="resume-preview-heading">
+              <div>
+                <span className="eyebrow">Предварительная проверка</span>
+                <h3>{preview.title}</h3>
+                <p>
+                  {preview.original_name} · {preview.source_type}
+                  {preview.page_count
+                    ? ` · ${plural(preview.page_count, "страница", "страницы", "страниц")}`
+                    : ""}
+                </p>
+              </div>
+              <span className="status-pill positive">Файл читается</span>
+            </div>
+            <div className="preview-counts">
+              <span>{plural(preview.facts.length, "сведение", "сведения", "сведений")}</span>
+              <span>
+                {plural(preview.questions.length, "вопрос", "вопроса", "вопросов")} без ответа
+              </span>
+            </div>
+            <details className="preview-details">
+              <summary>
+                <span>Посмотреть найденные сведения</span>
+                <ChevronDown size={18} aria-hidden="true" />
+              </summary>
+              <ul>
+                {preview.facts.map((fact, index) => (
+                  <li key={`${fact.category}-${index}`}>
+                    <strong>{profileCategoryName(fact.category)}</strong>
+                    <span>{fact.content}</span>
+                  </li>
+                ))}
+              </ul>
+            </details>
+            {profile.active_resume && (
+              <p className="settings-warning">
+                <AlertTriangle size={18} aria-hidden="true" />
+                Ранее подтверждённые сведения сохранятся. После импорта проверьте список и
+                отклоните устаревшие данные вручную.
+              </p>
+            )}
+            <div className="settings-form-actions">
+              <button
+                type="button"
+                className="primary-button"
+                disabled={importing}
+                onClick={() => void confirmImport()}
+              >
+                {importing ? "Импортируем…" : "Импортировать и сделать активным"}
+              </button>
+              <button
+                type="button"
+                className="secondary-button"
+                disabled={importing}
+                onClick={() => setPreview(null)}
+              >
+                Отменить
+              </button>
+            </div>
+          </div>
+        )}
+        {error && (
+          <p className="settings-submit-error" role="alert">
+            {error}
+          </p>
+        )}
+      </section>
+
+      <section className="profile-card wide" aria-labelledby="facts-title">
+        <div className="section-heading">
+          <div>
+            <span className="eyebrow">Проверка</span>
+            <h2 id="facts-title">Сведения из резюме</h2>
+            <p>Непроверенные сведения не используются в письмах, анкетах и сообщениях.</p>
+          </div>
+          <span className={pendingFacts.length ? "count-badge warning" : "count-badge"}>
+            {plural(pendingFacts.length, "ожидает", "ожидают", "ожидают")}
+          </span>
+        </div>
+        {pendingFacts.length ? (
+          <div className="profile-fact-list">
+            {pendingFacts.map((fact) => (
+              <ProfileFactReview
+                key={fact.id}
+                fact={fact}
+                onProfileChanged={onProfileChanged}
+                onToast={onToast}
+              />
+            ))}
+          </div>
+        ) : (
+          <div className="calm-state">Все новые сведения проверены</div>
+        )}
+        {(confirmedFacts.length > 0 || rejectedFacts.length > 0) && (
+          <details className="profile-history-details">
+            <summary>
+              <span>
+                Проверено: {confirmedFacts.length} · отклонено: {rejectedFacts.length}
+              </span>
+              <ChevronDown size={18} aria-hidden="true" />
+            </summary>
+            <div className="profile-reviewed-grid">
+              {[...confirmedFacts, ...rejectedFacts].map((fact) => (
+                <article key={fact.id}>
+                  <div>
+                    <strong>{profileCategoryName(fact.category)}</strong>
+                    <span
+                      className={`status-pill ${
+                        fact.state === "CONFIRMED" ? "positive" : "muted"
+                      }`}
+                    >
+                      {fact.state === "CONFIRMED" ? "Подтверждено" : "Отклонено"}
+                    </span>
+                  </div>
+                  <p>{fact.content}</p>
+                </article>
+              ))}
+            </div>
+          </details>
+        )}
+      </section>
+
+      <section className="profile-card wide" aria-labelledby="answers-title">
+        <div className="section-heading">
+          <div>
+            <span className="eyebrow">Частые вопросы</span>
+            <h2 id="answers-title">Сохранённые ответы</h2>
+            <p>Ответ применяется только после вашего подтверждения.</p>
+          </div>
+          <span className={pendingQuestions.length ? "count-badge warning" : "count-badge"}>
+            {plural(pendingQuestions.length, "без ответа", "без ответа", "без ответа")}
+          </span>
+        </div>
+        {pendingQuestions.length > 0 && (
+          <div className="profile-question-list">
+            {pendingQuestions.map((question) => (
+              <ProfileQuestionEditor
+                key={question.key}
+                question={question}
+                onProfileChanged={onProfileChanged}
+                onToast={onToast}
+              />
+            ))}
+          </div>
+        )}
+        {profile.answers.length > 0 && (
+          <div className="answer-bank">
+            {profile.answers.map((answer) => (
+              <article key={answer.key}>
+                <strong>{answer.question}</strong>
+                <p>{answer.answer}</p>
+              </article>
+            ))}
+          </div>
+        )}
+        {!pendingQuestions.length && !profile.answers.length && (
+          <div className="calm-state">Частых вопросов пока нет</div>
+        )}
+        {dismissedQuestions.length > 0 && (
+          <p className="settings-note">
+            Отложено без ответа: {dismissedQuestions.length}. Они не ограничивают поиск и не
+            подставляются в анкеты.
+          </p>
+        )}
+      </section>
+    </div>
+  );
+}
+
+function ProfileFactReview({
+  fact,
+  onProfileChanged,
+  onToast,
+}: {
+  fact: ProfileFact;
+  onProfileChanged: (profile: Profile) => void;
+  onToast: (toast: Toast) => void;
+}) {
+  const [allowLetters, setAllowLetters] = useState(false);
+  const [allowForms, setAllowForms] = useState(false);
+  const [allowMessages, setAllowMessages] = useState(false);
+  const [busy, setBusy] = useState<"confirm" | "reject" | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  async function review(action: "confirm" | "reject"): Promise<void> {
+    if (busy) return;
+    setBusy(action);
+    setError(null);
+    try {
+      const saved = await reviewProfileFact(
+        fact.id,
+        action,
+        action === "confirm"
+          ? {
+              allow_in_letters: allowLetters,
+              allow_in_forms: allowForms,
+              allow_in_messages: allowMessages,
+            }
+          : undefined,
+      );
+      onProfileChanged(saved);
+      onToast({
+        kind: "success",
+        message: action === "confirm" ? "Сведение подтверждено" : "Сведение отклонено",
+      });
+    } catch (reason) {
+      setError(readableError(reason));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  return (
+    <article className="profile-fact-card">
+      <div className="profile-fact-heading">
+        <span className="eyebrow">{profileCategoryName(fact.category)}</span>
+        <span className="status-pill warning">Нужно проверить</span>
+      </div>
+      <p>{fact.content}</p>
+      <fieldset>
+        <legend>Где можно использовать после подтверждения</legend>
+        <div>
+          <label>
+            <input
+              type="checkbox"
+              checked={allowLetters}
+              onChange={(event) => setAllowLetters(event.target.checked)}
+            />
+            <span>В письмах</span>
+          </label>
+          <label>
+            <input
+              type="checkbox"
+              checked={allowForms}
+              onChange={(event) => setAllowForms(event.target.checked)}
+            />
+            <span>В анкетах</span>
+          </label>
+          <label>
+            <input
+              type="checkbox"
+              checked={allowMessages}
+              onChange={(event) => setAllowMessages(event.target.checked)}
+            />
+            <span>В сообщениях</span>
+          </label>
+        </div>
+      </fieldset>
+      {error && (
+        <p className="settings-submit-error" role="alert">
+          {error}
+        </p>
+      )}
+      <div className="profile-review-actions">
+        <button
+          type="button"
+          className="primary-button"
+          disabled={busy !== null}
+          onClick={() => void review("confirm")}
+        >
+          {busy === "confirm" ? "Сохраняем…" : "Подтвердить"}
+        </button>
+        <button
+          type="button"
+          className="secondary-button"
+          disabled={busy !== null}
+          onClick={() => void review("reject")}
+        >
+          {busy === "reject" ? "Отклоняем…" : "Отклонить"}
+        </button>
+      </div>
+    </article>
+  );
+}
+
+function ProfileQuestionEditor({
+  question,
+  onProfileChanged,
+  onToast,
+}: {
+  question: ProfileQuestion;
+  onProfileChanged: (profile: Profile) => void;
+  onToast: (toast: Toast) => void;
+}) {
+  const [answer, setAnswer] = useState(question.answer ?? "");
+  const [busy, setBusy] = useState<"save" | "dismiss" | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  async function save(): Promise<void> {
+    if (busy) return;
+    if (!answer.trim()) {
+      setError("Введите ответ или отложите вопрос");
+      return;
+    }
+    setBusy("save");
+    setError(null);
+    try {
+      onProfileChanged(await saveProfileAnswer(question.key, answer));
+      onToast({ kind: "success", message: "Ответ сохранён" });
+    } catch (reason) {
+      setError(readableError(reason));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function dismiss(): Promise<void> {
+    if (busy) return;
+    setBusy("dismiss");
+    setError(null);
+    try {
+      onProfileChanged(await dismissProfileQuestion(question.key));
+      onToast({ kind: "success", message: "Вопрос отложен" });
+    } catch (reason) {
+      setError(readableError(reason));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  return (
+    <article className="profile-question-card">
+      <label>
+        <strong>{question.question}</strong>
+        <textarea
+          rows={3}
+          value={answer}
+          placeholder="Введите подтверждённый ответ"
+          onChange={(event) => setAnswer(event.target.value)}
+        />
+      </label>
+      {error && (
+        <p className="settings-submit-error" role="alert">
+          {error}
+        </p>
+      )}
+      <div className="profile-review-actions">
+        <button
+          type="button"
+          className="primary-button"
+          disabled={busy !== null}
+          onClick={() => void save()}
+        >
+          {busy === "save" ? "Сохраняем…" : "Сохранить ответ"}
+        </button>
+        <button
+          type="button"
+          className="secondary-button"
+          disabled={busy !== null}
+          onClick={() => void dismiss()}
+        >
+          {busy === "dismiss" ? "Откладываем…" : "Отложить"}
+        </button>
+      </div>
+    </article>
+  );
+}
+
 function SettingsView({
   dashboard,
+  directionOptions,
+  notificationSettings,
   widgets,
   onToggleWidget,
   onResetWidgets,
   onSettingsSaved,
+  onDirectionSaved,
+  onNotificationsSaved,
   onToast,
 }: {
   dashboard: Dashboard;
+  directionOptions: DirectionOptions;
+  notificationSettings: NotificationSettings;
   widgets: DashboardWidget[];
   onToggleWidget: (widget: DashboardWidget) => void;
   onResetWidgets: () => void;
   onSettingsSaved: (settings: QueueSettings) => void;
+  onDirectionSaved: (direction: DirectionSummary) => void;
+  onNotificationsSaved: (communications: Communications) => void;
   onToast: (toast: Toast) => void;
 }) {
   return (
@@ -1386,24 +2560,579 @@ function SettingsView({
             <p>По каким направлениям сейчас подбираются вакансии.</p>
           </div>
         </div>
-        <ul className="settings-directions">
+        <div className="settings-directions">
           {dashboard.directions.map((direction) => (
-            <li key={direction.id}>
-              <div>
-                <strong>{direction.name}</strong>
-                {direction.description && <span>{direction.description}</span>}
-                <span>
-                  {plural(direction.queued, "вакансия", "вакансии", "вакансий")} в очереди
-                </span>
-              </div>
-              <span className={`status-pill ${direction.is_active ? "positive" : "muted"}`}>
-                {direction.is_active ? "Включено" : "Выключено"}
-              </span>
-            </li>
+            <DirectionSettingsCard
+              key={direction.id}
+              direction={direction}
+              availableRegions={directionOptions.regions}
+              onSaved={onDirectionSaved}
+              onToast={onToast}
+            />
           ))}
-        </ul>
+        </div>
+      </section>
+
+      <section className="settings-card wide" aria-labelledby="notifications-title">
+        <div className="section-heading">
+          <div>
+            <span className="eyebrow">Важные события</span>
+            <h2 id="notifications-title">Уведомления</h2>
+            <p>Выберите, о чём программа должна сообщать на этом компьютере.</p>
+          </div>
+        </div>
+        <NotificationSettingsForm
+          settings={notificationSettings}
+          onSaved={onNotificationsSaved}
+          onToast={onToast}
+        />
       </section>
     </div>
+  );
+}
+
+const notificationEventOptions = [
+  {
+    id: "NEW_MESSAGE",
+    title: "Новое сообщение",
+    description: "Работодатель написал по отклику.",
+  },
+  {
+    id: "INVITATION",
+    title: "Приглашение",
+    description: "Появилось приглашение на звонок или собеседование.",
+  },
+  {
+    id: "REPLY_REQUIRED",
+    title: "Нужен ответ",
+    description: "Переписка ждёт вашего решения.",
+  },
+  {
+    id: "FORM_REQUIRED",
+    title: "Нужно заполнить анкету",
+    description: "Без ваших данных отклик нельзя продолжить.",
+  },
+  {
+    id: "AUTH_REQUIRED",
+    title: "Нужно войти в hh.ru",
+    description: "Поиск остановлен до входа или проверки.",
+  },
+  {
+    id: "ACCOUNT_WARNING",
+    title: "Предупреждение аккаунта",
+    description: "hh.ru ограничил действие или показал важное предупреждение.",
+  },
+  {
+    id: "UNKNOWN_RESULT",
+    title: "Результат не подтверждён",
+    description: "Нужно сверить действие с историей на hh.ru.",
+  },
+  {
+    id: "CRITICAL_ERROR",
+    title: "Критическая ошибка",
+    description: "Программа не может безопасно продолжить работу.",
+  },
+  {
+    id: "DAILY_SUMMARY",
+    title: "Итоги дня",
+    description: "Краткая сводка по поиску и откликам.",
+  },
+] as const;
+
+function windowsEvents(settings: NotificationSettings): string[] {
+  return notificationEventOptions
+    .filter((event) => settings.routing[event.id]?.includes("WINDOWS"))
+    .map((event) => event.id);
+}
+
+function NotificationSettingsForm({
+  settings,
+  onSaved,
+  onToast,
+}: {
+  settings: NotificationSettings;
+  onSaved: (communications: Communications) => void;
+  onToast: (toast: Toast) => void;
+}) {
+  const initialEvents = windowsEvents(settings);
+  const [baselineEnabled, setBaselineEnabled] = useState(settings.windows_enabled);
+  const [baselineEvents, setBaselineEvents] = useState(initialEvents);
+  const [enabled, setEnabled] = useState(settings.windows_enabled);
+  const [events, setEvents] = useState(initialEvents);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const dirty =
+    enabled !== baselineEnabled ||
+    events.join("|") !== baselineEvents.join("|");
+
+  useEffect(() => {
+    if (dirty || saving) return;
+    const incoming = windowsEvents(settings);
+    setBaselineEnabled(settings.windows_enabled);
+    setBaselineEvents(incoming);
+    setEnabled(settings.windows_enabled);
+    setEvents(incoming);
+  }, [dirty, saving, settings]);
+
+  function toggleEvent(eventId: string): void {
+    setEvents((current) =>
+      current.includes(eventId)
+        ? current.filter((value) => value !== eventId)
+        : notificationEventOptions
+            .map((option) => option.id)
+            .filter((value) => value === eventId || current.includes(value)),
+    );
+    setError(null);
+  }
+
+  async function save(): Promise<void> {
+    if (saving || !dirty) return;
+    setSaving(true);
+    setError(null);
+    try {
+      const updated = await updateNotificationSettings(enabled, events);
+      const savedSettings = updated.notification_settings;
+      const savedEvents = windowsEvents(savedSettings);
+      setBaselineEnabled(savedSettings.windows_enabled);
+      setBaselineEvents(savedEvents);
+      setEnabled(savedSettings.windows_enabled);
+      setEvents(savedEvents);
+      onSaved(updated);
+      onToast({ kind: "success", message: "Уведомления сохранены" });
+    } catch (reason) {
+      setError(readableError(reason));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className="notification-settings-form">
+      <label className="notification-master">
+        <span className="check-control">
+          <input
+            type="checkbox"
+            checked={enabled}
+            onChange={(event) => {
+              setEnabled(event.target.checked);
+              setError(null);
+            }}
+          />
+          <span aria-hidden="true" />
+        </span>
+        <span>
+          <strong>Показывать уведомления Windows</strong>
+          <small>Общий выключатель для выбранных событий.</small>
+        </span>
+      </label>
+
+      <div className="notification-event-grid">
+        {notificationEventOptions.map((event) => (
+          <label
+            className={`notification-event-option ${enabled ? "" : "disabled"}`}
+            key={event.id}
+          >
+            <input
+              type="checkbox"
+              checked={events.includes(event.id)}
+              disabled={!enabled}
+              onChange={() => toggleEvent(event.id)}
+            />
+            <span>
+              <strong>{event.title}</strong>
+              <small>{event.description}</small>
+            </span>
+          </label>
+        ))}
+      </div>
+
+      <div className="notification-settings-footer">
+        <span className="notification-unavailable">
+          {settings.telegram_enabled || settings.email_enabled
+            ? [
+                settings.telegram_enabled ? "Telegram включён" : null,
+                settings.email_enabled ? "электронная почта включена" : null,
+              ]
+                .filter(Boolean)
+                .join(" · ")
+            : "Telegram и электронная почта пока не подключены."}
+        </span>
+        {error && (
+          <span className="settings-submit-error" role="alert">
+            {error}
+          </span>
+        )}
+        <button
+          type="button"
+          className="primary-button"
+          disabled={saving || !dirty}
+          onClick={() => void save()}
+        >
+          {saving ? "Сохраняем…" : "Сохранить уведомления"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+type DirectionDraft = {
+  is_active: boolean;
+  queries: string;
+  regionAreas: string[];
+  work_formats: WorkFormat[];
+  employment_forms: EmploymentForm[];
+  minimum_salary: string;
+  desired_salary: string;
+  remote_all_russia: boolean;
+  schedule_minutes: string;
+};
+
+const workFormatNames: Record<WorkFormat, string> = {
+  REMOTE: "Удалённо",
+  ON_SITE: "В офисе",
+  HYBRID: "Гибрид",
+};
+
+const employmentFormNames: Record<EmploymentForm, string> = {
+  FULL: "Полная занятость",
+  PART: "Частичная занятость",
+  PROJECT: "Проектная работа",
+  FLY_IN_FLY_OUT: "Вахта",
+};
+
+function directionDraft(direction: DirectionSummary): DirectionDraft {
+  return {
+    is_active: direction.is_active,
+    queries: direction.queries.join("\n"),
+    regionAreas: direction.regions.map((region) => region.area),
+    work_formats: [...direction.work_formats],
+    employment_forms: [...direction.employment_forms],
+    minimum_salary: direction.minimum_salary?.toString() ?? "",
+    desired_salary: direction.desired_salary?.toString() ?? "",
+    remote_all_russia: direction.remote_all_russia,
+    schedule_minutes: direction.schedule_minutes.toString(),
+  };
+}
+
+function DirectionSettingsCard({
+  direction,
+  availableRegions,
+  onSaved,
+  onToast,
+}: {
+  direction: DirectionSummary;
+  availableRegions: SearchRegion[];
+  onSaved: (direction: DirectionSummary) => void;
+  onToast: (toast: Toast) => void;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [baseline, setBaseline] = useState<DirectionDraft>(() => directionDraft(direction));
+  const [draft, setDraft] = useState<DirectionDraft>(() => directionDraft(direction));
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const dirty = JSON.stringify(draft) !== JSON.stringify(baseline);
+
+  useEffect(() => {
+    if (dirty) return;
+    const next = directionDraft(direction);
+    setBaseline(next);
+    setDraft(next);
+  }, [direction, dirty]);
+
+  function toggleValue<T extends string>(values: T[], value: T): T[] {
+    return values.includes(value)
+      ? values.filter((item) => item !== value)
+      : [...values, value];
+  }
+
+  function optionalPositiveInteger(value: string, label: string): number | null {
+    if (!value.trim()) return null;
+    if (!/^\d+$/.test(value) || Number(value) < 1) {
+      throw new Error(`${label} должна быть положительным целым числом`);
+    }
+    return Number(value);
+  }
+
+  async function save(event: FormEvent<HTMLFormElement>): Promise<void> {
+    event.preventDefault();
+    if (saving) return;
+    try {
+      const queries = draft.queries
+        .split("\n")
+        .map((value) => value.trim())
+        .filter(Boolean);
+      if (!queries.length) throw new Error("Укажите хотя бы один поисковый запрос");
+      const regions = availableRegions.filter((region) =>
+        draft.regionAreas.includes(region.area),
+      );
+      if (!regions.length) throw new Error("Выберите хотя бы один город или Россию");
+      if (draft.remote_all_russia && !draft.work_formats.includes("REMOTE")) {
+        throw new Error("Поиск по всей России можно включить только для удалённой работы");
+      }
+      if (!/^\d+$/.test(draft.schedule_minutes)) {
+        throw new Error("Интервал поиска должен быть целым числом");
+      }
+      const scheduleMinutes = Number(draft.schedule_minutes);
+      if (scheduleMinutes < 5 || scheduleMinutes > 1440) {
+        throw new Error("Интервал поиска должен быть от 5 до 1440 минут");
+      }
+      const values: DirectionSettings = {
+        is_active: draft.is_active,
+        queries,
+        regions,
+        work_formats: draft.work_formats,
+        employment_forms: draft.employment_forms,
+        minimum_salary: optionalPositiveInteger(
+          draft.minimum_salary,
+          "Минимальная зарплата",
+        ),
+        desired_salary: optionalPositiveInteger(
+          draft.desired_salary,
+          "Желаемая зарплата",
+        ),
+        remote_all_russia: draft.remote_all_russia,
+        schedule_minutes: scheduleMinutes,
+      };
+      if (
+        values.minimum_salary !== null &&
+        values.desired_salary !== null &&
+        values.minimum_salary > values.desired_salary
+      ) {
+        throw new Error("Минимальная зарплата не может быть выше желаемой");
+      }
+      setSaving(true);
+      setError(null);
+      const saved = await updateDirection(direction.id, values);
+      const next = directionDraft(saved);
+      setBaseline(next);
+      setDraft(next);
+      setEditing(false);
+      onSaved(saved);
+      onToast({ kind: "success", message: `Направление «${saved.name}» сохранено` });
+    } catch (reason) {
+      setError(readableError(reason));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  function cancel(): void {
+    setDraft(baseline);
+    setError(null);
+    setEditing(false);
+  }
+
+  return (
+    <article className={`direction-settings-card ${editing ? "editing" : ""}`}>
+      <div className="direction-settings-summary">
+        <div>
+          <div className="direction-title-row">
+            <strong>{direction.name}</strong>
+            <span className={`status-pill ${direction.is_active ? "positive" : "muted"}`}>
+              {direction.is_active ? "Включено" : "Выключено"}
+            </span>
+          </div>
+          {direction.description && <span>{direction.description}</span>}
+          <span>
+            {plural(direction.queued, "вакансия", "вакансии", "вакансий")} в очереди
+            {direction.rejected > 0
+              ? ` · ${plural(direction.rejected, "отклонена", "отклонены", "отклонено")}`
+              : ""}
+          </span>
+        </div>
+        <button
+          type="button"
+          className="secondary-button"
+          aria-expanded={editing}
+          onClick={() => (editing ? cancel() : setEditing(true))}
+        >
+          <SlidersHorizontal size={17} aria-hidden="true" />
+          {editing ? "Закрыть" : "Настроить"}
+        </button>
+      </div>
+
+      {editing && (
+        <form className="direction-settings-form" onSubmit={(event) => void save(event)}>
+          <label className="direction-active-control">
+            <span className="check-control">
+              <input
+                type="checkbox"
+                checked={draft.is_active}
+                onChange={(event) =>
+                  setDraft((current) => ({ ...current, is_active: event.target.checked }))
+                }
+              />
+              <span aria-hidden="true" />
+            </span>
+            <span>
+              <strong>Искать вакансии по этому направлению</strong>
+              <small>Выключение остановит новые поиски, но сохранит историю.</small>
+            </span>
+          </label>
+
+          <label className="text-field direction-query-field">
+            <span>Поисковые запросы</span>
+            <textarea
+              rows={Math.max(3, Math.min(6, draft.queries.split("\n").length))}
+              value={draft.queries}
+              onChange={(event) =>
+                setDraft((current) => ({ ...current, queries: event.target.value }))
+              }
+            />
+            <small>Один запрос в каждой строке.</small>
+          </label>
+
+          <fieldset className="direction-choice-group">
+            <legend>Города и регионы</legend>
+            <div className="direction-option-grid region-options">
+              {availableRegions.map((region) => (
+                <label key={region.area}>
+                  <input
+                    type="checkbox"
+                    checked={draft.regionAreas.includes(region.area)}
+                    onChange={() =>
+                      setDraft((current) => ({
+                        ...current,
+                        regionAreas: toggleValue(current.regionAreas, region.area),
+                      }))
+                    }
+                  />
+                  <span>{region.name}</span>
+                </label>
+              ))}
+            </div>
+          </fieldset>
+
+          <div className="direction-two-columns">
+            <fieldset className="direction-choice-group">
+              <legend>Формат работы</legend>
+              <div className="direction-option-list">
+                {(Object.keys(workFormatNames) as WorkFormat[]).map((format) => (
+                  <label key={format}>
+                    <input
+                      type="checkbox"
+                      checked={draft.work_formats.includes(format)}
+                      onChange={() =>
+                        setDraft((current) => ({
+                          ...current,
+                          work_formats: toggleValue(current.work_formats, format),
+                        }))
+                      }
+                    />
+                    <span>{workFormatNames[format]}</span>
+                  </label>
+                ))}
+              </div>
+              <label className="inline-option">
+                <input
+                  type="checkbox"
+                  checked={draft.remote_all_russia}
+                  disabled={!draft.work_formats.includes("REMOTE")}
+                  onChange={(event) =>
+                    setDraft((current) => ({
+                      ...current,
+                      remote_all_russia: event.target.checked,
+                    }))
+                  }
+                />
+                <span>Удалённые вакансии по всей России</span>
+              </label>
+            </fieldset>
+
+            <fieldset className="direction-choice-group">
+              <legend>Занятость</legend>
+              <div className="direction-option-list">
+                {(Object.keys(employmentFormNames) as EmploymentForm[]).map((form) => (
+                  <label key={form}>
+                    <input
+                      type="checkbox"
+                      checked={draft.employment_forms.includes(form)}
+                      onChange={() =>
+                        setDraft((current) => ({
+                          ...current,
+                          employment_forms: toggleValue(current.employment_forms, form),
+                        }))
+                      }
+                    />
+                    <span>{employmentFormNames[form]}</span>
+                  </label>
+                ))}
+              </div>
+            </fieldset>
+          </div>
+
+          <div className="direction-number-grid">
+            <label className="number-field">
+              <span>Минимальная зарплата</span>
+              <div className="number-input">
+                <input
+                  inputMode="numeric"
+                  value={draft.minimum_salary}
+                  onChange={(event) =>
+                    setDraft((current) => ({
+                      ...current,
+                      minimum_salary: event.target.value,
+                    }))
+                  }
+                />
+                <span>₽</span>
+              </div>
+            </label>
+            <label className="number-field">
+              <span>Желаемая зарплата</span>
+              <div className="number-input">
+                <input
+                  inputMode="numeric"
+                  value={draft.desired_salary}
+                  onChange={(event) =>
+                    setDraft((current) => ({
+                      ...current,
+                      desired_salary: event.target.value,
+                    }))
+                  }
+                />
+                <span>₽</span>
+              </div>
+            </label>
+            <label className="number-field">
+              <span>Повторять поиск</span>
+              <div className="number-input">
+                <input
+                  inputMode="numeric"
+                  value={draft.schedule_minutes}
+                  onChange={(event) =>
+                    setDraft((current) => ({
+                      ...current,
+                      schedule_minutes: event.target.value,
+                    }))
+                  }
+                />
+                <span>мин</span>
+              </div>
+            </label>
+          </div>
+
+          {error && (
+            <p className="settings-submit-error" role="alert">
+              {error}
+            </p>
+          )}
+          <div className="settings-form-actions">
+            <button type="submit" className="primary-button" disabled={saving || !dirty}>
+              {saving ? "Сохраняем…" : "Сохранить направление"}
+            </button>
+            <button
+              type="button"
+              className="secondary-button"
+              disabled={saving}
+              onClick={cancel}
+            >
+              Отменить
+            </button>
+          </div>
+        </form>
+      )}
+    </article>
   );
 }
 
@@ -2018,10 +3747,26 @@ function ToastMessage({ toast, onClose }: { toast: Toast; onClose: () => void })
 }
 
 function stateTone(state: string): string {
-  if (["RUNNING", "READY", "COMPLETED", "CONFIRMED", "SENT"].includes(state)) {
+  if (
+    [
+      "RUNNING",
+      "READY",
+      "COMPLETED",
+      "CONFIRMED",
+      "SENT",
+      "APPLIED",
+      "VIEWED",
+      "INVITED",
+      "RECEIVED",
+    ].includes(state)
+  ) {
     return "positive";
   }
-  if (["RETRY_SCHEDULED", "REVIEW_REQUIRED", "INPUT_REQUIRED"].includes(state)) {
+  if (
+    ["RETRY_SCHEDULED", "REVIEW_REQUIRED", "INPUT_REQUIRED", "SCHEDULED", "PREPARING"].includes(
+      state,
+    )
+  ) {
     return "warning";
   }
   if (["FAILED", "UNKNOWN_RESULT"].includes(state)) return "danger";

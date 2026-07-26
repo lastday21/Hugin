@@ -125,7 +125,7 @@ def prepare_bridge(monkeypatch: pytest.MonkeyPatch) -> desktop.DesktopBridge:
     return desktop.DesktopBridge(Settings(environment="test"))
 
 
-def test_bridge_opens_saved_form_without_submitting_and_reuses_browser(
+def test_bridge_opens_saved_form_without_submitting_and_closes_browser(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     bridge = prepare_bridge(monkeypatch)
@@ -140,10 +140,10 @@ def test_bridge_opens_saved_form_without_submitting_and_reuses_browser(
         "skipped": 1,
     }
     assert second["status"] == "READY"
-    assert len(FakeBrowser.instances) == 1
-    assert FakeBrowser.instances[0].opened_login
+    assert len(FakeBrowser.instances) == 2
+    assert all(browser.opened_login for browser in FakeBrowser.instances)
+    assert all(browser.closed for browser in FakeBrowser.instances)
     bridge.close()
-    assert FakeBrowser.instances[0].closed
     bridge.close()
 
 
@@ -222,6 +222,43 @@ def test_bridge_rejects_bad_input_missing_draft_and_foreign_link(
     assert bridge.open_url(" https://hh.ru/vacancy/101 ")["status"] == "READY"
     monkeypatch.setattr(webbrowser, "open", lambda *_args, **_kwargs: False)
     assert bridge.open_url("https://www.hh.ru/vacancy/101")["status"] == "UNAVAILABLE"
+
+
+def test_bridge_opens_only_saved_secure_invitation_link(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bridge = prepare_bridge(monkeypatch)
+
+    class FakeCommunicationService:
+        booking_url: ClassVar[str | None] = None
+
+        def __init__(self, _session: object, _sender: object) -> None:
+            pass
+
+        def invitations(self, account_id: int) -> tuple[SimpleNamespace, ...]:
+            assert account_id == 1
+            return (SimpleNamespace(id=7, booking_url=self.booking_url),)
+
+    monkeypatch.setattr(desktop, "CommunicationService", FakeCommunicationService)
+    assert bridge.open_invitation(0)["status"] == "UNAVAILABLE"
+    assert bridge.open_invitation(8)["status"] == "UNAVAILABLE"
+    assert bridge.open_invitation(7)["status"] == "UNAVAILABLE"
+
+    FakeCommunicationService.booking_url = "http://example.com/interview"
+    assert bridge.open_invitation(7)["status"] == "UNAVAILABLE"
+    FakeCommunicationService.booking_url = "https://user:secret@example.com/interview"
+    assert bridge.open_invitation(7)["status"] == "UNAVAILABLE"
+
+    opened: list[str] = []
+
+    def open_link(url: str, **_kwargs: object) -> bool:
+        opened.append(url)
+        return True
+
+    monkeypatch.setattr(webbrowser, "open", open_link)
+    FakeCommunicationService.booking_url = " https://calendar.example.com/interview "
+    assert bridge.open_invitation(7)["status"] == "READY"
+    assert opened == ["https://calendar.example.com/interview"]
 
 
 def test_project_directory_and_health_probe(
@@ -330,21 +367,32 @@ def test_main_starts_window_and_always_closes_bridge(monkeypatch: pytest.MonkeyP
             events.append(("start", debug))
 
     class FakeBridge:
-        def __init__(self, selected: Settings) -> None:
+        def __init__(self, selected: Settings, **_kwargs: object) -> None:
             assert selected is settings
 
         def close(self) -> None:
             events.append("close")
 
+    class FakeWorker:
+        def __init__(self, selected: Settings, **_kwargs: object) -> None:
+            assert selected is settings
+
+        def start(self) -> None:
+            events.append("worker-start")
+
+        def stop(self) -> None:
+            events.append("worker-stop")
+
     monkeypatch.setattr(desktop, "get_settings", lambda: settings)
     monkeypatch.setattr(desktop, "ensure_services", lambda _settings: events.append("services"))
     monkeypatch.setattr(desktop, "import_module", lambda _name: FakeWebview())
     monkeypatch.setattr(desktop, "DesktopBridge", FakeBridge)
+    monkeypatch.setattr(desktop, "AutomationWorker", FakeWorker)
 
     desktop.main()
 
     assert events[0] == "services"
-    assert events[-2:] == [("start", False), "close"]
+    assert events[-3:] == [("start", False), "close", "worker-stop"]
     assert created[0][0] == ("Hugin — поиск работы", settings.desktop_api_url)
 
 
