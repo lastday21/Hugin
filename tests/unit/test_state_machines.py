@@ -21,8 +21,11 @@ def test_valid_state_transitions() -> None:
     ensure_task_transition(TaskState.RUNNING, TaskState.UNKNOWN_RESULT)
     ensure_task_transition(TaskState.RUNNING, TaskState.INPUT_REQUIRED)
     ensure_task_transition(TaskState.INPUT_REQUIRED, TaskState.REVIEW_REQUIRED)
+    ensure_task_transition(TaskState.UNKNOWN_RESULT, TaskState.REVIEW_REQUIRED)
     ensure_task_transition(TaskState.REVIEW_REQUIRED, TaskState.RETRY_SCHEDULED)
     ensure_system_transition(SystemState.RUNNING, SystemState.CAPTCHA_REQUIRED)
+    ensure_system_transition(SystemState.PAUSED, SystemState.AUTH_REQUIRED)
+    ensure_system_transition(SystemState.AUTH_REQUIRED, SystemState.PAUSED)
 
 
 @pytest.mark.parametrize(
@@ -30,6 +33,7 @@ def test_valid_state_transitions() -> None:
     [
         (ApplicationState.VIEWED, ApplicationState.APPLYING, ensure_application_transition),
         (TaskState.COMPLETED, TaskState.RUNNING, ensure_task_transition),
+        (TaskState.UNKNOWN_RESULT, TaskState.RETRY_SCHEDULED, ensure_task_transition),
         (SystemState.ACCOUNT_WARNING, SystemState.CAPTCHA_REQUIRED, ensure_system_transition),
     ],
 )

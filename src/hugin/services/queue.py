@@ -43,6 +43,8 @@ class QueueService:
         system = self._system.get()
         if system.state is not SystemState.RUNNING:
             return None
+        if self._tasks.has_unknown_result():
+            return None
         if system.next_apply_at is not None and system.next_apply_at > selected_at:
             return None
         return self._tasks.claim_next(
@@ -85,6 +87,8 @@ class QueueService:
             return current
         if current.state is not SystemState.PAUSED:
             raise ValueError("Сначала нужно устранить защитное состояние hh.ru")
+        if self._tasks.has_unknown_result():
+            raise ValueError("Сначала нужно сверить отклик, результат которого неизвестен")
         return self._system.transition(SystemState.RUNNING)
 
     def status(self) -> QueueStatus:

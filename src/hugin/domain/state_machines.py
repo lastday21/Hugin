@@ -39,7 +39,7 @@ TASK_TRANSITIONS: dict[TaskState, frozenset[TaskState]] = {
     TaskState.REVIEW_REQUIRED: frozenset({TaskState.RETRY_SCHEDULED, TaskState.SKIPPED}),
     TaskState.INPUT_REQUIRED: frozenset({TaskState.REVIEW_REQUIRED, TaskState.SKIPPED}),
     TaskState.UNKNOWN_RESULT: frozenset(
-        {TaskState.COMPLETED, TaskState.RETRY_SCHEDULED, TaskState.SKIPPED}
+        {TaskState.COMPLETED, TaskState.REVIEW_REQUIRED, TaskState.SKIPPED}
     ),
     TaskState.SKIPPED: frozenset(),
     TaskState.COMPLETED: frozenset(),
@@ -54,9 +54,11 @@ SYSTEM_TRANSITIONS: dict[SystemState, frozenset[SystemState]] = {
             SystemState.ACCOUNT_WARNING,
         }
     ),
-    SystemState.PAUSED: frozenset({SystemState.RUNNING}),
-    SystemState.AUTH_REQUIRED: frozenset({SystemState.RUNNING}),
-    SystemState.CAPTCHA_REQUIRED: frozenset({SystemState.RUNNING}),
+    SystemState.PAUSED: frozenset(
+        {SystemState.RUNNING, SystemState.AUTH_REQUIRED, SystemState.CAPTCHA_REQUIRED}
+    ),
+    SystemState.AUTH_REQUIRED: frozenset({SystemState.RUNNING, SystemState.PAUSED}),
+    SystemState.CAPTCHA_REQUIRED: frozenset({SystemState.RUNNING, SystemState.PAUSED}),
     SystemState.ACCOUNT_WARNING: frozenset({SystemState.RUNNING, SystemState.PAUSED}),
 }
 

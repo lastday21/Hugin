@@ -171,7 +171,10 @@ class ApplicationAutomationService:
         return priority
 
     def recover_interrupted(self) -> int:
-        return len(self._tasks.recover_running())
+        recovered = self._tasks.recover_running()
+        if recovered:
+            self._transition_system(SystemState.PAUSED)
+        return len(recovered)
 
     def policy(self, timezone_name: str | None = None) -> ApplicationPolicyRecord:
         return self._queue.policy(timezone_name)
@@ -220,8 +223,10 @@ class ApplicationAutomationService:
 
     def resume_after_authentication(self) -> None:
         current = self._system.get().state
-        if current in {SystemState.AUTH_REQUIRED, SystemState.CAPTCHA_REQUIRED}:
-            self._system.transition(SystemState.RUNNING)
+        if current not in {SystemState.AUTH_REQUIRED, SystemState.CAPTCHA_REQUIRED}:
+            return
+        target = SystemState.PAUSED if self._tasks.has_unknown_result() else SystemState.RUNNING
+        self._system.transition(target)
 
     def record_result(
         self,
@@ -277,6 +282,14 @@ class ApplicationAutomationService:
             )
             return RecordedApplyResult(blocking=False, sent=False)
 
+        if result.status is HhApplyStatus.MANUAL_REVIEW_REQUIRED:
+            self._tasks.transition(
+                job.task.id,
+                TaskState.REVIEW_REQUIRED,
+                error_code=result.status.value,
+            )
+            return RecordedApplyResult(blocking=False, sent=False)
+
         if result.status is HhApplyStatus.VACANCY_CLOSED:
             self._applications.transition_state(
                 job.application.id,
@@ -297,7 +310,8 @@ class ApplicationAutomationService:
                 error_code=result.status.value,
                 event_payload=payload,
             )
-            return RecordedApplyResult(blocking=False, sent=False)
+            self._transition_system(SystemState.PAUSED)
+            return RecordedApplyResult(blocking=True, sent=False)
 
         system_states = {
             HhApplyStatus.AUTH_REQUIRED: SystemState.AUTH_REQUIRED,
@@ -328,30 +342,6 @@ class ApplicationAutomationService:
             sent=False,
             next_apply_at=(retry_at if result.status is HhApplyStatus.RETRYABLE_ERROR else None),
         )
-
-    def confirm_unknown_as_applied(
-        self,
-        task_id: int,
-        *,
-        final_url: str,
-        confirmation: str,
-    ) -> RecordedApplyResult:
-        task = self._tasks.get(task_id)
-        if task.state is not TaskState.UNKNOWN_RESULT:
-            raise ValueError("Task state must be UNKNOWN_RESULT")
-        application = self._applications.get(task.application_id)
-        self._applications.transition_state(
-            application.id,
-            ApplicationState.APPLIED,
-            {
-                "hh_status": HhApplyStatus.APPLIED.value,
-                "confirmation": confirmation[:1000],
-                "final_url": final_url[:1000],
-            },
-        )
-        self._mark_cover_letter_sent(application.id, datetime.now(UTC))
-        self._tasks.transition(task.id, TaskState.COMPLETED)
-        return RecordedApplyResult(blocking=False, sent=True)
 
     def _mark_cover_letter_sent(self, application_id: int, sent_at: datetime) -> None:
         letter = self._session.scalar(

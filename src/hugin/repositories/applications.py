@@ -157,6 +157,23 @@ class ApplicationRepository:
         )
         return [_event_record(event) for event in events]
 
+    def append_event(
+        self,
+        application_id: int,
+        event_type: ApplicationEventType,
+        payload: EventPayload | None = None,
+    ) -> ApplicationEventRecord:
+        if self._session.get(ApplicationModel, application_id) is None:
+            raise ApplicationNotFoundError(application_id)
+        event = ApplicationEventModel(
+            application_id=application_id,
+            event_type=event_type,
+            payload=dict(payload or {}),
+        )
+        self._session.add(event)
+        self._session.flush()
+        return _event_record(event)
+
     def transition_state(
         self,
         application_id: int,

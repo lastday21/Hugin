@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from enum import StrEnum
 
 type EventPayload = dict[str, str | int | float | bool | None]
@@ -21,6 +21,22 @@ class ApplicationEventType(StrEnum):
     APPLIED = "APPLIED"
     UNKNOWN_RESULT = "UNKNOWN_RESULT"
     STATE_CHANGED = "STATE_CHANGED"
+
+
+class ReconciliationStatus(StrEnum):
+    APPLIED = "APPLIED"
+    NOT_FOUND = "NOT_FOUND"
+    AUTH_REQUIRED = "AUTH_REQUIRED"
+    CAPTCHA_REQUIRED = "CAPTCHA_REQUIRED"
+    UNAVAILABLE = "UNAVAILABLE"
+
+
+@dataclass(frozen=True, slots=True)
+class ApplicationReconciliationResult:
+    status: ReconciliationStatus
+    final_url: str = ""
+    confirmation: str = ""
+    checked_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
 
 @dataclass(frozen=True, slots=True)

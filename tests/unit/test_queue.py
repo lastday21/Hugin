@@ -28,7 +28,7 @@ from hugin.repositories import (
     SystemStateRepository,
     VacancyRepository,
 )
-from hugin.services import QueueService
+from hugin.services import ApplicationAutomationService, QueueService
 
 pytestmark = pytest.mark.integration
 
@@ -111,10 +111,19 @@ def test_unknown_result_requires_reconciliation_before_retry(settings: Settings)
             with pytest.raises(InvalidStateTransitionError):
                 repository.transition(task.id, TaskState.RUNNING)
 
+            retry_at = now + timedelta(minutes=15)
+            with pytest.raises(InvalidStateTransitionError):
+                repository.transition(
+                    task.id,
+                    TaskState.RETRY_SCHEDULED,
+                    scheduled_at=retry_at,
+                )
+
+            review = repository.transition(task.id, TaskState.REVIEW_REQUIRED)
+            assert review.state is TaskState.REVIEW_REQUIRED
             with pytest.raises(ValueError, match="scheduled_at"):
                 repository.transition(task.id, TaskState.RETRY_SCHEDULED)
 
-            retry_at = now + timedelta(minutes=15)
             retry = repository.transition(
                 task.id,
                 TaskState.RETRY_SCHEDULED,
@@ -231,11 +240,13 @@ def test_running_task_is_recovered_without_automatic_retry(settings: Settings) -
             task = repository.enqueue(application_id, 50, now)
             assert repository.claim_next(now) is not None
 
-            recovered = repository.recover_running()
+            recovered_count = ApplicationAutomationService(session).recover_interrupted()
+            recovered = repository.get(task.id)
 
-            assert [item.id for item in recovered] == [task.id]
-            assert recovered[0].state is TaskState.UNKNOWN_RESULT
-            assert recovered[0].last_error_code == "INTERRUPTED_DURING_APPLY"
+            assert recovered_count == 1
+            assert recovered.state is TaskState.UNKNOWN_RESULT
+            assert recovered.last_error_code == "INTERRUPTED_DURING_APPLY"
+            assert SystemStateRepository(session).get().state is SystemState.PAUSED
             assert repository.claim_next(now + timedelta(hours=1)) is None
             event = ApplicationRepository(session).list_events(application_id)[-1]
             assert event.event_type is ApplicationEventType.UNKNOWN_RESULT

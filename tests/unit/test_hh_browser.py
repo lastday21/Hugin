@@ -771,7 +771,7 @@ def test_changed_form_is_not_refilled(tmp_path: Path) -> None:
     assert page.fill_payload is None
 
 
-def test_application_is_submitted_with_cover_letter(tmp_path: Path) -> None:
+def test_application_is_prepared_without_submitting(tmp_path: Path) -> None:
     page = FakePage("https://hh.ru/applicant/resumes")
     page.application_payload = {
         "questions": [],
@@ -793,11 +793,12 @@ def test_application_is_submitted_with_cover_letter(tmp_path: Path) -> None:
         cover_letter="Содержательное письмо",
     )
 
-    assert result.status is HhApplyStatus.APPLIED
+    assert result.status is HhApplyStatus.MANUAL_REVIEW_REQUIRED
+    assert result.confirmation == "Форма заполнена, автоматическая отправка отключена"
     assert result.warnings == ("Город не указан",)
     assert page.locators[toggle_selector].clicked == 1
     assert page.locators[letter_selector].filled == ["Содержательное письмо"]
-    assert page.locators[submit_selector].clicked == 1
+    assert page.locators[submit_selector].clicked == 0
 
 
 def test_application_respects_retry_after_header(tmp_path: Path) -> None:
@@ -810,6 +811,7 @@ def test_application_respects_retry_after_header(tmp_path: Path) -> None:
     }
     page.response.status = 429
     page.response.headers["retry-after"] = "120"
+    page.goto_response = page.response
     page.locators['[data-qa="vacancy-response-popup-form-letter-input"]'] = FakeLocator()
     page.locators['[data-qa="vacancy-response-submit-popup"]'] = FakeLocator()
     page.locators["body"] = FakeLocator(text="Слишком много запросов")
@@ -824,7 +826,7 @@ def test_application_respects_retry_after_header(tmp_path: Path) -> None:
     assert result.retry_after_seconds == 120
 
 
-def test_application_stops_when_confirmation_cannot_be_read(tmp_path: Path) -> None:
+def test_application_does_not_wait_for_submission_confirmation(tmp_path: Path) -> None:
     page = FakePage("https://hh.ru/applicant/resumes")
     page.application_payload = {
         "questions": [],
@@ -842,11 +844,11 @@ def test_application_stops_when_confirmation_cannot_be_read(tmp_path: Path) -> N
         cover_letter="Письмо",
     )
 
-    assert result.status is HhApplyStatus.UNKNOWN_RESULT
-    assert result.confirmation == "HTTP 200: "
+    assert result.status is HhApplyStatus.MANUAL_REVIEW_REQUIRED
+    assert page.locators['[data-qa="vacancy-response-submit-popup"]'].clicked == 0
 
 
-def test_application_is_verified_in_negotiations(tmp_path: Path) -> None:
+def test_application_does_not_open_negotiations_to_infer_submission(tmp_path: Path) -> None:
     page = FakePage("https://hh.ru/applicant/resumes")
     page.application_payload = {
         "questions": [],
@@ -866,8 +868,8 @@ def test_application_is_verified_in_negotiations(tmp_path: Path) -> None:
         cover_letter="Письмо",
     )
 
-    assert result.status is HhApplyStatus.APPLIED
-    assert "подтверждено в списке откликов" in result.confirmation
+    assert result.status is HhApplyStatus.MANUAL_REVIEW_REQUIRED
+    assert page.locators['[data-qa="vacancy-response-submit-popup"]'].clicked == 0
 
 
 def test_repeat_application_form_is_not_submitted(tmp_path: Path) -> None:

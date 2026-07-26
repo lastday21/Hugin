@@ -616,8 +616,6 @@ class VisibleHhBrowser:
         expected_resume_title: str,
         cover_letter: str,
     ) -> HhApplyResult:
-        vacancy_id, normalized_url = self._vacancy_id_and_url(source_url)
-        parsed = urlparse(normalized_url)
         response_url = self._application_response_url(source_url)
         page = self._require_page()
         try:
@@ -684,73 +682,10 @@ class VisibleHhBrowser:
         if submit.count() != 1 or not submit.first.is_enabled():
             return HhApplyResult(HhApplyStatus.RETRYABLE_ERROR, page.url)
 
-        try:
-            with page.expect_response(
-                lambda response: (
-                    response.request.method == "POST"
-                    and "/applicant/vacancy_response" in response.url
-                ),
-                timeout=self._timeout_ms,
-            ) as response_info:
-                submit.first.click(no_wait_after=True)
-            response = response_info.value
-        except PlaywrightTimeoutError:
-            return HhApplyResult(HhApplyStatus.UNKNOWN_RESULT, page.url)
-
-        try:
-            page.wait_for_timeout(1_500)
-            confirmation = self._response_confirmation(response.status, response.text())
-            final_body = page.locator("body").inner_text().strip()
-        except PlaywrightError:
-            confirmation = self._response_confirmation(response.status, "")
-            final_body = ""
-        if response.status == 429:
-            return HhApplyResult(
-                HhApplyStatus.RETRYABLE_ERROR,
-                page.url,
-                confirmation,
-                warnings=initial.warnings,
-                retry_after_seconds=self._retry_after_seconds(response),
-            )
-        if self._contains_any(final_body, "вы уже откликались", "отклик уже отправлен"):
-            return HhApplyResult(
-                HhApplyStatus.ALREADY_APPLIED,
-                page.url,
-                confirmation,
-                warnings=initial.warnings,
-            )
-        if (
-            "/applicant/negotiations" in page.url
-            or self._contains_any(
-                final_body,
-                "отклик отправлен",
-                "вы откликнулись",
-                "резюме доставлено",
-            )
-            or self._contains_any(confirmation, '"success":true', '"status":"ok"')
-        ):
-            return HhApplyResult(
-                HhApplyStatus.APPLIED,
-                page.url,
-                confirmation,
-                warnings=initial.warnings,
-            )
-        if 200 <= response.status < 300 and self._vacancy_in_negotiations(
-            page,
-            parsed.scheme,
-            parsed.netloc,
-            vacancy_id,
-        ):
-            return HhApplyResult(
-                HhApplyStatus.APPLIED,
-                page.url,
-                f"{confirmation}; подтверждено в списке откликов",
-                warnings=initial.warnings,
-            )
         return HhApplyResult(
-            HhApplyStatus.UNKNOWN_RESULT,
+            HhApplyStatus.MANUAL_REVIEW_REQUIRED,
             page.url,
-            confirmation,
+            "Форма заполнена, автоматическая отправка отключена",
             warnings=initial.warnings,
         )
 

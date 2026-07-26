@@ -7,9 +7,11 @@ import pytest
 from hugin.core.settings import Settings
 from hugin.database import create_database, upgrade_database
 from hugin.domain import (
+    ApplicationReconciliationResult,
     ApplicationState,
     HhApplyResult,
     HhApplyStatus,
+    ReconciliationStatus,
     SystemState,
     TaskState,
     VacancyData,
@@ -25,6 +27,8 @@ from hugin.repositories import (
     VacancyRepository,
 )
 from hugin.services.application_automation import ApplicationAutomationService
+from hugin.services.application_reconciliation import ApplicationReconciliationService
+from hugin.services.queue import QueueService
 
 pytestmark = pytest.mark.integration
 
@@ -165,23 +169,26 @@ def test_automation_prepares_claims_and_records_results(settings: Settings) -> N
                 uncertain_job,
                 HhApplyResult(HhApplyStatus.UNKNOWN_RESULT, uncertain_vacancy.source_url),
             )
-            assert not uncertain.blocking
+            assert uncertain.blocking
             assert (
                 QueueTaskRepository(session).get(uncertain_job.task.id).state
                 is TaskState.UNKNOWN_RESULT
             )
-            assert SystemStateRepository(session).get().state is SystemState.RUNNING
+            assert SystemStateRepository(session).get().state is SystemState.PAUSED
             unknown_event = ApplicationRepository(session).list_events(
                 uncertain_job.application.id
             )[-1]
             assert unknown_event.payload["final_url"] == uncertain_vacancy.source_url
 
-            confirmed = service.confirm_unknown_as_applied(
+            confirmed = ApplicationReconciliationService(session).reconcile(
                 uncertain_job.task.id,
-                final_url="https://hh.ru/applicant/negotiations",
-                confirmation="Найдено в списке откликов",
+                ApplicationReconciliationResult(
+                    ReconciliationStatus.APPLIED,
+                    final_url="https://hh.ru/applicant/negotiations",
+                    confirmation="Найдено в списке откликов",
+                ),
             )
-            assert confirmed.sent
+            assert not confirmed.blocking
             assert (
                 ApplicationRepository(session).get(uncertain_job.application.id).state
                 is ApplicationState.APPLIED
@@ -189,6 +196,8 @@ def test_automation_prepares_claims_and_records_results(settings: Settings) -> N
             assert (
                 QueueTaskRepository(session).get(uncertain_job.task.id).state is TaskState.COMPLETED
             )
+            assert SystemStateRepository(session).get().state is SystemState.PAUSED
+            QueueService(session).resume()
             assert SystemStateRepository(session).get().state is SystemState.RUNNING
 
             closed_vacancy = vacancies.upsert(

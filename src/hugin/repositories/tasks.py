@@ -186,6 +186,16 @@ class QueueTaskRepository:
         )
         return {state: count for state, count in rows}
 
+    def has_unknown_result(self) -> bool:
+        return (
+            self._session.scalar(
+                select(ApplicationTaskModel.id)
+                .where(ApplicationTaskModel.state == TaskState.UNKNOWN_RESULT)
+                .limit(1)
+            )
+            is not None
+        )
+
     def transition(
         self,
         task_id: int,

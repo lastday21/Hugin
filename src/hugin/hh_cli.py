@@ -180,7 +180,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("pause", help="приостановить новые отклики")
     subparsers.add_parser("resume", help="продолжить обработку очереди")
 
-    apply = subparsers.add_parser("apply", help="автоматически отправить подходящие отклики")
+    apply = subparsers.add_parser("apply", help="подготовить подходящие отклики к проверке")
     apply.add_argument("--account-id", type=positive_int, default=1)
     apply.add_argument("--direction", required=True, help="название направления")
     apply.add_argument("--limit", type=positive_int, default=5, help="не более откликов за запуск")
@@ -862,6 +862,7 @@ def _apply_status_text(status: HhApplyStatus) -> str:
     messages = {
         HhApplyStatus.APPLIED: "отклик подтверждён",
         HhApplyStatus.ALREADY_APPLIED: "отклик уже был отправлен",
+        HhApplyStatus.MANUAL_REVIEW_REQUIRED: "форма подготовлена для ручной проверки",
         HhApplyStatus.QUESTIONS_REQUIRED: "требуется заполнить анкету",
         HhApplyStatus.VACANCY_CLOSED: "вакансия закрыта",
         HhApplyStatus.AUTH_REQUIRED: "требуется повторный вход",
