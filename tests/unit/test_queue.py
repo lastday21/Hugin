@@ -200,6 +200,7 @@ def test_queue_policy_gate_and_manual_pause_are_persistent(settings: Settings) -
             assert status.policy.timezone_name == "Europe/Moscow"
             assert status.task_counts[TaskState.RUNNING] == 1
 
+            assert queue.configure(timezone_name="UTC+05:00", daily_limit=51).daily_limit == 51
             with pytest.raises(ValueError, match="меньше 25"):
                 queue.configure(timezone_name="UTC+05:00", daily_limit=24)
             with pytest.raises(ValueError, match="Некорректный интервал"):

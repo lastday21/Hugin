@@ -1,4 +1,4 @@
-.PHONY: install format lint test check run db-upgrade db-current db-check db-downgrade docker-build docker-up docker-down docker-logs precommit-install
+.PHONY: install format lint test web-check web-build check run desktop db-upgrade db-current db-check db-downgrade docker-build docker-up docker-down docker-logs precommit-install
 
 install:
 	uv sync --all-groups --all-extras
@@ -15,10 +15,20 @@ lint:
 test:
 	uv run pytest --cov=hugin --cov-report=term-missing
 
-check: lint test
+web-check:
+	npm ci --prefix web
+	npm run check --prefix web
+
+web-build: web-check
+	npm run build --prefix web
+
+check: lint test web-build
 
 run:
 	uv run hugin
+
+desktop:
+	uv run hugin-desktop
 
 db-upgrade:
 	uv run hugin-db upgrade

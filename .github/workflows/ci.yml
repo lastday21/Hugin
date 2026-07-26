@@ -107,9 +107,35 @@ jobs:
       - name: Выполнить проверки
         run: uv run --no-sync pytest --cov=hugin --cov-branch --cov-report=term-missing
 
+  frontend:
+    name: Оконный интерфейс
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Получить исходный код
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Показать версию Node.js
+        run: node --version
+
+      - name: Установить зависимости интерфейса
+        run: npm ci --prefix web
+
+      - name: Проверить исходный код интерфейса
+        run: npm run check --prefix web
+
+      - name: Собрать интерфейс
+        run: npm run build --prefix web
+
+      - name: Проверить актуальность готовых файлов
+        run: git diff --exit-code -- src/hugin/web_dist
+
   package:
     name: Пакет Python
-    needs: [quality, tests]
+    needs: [quality, tests, frontend]
     runs-on: ubuntu-latest
     timeout-minutes: 10
 

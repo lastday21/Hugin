@@ -27,6 +27,7 @@ class Settings(BaseSettings):
     environment: Literal["development", "test", "production"] = "development"
     api_host: str = "127.0.0.1"
     api_port: int = Field(default=8000, ge=1, le=65535)
+    desktop_api_url: str = "http://127.0.0.1:8010"
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
     data_dir: Path = Field(default_factory=default_data_dir)
     database_host: str = "127.0.0.1"

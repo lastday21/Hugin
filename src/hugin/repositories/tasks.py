@@ -278,7 +278,7 @@ class ApplicationSettingsRepository:
             model.hh_apply_delay_max_seconds if delay_max_seconds is None else delay_max_seconds
         )
         if proposed_daily_limit < 25:
-            raise ValueError("Суточное ограничение не может быть меньше 25")
+            raise ValueError("Дневное ограничение не может быть меньше 25")
         if proposed_delay_min < 0 or proposed_delay_max < proposed_delay_min:
             raise ValueError("Некорректный интервал между откликами")
         if timezone_name is not None:
