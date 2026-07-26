@@ -78,7 +78,13 @@ def test_resume_import_is_idempotent_and_questions_are_reusable(
 
             fact_service = ProfileFactService(session)
             first_fact = fact_service.list_pending(account.id)[0]
-            fact_service.confirm(account.id, first_fact.id)
+            fact_service.confirm(
+                account.id,
+                first_fact.id,
+                allow_in_letters=True,
+                allow_in_forms=True,
+                allow_in_messages=True,
+            )
             confirmed = session.get(VerifiedFactModel, first_fact.id)
             assert confirmed is not None
             assert confirmed.state is ConfirmationState.CONFIRMED

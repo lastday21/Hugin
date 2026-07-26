@@ -274,6 +274,7 @@ class ResumeImportService:
         source: Path,
         *,
         hh_resume_id: str | None = None,
+        original_name: str | None = None,
     ) -> ResumeImportResult:
         account = self._session.get(HhAccountModel, account_id)
         if account is None:
@@ -294,7 +295,7 @@ class ResumeImportService:
         resume.title = profile_data.title
         resume.source_type = document.source_type.value
         resume.source_reference = str(stored_path)
-        resume.source_original_name = document.original_name
+        resume.source_original_name = original_name or document.original_name
         resume.source_sha256 = document.sha256
         resume.source_size_bytes = document.size_bytes
         resume.source_page_count = document.page_count
@@ -525,6 +526,21 @@ class ProfileQuestionService:
         question.answered_at = datetime.now(UTC)
         self._session.flush()
 
+    def dismiss(self, account_id: int, key: str) -> None:
+        profile = self._profile(account_id)
+        question = self._session.scalar(
+            select(ProfileQuestionModel).where(
+                ProfileQuestionModel.profile_id == profile.id,
+                ProfileQuestionModel.key == key,
+            )
+        )
+        if question is None:
+            raise LookupError("Вопрос не найден")
+        question.state = ProfileQuestionState.DISMISSED
+        question.answer_text = None
+        question.answered_at = None
+        self._session.flush()
+
     def _profile(self, account_id: int) -> CandidateProfileModel:
         profile = self._session.scalar(
             select(CandidateProfileModel).where(CandidateProfileModel.account_id == account_id)
@@ -550,12 +566,20 @@ class ProfileFactService:
         )
         return tuple(ProfileFactReview(fact.id, fact.category, fact.content) for fact in facts)
 
-    def confirm(self, account_id: int, fact_id: int) -> None:
+    def confirm(
+        self,
+        account_id: int,
+        fact_id: int,
+        *,
+        allow_in_letters: bool = False,
+        allow_in_forms: bool = False,
+        allow_in_messages: bool = False,
+    ) -> None:
         fact = self._fact(account_id, fact_id)
         fact.state = ConfirmationState.CONFIRMED
-        fact.allow_in_letters = True
-        fact.allow_in_forms = True
-        fact.allow_in_messages = True
+        fact.allow_in_letters = allow_in_letters
+        fact.allow_in_forms = allow_in_forms
+        fact.allow_in_messages = allow_in_messages
         self._session.flush()
 
     def reject(self, account_id: int, fact_id: int) -> None:

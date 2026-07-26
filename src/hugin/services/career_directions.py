@@ -43,9 +43,7 @@ DEFAULT_DIRECTION_QUERIES = {
 
 DEFAULT_DIRECTION_DESCRIPTIONS = {
     DirectionScope.PYTHON_BACKEND: "Только серверная разработка на Python",
-    DirectionScope.IT_ADJACENT: (
-        "Fullstack, автоматизация и другие подходящие технические роли"
-    ),
+    DirectionScope.IT_ADJACENT: ("Fullstack, автоматизация и другие подходящие технические роли"),
 }
 
 COMMON_REGIONS = {
@@ -121,9 +119,7 @@ class CareerDirectionService:
 
         existing = self._directions.get_by_account_and_name(account_id, direction_name.strip())
         actual_scope = role_scope or (
-            existing.scope
-            if existing is not None
-            else self._scope_from_name(direction_name)
+            existing.scope if existing is not None else self._scope_from_name(direction_name)
         )
         normalized_queries = self._queries(
             queries,
@@ -212,6 +208,52 @@ class CareerDirectionService:
             raise LookupError(f"У направления «{direction_name}» нет настроенных запросов")
         facts = self._confirmed_facts(account_id, resume.id)
         return self._settings(direction, resume, queries, facts)
+
+    def update(
+        self,
+        *,
+        account_id: int,
+        direction_id: int,
+        is_active: bool,
+        queries: tuple[str, ...],
+        regions: tuple[SearchRegion, ...],
+        work_formats: tuple[WorkFormat, ...],
+        employment_forms: tuple[EmploymentForm, ...],
+        minimum_salary: int | None,
+        desired_salary: int | None,
+        remote_all_russia: bool,
+        schedule_minutes: int,
+    ) -> DirectionSearchSettings:
+        direction = self._directions.get_for_account(account_id, direction_id)
+        if schedule_minutes < 5:
+            raise ValueError("Интервал поиска должен быть не меньше 5 минут")
+        saved = self.configure(
+            account_id=account_id,
+            direction_name=direction.name,
+            queries=queries,
+            regions=regions,
+            work_formats=work_formats,
+            employment_forms=employment_forms,
+            minimum_salary=minimum_salary,
+            desired_salary=desired_salary,
+            remote_all_russia=remote_all_russia,
+            role_scope=direction.scope,
+            schedule_minutes=schedule_minutes,
+        )
+        updated_direction = self._directions.set_active(account_id, direction_id, is_active)
+        return DirectionSearchSettings(
+            direction=updated_direction,
+            resume=saved.resume,
+            queries=saved.queries,
+            work_formats=saved.work_formats,
+            employment_forms=saved.employment_forms,
+            minimum_salary=saved.minimum_salary,
+            desired_salary=saved.desired_salary,
+            salary_currency=saved.salary_currency,
+            remote_all_russia=saved.remote_all_russia,
+            skills_from_resume=saved.skills_from_resume,
+            role_scope=saved.role_scope,
+        )
 
     def build_search_tasks(
         self,
@@ -333,9 +375,7 @@ class CareerDirectionService:
     @staticmethod
     def _scope_from_name(direction_name: str) -> DirectionScope:
         normalized = direction_name.casefold().replace("-", " ")
-        if "python" in normalized and (
-            "backend" in normalized or "бэкенд" in normalized
-        ):
+        if "python" in normalized and ("backend" in normalized or "бэкенд" in normalized):
             return DirectionScope.PYTHON_BACKEND
         return DirectionScope.IT_ADJACENT
 

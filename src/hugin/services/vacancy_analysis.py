@@ -135,14 +135,13 @@ class VacancyRoleRouter:
             return DirectionScope.IT_ADJACENT
         has_python = "python" in complete_text
         has_backend = any(marker in complete_text for marker in cls._backend_markers)
-        if has_python and has_backend and (
-            any(marker in title for marker in cls._backend_markers)
-            or "python" in title
+        if (
+            has_python
+            and has_backend
+            and (any(marker in title for marker in cls._backend_markers) or "python" in title)
         ):
             return DirectionScope.PYTHON_BACKEND
-        if "python" in title and any(
-            marker in title for marker in cls._developer_markers
-        ):
+        if "python" in title and any(marker in title for marker in cls._developer_markers):
             return DirectionScope.IT_ADJACENT
         if any(marker in title for marker in cls._adjacent_title_markers):
             return DirectionScope.IT_ADJACENT
@@ -242,11 +241,7 @@ class PythonBackendRules:
                 category=RuleCategory.ROUTED,
                 reasons=(
                     "перенесена в другое направление: "
-                    + (
-                        "Python backend"
-                        if destination is DirectionScope.PYTHON_BACKEND
-                        else "ИТ"
-                    ),
+                    + ("Python backend" if destination is DirectionScope.PYTHON_BACKEND else "ИТ"),
                 ),
                 target_scope=destination,
             )
@@ -735,9 +730,7 @@ class VacancyAnalysisService:
                 "soft_boundary": rules.soft_boundary,
                 "duplicate_of_id": stored.duplicate_of_id,
                 "target_scope": (
-                    evaluation.target_scope.value
-                    if evaluation.target_scope is not None
-                    else None
+                    evaluation.target_scope.value if evaluation.target_scope is not None else None
                 ),
             },
             rules_version=RULES_VERSION,

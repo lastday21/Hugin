@@ -93,7 +93,13 @@ def run(argv: Sequence[str] | None = None) -> int:
                 elif arguments.command == "facts":
                     pending_facts = ProfileFactService(session).list_pending(arguments.account_id)
                 elif arguments.command == "confirm-fact":
-                    ProfileFactService(session).confirm(arguments.account_id, arguments.fact_id)
+                    ProfileFactService(session).confirm(
+                        arguments.account_id,
+                        arguments.fact_id,
+                        allow_in_letters=True,
+                        allow_in_forms=True,
+                        allow_in_messages=True,
+                    )
                 elif arguments.command == "reject-fact":
                     ProfileFactService(session).reject(arguments.account_id, arguments.fact_id)
                 elif arguments.command == "questions":

@@ -128,7 +128,18 @@ def test_fact_review_commands(
             assert account_id == 1
             return (ProfileFactReview(3, "skills", "Python " * 40),)
 
-        def confirm(self, account_id: int, fact_id: int) -> None:
+        def confirm(
+            self,
+            account_id: int,
+            fact_id: int,
+            *,
+            allow_in_letters: bool,
+            allow_in_forms: bool,
+            allow_in_messages: bool,
+        ) -> None:
+            assert allow_in_letters
+            assert allow_in_forms
+            assert allow_in_messages
             actions.append(("confirm", fact_id))
 
         def reject(self, account_id: int, fact_id: int) -> None:

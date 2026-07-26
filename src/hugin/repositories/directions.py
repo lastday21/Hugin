@@ -293,6 +293,30 @@ class DirectionRepository:
         )
         return _direction_record(model) if model is not None else None
 
+    def get_for_account(self, account_id: int, direction_id: int) -> DirectionRecord:
+        model = self._session.scalar(
+            select(CareerDirectionModel).where(
+                CareerDirectionModel.id == direction_id,
+                CareerDirectionModel.account_id == account_id,
+            )
+        )
+        if model is None:
+            raise LookupError("Направление не найдено")
+        return _direction_record(model)
+
+    def set_active(self, account_id: int, direction_id: int, is_active: bool) -> DirectionRecord:
+        model = self._session.scalar(
+            select(CareerDirectionModel).where(
+                CareerDirectionModel.id == direction_id,
+                CareerDirectionModel.account_id == account_id,
+            )
+        )
+        if model is None:
+            raise LookupError("Направление не найдено")
+        model.is_active = is_active
+        self._session.flush()
+        return _direction_record(model)
+
     def list_for_account(self, account_id: int) -> list[DirectionRecord]:
         models = self._session.scalars(
             select(CareerDirectionModel)

@@ -73,8 +73,9 @@ def test_direction_settings_use_active_resume_and_build_city_searches(
             tasks = CareerDirectionService(session).build_search_tasks(account.id, "ИТ")
 
             assert configured.resume == resume
-            assert tuple(query.query for query in configured.queries) == (
-                DEFAULT_DIRECTION_QUERIES[DirectionScope.IT_ADJACENT]
+            assert (
+                tuple(query.query for query in configured.queries)
+                == (DEFAULT_DIRECTION_QUERIES[DirectionScope.IT_ADJACENT])
             )
             assert configured.role_scope is DirectionScope.IT_ADJACENT
             assert configured.work_formats == (WorkFormat.REMOTE, WorkFormat.ON_SITE)
@@ -116,6 +117,32 @@ def test_direction_settings_use_active_resume_and_build_city_searches(
             assert synchronized.resume == resume
             assert session.scalar(select(func.count()).select_from(DirectionSearchQueryModel)) == 6
             assert session.scalar(select(func.count()).select_from(VacancyDiscoveryModel)) == 1
+
+            updated = CareerDirectionService(session).update(
+                account_id=account.id,
+                direction_id=configured.direction.id,
+                is_active=False,
+                queries=("Fullstack Python", "Интеграции Python API"),
+                regions=(SearchRegion("88", "Казань"),),
+                work_formats=(WorkFormat.REMOTE, WorkFormat.HYBRID),
+                employment_forms=(EmploymentForm.FULL, EmploymentForm.PROJECT),
+                minimum_salary=160_000,
+                desired_salary=230_000,
+                remote_all_russia=True,
+                schedule_minutes=90,
+            )
+            assert updated.direction.is_active is False
+            assert tuple(query.query for query in updated.queries) == (
+                "Fullstack Python",
+                "Интеграции Python API",
+            )
+            assert updated.queries[0].regions == (SearchRegion("88", "Казань"),)
+            assert updated.work_formats == (WorkFormat.REMOTE, WorkFormat.HYBRID)
+            assert updated.employment_forms == (EmploymentForm.FULL, EmploymentForm.PROJECT)
+            assert updated.minimum_salary == 160_000
+            assert updated.desired_salary == 230_000
+            assert updated.remote_all_russia is True
+            assert updated.queries[0].schedule_minutes == 90
     finally:
         database.close()
 
@@ -145,8 +172,9 @@ def test_direction_without_cities_searches_all_russia(settings: Settings) -> Non
             )
             tasks = CareerDirectionService(session).build_search_tasks(account.id, "ИТ")
 
-            assert tuple(query.query for query in configured.queries) == (
-                DEFAULT_DIRECTION_QUERIES[DirectionScope.IT_ADJACENT]
+            assert (
+                tuple(query.query for query in configured.queries)
+                == (DEFAULT_DIRECTION_QUERIES[DirectionScope.IT_ADJACENT])
             )
             assert configured.queries[0].regions == (SearchRegion("113", "Россия"),)
             assert configured.work_formats == ()
