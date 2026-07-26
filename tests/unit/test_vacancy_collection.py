@@ -4,12 +4,16 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
+from sqlalchemy import func, select
 
 from hugin.core.settings import Settings
 from hugin.database import create_database, upgrade_database
+from hugin.database.models import ApplicationModel
 from hugin.domain import VacancyData, VacancyState
+from hugin.domain.directions import DirectionScope
 from hugin.repositories import AccountRepository, DirectionRepository, ResumeRepository
 from hugin.repositories.vacancies import VacancyRepository
+from hugin.services.application_automation import ApplicationAutomationService
 from hugin.services.vacancy_analysis import RuleCategory, VacancyAnalysisService
 from hugin.services.vacancy_review import VacancyReviewService
 
@@ -52,14 +56,14 @@ def test_collection_tracks_changes_discoveries_duplicates_and_rejected(
             account = AccountRepository(session).create("Тест", "account-vacancies")
             resume = ResumeRepository(session).upsert(account.id, "resume-1", "Python")
             directions = DirectionRepository(session)
-            direction = directions.create(account.id, "ИТ")
+            direction = directions.create(account.id, "Python backend")
             directions.attach_resume(direction.id, resume.id)
             query = directions.add_query(direction.id, "Python backend", area="1")
 
             service = VacancyAnalysisService(session)
             results = service.synchronize(
                 account_external_id="account-vacancies",
-                direction_name="ИТ",
+                direction_name="Python backend",
                 vacancies=(
                     detailed_vacancy("100", "Python backend разработчик"),
                     detailed_vacancy("101", "Python backend-разработчик"),
@@ -113,14 +117,14 @@ def test_collection_tracks_changes_discoveries_duplicates_and_rejected(
             review = VacancyReviewService(session)
             rejected = review.list_rejected(
                 account_id=account.id,
-                direction_name="ИТ",
+                direction_name="Python backend",
                 company="другая",
                 reason="аналитика",
             )
             assert [entry.vacancy.hh_id for entry in rejected] == ["102"]
             restored = review.restore(
                 account_id=account.id,
-                direction_name="ИТ",
+                direction_name="Python backend",
                 hh_id="102",
             )
             assert restored.tracking.state is VacancyState.ANALYZED
@@ -150,5 +154,70 @@ def test_rejected_list_validates_sort_and_restore_state(settings: Settings) -> N
                 )
             with pytest.raises(ValueError, match="не находится"):
                 review.restore(account_id=account.id, direction_name="ИТ", hh_id="200")
+    finally:
+        database.close()
+
+
+def test_fullstack_found_by_python_is_routed_to_it_without_duplicate_task(
+    settings: Settings,
+) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    try:
+        with database.sessions.begin() as session:
+            account = AccountRepository(session).create("Тест", "account-routing")
+            resume = ResumeRepository(session).upsert(account.id, "resume-routing", "Python")
+            directions = DirectionRepository(session)
+            python_direction = directions.create(
+                account.id,
+                "Python backend",
+                scoring_config={"role_scope": DirectionScope.PYTHON_BACKEND.value},
+            )
+            it_direction = directions.create(
+                account.id,
+                "ИТ",
+                scoring_config={"role_scope": DirectionScope.IT_ADJACENT.value},
+            )
+            directions.attach_resume(python_direction.id, resume.id)
+            directions.attach_resume(it_direction.id, resume.id)
+            vacancy = detailed_vacancy(
+                "routed-fullstack",
+                "Middle Full-stack разработчик",
+                description="Python, FastAPI, TypeScript и React",
+            )
+
+            analyzed = VacancyAnalysisService(session).synchronize(
+                account_external_id="account-routing",
+                direction_name="Python backend",
+                vacancies=(vacancy,),
+            )
+
+            assert analyzed[0].evaluation.category is RuleCategory.ROUTED
+            stored = VacancyRepository(session).get_by_hh_id("routed-fullstack")
+            assert stored is not None
+            assert (
+                directions.get_tracked_vacancy(python_direction.id, stored.id).state
+                is VacancyState.SKIPPED
+            )
+            assert (
+                directions.get_tracked_vacancy(it_direction.id, stored.id).state
+                is VacancyState.ANALYZED
+            )
+
+            prepared = ApplicationAutomationService(session).prepare(
+                account_external_id="account-routing",
+                direction_name="ИТ",
+                include_stretch=True,
+            )
+            repeated = ApplicationAutomationService(session).prepare(
+                account_external_id="account-routing",
+                direction_name="ИТ",
+                include_stretch=True,
+            )
+
+            assert prepared.created == 1
+            assert repeated.created == 0
+            assert repeated.existing == 1
+            assert session.scalar(select(func.count()).select_from(ApplicationModel)) == 1
     finally:
         database.close()

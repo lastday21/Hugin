@@ -4,9 +4,10 @@ from decimal import Decimal
 
 import pytest
 
-from hugin.domain.directions import SearchRegion, WorkFormat
+from hugin.domain.directions import DirectionScope, SearchRegion, WorkFormat
 from hugin.domain.vacancies import VacancyAvailability, VacancyData
 from hugin.services.vacancy_analysis import (
+    AdjacentItRules,
     PythonBackendRules,
     RuleCategory,
     RuleContext,
@@ -95,19 +96,19 @@ def test_senior_marker_is_a_risk_but_not_a_rejection() -> None:
     assert any("без анализа обязанностей" in reason for reason in result.reasons)
 
 
-def test_low_soft_score_does_not_reject_related_vacancy() -> None:
-    result = PythonBackendRules().evaluate(
-        VacancyData(
-            "low-score",
-            "Инженер автоматизации",
-            "https://hh.ru/vacancy/low-score",
-            description="Писать небольшие инструменты на Python",
-        )
+def test_automation_is_routed_from_python_backend_to_it() -> None:
+    vacancy = VacancyData(
+        "low-score",
+        "Инженер автоматизации",
+        "https://hh.ru/vacancy/low-score",
+        description="Писать небольшие инструменты на Python",
     )
+    routed = PythonBackendRules().evaluate(vacancy)
+    result = AdjacentItRules().evaluate(vacancy)
 
-    assert result.score < PythonBackendRules.soft_boundary
+    assert routed.category is RuleCategory.ROUTED
+    assert routed.target_scope is DirectionScope.IT_ADJACENT
     assert result.accepted
-    assert any("только на порядок очереди" in reason for reason in result.reasons)
 
 
 def test_leading_role_is_not_rejected() -> None:
@@ -127,32 +128,34 @@ def test_leading_role_is_not_rejected() -> None:
 
 
 def test_python_automation_with_llm_is_a_match() -> None:
-    result = PythonBackendRules().evaluate(
-        VacancyData(
-            "7",
-            "Разработчик / Automation Engineer (интеграции, LLM/RAG)",
-            "https://hh.ru/vacancy/7",
-            description="Писать backend-сервисы на Python и работать через API моделей",
-            experience="Опыт 1\N{EN DASH}3 года",
-            key_skills=("Python", "FastAPI", "Docker", "Git"),
-        )
+    vacancy = VacancyData(
+        "7",
+        "Разработчик / Automation Engineer (интеграции, LLM/RAG)",
+        "https://hh.ru/vacancy/7",
+        description="Писать backend-сервисы на Python и работать через API моделей",
+        experience="Опыт 1\N{EN DASH}3 года",
+        key_skills=("Python", "FastAPI", "Docker", "Git"),
     )
+    routed = PythonBackendRules().evaluate(vacancy)
+    result = AdjacentItRules().evaluate(vacancy)
 
+    assert routed.category is RuleCategory.ROUTED
     assert result.category is RuleCategory.MATCH
 
 
 def test_ai_agent_engineer_is_a_stretch_match() -> None:
-    result = PythonBackendRules().evaluate(
-        VacancyData(
-            "8",
-            "AI Agent Engineer (NLP/LLM)",
-            "https://hh.ru/vacancy/8",
-            description="Логика агентов на Python и интеграция через backend API",
-            experience="Опыт 1\N{EN DASH}3 года",
-            key_skills=("Python", "LangGraph", "LLM", "NLP"),
-        )
+    vacancy = VacancyData(
+        "8",
+        "AI Agent Engineer (NLP/LLM)",
+        "https://hh.ru/vacancy/8",
+        description="Логика агентов на Python и интеграция через backend API",
+        experience="Опыт 1\N{EN DASH}3 года",
+        key_skills=("Python", "LangGraph", "LLM", "NLP"),
     )
+    routed = PythonBackendRules().evaluate(vacancy)
+    result = AdjacentItRules().evaluate(vacancy)
 
+    assert routed.category is RuleCategory.ROUTED
     assert result.accepted
     assert result.category is RuleCategory.STRETCH
     assert any("дополнительная подготовка" in reason for reason in result.reasons)
@@ -241,7 +244,7 @@ def test_mandatory_work_format_conflict_is_rejected() -> None:
     assert any("формат работы" in reason for reason in result.reasons)
 
 
-def test_mandatory_relocation_outside_selected_cities_is_rejected() -> None:
+def test_mandatory_relocation_to_elabuga_is_allowed() -> None:
     result = PythonBackendRules().evaluate(
         VacancyData(
             "relocation",
@@ -255,5 +258,65 @@ def test_mandatory_relocation_outside_selected_cities_is_rejected() -> None:
         RuleContext(regions=(SearchRegion("1", "Москва"), SearchRegion("2", "Санкт-Петербург"))),
     )
 
+    assert result.category is RuleCategory.MATCH
+
+
+@pytest.mark.parametrize("city", ["Владивосток", "Хабаровск"])
+def test_mandatory_relocation_to_far_east_is_rejected(city: str) -> None:
+    result = PythonBackendRules().evaluate(
+        VacancyData(
+            f"relocation-{city}",
+            "Python backend разработчик",
+            f"https://hh.ru/vacancy/relocation-{city}",
+            description=f"Python backend. Обязательная релокация в город {city}.",
+        )
+    )
+
     assert result.category is RuleCategory.REJECTED
-    assert any("переезд" in reason for reason in result.reasons)
+    assert any("Дальний Восток" in reason for reason in result.reasons)
+
+
+def test_fullstack_is_owned_by_it_even_with_python_backend() -> None:
+    vacancy = VacancyData(
+        "fullstack",
+        "Middle Full-stack разработчик",
+        "https://hh.ru/vacancy/fullstack",
+        description="Python, FastAPI, TypeScript и React",
+    )
+
+    routed = PythonBackendRules().evaluate(vacancy)
+    accepted = AdjacentItRules().evaluate(vacancy)
+
+    assert routed.category is RuleCategory.ROUTED
+    assert routed.target_scope is DirectionScope.IT_ADJACENT
+    assert accepted.category is RuleCategory.MATCH
+
+
+def test_machine_learning_role_is_a_stretch_in_it() -> None:
+    vacancy = VacancyData(
+        "ml",
+        "Middle ML-инженер",
+        "https://hh.ru/vacancy/ml",
+        description="Разработка служб на Python и обучение моделей",
+    )
+
+    routed = PythonBackendRules().evaluate(vacancy)
+    accepted = AdjacentItRules().evaluate(vacancy)
+
+    assert routed.category is RuleCategory.ROUTED
+    assert accepted.category is RuleCategory.STRETCH
+
+
+def test_unrelated_mandatory_dotnet_stack_is_rejected_in_it() -> None:
+    result = AdjacentItRules().evaluate(
+        VacancyData(
+            "dotnet",
+            "Backend C# Developer",
+            "https://hh.ru/vacancy/dotnet",
+            required_qualifications="Обязательный стек: C# и .NET",
+        ),
+        RuleContext(skills=("Python, FastAPI, PostgreSQL",)),
+    )
+
+    assert result.category is RuleCategory.REJECTED
+    assert any("подтверждённым опытом" in reason for reason in result.reasons)

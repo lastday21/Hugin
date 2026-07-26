@@ -6,6 +6,7 @@ from hugin.services.hh_profile import HhProfileSyncService
 from hugin.services.job_search import JobSearchSyncService
 from hugin.services.queue import QueueService
 from hugin.services.vacancy_analysis import (
+    AdjacentItRules,
     PythonBackendRules,
     RuleCategory,
     VacancyAnalysisService,
@@ -13,6 +14,7 @@ from hugin.services.vacancy_analysis import (
 from hugin.services.vacancy_review import VacancyReviewService
 
 __all__ = [
+    "AdjacentItRules",
     "ApplicationAutomationService",
     "CoverLetterService",
     "HhProfileSyncService",

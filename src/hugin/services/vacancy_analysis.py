@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 from hugin.domain.directions import (
     AccountRecord,
     DirectionRecord,
+    DirectionScope,
     SearchRegion,
     VacancyState,
     WorkFormat,
@@ -21,13 +22,14 @@ from hugin.repositories.vacancies import VacancyRepository
 from hugin.services.career_directions import CareerDirectionService
 from hugin.services.vacancy_duplicates import VacancyDuplicateDetector
 
-RULES_VERSION = "python_it_v2"
+RULES_VERSION = "python_it_v3"
 
 
 class RuleCategory(StrEnum):
     MATCH = "MATCH"
     STRETCH = "STRETCH"
     REJECTED = "REJECTED"
+    ROUTED = "ROUTED"
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,10 +55,11 @@ class RuleEvaluation:
     category: RuleCategory
     reasons: tuple[str, ...]
     components: tuple[RuleComponent, ...] = ()
+    target_scope: DirectionScope | None = None
 
     @property
     def accepted(self) -> bool:
-        return self.category is not RuleCategory.REJECTED
+        return self.category in {RuleCategory.MATCH, RuleCategory.STRETCH}
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,8 +69,90 @@ class VacancyAnalysisResult:
     state: VacancyState
 
 
+class VacancyRoleRouter:
+    _adjacent_title_markers: ClassVar[tuple[str, ...]] = (
+        "fullstack",
+        "full-stack",
+        "full stack",
+        "фулстек",
+        "automation",
+        "автоматизац",
+        "интеграц",
+        "integration",
+        "автотест",
+        "qa automation",
+        "test automation",
+        "etl",
+        "data engineer",
+        "инженер данных",
+        "devops",
+        "sre",
+        "platform engineer",
+        "llm",
+        "rag",
+        "ai agent",
+        "ai engineer",
+        "nlp engineer",
+        "ml engineer",
+        "ml-инженер",
+        "ml инженер",
+        "ml lead",
+        "machine learning",
+    )
+    _backend_markers: ClassVar[tuple[str, ...]] = (
+        "backend",
+        "back-end",
+        "бэкенд",
+        "fastapi",
+        "django",
+        "flask",
+        "серверн",
+        "микросервис",
+        "rest api",
+        "backend api",
+    )
+    _developer_markers: ClassVar[tuple[str, ...]] = (
+        "разработ",
+        "developer",
+        "engineer",
+        "инженер",
+        "программист",
+    )
+
+    @classmethod
+    def classify(cls, vacancy: VacancyData) -> DirectionScope | None:
+        title = vacancy.title.casefold()
+        complete_text = " ".join(
+            (
+                title,
+                (vacancy.description or "").casefold(),
+                (vacancy.responsibilities or "").casefold(),
+                (vacancy.required_qualifications or "").casefold(),
+                " ".join(vacancy.key_skills).casefold(),
+            )
+        )
+        if any(marker in title for marker in cls._adjacent_title_markers):
+            return DirectionScope.IT_ADJACENT
+        has_python = "python" in complete_text
+        has_backend = any(marker in complete_text for marker in cls._backend_markers)
+        if has_python and has_backend and (
+            any(marker in title for marker in cls._backend_markers)
+            or "python" in title
+        ):
+            return DirectionScope.PYTHON_BACKEND
+        if "python" in title and any(
+            marker in title for marker in cls._developer_markers
+        ):
+            return DirectionScope.IT_ADJACENT
+        if any(marker in title for marker in cls._adjacent_title_markers):
+            return DirectionScope.IT_ADJACENT
+        return None
+
+
 class PythonBackendRules:
     soft_boundary: ClassVar[float] = 50
+    scope: ClassVar[DirectionScope] = DirectionScope.PYTHON_BACKEND
+    requires_python_without_profile: ClassVar[bool] = True
     _excluded_specializations: ClassVar[tuple[tuple[str, str], ...]] = (
         ("аналитик", "другое направление: аналитика"),
         ("analyst", "другое направление: аналитика"),
@@ -98,6 +183,13 @@ class PythonBackendRules:
         "интеграц",
         " api",
         "etl",
+        "fullstack",
+        "full-stack",
+        "devops",
+        "автотест",
+        "test automation",
+        "llm",
+        "rag",
     )
     _useful_skills: ClassVar[tuple[str, ...]] = (
         "python",
@@ -143,9 +235,25 @@ class PythonBackendRules:
         if scam is not None:
             rejected.append(f"подозрительное требование: {scam}")
 
+        destination = VacancyRoleRouter.classify(vacancy)
+        if not rejected and destination is not None and destination is not self.scope:
+            return RuleEvaluation(
+                score=0,
+                category=RuleCategory.ROUTED,
+                reasons=(
+                    "перенесена в другое направление: "
+                    + (
+                        "Python backend"
+                        if destination is DirectionScope.PYTHON_BACKEND
+                        else "ИТ"
+                    ),
+                ),
+                target_scope=destination,
+            )
+
         has_development = any(marker in complete_text for marker in self._development_markers)
         for marker, reason in self._excluded_specializations:
-            if marker in title and not self._has_secondary_development_role(title):
+            if marker in title:
                 rejected.append(reason)
                 break
         if not has_development:
@@ -161,7 +269,7 @@ class PythonBackendRules:
                 and self._explicit_other_stack(title, requirements)
             ):
                 rejected.append("обязательные технологии не связаны с подтверждённым опытом")
-        elif "python" not in complete_text:
+        elif self.requires_python_without_profile and "python" not in complete_text:
             rejected.append("Python не указан в названии, описании или навыках")
 
         senior_responsibility = any(
@@ -183,7 +291,7 @@ class PythonBackendRules:
             )
 
         if self._relocation_conflicts(complete_text, context):
-            rejected.append("обязательный переезд указан вне выбранных городов")
+            rejected.append("обязательный переезд на Дальний Восток не входит в настройки")
 
         format_score = self._work_format_score(vacancy, context)
         if format_score is not None:
@@ -310,6 +418,10 @@ class PythonBackendRules:
                 "java developer",
                 "php developer",
                 "1с разработ",
+                "c# developer",
+                ".net developer",
+                "разработчик c#",
+                "разработчик .net",
             )
         )
 
@@ -377,9 +489,27 @@ class PythonBackendRules:
                 "переезд обязателен",
             )
         )
-        if not mandatory or not context.regions:
+        if not mandatory:
             return False
-        return not any(region.name.casefold() in text for region in context.regions)
+        return any(
+            marker in text
+            for marker in (
+                "дальний восток",
+                "владивосток",
+                "хабаровск",
+                "приморск",
+                "хабаровский край",
+                "сахалин",
+                "камчат",
+                "магадан",
+                "чукот",
+                "якутск",
+                "якутия",
+                "республика саха",
+                "амурская область",
+                "благовещенск",
+            )
+        )
 
     @staticmethod
     def _salary_score(vacancy: VacancyData, context: RuleContext) -> float | None:
@@ -434,13 +564,61 @@ class PythonBackendRules:
         return min(score, 100)
 
 
+class AdjacentItRules(PythonBackendRules):
+    scope: ClassVar[DirectionScope] = DirectionScope.IT_ADJACENT
+    requires_python_without_profile: ClassVar[bool] = False
+    _stretch_specializations: ClassVar[tuple[str, ...]] = (
+        *PythonBackendRules._stretch_specializations,
+        "machine learning",
+        "ml engineer",
+        "ml-инженер",
+        "ml инженер",
+        "ml lead",
+    )
+    _excluded_specializations: ClassVar[tuple[tuple[str, str], ...]] = (
+        ("аналитик", "другое направление: аналитика без разработки"),
+        ("analyst", "другое направление: аналитика без разработки"),
+        ("ручной тестировщик", "работа не связана с написанием кода"),
+        ("manual qa", "работа не связана с написанием кода"),
+        ("mobile", "другое основное направление: мобильная разработка"),
+    )
+
+    @staticmethod
+    def _role_score(title: str, text: str) -> float:
+        if any(marker in title for marker in ("fullstack", "full-stack", "full stack")):
+            return 100
+        if any(
+            marker in title
+            for marker in (
+                "automation",
+                "автоматизац",
+                "интеграц",
+                "автотест",
+                "etl",
+                "devops",
+                "llm",
+                "rag",
+                "ai agent",
+            )
+        ):
+            return 90
+        if "python" in title:
+            return 80
+        if "python" in text:
+            return 70
+        return 55
+
+
 class VacancyAnalysisService:
     def __init__(self, session: Session) -> None:
         self._session = session
         self._accounts = AccountRepository(session)
         self._directions = DirectionRepository(session)
         self._vacancies = VacancyRepository(session)
-        self._rules = PythonBackendRules()
+        self._rules = {
+            DirectionScope.PYTHON_BACKEND: PythonBackendRules(),
+            DirectionScope.IT_ADJACENT: AdjacentItRules(),
+        }
         self._duplicates = VacancyDuplicateDetector()
 
     def pending(
@@ -466,7 +644,9 @@ class VacancyAnalysisService:
         for vacancy in vacancies:
             stored = self._vacancies.upsert(vacancy)
             self._directions.track_vacancy(direction.id, stored.id)
-            results.append(self._apply(direction.id, stored, vacancy, context))
+            result = self._apply(direction, stored, vacancy, context)
+            self._route(account.id, direction, stored, vacancy, result)
+            results.append(result)
         return tuple(results)
 
     def reanalyze(
@@ -480,17 +660,19 @@ class VacancyAnalysisService:
         results: list[VacancyAnalysisResult] = []
         for stored in self._vacancies.list_detailed_for_direction(direction.id):
             vacancy = self._data(stored)
-            results.append(self._apply(direction.id, stored, vacancy, context))
+            result = self._apply(direction, stored, vacancy, context)
+            self._route(account.id, direction, stored, vacancy, result)
+            results.append(result)
         return tuple(results)
 
     def _apply(
         self,
-        direction_id: int,
+        direction: DirectionRecord,
         stored: VacancyRecord,
         vacancy: VacancyData,
         context: RuleContext,
     ) -> VacancyAnalysisResult:
-        tracked = self._directions.get_tracked_vacancy(direction_id, stored.id)
+        tracked = self._directions.get_tracked_vacancy(direction.id, stored.id)
         if tracked.rules_details.get("manual_override") == "ACCEPT":
             raw_reasons = tracked.rules_details.get("reasons", [])
             reason_values = raw_reasons if isinstance(raw_reasons, list) else []
@@ -511,7 +693,8 @@ class VacancyAnalysisService:
                 duplicate.similarity,
             )
 
-        evaluation = self._rules.evaluate(vacancy, context)
+        rules = self._rules[direction.scope]
+        evaluation = rules.evaluate(vacancy, context)
         if duplicate is not None:
             evaluation = RuleEvaluation(
                 evaluation.score,
@@ -522,14 +705,17 @@ class VacancyAnalysisService:
                     f"связанная вакансия: {duplicate.canonical.hh_id}",
                 ),
                 evaluation.components,
+                evaluation.target_scope,
             )
         if vacancy.availability is not VacancyAvailability.ACTIVE:
             state = VacancyState.CLOSED
+        elif evaluation.category is RuleCategory.ROUTED:
+            state = VacancyState.SKIPPED
         else:
             state = VacancyState.ANALYZED if evaluation.accepted else VacancyState.FILTERED_OUT
 
         self._directions.apply_rules(
-            direction_id,
+            direction.id,
             stored.id,
             state=state,
             score=evaluation.score,
@@ -546,12 +732,44 @@ class VacancyAnalysisService:
                     }
                     for component in evaluation.components
                 ],
-                "soft_boundary": self._rules.soft_boundary,
+                "soft_boundary": rules.soft_boundary,
                 "duplicate_of_id": stored.duplicate_of_id,
+                "target_scope": (
+                    evaluation.target_scope.value
+                    if evaluation.target_scope is not None
+                    else None
+                ),
             },
             rules_version=RULES_VERSION,
         )
         return VacancyAnalysisResult(stored, evaluation, state)
+
+    def _route(
+        self,
+        account_id: int,
+        source: DirectionRecord,
+        stored: VacancyRecord,
+        vacancy: VacancyData,
+        result: VacancyAnalysisResult,
+    ) -> None:
+        target_scope = result.evaluation.target_scope
+        if result.evaluation.category is not RuleCategory.ROUTED or target_scope is None:
+            return
+        target = next(
+            (
+                direction
+                for direction in self._directions.list_for_account(account_id)
+                if direction.id != source.id
+                and direction.is_active
+                and direction.scope is target_scope
+            ),
+            None,
+        )
+        if target is None:
+            return
+        self._directions.track_vacancy(target.id, stored.id)
+        target_context = self._context(account_id, target.name)
+        self._apply(target, stored, vacancy, target_context)
 
     def _account_and_direction(
         self,

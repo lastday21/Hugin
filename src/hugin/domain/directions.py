@@ -29,6 +29,11 @@ class EmploymentForm(StrEnum):
     FLY_IN_FLY_OUT = "FLY_IN_FLY_OUT"
 
 
+class DirectionScope(StrEnum):
+    PYTHON_BACKEND = "PYTHON_BACKEND"
+    IT_ADJACENT = "IT_ADJACENT"
+
+
 @dataclass(frozen=True, slots=True)
 class SearchRegion:
     area: str
@@ -55,6 +60,21 @@ class DirectionRecord:
     is_active: bool
     created_at: datetime
     updated_at: datetime
+
+    @property
+    def scope(self) -> DirectionScope:
+        value = self.scoring_config.get("role_scope")
+        if isinstance(value, str):
+            try:
+                return DirectionScope(value)
+            except ValueError:
+                pass
+        normalized_name = self.name.casefold().replace("-", " ")
+        if "python" in normalized_name and (
+            "backend" in normalized_name or "бэкенд" in normalized_name
+        ):
+            return DirectionScope.PYTHON_BACKEND
+        return DirectionScope.IT_ADJACENT
 
 
 @dataclass(frozen=True, slots=True)

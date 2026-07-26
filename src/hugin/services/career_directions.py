@@ -11,6 +11,7 @@ from hugin.database.models import CandidateProfileModel, VerifiedFactModel
 from hugin.domain.content import ConfirmationState
 from hugin.domain.directions import (
     DirectionRecord,
+    DirectionScope,
     EmploymentForm,
     ResumeRecord,
     SearchQueryRecord,
@@ -24,6 +25,28 @@ from hugin.repositories.directions import (
 )
 
 RUSSIA_REGION = SearchRegion("113", "Россия")
+
+DEFAULT_DIRECTION_QUERIES = {
+    DirectionScope.PYTHON_BACKEND: (
+        "Python backend разработчик",
+        "Backend разработчик Python",
+    ),
+    DirectionScope.IT_ADJACENT: (
+        "Fullstack разработчик Python",
+        "Инженер автоматизации Python",
+        "Разработчик интеграций Python API",
+        "Инженер по автотестам Python",
+        "LLM RAG разработчик Python",
+        "ETL разработчик Python",
+    ),
+}
+
+DEFAULT_DIRECTION_DESCRIPTIONS = {
+    DirectionScope.PYTHON_BACKEND: "Только серверная разработка на Python",
+    DirectionScope.IT_ADJACENT: (
+        "Fullstack, автоматизация и другие подходящие технические роли"
+    ),
+}
 
 COMMON_REGIONS = {
     "москва": SearchRegion("1", "Москва"),
@@ -58,6 +81,7 @@ class DirectionSearchSettings:
     salary_currency: str
     remote_all_russia: bool
     skills_from_resume: tuple[str, ...]
+    role_scope: DirectionScope
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,13 +112,26 @@ class CareerDirectionService:
         minimum_salary: int | None = None,
         desired_salary: int | None = None,
         remote_all_russia: bool | None = None,
+        role_scope: DirectionScope | None = None,
         schedule_minutes: int = 120,
     ) -> DirectionSearchSettings:
         self._accounts.get(account_id)
         resume = self._resumes.get_profile_active(account_id)
         facts = self._confirmed_facts(account_id, resume.id)
 
-        normalized_queries = self._queries(queries, facts, resume.title)
+        existing = self._directions.get_by_account_and_name(account_id, direction_name.strip())
+        actual_scope = role_scope or (
+            existing.scope
+            if existing is not None
+            else self._scope_from_name(direction_name)
+        )
+        normalized_queries = self._queries(
+            queries,
+            facts,
+            resume.title,
+            direction_name,
+            actual_scope,
+        )
         normalized_regions = self._unique_regions(regions) or (RUSSIA_REGION,)
         normalized_formats = self._work_formats(work_formats, facts)
         normalized_employment = self._employment_forms(employment_forms, facts)
@@ -112,8 +149,8 @@ class CareerDirectionService:
                 "Поиск удалённых вакансий по всей России можно включить "
                 "только для удалённого формата"
             )
-        existing = self._directions.get_by_account_and_name(account_id, direction_name.strip())
         scoring_config = dict(existing.scoring_config) if existing is not None else {}
+        scoring_config["role_scope"] = actual_scope.value
         scoring_config["search_settings"] = {
             "minimum_salary": actual_minimum,
             "desired_salary": actual_desired,
@@ -125,6 +162,7 @@ class CareerDirectionService:
         direction = self._directions.upsert(
             account_id,
             direction_name.strip(),
+            description=DEFAULT_DIRECTION_DESCRIPTIONS[actual_scope],
             scoring_config=scoring_config,
         )
         self._directions.attach_resume(direction.id, resume.id)
@@ -242,6 +280,7 @@ class CareerDirectionService:
             salary_currency=str(search.get("salary_currency", "RUB")),
             remote_all_russia=search.get("remote_all_russia") is True,
             skills_from_resume=facts.get("skills", ()),
+            role_scope=direction.scope,
         )
 
     def _confirmed_facts(
@@ -276,12 +315,29 @@ class CareerDirectionService:
         supplied: tuple[str, ...] | None,
         facts: dict[str, tuple[str, ...]],
         resume_title: str,
+        direction_name: str,
+        role_scope: DirectionScope,
     ) -> tuple[str, ...]:
-        values = supplied or facts.get("desired_position", ()) or (resume_title,)
+        normalized_name = direction_name.strip().casefold().replace("-", " ")
+        if supplied:
+            values = supplied
+        elif role_scope is DirectionScope.PYTHON_BACKEND or normalized_name in {"ит", "it"}:
+            values = DEFAULT_DIRECTION_QUERIES[role_scope]
+        else:
+            values = facts.get("desired_position", ()) or (resume_title,)
         normalized = tuple(dict.fromkeys(value.strip() for value in values if value.strip()))
         if not normalized:
             raise ValueError("У активного резюме отсутствует название для поискового запроса")
         return normalized
+
+    @staticmethod
+    def _scope_from_name(direction_name: str) -> DirectionScope:
+        normalized = direction_name.casefold().replace("-", " ")
+        if "python" in normalized and (
+            "backend" in normalized or "бэкенд" in normalized
+        ):
+            return DirectionScope.PYTHON_BACKEND
+        return DirectionScope.IT_ADJACENT
 
     @staticmethod
     def _unique_regions(regions: tuple[SearchRegion, ...]) -> tuple[SearchRegion, ...]:

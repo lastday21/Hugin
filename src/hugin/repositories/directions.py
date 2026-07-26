@@ -293,6 +293,14 @@ class DirectionRepository:
         )
         return _direction_record(model) if model is not None else None
 
+    def list_for_account(self, account_id: int) -> list[DirectionRecord]:
+        models = self._session.scalars(
+            select(CareerDirectionModel)
+            .where(CareerDirectionModel.account_id == account_id)
+            .order_by(CareerDirectionModel.id)
+        )
+        return [_direction_record(model) for model in models]
+
     def add_query(
         self,
         direction_id: int,

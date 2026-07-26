@@ -124,6 +124,9 @@ class ApplicationAutomationService:
                 continue
             current = self._applications.get_by_key(account.id, tracked.vacancy_id, resume.id)
             if current is not None:
+                if current.direction_id != direction.id:
+                    existing += 1
+                    continue
                 task = self._tasks.get_by_application_id(current.id)
                 if task is None and current.state is ApplicationState.APPLYING:
                     self._tasks.enqueue(current.id, self._priority(tracked))
@@ -170,7 +173,7 @@ class ApplicationAutomationService:
     def recover_interrupted(self) -> int:
         return len(self._tasks.recover_running())
 
-    def policy(self, timezone_name: str) -> ApplicationPolicyRecord:
+    def policy(self, timezone_name: str | None = None) -> ApplicationPolicyRecord:
         return self._queue.policy(timezone_name)
 
     def claim_next(

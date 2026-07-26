@@ -12,10 +12,13 @@ from hugin.database.models import (
     VerifiedFactModel,
 )
 from hugin.domain.content import ConfirmationState
-from hugin.domain.directions import EmploymentForm, SearchRegion, WorkFormat
+from hugin.domain.directions import DirectionScope, EmploymentForm, SearchRegion, WorkFormat
 from hugin.domain.vacancies import VacancyData
 from hugin.repositories.directions import AccountRepository, ResumeRepository
-from hugin.services.career_directions import CareerDirectionService
+from hugin.services.career_directions import (
+    DEFAULT_DIRECTION_QUERIES,
+    CareerDirectionService,
+)
 from hugin.services.job_search import JobSearchSyncService
 
 pytestmark = pytest.mark.integration
@@ -70,7 +73,10 @@ def test_direction_settings_use_active_resume_and_build_city_searches(
             tasks = CareerDirectionService(session).build_search_tasks(account.id, "ИТ")
 
             assert configured.resume == resume
-            assert [query.query for query in configured.queries] == ["Python backend разработчик"]
+            assert tuple(query.query for query in configured.queries) == (
+                DEFAULT_DIRECTION_QUERIES[DirectionScope.IT_ADJACENT]
+            )
+            assert configured.role_scope is DirectionScope.IT_ADJACENT
             assert configured.work_formats == (WorkFormat.REMOTE, WorkFormat.ON_SITE)
             assert configured.employment_forms == (EmploymentForm.FULL,)
             assert configured.minimum_salary == 180_000
@@ -80,7 +86,7 @@ def test_direction_settings_use_active_resume_and_build_city_searches(
                 ("1", "Москва"),
                 ("3", "Екатеринбург"),
                 ("113", "Россия — удалённо"),
-            ]
+            ] * len(DEFAULT_DIRECTION_QUERIES[DirectionScope.IT_ADJACENT])
             assert tasks[0].filters == {
                 "order_by": "publication_time",
                 "employment_form": ["FULL"],
@@ -108,7 +114,7 @@ def test_direction_settings_use_active_resume_and_build_city_searches(
                 ),
             )
             assert synchronized.resume == resume
-            assert session.scalar(select(func.count()).select_from(DirectionSearchQueryModel)) == 1
+            assert session.scalar(select(func.count()).select_from(DirectionSearchQueryModel)) == 6
             assert session.scalar(select(func.count()).select_from(VacancyDiscoveryModel)) == 1
     finally:
         database.close()
@@ -139,12 +145,16 @@ def test_direction_without_cities_searches_all_russia(settings: Settings) -> Non
             )
             tasks = CareerDirectionService(session).build_search_tasks(account.id, "ИТ")
 
-            assert [query.query for query in configured.queries] == ["Разработчик"]
+            assert tuple(query.query for query in configured.queries) == (
+                DEFAULT_DIRECTION_QUERIES[DirectionScope.IT_ADJACENT]
+            )
             assert configured.queries[0].regions == (SearchRegion("113", "Россия"),)
             assert configured.work_formats == ()
             assert configured.employment_forms == ()
             assert configured.minimum_salary is None
-            assert [(task.area, task.region_name) for task in tasks] == [("113", "Россия")]
+            assert [(task.area, task.region_name) for task in tasks] == [
+                ("113", "Россия"),
+            ] * len(DEFAULT_DIRECTION_QUERIES[DirectionScope.IT_ADJACENT])
             assert tasks[0].filters == {"order_by": "publication_time"}
     finally:
         database.close()

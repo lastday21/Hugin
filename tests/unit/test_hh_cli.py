@@ -509,7 +509,7 @@ def test_queue_settings_pause_and_status_work_without_browser(
             calls.append(("pause", None))
             return system
 
-        def policy(self, timezone_name: str) -> SimpleNamespace:
+        def policy(self, timezone_name: str | None = None) -> SimpleNamespace:
             calls.append(("policy", timezone_name))
             return policy
 
@@ -828,7 +828,7 @@ def test_analyze_loads_details_and_prints_rule_reasons(
 
     output = capsys.readouterr().out
     assert "Проверено вакансий: 1" in output
-    assert "Подходят: 1. Пограничные: 0. Отклонены: 0" in output
+    assert "Подходят: 1. Пограничные: 0. Перенесены: 0. Отклонены: 0" in output
     assert "Добавлено в очередь: 1" in output
     assert "Python указан в названии" in output
     assert FakeBrowser.created is not None
@@ -865,8 +865,7 @@ def test_apply_runs_queue_and_records_confirmed_result(
         def recover_interrupted(self) -> int:
             return 0
 
-        def policy(self, timezone_name: str) -> SimpleNamespace:
-            assert timezone_name
+        def policy(self, timezone_name: str | None = None) -> SimpleNamespace:
             return SimpleNamespace(
                 daily_limit=25,
                 delay_min_seconds=30,
@@ -962,7 +961,7 @@ def test_apply_keeps_queue_available_when_one_result_is_unknown(
         def recover_interrupted(self) -> int:
             return 1
 
-        def policy(self, timezone_name: str) -> SimpleNamespace:
+        def policy(self, timezone_name: str | None = None) -> SimpleNamespace:
             return SimpleNamespace(
                 daily_limit=25,
                 delay_min_seconds=30,

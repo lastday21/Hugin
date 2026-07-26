@@ -416,12 +416,14 @@ def run(argv: Sequence[str] | None = None) -> int:
 
         matched = sum(result.evaluation.category is RuleCategory.MATCH for result in analyzed)
         stretch = sum(result.evaluation.category is RuleCategory.STRETCH for result in analyzed)
+        routed = sum(result.evaluation.category is RuleCategory.ROUTED for result in analyzed)
         duplicates = sum(result.vacancy.duplicate_of_id is not None for result in analyzed)
-        rejected = len(analyzed) - matched - stretch
+        rejected = len(analyzed) - matched - stretch - routed
         print(f"Проверено вакансий: {len(analyzed)}.")
         print(
             f"Подходят: {matched}. Пограничные: {stretch}. "
-            f"Отклонены: {rejected}. Из них похожих публикаций: {duplicates}."
+            f"Перенесены: {routed}. Отклонены: {rejected}. "
+            f"Из них похожих публикаций: {duplicates}."
         )
         print(
             f"Добавлено в очередь: {queued.created}. Уже находилось в обработке: {queued.existing}."
@@ -432,6 +434,7 @@ def run(argv: Sequence[str] | None = None) -> int:
                 RuleCategory.MATCH: "подходит",
                 RuleCategory.STRETCH: "условно подходит",
                 RuleCategory.REJECTED: "отклонена",
+                RuleCategory.ROUTED: "перенесена",
             }
             decision = decisions[evaluation.category]
             reasons = "; ".join(evaluation.reasons)
@@ -785,9 +788,15 @@ def _run_applications(
             print("Дневное ограничение исчерпано, новые отклики не отправлены.")
             return 0
 
-        while sent < run_limit:
+        while sent < arguments.limit:
             with database.sessions.begin() as session:
-                job = ApplicationAutomationService(session).claim_next(
+                runtime_service = ApplicationAutomationService(session)
+                runtime_policy = runtime_service.policy()
+                sent_today = runtime_service.applied_since(prepared.account_id, day_start)
+                if sent_today >= runtime_policy.daily_limit:
+                    print("Дневное ограничение достигнуто, очередь остановлена до завтра.")
+                    break
+                job = runtime_service.claim_next(
                     prepared.direction_id,
                     require_cover_letter=True,
                 )
@@ -807,16 +816,18 @@ def _run_applications(
                     job.vacancy.source_url,
                     f"Ошибка выполнения: {type(error).__name__}",
                 )
-            apply_delay = None
-            if result.status is HhApplyStatus.APPLIED:
-                apply_delay = timedelta(
-                    seconds=random.uniform(
-                        policy.delay_min_seconds,
-                        policy.delay_max_seconds,
-                    )
-                )
             with database.sessions.begin() as session:
-                recorded = ApplicationAutomationService(session).record_result(
+                runtime_service = ApplicationAutomationService(session)
+                current_policy = runtime_service.policy()
+                apply_delay = None
+                if result.status is HhApplyStatus.APPLIED:
+                    apply_delay = timedelta(
+                        seconds=random.uniform(
+                            current_policy.delay_min_seconds,
+                            current_policy.delay_max_seconds,
+                        )
+                    )
+                recorded = runtime_service.record_result(
                     job,
                     result,
                     apply_delay=apply_delay,
@@ -830,7 +841,7 @@ def _run_applications(
             if recorded.blocking:
                 blocking = True
                 break
-            if recorded.sent and sent < run_limit and recorded.next_apply_at is not None:
+            if recorded.sent and sent < arguments.limit and recorded.next_apply_at is not None:
                 wait_seconds = max(
                     (recorded.next_apply_at - datetime.now(UTC)).total_seconds(),
                     0,
