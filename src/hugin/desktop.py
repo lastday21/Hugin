@@ -47,6 +47,20 @@ class WebviewModule(Protocol):
     def start(self, *, debug: bool = False) -> None: ...
 
 
+class WindowsUser32(Protocol):
+    def MessageBoxW(
+        self,
+        parent: int | None,
+        message: str,
+        title: str,
+        flags: int,
+    ) -> int: ...
+
+
+class WindowsLibraries(Protocol):
+    user32: WindowsUser32
+
+
 class DesktopBridge:
     def __init__(
         self,
@@ -258,8 +272,8 @@ def show_launch_error(message: str) -> None:
         return
     import ctypes
 
-    user32 = ctypes.windll.user32
-    user32.MessageBoxW(None, message, title, 0x10)
+    windows = cast(WindowsLibraries, vars(ctypes)["windll"])
+    windows.user32.MessageBoxW(None, message, title, 0x10)
 
 
 def main() -> None:
