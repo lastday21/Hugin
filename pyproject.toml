@@ -33,6 +33,7 @@ hugin-resume = "hugin.resume_cli:main"
 hugin-resume-improve = "hugin.resume_improvement_cli:main"
 hugin-letters = "hugin.cover_letter_cli:main"
 hugin-forms = "hugin.screening_cli:main"
+hugin-backup = "hugin.backup_cli:main"
 hugin-desktop = "hugin.desktop:launch"
 
 [dependency-groups]
@@ -97,6 +98,10 @@ select = ["B", "E", "F", "I", "RUF", "SIM", "UP"]
 "src/hugin/services/screening_forms.py" = ["RUF001"]
 "src/hugin/screening_cli.py" = ["RUF001"]
 "src/hugin/desktop.py" = ["RUF001"]
+"src/hugin/adapters/postgres_backup.py" = ["RUF001"]
+"src/hugin/services/backups.py" = ["RUF001"]
+"src/hugin/workers/backups.py" = ["RUF001"]
+"src/hugin/backup_cli.py" = ["RUF001"]
 "tests/unit/test_resume_*.py" = ["RUF001"]
 "tests/unit/test_hh_browser.py" = ["RUF001"]
 "tests/unit/test_screening_forms.py" = ["RUF001"]

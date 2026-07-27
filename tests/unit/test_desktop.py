@@ -403,6 +403,22 @@ def test_ensure_services_starts_docker_and_reports_failures(
 ) -> None:
     settings = Settings(environment="test")
     monkeypatch.setattr(desktop, "project_directory", lambda: tmp_path)
+    backups: list[tuple[object, ...]] = []
+
+    class Backup:
+        def __init__(self, selected: Settings, *, adapter: object) -> None:
+            backups.append(("init", selected, adapter))
+
+        def create(self, reason: str) -> None:
+            backups.append(("create", reason))
+
+    adapter = object()
+    monkeypatch.setattr(desktop, "BackupService", Backup)
+    monkeypatch.setattr(
+        desktop,
+        "DockerPostgresBackupAdapter",
+        lambda root: adapter if root == tmp_path else None,
+    )
     readiness = iter((False, True))
     monkeypatch.setattr(desktop, "api_is_ready", lambda _url: next(readiness))
     calls: list[tuple[list[str], Path, bool, bool, int]] = []
@@ -424,12 +440,23 @@ def test_ensure_services_starts_docker_and_reports_failures(
     desktop.ensure_services(settings)
     assert calls == [
         (
+            ["docker", "compose", "up", "--detach", "--wait", "db"],
+            tmp_path,
+            True,
+            True,
+            int(getattr(subprocess, "CREATE_NO_WINDOW", 0)),
+        ),
+        (
             ["docker", "compose", "up", "--detach", "--build", "--wait"],
             tmp_path,
             True,
             True,
             int(getattr(subprocess, "CREATE_NO_WINDOW", 0)),
-        )
+        ),
+    ]
+    assert backups == [
+        ("init", settings, adapter),
+        ("create", "pre-update"),
     ]
 
     monkeypatch.setattr(desktop, "api_is_ready", lambda _url: False)
@@ -489,13 +516,15 @@ def test_main_starts_window_and_always_closes_bridge(monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(desktop, "AutomationWorker", FakeWorker)
     monkeypatch.setattr(desktop, "ApplicationWorker", FakeWorker)
     monkeypatch.setattr(desktop, "NotificationWorker", FakeWorker)
+    monkeypatch.setattr(desktop, "BackupWorker", FakeWorker)
 
     desktop.main()
 
     assert events[0] == "services"
-    assert events[-5:] == [
+    assert events[-6:] == [
         ("start", False),
         "close",
+        "worker-stop",
         "worker-stop",
         "worker-stop",
         "worker-stop",

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from datetime import UTC, datetime
 
 import pytest
@@ -164,7 +165,7 @@ def test_worker_start_stop_are_idempotent(
         return thread
 
     monkeypatch.setattr(worker_module, "upgrade_database", upgraded.append)
-    monkeypatch.setattr(worker_module.threading, "Thread", create_thread)
+    monkeypatch.setattr(threading, "Thread", create_thread)
     settings = Settings(environment="test")
     worker = worker_module.NotificationWorker(settings)
 

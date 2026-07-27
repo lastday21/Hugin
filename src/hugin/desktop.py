@@ -25,17 +25,20 @@ from hugin.adapters.notification_credentials import (
     TelegramCredentials,
     WindowsNotificationCredentialStore,
 )
+from hugin.adapters.postgres_backup import DockerPostgresBackupAdapter
 from hugin.core.settings import Settings, get_settings
 from hugin.database import create_database, upgrade_database
 from hugin.database.models import ApplicationModel, VacancyModel
 from hugin.domain.automation import AutomationJobKind
 from hugin.domain.content import RecruiterMessageState
 from hugin.domain.hh import HhFormReviewStatus
+from hugin.services.backups import BackupService
 from hugin.services.communications import CommunicationService, RecordingMessageSender
 from hugin.services.hh_login import HhLoginService, LoginStatus
 from hugin.services.screening_forms import ScreeningDraftService
 from hugin.workers.applications import ApplicationWorker
 from hugin.workers.automation import AutomationWorker
+from hugin.workers.backups import BackupWorker
 from hugin.workers.hh_search import HhSearchJobHandler
 from hugin.workers.hh_sync import HhSyncJobHandler
 from hugin.workers.notifications import NotificationWorker
@@ -398,6 +401,20 @@ def ensure_services(settings: Settings, *, timeout_seconds: int = 90) -> None:
     if api_is_ready(settings.desktop_api_url):
         return
     root = project_directory()
+    database = subprocess.run(
+        ["docker", "compose", "up", "--detach", "--wait", "db"],
+        cwd=root,
+        check=False,
+        capture_output=True,
+        text=True,
+        creationflags=int(getattr(subprocess, "CREATE_NO_WINDOW", 0)),
+    )
+    if database.returncode != 0:
+        raise RuntimeError("Не удалось запустить PostgreSQL для резервного копирования")
+    BackupService(
+        settings,
+        adapter=DockerPostgresBackupAdapter(root),
+    ).create("pre-update")
     completed = subprocess.run(
         ["docker", "compose", "up", "--detach", "--build", "--wait"],
         cwd=root,
@@ -486,10 +503,12 @@ def main() -> None:
         browser_lock=browser_lock,
     )
     notification_worker = NotificationWorker(settings)
+    backup_worker = BackupWorker(settings)
     bridge = DesktopBridge(settings, browser_lock=browser_lock)
     worker.start()
     application_worker.start()
     notification_worker.start()
+    backup_worker.start()
     try:
         webview.create_window(
             "Hugin — поиск работы",
@@ -503,6 +522,7 @@ def main() -> None:
         webview.start(debug=False)
     finally:
         bridge.close()
+        backup_worker.stop()
         notification_worker.stop()
         application_worker.stop()
         worker.stop()
