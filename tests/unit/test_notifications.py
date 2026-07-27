@@ -105,6 +105,7 @@ def test_notification_collection_delivery_and_retry_are_idempotent(
             )
             application_settings = session.get(ApplicationSettingsModel, 1)
             assert application_settings is not None
+            application_settings.timezone_name = "UTC+05:00"
             application_settings.windows_notifications_enabled = True
             application_settings.telegram_enabled = True
             application_settings.email_enabled = True

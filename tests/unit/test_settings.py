@@ -5,7 +5,7 @@ import pytest
 from pydantic import ValidationError
 
 from hugin.core.settings import Settings, default_data_dir, get_settings
-from hugin.domain.time import local_day_start_utc, local_timezone_name
+from hugin.domain.time import local_day_start_utc, local_timezone_name, timezone_by_name
 
 
 def test_default_api_is_local_only() -> None:
@@ -82,3 +82,13 @@ def test_local_day_start_is_converted_to_utc() -> None:
     assert local_day_start_utc(local_now) == datetime(2026, 7, 20, 19, tzinfo=UTC)
     assert local_timezone_name(local_now) == "UTC+05:00"
     assert local_timezone_name(datetime(2026, 7, 21, 10, 30))
+
+
+def test_timezone_name_supports_saved_offset_region_and_safe_fallback() -> None:
+    value = datetime(2026, 7, 27, 16, 0, tzinfo=UTC)
+
+    assert value.astimezone(timezone_by_name("UTC+05:00")).hour == 21
+    assert value.astimezone(timezone_by_name("UTC-03:30")).hour == 12
+    assert timezone_by_name("Europe/Moscow").utcoffset(value) == timedelta(hours=3)
+    assert timezone_by_name("UTC+99:99") is UTC
+    assert timezone_by_name("missing/timezone") is UTC

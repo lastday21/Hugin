@@ -1,4 +1,8 @@
-from datetime import UTC, datetime
+import re
+from datetime import UTC, datetime, timedelta, timezone, tzinfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+UTC_OFFSET = re.compile(r"^UTC(?P<sign>[+-])(?P<hours>\d{2}):(?P<minutes>\d{2})$")
 
 
 def as_utc(value: datetime) -> datetime:
@@ -21,3 +25,23 @@ def local_timezone_name(value: datetime | None = None) -> str:
     zone = local_value.tzinfo
     key = getattr(zone, "key", None)
     return str(key or local_value.tzname() or zone or "UTC")
+
+
+def timezone_by_name(value: str) -> tzinfo:
+    name = value.strip()
+    if name in {"UTC", "Etc/UTC", "GMT"}:
+        return UTC
+    matched = UTC_OFFSET.fullmatch(name)
+    if matched is not None:
+        hours = int(matched.group("hours"))
+        minutes = int(matched.group("minutes"))
+        if hours > 23 or minutes > 59:
+            return UTC
+        offset = timedelta(hours=hours, minutes=minutes)
+        if matched.group("sign") == "-":
+            offset = -offset
+        return timezone(offset, name)
+    try:
+        return ZoneInfo(name)
+    except ZoneInfoNotFoundError:
+        return UTC

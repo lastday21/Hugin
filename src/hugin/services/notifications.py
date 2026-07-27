@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, time
+from datetime import UTC, datetime, time, tzinfo
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -28,6 +28,7 @@ from hugin.domain.content import (
     NotificationChannel,
 )
 from hugin.domain.tasks import TaskState
+from hugin.domain.time import timezone_by_name
 from hugin.repositories.communications import CommunicationRepository
 from hugin.services.ui_communications import WINDOWS_NOTIFICATION_EVENTS
 
@@ -174,9 +175,15 @@ class NotificationService:
                 scheduled_at=selected_at,
             )
 
-        local_now = selected_at.astimezone()
+        settings = self._settings()
+        local_zone = timezone_by_name(settings.timezone_name)
+        local_now = selected_at.astimezone(local_zone)
         if local_now.hour >= 20:
-            created += self._enqueue_daily_summary(account_id, selected_at)
+            created += self._enqueue_daily_summary(
+                account_id,
+                selected_at,
+                local_zone,
+            )
         return created
 
     def enqueue_event(
@@ -216,8 +223,13 @@ class NotificationService:
             created += int(not before)
         return created
 
-    def _enqueue_daily_summary(self, account_id: int, now: datetime) -> int:
-        local_now = now.astimezone()
+    def _enqueue_daily_summary(
+        self,
+        account_id: int,
+        now: datetime,
+        local_zone: tzinfo,
+    ) -> int:
+        local_now = now.astimezone(local_zone)
         local_date = local_now.date()
         day_start = datetime.combine(local_date, time.min, tzinfo=local_now.tzinfo).astimezone(UTC)
         found = self._session.scalar(
