@@ -179,7 +179,9 @@ def test_communications_api_edits_draft_and_rejects_foreign_data(
             headers=headers,
             json={
                 "windows_enabled": True,
-                "windows_events": ["NEW_MESSAGE", "SOMETHING_ELSE"],
+                "telegram_enabled": False,
+                "email_enabled": False,
+                "events": ["NEW_MESSAGE", "SOMETHING_ELSE"],
             },
         )
         assert invalid_event.status_code == 422
@@ -374,7 +376,9 @@ def test_ui_communications_reports_missing_settings_and_account(
                 service.update_notification_settings(
                     account_id=account_id + 999,
                     windows_enabled=True,
-                    windows_events=(),
+                    telegram_enabled=False,
+                    email_enabled=False,
+                    events=(),
                 )
 
             session.execute(delete(ApplicationSettingsModel))
@@ -385,7 +389,9 @@ def test_ui_communications_reports_missing_settings_and_account(
                 service.update_notification_settings(
                     account_id=account_id,
                     windows_enabled=True,
-                    windows_events=(),
+                    telegram_enabled=False,
+                    email_enabled=False,
+                    events=(),
                 )
     finally:
         database.close()

@@ -264,7 +264,9 @@ export async function confirmReply(
 
 export async function updateNotificationSettings(
   windowsEnabled: boolean,
-  windowsEvents: string[],
+  telegramEnabled: boolean,
+  emailEnabled: boolean,
+  events: string[],
 ): Promise<Communications> {
   const session = await request<{ key: string }>("/api/session");
   return request<Communications>(
@@ -274,7 +276,9 @@ export async function updateNotificationSettings(
       headers: { "X-Hugin-Session": session.key },
       body: JSON.stringify({
         windows_enabled: windowsEnabled,
-        windows_events: windowsEvents,
+        telegram_enabled: telegramEnabled,
+        email_enabled: emailEnabled,
+        events,
       }),
     },
   );

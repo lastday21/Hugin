@@ -446,7 +446,9 @@ def test_workspace_endpoints_return_real_data_and_protect_changes(settings: Sett
 
         notification_values = {
             "windows_enabled": False,
-            "windows_events": ["NEW_MESSAGE", "AUTH_REQUIRED"],
+            "telegram_enabled": True,
+            "email_enabled": False,
+            "events": ["NEW_MESSAGE", "AUTH_REQUIRED"],
         }
         notification_path = f"/api/communications/notifications?account_id={account_id}"
         assert (
@@ -468,10 +470,11 @@ def test_workspace_endpoints_return_real_data_and_protect_changes(settings: Sett
         assert notifications.status_code == 200
         saved_notifications = notifications.json()["notification_settings"]
         assert saved_notifications["windows_enabled"] is False
-        assert saved_notifications["routing"]["NEW_MESSAGE"] == ["WINDOWS"]
-        assert saved_notifications["routing"]["AUTH_REQUIRED"] == ["WINDOWS"]
+        assert saved_notifications["telegram_enabled"] is True
+        assert saved_notifications["routing"]["NEW_MESSAGE"] == ["TELEGRAM"]
+        assert saved_notifications["routing"]["AUTH_REQUIRED"] == ["TELEGRAM"]
         assert saved_notifications["routing"]["INVITATION"] == []
-        assert saved_notifications["routing"]["CAPTCHA_REQUIRED"] == ["WINDOWS"]
+        assert "CAPTCHA_REQUIRED" not in saved_notifications["routing"]
 
         direction_values = {
             "is_active": False,

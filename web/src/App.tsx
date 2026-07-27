@@ -2652,9 +2652,9 @@ const notificationEventOptions = [
   },
 ] as const;
 
-function windowsEvents(settings: NotificationSettings): string[] {
+function selectedNotificationEvents(settings: NotificationSettings): string[] {
   return notificationEventOptions
-    .filter((event) => settings.routing[event.id]?.includes("WINDOWS"))
+    .filter((event) => (settings.routing[event.id]?.length ?? 0) > 0)
     .map((event) => event.id);
 }
 
@@ -2667,23 +2667,46 @@ function NotificationSettingsForm({
   onSaved: (communications: Communications) => void;
   onToast: (toast: Toast) => void;
 }) {
-  const initialEvents = windowsEvents(settings);
-  const [baselineEnabled, setBaselineEnabled] = useState(settings.windows_enabled);
+  const initialEvents = selectedNotificationEvents(settings);
+  const [baselineChannels, setBaselineChannels] = useState([
+    settings.windows_enabled,
+    settings.telegram_enabled,
+    settings.email_enabled,
+  ]);
   const [baselineEvents, setBaselineEvents] = useState(initialEvents);
-  const [enabled, setEnabled] = useState(settings.windows_enabled);
+  const [windowsEnabled, setWindowsEnabled] = useState(settings.windows_enabled);
+  const [telegramEnabled, setTelegramEnabled] = useState(settings.telegram_enabled);
+  const [emailEnabled, setEmailEnabled] = useState(settings.email_enabled);
   const [events, setEvents] = useState(initialEvents);
   const [saving, setSaving] = useState(false);
+  const [telegramToken, setTelegramToken] = useState("");
+  const [telegramChat, setTelegramChat] = useState("");
+  const [smtpHost, setSmtpHost] = useState("");
+  const [smtpPort, setSmtpPort] = useState("587");
+  const [smtpUsername, setSmtpUsername] = useState("");
+  const [smtpPassword, setSmtpPassword] = useState("");
+  const [emailSender, setEmailSender] = useState("");
+  const [emailRecipient, setEmailRecipient] = useState("");
+  const [credentialsSaving, setCredentialsSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const dirty =
-    enabled !== baselineEnabled ||
+    [windowsEnabled, telegramEnabled, emailEnabled].join("|") !==
+      baselineChannels.join("|") ||
     events.join("|") !== baselineEvents.join("|");
+  const anyChannel = windowsEnabled || telegramEnabled || emailEnabled;
 
   useEffect(() => {
     if (dirty || saving) return;
-    const incoming = windowsEvents(settings);
-    setBaselineEnabled(settings.windows_enabled);
+    const incoming = selectedNotificationEvents(settings);
+    setBaselineChannels([
+      settings.windows_enabled,
+      settings.telegram_enabled,
+      settings.email_enabled,
+    ]);
     setBaselineEvents(incoming);
-    setEnabled(settings.windows_enabled);
+    setWindowsEnabled(settings.windows_enabled);
+    setTelegramEnabled(settings.telegram_enabled);
+    setEmailEnabled(settings.email_enabled);
     setEvents(incoming);
   }, [dirty, saving, settings]);
 
@@ -2703,12 +2726,23 @@ function NotificationSettingsForm({
     setSaving(true);
     setError(null);
     try {
-      const updated = await updateNotificationSettings(enabled, events);
+      const updated = await updateNotificationSettings(
+        windowsEnabled,
+        telegramEnabled,
+        emailEnabled,
+        events,
+      );
       const savedSettings = updated.notification_settings;
-      const savedEvents = windowsEvents(savedSettings);
-      setBaselineEnabled(savedSettings.windows_enabled);
+      const savedEvents = selectedNotificationEvents(savedSettings);
+      setBaselineChannels([
+        savedSettings.windows_enabled,
+        savedSettings.telegram_enabled,
+        savedSettings.email_enabled,
+      ]);
       setBaselineEvents(savedEvents);
-      setEnabled(savedSettings.windows_enabled);
+      setWindowsEnabled(savedSettings.windows_enabled);
+      setTelegramEnabled(savedSettings.telegram_enabled);
+      setEmailEnabled(savedSettings.email_enabled);
       setEvents(savedEvents);
       onSaved(updated);
       onToast({ kind: "success", message: "Уведомления сохранены" });
@@ -2719,36 +2753,214 @@ function NotificationSettingsForm({
     }
   }
 
+  async function saveTelegram(): Promise<void> {
+    if (!window.pywebview?.api || credentialsSaving) {
+      setError("Настройка Telegram доступна в оконном приложении Hugin.");
+      return;
+    }
+    setCredentialsSaving(true);
+    setError(null);
+    try {
+      const result = await window.pywebview.api.save_telegram_notifications(
+        telegramToken,
+        telegramChat,
+      );
+      if (result.status !== "READY") throw new Error(result.message);
+      setTelegramToken("");
+      setTelegramChat("");
+      setTelegramEnabled(true);
+      onToast({ kind: "success", message: result.message });
+    } catch (reason) {
+      setError(readableError(reason));
+    } finally {
+      setCredentialsSaving(false);
+    }
+  }
+
+  async function saveEmail(): Promise<void> {
+    if (!window.pywebview?.api || credentialsSaving) {
+      setError("Настройка почты доступна в оконном приложении Hugin.");
+      return;
+    }
+    const port = Number(smtpPort);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      setError("Укажите корректный порт почтового сервера.");
+      return;
+    }
+    setCredentialsSaving(true);
+    setError(null);
+    try {
+      const result = await window.pywebview.api.save_email_notifications(
+        smtpHost,
+        port,
+        smtpUsername,
+        smtpPassword,
+        emailSender,
+        emailRecipient,
+        true,
+      );
+      if (result.status !== "READY") throw new Error(result.message);
+      setSmtpPassword("");
+      setEmailEnabled(true);
+      onToast({ kind: "success", message: result.message });
+    } catch (reason) {
+      setError(readableError(reason));
+    } finally {
+      setCredentialsSaving(false);
+    }
+  }
+
   return (
     <div className="notification-settings-form">
-      <label className="notification-master">
-        <span className="check-control">
-          <input
-            type="checkbox"
-            checked={enabled}
-            onChange={(event) => {
-              setEnabled(event.target.checked);
-              setError(null);
-            }}
-          />
-          <span aria-hidden="true" />
-        </span>
-        <span>
-          <strong>Показывать уведомления Windows</strong>
-          <small>Общий выключатель для выбранных событий.</small>
-        </span>
-      </label>
+      <div className="notification-channel-grid">
+        {[
+          {
+            title: "Windows",
+            description: "Показывать на этом компьютере.",
+            enabled: windowsEnabled,
+            setEnabled: setWindowsEnabled,
+          },
+          {
+            title: "Telegram",
+            description: "Отправлять через подключённого бота.",
+            enabled: telegramEnabled,
+            setEnabled: setTelegramEnabled,
+          },
+          {
+            title: "Электронная почта",
+            description: "Отправлять на сохранённый адрес.",
+            enabled: emailEnabled,
+            setEnabled: setEmailEnabled,
+          },
+        ].map((channel) => (
+          <label className="notification-master" key={channel.title}>
+            <span className="check-control">
+              <input
+                type="checkbox"
+                checked={channel.enabled}
+                onChange={(event) => {
+                  channel.setEnabled(event.target.checked);
+                  setError(null);
+                }}
+              />
+              <span aria-hidden="true" />
+            </span>
+            <span>
+              <strong>{channel.title}</strong>
+              <small>{channel.description}</small>
+            </span>
+          </label>
+        ))}
+      </div>
+
+      <div className="notification-connection-grid">
+        <details className="notification-connection">
+          <summary>Подключить Telegram</summary>
+          <div>
+            <label>
+              <span>Токен бота</span>
+              <input
+                type="password"
+                autoComplete="off"
+                value={telegramToken}
+                onChange={(event) => setTelegramToken(event.target.value)}
+              />
+            </label>
+            <label>
+              <span>Номер чата</span>
+              <input
+                type="text"
+                value={telegramChat}
+                onChange={(event) => setTelegramChat(event.target.value)}
+              />
+            </label>
+            <button
+              type="button"
+              className="secondary-button"
+              disabled={credentialsSaving}
+              onClick={() => void saveTelegram()}
+            >
+              Сохранить Telegram
+            </button>
+          </div>
+        </details>
+        <details className="notification-connection">
+          <summary>Подключить электронную почту</summary>
+          <div>
+            <label>
+              <span>Почтовый сервер</span>
+              <input
+                type="text"
+                value={smtpHost}
+                onChange={(event) => setSmtpHost(event.target.value)}
+              />
+            </label>
+            <label>
+              <span>Порт</span>
+              <input
+                type="number"
+                min="1"
+                max="65535"
+                value={smtpPort}
+                onChange={(event) => setSmtpPort(event.target.value)}
+              />
+            </label>
+            <label>
+              <span>Имя пользователя</span>
+              <input
+                type="text"
+                autoComplete="username"
+                value={smtpUsername}
+                onChange={(event) => setSmtpUsername(event.target.value)}
+              />
+            </label>
+            <label>
+              <span>Пароль приложения</span>
+              <input
+                type="password"
+                autoComplete="new-password"
+                value={smtpPassword}
+                onChange={(event) => setSmtpPassword(event.target.value)}
+              />
+            </label>
+            <label>
+              <span>Адрес отправителя</span>
+              <input
+                type="email"
+                value={emailSender}
+                onChange={(event) => setEmailSender(event.target.value)}
+              />
+            </label>
+            <label>
+              <span>Куда отправлять</span>
+              <input
+                type="email"
+                value={emailRecipient}
+                onChange={(event) => setEmailRecipient(event.target.value)}
+              />
+            </label>
+            <button
+              type="button"
+              className="secondary-button"
+              disabled={credentialsSaving}
+              onClick={() => void saveEmail()}
+            >
+              Сохранить почту
+            </button>
+          </div>
+        </details>
+      </div>
 
       <div className="notification-event-grid">
         {notificationEventOptions.map((event) => (
           <label
-            className={`notification-event-option ${enabled ? "" : "disabled"}`}
+            className={`notification-event-option ${anyChannel ? "" : "disabled"}`}
             key={event.id}
           >
             <input
               type="checkbox"
               checked={events.includes(event.id)}
-              disabled={!enabled}
+              disabled={!anyChannel}
               onChange={() => toggleEvent(event.id)}
             />
             <span>
@@ -2761,14 +2973,7 @@ function NotificationSettingsForm({
 
       <div className="notification-settings-footer">
         <span className="notification-unavailable">
-          {settings.telegram_enabled || settings.email_enabled
-            ? [
-                settings.telegram_enabled ? "Telegram включён" : null,
-                settings.email_enabled ? "электронная почта включена" : null,
-              ]
-                .filter(Boolean)
-                .join(" · ")
-            : "Telegram и электронная почта пока не подключены."}
+          Telegram и почта используют данные из защищённого хранилища Windows.
         </span>
         {error && (
           <span className="settings-submit-error" role="alert">

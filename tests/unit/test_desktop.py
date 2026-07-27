@@ -318,6 +318,48 @@ def test_bridge_sends_only_exact_confirmed_reply(
     }
 
 
+def test_bridge_saves_notification_credentials_in_windows_store(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    saved: list[object] = []
+
+    class Store:
+        def load_telegram(self) -> object | None:
+            return saved[0] if saved else None
+
+        def load_email(self) -> object | None:
+            return saved[1] if len(saved) > 1 else None
+
+        def save_telegram(self, credentials: object) -> None:
+            saved.append(credentials)
+
+        def save_email(self, credentials: object) -> None:
+            while len(saved) < 1:
+                saved.append(None)
+            saved.append(credentials)
+
+    monkeypatch.setattr(desktop, "WindowsNotificationCredentialStore", Store)
+    bridge = desktop.DesktopBridge(Settings(environment="test"))
+
+    assert bridge.notification_credentials_status()["telegram_configured"] is False
+    assert bridge.save_telegram_notifications("bot-token", "-100123")["status"] == "READY"
+    assert (
+        bridge.save_email_notifications(
+            "smtp.example.com",
+            587,
+            "user",
+            "password",
+            "from@example.com",
+            "to@example.com",
+            True,
+        )["status"]
+        == "READY"
+    )
+    status = bridge.notification_credentials_status()
+    assert status["telegram_configured"] is True
+    assert status["email_configured"] is True
+
+
 def test_project_directory_and_health_probe(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -446,13 +488,15 @@ def test_main_starts_window_and_always_closes_bridge(monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(desktop, "DesktopBridge", FakeBridge)
     monkeypatch.setattr(desktop, "AutomationWorker", FakeWorker)
     monkeypatch.setattr(desktop, "ApplicationWorker", FakeWorker)
+    monkeypatch.setattr(desktop, "NotificationWorker", FakeWorker)
 
     desktop.main()
 
     assert events[0] == "services"
-    assert events[-4:] == [
+    assert events[-5:] == [
         ("start", False),
         "close",
+        "worker-stop",
         "worker-stop",
         "worker-stop",
     ]

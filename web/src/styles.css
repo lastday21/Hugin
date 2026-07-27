@@ -1581,6 +1581,17 @@ ol {
   gap: 18px;
 }
 
+.notification-channel-grid,
+.notification-connection-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.notification-connection-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
 .notification-master {
   display: flex;
   align-items: center;
@@ -1589,6 +1600,44 @@ ol {
   background: #f5f8f6;
   border: 1px solid var(--line);
   border-radius: 14px;
+}
+
+.notification-connection {
+  padding: 14px 16px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+}
+
+.notification-connection summary {
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.notification-connection > div {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 14px;
+}
+
+.notification-connection label {
+  display: grid;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.notification-connection input {
+  width: 100%;
+  padding: 10px 11px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: #ffffff;
+  color: var(--text);
+}
+
+.notification-connection button {
+  align-self: end;
 }
 
 .notification-master > span:last-child,
@@ -2777,6 +2826,12 @@ ol {
   }
 
   .notification-event-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .notification-channel-grid,
+  .notification-connection-grid,
+  .notification-connection > div {
     grid-template-columns: 1fr;
   }
 

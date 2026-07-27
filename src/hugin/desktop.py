@@ -20,6 +20,11 @@ from sqlalchemy import select
 from hugin.adapters.credentials import WindowsCredentialStore
 from hugin.adapters.hh_browser import VisibleHhBrowser
 from hugin.adapters.hh_messages import HhBrowserMessageSender
+from hugin.adapters.notification_credentials import (
+    EmailCredentials,
+    TelegramCredentials,
+    WindowsNotificationCredentialStore,
+)
 from hugin.core.settings import Settings, get_settings
 from hugin.database import create_database, upgrade_database
 from hugin.database.models import ApplicationModel, VacancyModel
@@ -33,6 +38,7 @@ from hugin.workers.applications import ApplicationWorker
 from hugin.workers.automation import AutomationWorker
 from hugin.workers.hh_search import HhSearchJobHandler
 from hugin.workers.hh_sync import HhSyncJobHandler
+from hugin.workers.notifications import NotificationWorker
 
 
 class WebviewWindow(Protocol):
@@ -229,6 +235,61 @@ class DesktopBridge:
         )
         return self._result(status, message_text)
 
+    def notification_credentials_status(self) -> dict[str, object]:
+        store = WindowsNotificationCredentialStore()
+        try:
+            telegram = store.load_telegram() is not None
+            email = store.load_email() is not None
+        except RuntimeError as error:
+            return {
+                **self._result("UNAVAILABLE", str(error)),
+                "telegram_configured": False,
+                "email_configured": False,
+            }
+        return {
+            **self._result("READY", "Настройки уведомлений проверены"),
+            "telegram_configured": telegram,
+            "email_configured": email,
+        }
+
+    def save_telegram_notifications(self, bot_token: str, chat_id: str) -> dict[str, object]:
+        try:
+            WindowsNotificationCredentialStore().save_telegram(
+                TelegramCredentials(bot_token, chat_id)
+            )
+        except (RuntimeError, ValueError) as error:
+            return self._result("UNAVAILABLE", str(error))
+        return self._result("READY", "Telegram сохранён в защищённом хранилище Windows")
+
+    def save_email_notifications(
+        self,
+        smtp_host: str,
+        smtp_port: int,
+        username: str,
+        password: str,
+        sender: str,
+        recipient: str,
+        starttls: bool,
+    ) -> dict[str, object]:
+        try:
+            WindowsNotificationCredentialStore().save_email(
+                EmailCredentials(
+                    smtp_host,
+                    smtp_port,
+                    username,
+                    password,
+                    sender,
+                    recipient,
+                    starttls,
+                )
+            )
+        except (RuntimeError, ValueError) as error:
+            return self._result("UNAVAILABLE", str(error))
+        return self._result(
+            "READY",
+            "Электронная почта сохранена в защищённом хранилище Windows",
+        )
+
     def close(self) -> None:
         return None
 
@@ -424,9 +485,11 @@ def main() -> None:
         settings,
         browser_lock=browser_lock,
     )
+    notification_worker = NotificationWorker(settings)
     bridge = DesktopBridge(settings, browser_lock=browser_lock)
     worker.start()
     application_worker.start()
+    notification_worker.start()
     try:
         webview.create_window(
             "Hugin — поиск работы",
@@ -440,6 +503,7 @@ def main() -> None:
         webview.start(debug=False)
     finally:
         bridge.close()
+        notification_worker.stop()
         application_worker.stop()
         worker.stop()
 

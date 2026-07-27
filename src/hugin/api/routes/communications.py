@@ -103,7 +103,9 @@ class NotificationSettingsUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     windows_enabled: bool
-    windows_events: tuple[str, ...] = Field(max_length=len(WINDOWS_NOTIFICATION_EVENTS))
+    telegram_enabled: bool
+    email_enabled: bool
+    events: tuple[str, ...] = Field(max_length=len(WINDOWS_NOTIFICATION_EVENTS))
 
 
 router = APIRouter(prefix="/api/communications", tags=["communications"])
@@ -273,7 +275,9 @@ def update_notification_settings(
         updated = UiCommunicationService(session).update_notification_settings(
             account_id=account_id,
             windows_enabled=values.windows_enabled,
-            windows_events=values.windows_events,
+            telegram_enabled=values.telegram_enabled,
+            email_enabled=values.email_enabled,
+            events=values.events,
         )
         return CommunicationsResponse.model_validate(updated)
     except (LookupError, ValueError) as error:

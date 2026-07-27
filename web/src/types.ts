@@ -313,6 +313,8 @@ export interface BridgeResult {
   message: string;
   filled?: number;
   skipped?: number;
+  telegram_configured?: boolean;
+  email_configured?: boolean;
 }
 
 declare global {
@@ -326,6 +328,20 @@ declare global {
           messageId: number,
           contentHash: string,
           contentVersion: number,
+        ) => Promise<BridgeResult>;
+        notification_credentials_status: () => Promise<BridgeResult>;
+        save_telegram_notifications: (
+          botToken: string,
+          chatId: string,
+        ) => Promise<BridgeResult>;
+        save_email_notifications: (
+          smtpHost: string,
+          smtpPort: number,
+          username: string,
+          password: string,
+          sender: string,
+          recipient: string,
+          starttls: boolean,
         ) => Promise<BridgeResult>;
       };
     };

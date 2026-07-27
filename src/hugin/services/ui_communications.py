@@ -203,24 +203,35 @@ class UiCommunicationService:
         *,
         account_id: int,
         windows_enabled: bool,
-        windows_events: tuple[str, ...],
+        telegram_enabled: bool,
+        email_enabled: bool,
+        events: tuple[str, ...],
     ) -> UiCommunications:
         if self._session.get(HhAccountModel, account_id) is None:
             raise LookupError("Аккаунт hh.ru не найден")
         settings = self._session.get(ApplicationSettingsModel, 1)
         if settings is None:
             raise LookupError("Настройки уведомлений не найдены")
-        selected_events = tuple(dict.fromkeys(event.strip().upper() for event in windows_events))
+        selected_events = tuple(dict.fromkeys(event.strip().upper() for event in events))
         unknown = set(selected_events) - set(WINDOWS_NOTIFICATION_EVENTS)
         if unknown:
             raise ValueError("Выбран неизвестный вид уведомления")
 
-        updated = self._all_routing(settings.notification_routing)
-        for event in WINDOWS_NOTIFICATION_EVENTS:
-            updated[event] = [channel for channel in updated.get(event, []) if channel != "WINDOWS"]
+        selected_channels = [
+            channel
+            for channel, enabled in (
+                ("WINDOWS", windows_enabled),
+                ("TELEGRAM", telegram_enabled),
+                ("EMAIL", email_enabled),
+            )
+            if enabled
+        ]
+        updated: dict[str, list[str]] = {event: [] for event in WINDOWS_NOTIFICATION_EVENTS}
         for event in selected_events:
-            updated[event].append("WINDOWS")
+            updated[event].extend(selected_channels)
         settings.windows_notifications_enabled = windows_enabled
+        settings.telegram_enabled = telegram_enabled
+        settings.email_enabled = email_enabled
         routing: ConfigPayload = {event: channels for event, channels in updated.items()}
         settings.notification_routing = routing
         self._session.flush()

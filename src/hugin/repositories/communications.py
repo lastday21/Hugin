@@ -459,6 +459,59 @@ class CommunicationRepository:
             raise RuntimeError("Не удалось получить новое уведомление")
         return _notification_record(model)
 
+    def claim_due_notification(self, now: datetime) -> NotificationRecord | None:
+        model = self._session.scalar(
+            select(NotificationModel)
+            .where(
+                NotificationModel.state.in_(
+                    {
+                        DeliveryState.PENDING,
+                        DeliveryState.FAILED,
+                    }
+                ),
+                NotificationModel.scheduled_at <= as_utc(now),
+            )
+            .order_by(NotificationModel.scheduled_at, NotificationModel.id)
+            .with_for_update(skip_locked=True)
+            .limit(1)
+        )
+        return _notification_record(model) if model is not None else None
+
+    def mark_notification_sent(
+        self,
+        notification_id: int,
+        sent_at: datetime,
+    ) -> NotificationRecord:
+        model = self._session.get(NotificationModel, notification_id)
+        if model is None:
+            raise CommunicationNotFoundError("Уведомление не найдено")
+        if model.state is DeliveryState.SENT:
+            return _notification_record(model)
+        model.state = DeliveryState.SENT
+        model.sent_at = as_utc(sent_at)
+        model.error_code = None
+        self._session.flush()
+        return _notification_record(model)
+
+    def mark_notification_failed(
+        self,
+        notification_id: int,
+        *,
+        error_code: str,
+        retry_at: datetime,
+    ) -> NotificationRecord:
+        model = self._session.get(NotificationModel, notification_id)
+        if model is None:
+            raise CommunicationNotFoundError("Уведомление не найдено")
+        if model.state is DeliveryState.SENT:
+            return _notification_record(model)
+        selected_code = error_code.strip().upper()[:64]
+        model.state = DeliveryState.FAILED
+        model.error_code = selected_code or "DELIVERY_FAILED"
+        model.scheduled_at = as_utc(retry_at)
+        self._session.flush()
+        return _notification_record(model)
+
     def _message_model(
         self,
         account_id: int,
