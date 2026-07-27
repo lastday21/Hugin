@@ -109,7 +109,7 @@ def test_communications_migration_preserves_existing_rows(settings: Settings) ->
         database.close()
 
     upgrade_database(settings)
-    assert current_revision(settings) == "0013_communications"
+    assert current_revision(settings) == "0014_ai_prompt_settings"
     check_database_schema(settings)
 
     migrated = create_database(settings)
@@ -123,6 +123,10 @@ def test_communications_migration_preserves_existing_rows(settings: Settings) ->
         }
         assert "deduplication_key" in {
             column["name"] for column in inspect(migrated.engine).get_columns("notifications")
+        }
+        assert "ai_prompt_overrides" in {
+            column["name"]
+            for column in inspect(migrated.engine).get_columns("application_settings")
         }
 
         with migrated.engine.begin() as connection:

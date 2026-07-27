@@ -17,6 +17,11 @@ from hugin.database.models import (
 )
 from hugin.domain.content import InvitationState, MessageDirection, RecruiterMessageState
 from hugin.domain.directions import ConfigPayload
+from hugin.services.ai_prompts import (
+    DEFAULT_AI_PROMPTS,
+    AiPromptSettings,
+    AiPromptSettingsService,
+)
 
 WINDOWS_NOTIFICATION_EVENTS = (
     "NEW_MESSAGE",
@@ -79,6 +84,7 @@ class UiCommunications:
     unread_messages: int
     unseen_invitations: int
     notification_settings: UiNotificationSettings
+    ai_prompt_settings: UiAiPromptSettings
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,6 +93,14 @@ class UiNotificationSettings:
     telegram_enabled: bool
     email_enabled: bool
     routing: dict[str, tuple[str, ...]]
+
+
+@dataclass(frozen=True, slots=True)
+class UiAiPromptSettings:
+    resume: str
+    cover_letter: str
+    recruiter_reply: str
+    defaults: AiPromptSettings
 
 
 class UiCommunicationService:
@@ -196,7 +210,31 @@ class UiCommunicationService:
                 email_enabled=settings.email_enabled,
                 routing=self._routing(settings.notification_routing),
             ),
+            ai_prompt_settings=self._ai_prompt_settings(),
         )
+
+    def update_ai_prompt_settings(
+        self,
+        *,
+        account_id: int,
+        resume: str,
+        cover_letter: str,
+        recruiter_reply: str,
+    ) -> UiCommunications:
+        if self._session.get(HhAccountModel, account_id) is None:
+            raise LookupError("Аккаунт hh.ru не найден")
+        AiPromptSettingsService(self._session).update(
+            resume=resume,
+            cover_letter=cover_letter,
+            recruiter_reply=recruiter_reply,
+        )
+        return self.get(account_id)
+
+    def reset_ai_prompt_settings(self, *, account_id: int) -> UiCommunications:
+        if self._session.get(HhAccountModel, account_id) is None:
+            raise LookupError("Аккаунт hh.ru не найден")
+        AiPromptSettingsService(self._session).reset()
+        return self.get(account_id)
 
     def update_notification_settings(
         self,
@@ -259,6 +297,15 @@ class UiCommunicationService:
             RecruiterMessageState.DRAFT,
             RecruiterMessageState.REVIEW_REQUIRED,
         }
+
+    def _ai_prompt_settings(self) -> UiAiPromptSettings:
+        current = AiPromptSettingsService(self._session).get()
+        return UiAiPromptSettings(
+            resume=current.resume,
+            cover_letter=current.cover_letter,
+            recruiter_reply=current.recruiter_reply,
+            defaults=DEFAULT_AI_PROMPTS,
+        )
 
     @staticmethod
     def _all_routing(value: dict[str, object]) -> dict[str, list[str]]:

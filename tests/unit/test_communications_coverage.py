@@ -266,6 +266,71 @@ def test_communications_api_handles_no_messages_and_unknown_result(
         app.state.database.close()
 
 
+def test_ai_prompt_settings_api_updates_and_resets(settings: Settings) -> None:
+    account_id, _vacancy_id, _rejected_id = seed_workspace(settings)
+    app = create_app(settings)
+    path = f"/api/communications/ai-prompts?account_id={account_id}"
+    try:
+        session_key = request(app, "GET", "/api/session").json()["key"]
+        headers = {"X-Hugin-Session": session_key}
+        current = request(
+            app,
+            "GET",
+            f"/api/communications?account_id={account_id}",
+        ).json()["ai_prompt_settings"]
+        assert current["resume"] == current["defaults"]["resume"]
+        assert request(app, "PUT", path, json=current["defaults"]).status_code == 403
+        assert (
+            request(
+                app,
+                "PUT",
+                path,
+                headers=headers,
+                json={
+                    "resume": "",
+                    "cover_letter": "Пиши кратко.",
+                    "recruiter_reply": "Отвечай по существу.",
+                },
+            ).status_code
+            == 422
+        )
+
+        saved = request(
+            app,
+            "PUT",
+            path,
+            headers=headers,
+            json={
+                "resume": "Подчёркивай результат работы.",
+                "cover_letter": "Пиши коротко и естественно.",
+                "recruiter_reply": "Отвечай дружелюбно.",
+            },
+        )
+        assert saved.status_code == 200
+        assert saved.json()["ai_prompt_settings"]["recruiter_reply"] == "Отвечай дружелюбно."
+
+        reset = request(
+            app,
+            "POST",
+            f"/api/communications/ai-prompts/reset?account_id={account_id}",
+            headers=headers,
+        )
+        assert reset.status_code == 200
+        prompts = reset.json()["ai_prompt_settings"]
+        assert prompts["resume"] == prompts["defaults"]["resume"]
+        assert (
+            request(
+                app,
+                "POST",
+                "/api/communications/ai-prompts/reset?account_id=99999",
+                headers=headers,
+            ).status_code
+            == 404
+        )
+    finally:
+        app.state.database.close()
+
+
 def test_communication_services_validate_inputs_without_sending(
     settings: Settings,
 ) -> None:

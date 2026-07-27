@@ -16,6 +16,7 @@ from hugin.domain.communications import (
     StaleMessageDraftError,
 )
 from hugin.domain.content import MessageDirection, RecruiterMessageState
+from hugin.services.ai_prompts import MAX_PROMPT_LENGTH
 from hugin.services.communications import CommunicationService, RecordingMessageSender
 from hugin.services.ui_communications import (
     WINDOWS_NOTIFICATION_EVENTS,
@@ -76,6 +77,18 @@ class NotificationSettingsResponse(BaseModel):
     routing: dict[str, tuple[str, ...]]
 
 
+class AiPromptValuesResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    resume: str
+    cover_letter: str
+    recruiter_reply: str
+
+
+class AiPromptSettingsResponse(AiPromptValuesResponse):
+    defaults: AiPromptValuesResponse
+
+
 class CommunicationsResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -84,6 +97,7 @@ class CommunicationsResponse(BaseModel):
     unread_messages: int
     unseen_invitations: int
     notification_settings: NotificationSettingsResponse
+    ai_prompt_settings: AiPromptSettingsResponse
 
 
 class ReplyDraftUpdate(BaseModel):
@@ -106,6 +120,14 @@ class NotificationSettingsUpdate(BaseModel):
     telegram_enabled: bool
     email_enabled: bool
     events: tuple[str, ...] = Field(max_length=len(WINDOWS_NOTIFICATION_EVENTS))
+
+
+class AiPromptSettingsUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    resume: str = Field(min_length=1, max_length=MAX_PROMPT_LENGTH)
+    cover_letter: str = Field(min_length=1, max_length=MAX_PROMPT_LENGTH)
+    recruiter_reply: str = Field(min_length=1, max_length=MAX_PROMPT_LENGTH)
 
 
 router = APIRouter(prefix="/api/communications", tags=["communications"])
@@ -279,6 +301,38 @@ def update_notification_settings(
             email_enabled=values.email_enabled,
             events=values.events,
         )
+        return CommunicationsResponse.model_validate(updated)
+    except (LookupError, ValueError) as error:
+        raise _communication_error(error) from error
+
+
+@router.put("/ai-prompts", response_model=CommunicationsResponse)
+def update_ai_prompt_settings(
+    values: AiPromptSettingsUpdate,
+    session: WriteSession,
+    _guard: SessionGuard,
+    account_id: int = Query(default=1, ge=1),
+) -> CommunicationsResponse:
+    try:
+        updated = UiCommunicationService(session).update_ai_prompt_settings(
+            account_id=account_id,
+            resume=values.resume,
+            cover_letter=values.cover_letter,
+            recruiter_reply=values.recruiter_reply,
+        )
+        return CommunicationsResponse.model_validate(updated)
+    except (LookupError, ValueError) as error:
+        raise _communication_error(error) from error
+
+
+@router.post("/ai-prompts/reset", response_model=CommunicationsResponse)
+def reset_ai_prompt_settings(
+    session: WriteSession,
+    _guard: SessionGuard,
+    account_id: int = Query(default=1, ge=1),
+) -> CommunicationsResponse:
+    try:
+        updated = UiCommunicationService(session).reset_ai_prompt_settings(account_id=account_id)
         return CommunicationsResponse.model_validate(updated)
     except (LookupError, ValueError) as error:
         raise _communication_error(error) from error

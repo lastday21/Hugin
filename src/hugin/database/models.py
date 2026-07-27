@@ -1182,6 +1182,11 @@ class ApplicationSettingsModel(Base):
     telegram_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     email_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     notification_routing: Mapped[ConfigPayload] = mapped_column(JSONB, default=dict, nullable=False)
+    ai_prompt_overrides: Mapped[ConfigPayload] = mapped_column(
+        JSONB,
+        default=dict,
+        nullable=False,
+    )
     diagnostics_retention_days: Mapped[int] = mapped_column(Integer, default=30, nullable=False)
     logs_retention_days: Mapped[int] = mapped_column(Integer, default=90, nullable=False)
     backups_retention_days: Mapped[int] = mapped_column(Integer, default=30, nullable=False)

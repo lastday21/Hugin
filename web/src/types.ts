@@ -262,6 +262,7 @@ export interface Communications {
   unread_messages: number;
   unseen_invitations: number;
   notification_settings: NotificationSettings;
+  ai_prompt_settings: AiPromptSettings;
 }
 
 export interface NotificationSettings {
@@ -269,6 +270,16 @@ export interface NotificationSettings {
   telegram_enabled: boolean;
   email_enabled: boolean;
   routing: Record<string, string[]>;
+}
+
+export interface AiPromptValues {
+  resume: string;
+  cover_letter: string;
+  recruiter_reply: string;
+}
+
+export interface AiPromptSettings extends AiPromptValues {
+  defaults: AiPromptValues;
 }
 
 export interface VacancyQuestion {
@@ -315,6 +326,7 @@ export interface BridgeResult {
   skipped?: number;
   telegram_configured?: boolean;
   email_configured?: boolean;
+  body?: string;
 }
 
 declare global {
@@ -329,6 +341,7 @@ declare global {
           contentHash: string,
           contentVersion: number,
         ) => Promise<BridgeResult>;
+        generate_reply: (applicationId: number) => Promise<BridgeResult>;
         notification_credentials_status: () => Promise<BridgeResult>;
         save_telegram_notifications: (
           botToken: string,

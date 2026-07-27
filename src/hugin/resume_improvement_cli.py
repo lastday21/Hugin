@@ -12,6 +12,7 @@ from hugin.adapters.yandex_credentials import (
 )
 from hugin.core.settings import Settings, get_settings
 from hugin.database import create_database, upgrade_database
+from hugin.services.ai_prompts import AiPromptSettingsService
 from hugin.services.resume_improvement import (
     ResumeImprovementService,
     ResumeNarrativeBlock,
@@ -89,6 +90,7 @@ def run(argv: Sequence[str] | None = None) -> int:
                     session,
                     settings.data_dir,
                     client,
+                    AiPromptSettingsService(session).get().resume,
                 ).improve(
                     arguments.account_id,
                     ask,

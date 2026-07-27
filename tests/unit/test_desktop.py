@@ -318,6 +318,55 @@ def test_bridge_sends_only_exact_confirmed_reply(
     }
 
 
+def test_bridge_generates_editable_reply_draft(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ReplySessions:
+        def begin(self) -> object:
+            return nullcontext(object())
+
+    class ReplyDatabase:
+        sessions = ReplySessions()
+
+        def close(self) -> None:
+            return None
+
+    class FakeReplyService:
+        def __init__(self, _session: object, model: object) -> None:
+            assert model == "configured-model"
+
+        def generate(self, **values: int) -> SimpleNamespace:
+            assert values == {"account_id": 1, "application_id": 12}
+            return SimpleNamespace(body="Подготовленный ответ")
+
+    monkeypatch.setattr(desktop, "upgrade_database", lambda _settings: None)
+    monkeypatch.setattr(desktop, "create_database", lambda _settings: ReplyDatabase())
+    monkeypatch.setattr(
+        desktop,
+        "configured_yandex_ai_client",
+        lambda _settings: "configured-model",
+    )
+    monkeypatch.setattr(desktop, "RecruiterReplyService", FakeReplyService)
+    bridge = desktop.DesktopBridge(Settings(environment="test"))
+
+    assert bridge.generate_reply(0)["status"] == "UNAVAILABLE"
+    assert bridge.generate_reply(12) == {
+        "status": "READY",
+        "message": "Черновик подготовлен. Проверьте и при необходимости измените его.",
+        "body": "Подготовленный ответ",
+    }
+
+    monkeypatch.setattr(
+        desktop,
+        "configured_yandex_ai_client",
+        lambda _settings: (_ for _ in ()).throw(LookupError("YandexGPT не настроен")),
+    )
+    assert bridge.generate_reply(12) == {
+        "status": "UNAVAILABLE",
+        "message": "YandexGPT не настроен",
+    }
+
+
 def test_bridge_saves_notification_credentials_in_windows_store(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

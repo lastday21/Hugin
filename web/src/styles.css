@@ -1498,6 +1498,35 @@ ol {
   border-top: 1px solid var(--line);
 }
 
+.reply-mode {
+  display: inline-flex;
+  gap: 3px;
+  margin-bottom: 12px;
+  padding: 3px;
+  background: #edf2ef;
+  border-radius: 10px;
+}
+
+.reply-mode button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 34px;
+  padding: 0 11px;
+  color: #526159;
+  background: transparent;
+  border: 0;
+  border-radius: 8px;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.reply-mode button.active {
+  color: var(--text);
+  background: #ffffff;
+  box-shadow: 0 1px 4px rgb(32 52 41 / 12%);
+}
+
 .reply-editor > label {
   display: block;
   margin-bottom: 6px;
@@ -1527,6 +1556,40 @@ ol {
   flex: 1;
   color: var(--muted);
   font-size: 11px;
+}
+
+.reply-generation {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  min-height: 104px;
+  padding: 16px;
+  background: #f4f8f6;
+  border: 1px solid #dbe7e0;
+  border-radius: 11px;
+}
+
+.reply-generation > div {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.reply-generation strong {
+  font-size: 13px;
+}
+
+.reply-generation span {
+  max-width: 620px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.reply-generation button {
+  flex: 0 0 auto;
 }
 
 .invitation-list {
@@ -2004,6 +2067,78 @@ ol {
 
 .settings-card.wide {
   grid-column: 1 / -1;
+}
+
+.ai-prompt-settings {
+  margin-top: 16px;
+  border: 1px solid #e1e8e3;
+  border-radius: 12px;
+}
+
+.ai-prompt-settings > summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  min-height: 62px;
+  padding: 12px 14px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.ai-prompt-settings > summary::-webkit-details-marker {
+  display: none;
+}
+
+.ai-prompt-settings > summary > span {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.ai-prompt-settings > summary strong {
+  font-size: 13px;
+}
+
+.ai-prompt-settings > summary small,
+.ai-prompt-fields .text-field > small {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 400;
+}
+
+.ai-prompt-settings > summary svg {
+  color: var(--muted);
+  transition: transform 160ms ease;
+}
+
+.ai-prompt-settings[open] > summary svg {
+  transform: rotate(180deg);
+}
+
+.ai-prompt-settings[open] > summary {
+  border-bottom: 1px solid #e1e8e3;
+}
+
+.ai-prompt-fields {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  padding: 16px 16px 0;
+}
+
+.ai-prompt-fields .text-field {
+  align-content: start;
+}
+
+.ai-prompt-settings > .settings-note,
+.ai-prompt-settings > .settings-submit-error {
+  margin-right: 16px;
+  margin-left: 16px;
+}
+
+.ai-prompt-settings > .settings-form-actions {
+  padding: 12px 16px 16px;
 }
 
 .widget-selector {
@@ -2775,6 +2910,10 @@ ol {
     grid-column: auto;
   }
 
+  .ai-prompt-fields {
+    grid-template-columns: 1fr;
+  }
+
   .direction-option-grid {
     grid-template-columns: repeat(3, minmax(0, 1fr));
   }
@@ -2892,9 +3031,20 @@ ol {
   }
 
   .reply-actions,
+  .reply-generation,
   .invitation-card {
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .reply-mode {
+    display: flex;
+    flex-wrap: wrap;
+  }
+
+  .reply-mode button {
+    flex: 1 1 auto;
+    justify-content: center;
   }
 
   .conversation-panel > header,

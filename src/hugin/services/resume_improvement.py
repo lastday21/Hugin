@@ -24,6 +24,7 @@ from hugin.database.models import (
     ResumeModel,
     VacancyModel,
 )
+from hugin.services.ai_prompts import DEFAULT_AI_PROMPTS, with_user_prompt
 from hugin.services.resume_prompts import (
     QUESTION_PROMPT_VERSION,
     REWRITE_PROMPT_VERSION,
@@ -326,11 +327,18 @@ class ResumeBlockExtractor:
 
 
 class ResumeImprovementService:
-    def __init__(self, session: Session, data_dir: Path, model: ResumeTextModel) -> None:
+    def __init__(
+        self,
+        session: Session,
+        data_dir: Path,
+        model: ResumeTextModel,
+        user_prompt: str = DEFAULT_AI_PROMPTS.resume,
+    ) -> None:
         self._session = session
         self._data_dir = data_dir
         self._model = model
         self._extractor = ResumeBlockExtractor()
+        self._system_prompt = with_user_prompt(SYSTEM_PROMPT, user_prompt)
 
     def improve(
         self,
@@ -366,7 +374,7 @@ class ResumeImprovementService:
                 self._answer(block, question, answer_provider) for question in questions
             )
             rewrite_response = self._model.complete(
-                SYSTEM_PROMPT,
+                self._system_prompt,
                 build_rewrite_prompt(
                     context,
                     tuple(
@@ -417,7 +425,7 @@ class ResumeImprovementService:
         context: ResumePromptContext,
     ) -> tuple[ResumeQuestionAssessment, ...]:
         prompt = build_questions_prompt(context)
-        response = self._model.complete(SYSTEM_PROMPT, prompt)
+        response = self._model.complete(self._system_prompt, prompt)
         try:
             return parse_question_assessments(response)
         except ValueError:
@@ -426,7 +434,9 @@ class ResumeImprovementService:
                 "Предыдущий ответ имел неверный формат. Верни только корректный JSON-массив "
                 "из пяти объектов без разметки и пояснений."
             )
-            return parse_question_assessments(self._model.complete(SYSTEM_PROMPT, retry_prompt))
+            return parse_question_assessments(
+                self._model.complete(self._system_prompt, retry_prompt)
+            )
 
     def _active_resume(self, account_id: int) -> tuple[CandidateProfileModel, ResumeModel]:
         profile = self._session.scalar(

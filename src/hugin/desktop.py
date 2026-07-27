@@ -26,16 +26,20 @@ from hugin.adapters.notification_credentials import (
     WindowsNotificationCredentialStore,
 )
 from hugin.adapters.postgres_backup import DockerPostgresBackupAdapter
+from hugin.adapters.yandex_ai import YandexAIError
 from hugin.core.settings import Settings, get_settings
 from hugin.database import create_database, upgrade_database
 from hugin.database.models import ApplicationModel, VacancyModel
 from hugin.domain.automation import AutomationJobKind
+from hugin.domain.communications import CommunicationNotFoundError, CommunicationStateError
 from hugin.domain.content import RecruiterMessageState
 from hugin.domain.hh import HhFormReviewStatus
 from hugin.services.backups import BackupService
 from hugin.services.communications import CommunicationService, RecordingMessageSender
 from hugin.services.hh_login import HhLoginService, LoginStatus
+from hugin.services.recruiter_reply import RecruiterReplyService
 from hugin.services.screening_forms import ScreeningDraftService
+from hugin.services.yandex_client import configured_yandex_ai_client
 from hugin.workers.applications import ApplicationWorker
 from hugin.workers.automation import AutomationWorker
 from hugin.workers.backups import BackupWorker
@@ -238,6 +242,35 @@ class DesktopBridge:
         )
         return self._result(status, message_text)
 
+    def generate_reply(self, application_id: int) -> dict[str, object]:
+        if application_id < 1:
+            return self._result("UNAVAILABLE", "Некорректный номер отклика")
+        try:
+            client = configured_yandex_ai_client(self._settings)
+            upgrade_database(self._settings)
+            database = create_database(self._settings)
+            try:
+                with database.sessions.begin() as session:
+                    draft = RecruiterReplyService(session, client).generate(
+                        account_id=self._account_id,
+                        application_id=application_id,
+                    )
+            finally:
+                database.close()
+        except (
+            CommunicationNotFoundError,
+            CommunicationStateError,
+            LookupError,
+            ValueError,
+            YandexAIError,
+        ) as error:
+            return self._result("UNAVAILABLE", str(error))
+        return self._result(
+            "READY",
+            "Черновик подготовлен. Проверьте и при необходимости измените его.",
+            body=draft.body,
+        )
+
     def notification_credentials_status(self) -> dict[str, object]:
         store = WindowsNotificationCredentialStore()
         try:
@@ -376,8 +409,12 @@ class DesktopBridge:
         }
 
     @staticmethod
-    def _result(status: str, message: str) -> dict[str, object]:
-        return {"status": status, "message": message}
+    def _result(
+        status: str,
+        message: str,
+        **details: object,
+    ) -> dict[str, object]:
+        return {"status": status, "message": message, **details}
 
 
 def project_directory(start: Path | None = None) -> Path:

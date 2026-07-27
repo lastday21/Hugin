@@ -1,4 +1,5 @@
 import type {
+  AiPromptValues,
   Communications,
   Dashboard,
   DirectionOptions,
@@ -280,6 +281,31 @@ export async function updateNotificationSettings(
         email_enabled: emailEnabled,
         events,
       }),
+    },
+  );
+}
+
+export async function updateAiPromptSettings(
+  values: AiPromptValues,
+): Promise<Communications> {
+  const session = await request<{ key: string }>("/api/session");
+  return request<Communications>(
+    `/api/communications/ai-prompts?account_id=${ACCOUNT_ID}`,
+    {
+      method: "PUT",
+      headers: { "X-Hugin-Session": session.key },
+      body: JSON.stringify(values),
+    },
+  );
+}
+
+export async function resetAiPromptSettings(): Promise<Communications> {
+  const session = await request<{ key: string }>("/api/session");
+  return request<Communications>(
+    `/api/communications/ai-prompts/reset?account_id=${ACCOUNT_ID}`,
+    {
+      method: "POST",
+      headers: { "X-Hugin-Session": session.key },
     },
   );
 }

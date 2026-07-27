@@ -19,6 +19,7 @@ import {
   Search,
   Settings,
   SlidersHorizontal,
+  Sparkles,
   Upload,
   UserRound,
   X,
@@ -48,6 +49,8 @@ import {
   reviewProfileFact,
   saveReplyDraft,
   saveProfileAnswer,
+  resetAiPromptSettings,
+  updateAiPromptSettings,
   updateNotificationSettings,
   updateDirection,
   updateQueueSettings,
@@ -61,6 +64,8 @@ import {
   type DashboardWidget,
 } from "./dashboardPreferences";
 import type {
+  AiPromptSettings,
+  AiPromptValues,
   Communications,
   Conversation,
   Dashboard,
@@ -616,6 +621,7 @@ export default function App() {
                   dashboard={workspace.dashboard}
                   directionOptions={workspace.directionOptions}
                   notificationSettings={workspace.communications.notification_settings}
+                  aiPromptSettings={workspace.communications.ai_prompt_settings}
                   widgets={widgets}
                   onToggleWidget={toggleWidget}
                   onResetWidgets={resetWidgets}
@@ -1640,12 +1646,16 @@ function CommunicationsView({
     communications.conversations[0]?.application_id ?? null,
   );
   const [draft, setDraft] = useState("");
+  const [replyMode, setReplyMode] = useState<"manual" | "ai">("manual");
   const [busy, setBusy] = useState(false);
   const selected =
     communications.conversations.find(
       (conversation) => conversation.application_id === selectedApplicationId,
     ) ?? communications.conversations[0];
   const reply = selected ? latestEditableReply(selected) : undefined;
+  const hasIncoming = selected?.messages.some(
+    (message) => message.direction === "INCOMING",
+  );
 
   useEffect(() => {
     if (!selectedApplicationId && communications.conversations[0]) {
@@ -1655,6 +1665,7 @@ function CommunicationsView({
 
   useEffect(() => {
     setDraft(reply?.body ?? "");
+    setReplyMode("manual");
   }, [reply?.body, reply?.id, selectedApplicationId]);
 
   async function selectConversation(conversation: Conversation): Promise<void> {
@@ -1673,6 +1684,42 @@ function CommunicationsView({
     try {
       onChanged(await saveReplyDraft(selected.application_id, draft.trim()));
       onToast({ kind: "success", message: "Черновик ответа сохранён" });
+    } catch (reason) {
+      onToast({ kind: "error", message: readableError(reason) });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function generateDraft(): Promise<void> {
+    if (!selected || !hasIncoming || busy) return;
+    if (
+      draft.trim() &&
+      draft.trim() !== reply?.body &&
+      !window.confirm("Заменить несохранённый текст новым черновиком?")
+    ) {
+      return;
+    }
+    if (!window.pywebview?.api) {
+      onToast({
+        kind: "error",
+        message: "Подготовка ответа доступна только в оконном приложении Hugin",
+      });
+      return;
+    }
+    setBusy(true);
+    try {
+      const result = await window.pywebview.api.generate_reply(
+        selected.application_id,
+      );
+      if (result.status !== "READY") {
+        throw new Error(result.message);
+      }
+      const updated = await loadCommunications();
+      onChanged(updated);
+      setDraft(result.body ?? "");
+      setReplyMode("manual");
+      onToast({ kind: "success", message: result.message });
     } catch (reason) {
       onToast({ kind: "error", message: readableError(reason) });
     } finally {
@@ -1786,7 +1833,7 @@ function CommunicationsView({
           </button>
         </div>
         <p className="communications-note">
-          Подтверждение сохраняет выбранный текст, но ничего не отправляет.
+          Ответ отправляется только после просмотра и явного подтверждения.
         </p>
       </div>
 
@@ -1871,44 +1918,93 @@ function CommunicationsView({
                     ))}
                   </ol>
                   <div className="reply-editor">
-                    <label htmlFor="reply-draft">Черновик ответа</label>
-                    <textarea
-                      id="reply-draft"
-                      value={draft}
-                      rows={6}
-                      maxLength={5000}
-                      placeholder="Введите ответ работодателю"
-                      onChange={(event) => setDraft(event.target.value)}
-                    />
-                    <div className="reply-actions">
-                      <span>
-                        {reply?.state === "CONFIRMED"
-                          ? "Текст подтверждён и готов к отправке."
-                          : "Сохраните текст и проверьте его перед отправкой."}
-                      </span>
+                    <div className="reply-mode" role="group" aria-label="Способ ответа">
                       <button
                         type="button"
-                        className="secondary-button"
-                        disabled={busy || !draft.trim() || draft.trim() === reply?.body}
-                        onClick={() => void saveDraft()}
+                        className={replyMode === "manual" ? "active" : undefined}
+                        aria-pressed={replyMode === "manual"}
+                        onClick={() => setReplyMode("manual")}
                       >
-                        Сохранить
+                        Написать самому
                       </button>
                       <button
                         type="button"
-                        className="primary-button"
-                        disabled={
-                          busy ||
-                          !reply?.content_hash ||
-                          draft.trim() !== reply.body
-                        }
-                        onClick={() => void confirmDraft()}
+                        className={replyMode === "ai" ? "active" : undefined}
+                        aria-pressed={replyMode === "ai"}
+                        onClick={() => setReplyMode("ai")}
                       >
-                        {reply?.state === "CONFIRMED"
-                          ? "Отправить подтверждённый"
-                          : "Подтвердить и отправить"}
+                        <Sparkles size={15} aria-hidden="true" />
+                        Сгенерировать нейросетью
                       </button>
                     </div>
+                    {replyMode === "manual" ? (
+                      <>
+                        <label htmlFor="reply-draft">Черновик ответа</label>
+                        <textarea
+                          id="reply-draft"
+                          value={draft}
+                          rows={6}
+                          maxLength={5000}
+                          placeholder="Введите ответ работодателю"
+                          onChange={(event) => setDraft(event.target.value)}
+                        />
+                        <div className="reply-actions">
+                          <span>
+                            {reply?.state === "CONFIRMED"
+                              ? "Текст подтверждён и готов к отправке."
+                              : "Сохраните текст и проверьте его перед отправкой."}
+                          </span>
+                          <button
+                            type="button"
+                            className="secondary-button"
+                            disabled={
+                              busy || !draft.trim() || draft.trim() === reply?.body
+                            }
+                            onClick={() => void saveDraft()}
+                          >
+                            Сохранить
+                          </button>
+                          <button
+                            type="button"
+                            className="primary-button"
+                            disabled={
+                              busy ||
+                              !reply?.content_hash ||
+                              draft.trim() !== reply.body
+                            }
+                            onClick={() => void confirmDraft()}
+                          >
+                            {reply?.state === "CONFIRMED"
+                              ? "Отправить подтверждённый"
+                              : "Подтвердить и отправить"}
+                          </button>
+                        </div>
+                      </>
+                    ) : (
+                      <div className="reply-generation">
+                        <div>
+                          <strong>Подготовить черновик по переписке</strong>
+                          <span>
+                            {hasIncoming
+                              ? "Нейросеть учтёт вакансию и только разрешённые вами подтверждённые сведения. Перед отправкой текст можно изменить."
+                              : "Черновик можно будет подготовить после первого сообщения работодателя."}
+                          </span>
+                        </div>
+                        <button
+                          type="button"
+                          className="primary-button"
+                          disabled={busy || !hasIncoming}
+                          onClick={() => void generateDraft()}
+                        >
+                          <Sparkles size={16} aria-hidden="true" />
+                          {busy
+                            ? "Готовим…"
+                            : hasIncoming
+                              ? "Подготовить черновик"
+                              : "Пока нечего отвечать"}
+                        </button>
+                      </div>
+                    )}
                   </div>
                 </article>
               )}
@@ -2514,6 +2610,7 @@ function SettingsView({
   dashboard,
   directionOptions,
   notificationSettings,
+  aiPromptSettings,
   widgets,
   onToggleWidget,
   onResetWidgets,
@@ -2525,6 +2622,7 @@ function SettingsView({
   dashboard: Dashboard;
   directionOptions: DirectionOptions;
   notificationSettings: NotificationSettings;
+  aiPromptSettings: AiPromptSettings;
   widgets: DashboardWidget[];
   onToggleWidget: (widget: DashboardWidget) => void;
   onResetWidgets: () => void;
@@ -2586,6 +2684,21 @@ function SettingsView({
         </div>
       </section>
 
+      <section className="settings-card wide" aria-labelledby="ai-prompts-title">
+        <div className="section-heading">
+          <div>
+            <span className="eyebrow">Нейросеть</span>
+            <h2 id="ai-prompts-title">Инструкции для текстов</h2>
+            <p>Используется YandexGPT. Настройки скрыты, пока они не нужны.</p>
+          </div>
+        </div>
+        <AiPromptSettingsForm
+          settings={aiPromptSettings}
+          onSaved={onNotificationsSaved}
+          onToast={onToast}
+        />
+      </section>
+
       <section className="settings-card wide" aria-labelledby="notifications-title">
         <div className="section-heading">
           <div>
@@ -2601,6 +2714,144 @@ function SettingsView({
         />
       </section>
     </div>
+  );
+}
+
+function AiPromptSettingsForm({
+  settings,
+  onSaved,
+  onToast,
+}: {
+  settings: AiPromptSettings;
+  onSaved: (communications: Communications) => void;
+  onToast: (toast: Toast) => void;
+}) {
+  const [values, setValues] = useState<AiPromptValues>({
+    resume: settings.resume,
+    cover_letter: settings.cover_letter,
+    recruiter_reply: settings.recruiter_reply,
+  });
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    setValues({
+      resume: settings.resume,
+      cover_letter: settings.cover_letter,
+      recruiter_reply: settings.recruiter_reply,
+    });
+  }, [settings.cover_letter, settings.recruiter_reply, settings.resume]);
+
+  const dirty =
+    values.resume.trim() !== settings.resume ||
+    values.cover_letter.trim() !== settings.cover_letter ||
+    values.recruiter_reply.trim() !== settings.recruiter_reply;
+  const complete =
+    Boolean(values.resume.trim()) &&
+    Boolean(values.cover_letter.trim()) &&
+    Boolean(values.recruiter_reply.trim());
+
+  function change(key: keyof AiPromptValues, value: string): void {
+    setValues((current) => ({ ...current, [key]: value }));
+    setError(null);
+  }
+
+  async function save(): Promise<void> {
+    if (!dirty || !complete || busy) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const communications = await updateAiPromptSettings(values);
+      onSaved(communications);
+      onToast({ kind: "success", message: "Инструкции нейросети сохранены" });
+    } catch (reason) {
+      setError(readableError(reason));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function reset(): Promise<void> {
+    if (busy || !window.confirm("Вернуть стандартные инструкции нейросети?")) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const communications = await resetAiPromptSettings();
+      onSaved(communications);
+      onToast({ kind: "success", message: "Стандартные инструкции восстановлены" });
+    } catch (reason) {
+      setError(readableError(reason));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <details className="ai-prompt-settings">
+      <summary>
+        <span>
+          <strong>Изменить инструкции</strong>
+          <small>Для резюме, сопроводительных писем и ответов работодателям</small>
+        </span>
+        <ChevronDown size={18} aria-hidden="true" />
+      </summary>
+      <div className="ai-prompt-fields">
+        {[
+          {
+            key: "resume" as const,
+            title: "Улучшение резюме",
+            hint: "Как переписывать блоки резюме под выбранную роль.",
+          },
+          {
+            key: "cover_letter" as const,
+            title: "Сопроводительные письма",
+            hint: "Стиль и подача письма для конкретной вакансии.",
+          },
+          {
+            key: "recruiter_reply" as const,
+            title: "Ответы работодателям",
+            hint: "Как готовить черновики по текущей переписке.",
+          },
+        ].map((field) => (
+          <label className="text-field" key={field.key}>
+            <span>{field.title}</span>
+            <small>{field.hint}</small>
+            <textarea
+              rows={4}
+              maxLength={4000}
+              value={values[field.key]}
+              onChange={(event) => change(field.key, event.target.value)}
+            />
+          </label>
+        ))}
+      </div>
+      <p className="settings-note">
+        Правила точности и запрет отправки без подтверждения изменить нельзя.
+      </p>
+      {error && (
+        <p className="settings-submit-error" role="alert">
+          {error}
+        </p>
+      )}
+      <div className="settings-form-actions">
+        <button
+          type="button"
+          className="primary-button"
+          disabled={!dirty || !complete || busy}
+          onClick={() => void save()}
+        >
+          {busy ? "Сохраняем…" : "Сохранить"}
+        </button>
+        <button
+          type="button"
+          className="secondary-button"
+          disabled={busy}
+          onClick={() => void reset()}
+        >
+          Вернуть стандартные
+        </button>
+      </div>
+    </details>
   );
 }
 

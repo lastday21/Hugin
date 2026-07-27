@@ -137,8 +137,14 @@ def test_run_uses_separate_service_and_reports_paths(
     received_answers: list[str] = []
 
     class FakeService:
-        def __init__(self, _session: object, _data_dir: Path, _client: object) -> None:
-            pass
+        def __init__(
+            self,
+            _session: object,
+            _data_dir: Path,
+            _client: object,
+            user_prompt: str,
+        ) -> None:
+            assert user_prompt == "Сохраняй подтверждённые факты."
 
         def improve(
             self,
@@ -155,6 +161,17 @@ def test_run_uses_separate_service_and_reports_paths(
             received_answers.append(answer)
             return result
 
+    class FakePromptSettingsService:
+        def __init__(self, _session: object) -> None:
+            pass
+
+        def get(self) -> object:
+            return type(
+                "PromptSettings",
+                (),
+                {"resume": "Сохраняй подтверждённые факты."},
+            )()
+
     monkeypatch.setattr(
         resume_improvement_cli,
         "WindowsYandexAICredentialStore",
@@ -169,6 +186,11 @@ def test_run_uses_separate_service_and_reports_paths(
     monkeypatch.setattr(resume_improvement_cli, "upgrade_database", lambda _settings: None)
     monkeypatch.setattr(resume_improvement_cli, "create_database", lambda _settings: database)
     monkeypatch.setattr(resume_improvement_cli, "ResumeImprovementService", FakeService)
+    monkeypatch.setattr(
+        resume_improvement_cli,
+        "AiPromptSettingsService",
+        FakePromptSettingsService,
+    )
     monkeypatch.setattr("builtins.input", lambda _prompt: "Сократил ручную работу.")
 
     assert (

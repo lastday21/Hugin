@@ -26,6 +26,7 @@ from hugin.database.models import (
 from hugin.domain.applications import ApplicationState
 from hugin.domain.content import ConfirmationState, CoverLetterState
 from hugin.domain.tasks import TaskState
+from hugin.services.ai_prompts import AiPromptSettingsService, with_user_prompt
 from hugin.services.resume_improvement import ResumeBlockExtractor
 
 PROMPT_PURPOSE = "cover_letter"
@@ -226,6 +227,8 @@ class CoverLetterService:
             raise RuntimeError("Для создания писем нужно настроить YandexGPT")
         direction = self._direction(account_id, direction_name)
         prompt_version = self._prompt_version()
+        user_instruction = AiPromptSettingsService(self._session).get().cover_letter
+        instruction_version = self._instruction_version(user_instruction)
         items: list[CoverLetterPreparationItem] = []
         already_ready = 0
         attempted = 0
@@ -233,7 +236,13 @@ class CoverLetterService:
         if vacancy_hh_id is not None and not candidates:
             raise LookupError(f"Вакансия № {vacancy_hh_id} не найдена в готовой очереди")
         for candidate in candidates:
-            item = self._prepare_one(candidate, direction, prompt_version)
+            item = self._prepare_one(
+                candidate,
+                direction,
+                prompt_version,
+                user_instruction,
+                instruction_version,
+            )
             if item.action == "existing":
                 already_ready += 1
                 continue
@@ -252,13 +261,16 @@ class CoverLetterService:
 
     def status(self, *, account_id: int, direction_name: str) -> CoverLetterStatus:
         direction = self._direction(account_id, direction_name)
+        instruction_version = self._instruction_version(
+            AiPromptSettingsService(self._session).get().cover_letter
+        )
         rows = self._session.execute(
             select(CoverLetterModel.state, func.count())
             .join(ApplicationModel, ApplicationModel.id == CoverLetterModel.application_id)
             .where(
                 ApplicationModel.account_id == account_id,
                 ApplicationModel.direction_id == direction.id,
-                CoverLetterModel.instruction_version == INSTRUCTION_VERSION,
+                CoverLetterModel.instruction_version == instruction_version,
             )
             .group_by(CoverLetterModel.state)
         )
@@ -279,7 +291,7 @@ class CoverLetterService:
                     ~select(CoverLetterModel.id)
                     .where(
                         CoverLetterModel.application_id == ApplicationModel.id,
-                        CoverLetterModel.instruction_version == INSTRUCTION_VERSION,
+                        CoverLetterModel.instruction_version == instruction_version,
                     )
                     .exists(),
                 )
@@ -298,17 +310,22 @@ class CoverLetterService:
         candidate: _Candidate,
         direction: CareerDirectionModel,
         prompt_version: PromptVersionModel,
+        user_instruction: str,
+        instruction_version: str,
     ) -> CoverLetterPreparationItem:
         model = self._require_model()
         facts = self._select_facts(candidate, direction.id)
-        user_prompt = build_cover_letter_prompt(
-            candidate.vacancy,
-            direction.name,
-            candidate.direction_vacancy.rules_details.get("reasons", []),
-            facts,
+        user_prompt = with_user_prompt(
+            build_cover_letter_prompt(
+                candidate.vacancy,
+                direction.name,
+                candidate.direction_vacancy.rules_details.get("reasons", []),
+                facts,
+            ),
+            user_instruction,
         )
         context_hash = hashlib.sha256(user_prompt.encode("utf-8")).hexdigest()
-        letter = self._current_letter(candidate.application.id)
+        letter = self._current_letter(candidate.application.id, instruction_version)
         if (
             letter is not None
             and letter.state is CoverLetterState.READY
@@ -323,8 +340,9 @@ class CoverLetterService:
             candidate,
             prompt_version,
             context_hash,
+            instruction_version,
         )
-        source = self._duplicate_source(candidate)
+        source = self._duplicate_source(candidate, instruction_version)
         if source is not None and source.text:
             source_fact_ids = tuple(
                 self._session.scalars(
@@ -521,11 +539,15 @@ class CoverLetterService:
             )
         return tuple(selected)
 
-    def _current_letter(self, application_id: int) -> CoverLetterModel | None:
+    def _current_letter(
+        self,
+        application_id: int,
+        instruction_version: str,
+    ) -> CoverLetterModel | None:
         return self._session.scalar(
             select(CoverLetterModel).where(
                 CoverLetterModel.application_id == application_id,
-                CoverLetterModel.instruction_version == INSTRUCTION_VERSION,
+                CoverLetterModel.instruction_version == instruction_version,
             )
         )
 
@@ -535,6 +557,7 @@ class CoverLetterService:
         candidate: _Candidate,
         prompt_version: PromptVersionModel,
         context_hash: str,
+        instruction_version: str,
     ) -> CoverLetterModel:
         model = self._require_model()
         if letter is None:
@@ -543,7 +566,7 @@ class CoverLetterService:
                 vacancy_id=candidate.vacancy.id,
                 direction_id=candidate.application.direction_id,
                 resume_id=candidate.resume.id,
-                instruction_version=INSTRUCTION_VERSION,
+                instruction_version=instruction_version,
                 model_name=model.model_name,
             )
             self._session.add(letter)
@@ -557,7 +580,11 @@ class CoverLetterService:
         self._session.flush()
         return letter
 
-    def _duplicate_source(self, candidate: _Candidate) -> CoverLetterModel | None:
+    def _duplicate_source(
+        self,
+        candidate: _Candidate,
+        instruction_version: str,
+    ) -> CoverLetterModel | None:
         model = self._require_model()
         canonical_id = candidate.vacancy.duplicate_of_id
         if canonical_id is None:
@@ -569,7 +596,7 @@ class CoverLetterService:
                 ApplicationModel.account_id == candidate.application.account_id,
                 ApplicationModel.vacancy_id == canonical_id,
                 ApplicationModel.resume_id == candidate.resume.id,
-                CoverLetterModel.instruction_version == INSTRUCTION_VERSION,
+                CoverLetterModel.instruction_version == instruction_version,
                 CoverLetterModel.model_name == model.model_name,
                 CoverLetterModel.state.in_((CoverLetterState.READY, CoverLetterState.SENT)),
                 CoverLetterModel.text.is_not(None),
@@ -625,6 +652,11 @@ class CoverLetterService:
         if self._model is None:
             raise RuntimeError("Для создания писем нужно настроить YandexGPT")
         return self._model
+
+    @staticmethod
+    def _instruction_version(user_instruction: str) -> str:
+        fingerprint = hashlib.sha256(user_instruction.encode("utf-8")).hexdigest()[:12]
+        return f"{INSTRUCTION_VERSION}_{fingerprint}"
 
     @staticmethod
     def _item(
