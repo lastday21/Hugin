@@ -23,6 +23,7 @@ from hugin.adapters.hh_messages import HhBrowserMessageSender
 from hugin.core.settings import Settings, get_settings
 from hugin.database import create_database, upgrade_database
 from hugin.database.models import ApplicationModel, VacancyModel
+from hugin.domain.automation import AutomationJobKind
 from hugin.domain.content import RecruiterMessageState
 from hugin.domain.hh import HhFormReviewStatus
 from hugin.services.communications import CommunicationService, RecordingMessageSender
@@ -31,6 +32,7 @@ from hugin.services.screening_forms import ScreeningDraftService
 from hugin.workers.applications import ApplicationWorker
 from hugin.workers.automation import AutomationWorker
 from hugin.workers.hh_search import HhSearchJobHandler
+from hugin.workers.hh_sync import HhSyncJobHandler
 
 
 class WebviewWindow(Protocol):
@@ -396,13 +398,26 @@ def main() -> None:
             "Установите оконную часть: uv sync --extra desktop --extra browser"
         ) from error
     browser_lock = threading.Lock()
+    search_handler = HhSearchJobHandler(
+        settings,
+        browser_lock=browser_lock,
+    )
+    messages_handler = HhSyncJobHandler(
+        settings,
+        AutomationJobKind.MESSAGES,
+        browser_lock=browser_lock,
+    )
+    statuses_handler = HhSyncJobHandler(
+        settings,
+        AutomationJobKind.STATUSES,
+        browser_lock=browser_lock,
+    )
     worker = AutomationWorker(
         settings,
         handlers={
-            HhSearchJobHandler.kind: HhSearchJobHandler(
-                settings,
-                browser_lock=browser_lock,
-            )
+            HhSearchJobHandler.kind: search_handler,
+            AutomationJobKind.MESSAGES: messages_handler,
+            AutomationJobKind.STATUSES: statuses_handler,
         },
     )
     application_worker = ApplicationWorker(

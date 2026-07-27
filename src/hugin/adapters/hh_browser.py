@@ -10,10 +10,11 @@ from email.utils import parsedate_to_datetime
 from math import ceil
 from pathlib import Path
 from types import TracebackType
-from urllib.parse import urlencode, urljoin, urlparse, urlunparse
+from urllib.parse import urlencode, urlparse, urlunparse
 
 from playwright.sync_api import (
     BrowserContext,
+    Frame,
     Locator,
     Page,
     Playwright,
@@ -28,6 +29,7 @@ from playwright.sync_api import (
 )
 
 from hugin.domain.communications import MessageSendOutcome, MessageSendResult
+from hugin.domain.content import MessageDirection
 from hugin.domain.hh import (
     HhApplyResult,
     HhApplyStatus,
@@ -39,6 +41,12 @@ from hugin.domain.hh import (
     HhScreeningField,
     HhScreeningForm,
     screening_form_hash,
+)
+from hugin.domain.hh_sync import (
+    HhChatMessageData,
+    HhNegotiationData,
+    HhNegotiationStatus,
+    HhSyncBlockedError,
 )
 from hugin.domain.vacancies import VacancyAvailability, VacancyData, VacancySearchResult
 from hugin.services.hh_login import HhCredentials, LoginStatus
@@ -334,6 +342,60 @@ return {filled, skipped};
 }
 """
 
+NEGOTIATIONS_SCRIPT = """
+() => Array.from(document.querySelectorAll('[data-qa="negotiations-item"]')).map((item) => {
+    const vacancy = item.querySelector('[data-qa="negotiations-item-vacancy"]');
+    const anchor = vacancy?.closest('a') || vacancy?.querySelector('a[href*="/vacancy/"]');
+    const tag = item.querySelector('[data-qa^="negotiations-tag"]');
+    return {
+        vacancyHref: anchor?.getAttribute('href') || '',
+        statusQa: tag?.getAttribute('data-qa') || '',
+        statusLabel: (tag?.textContent || '').trim().replace(/\\s+/g, ' '),
+        chatAvailable: Boolean(item.querySelector('[data-qa="open_chat"]')),
+    };
+})
+"""
+
+OPEN_NEGOTIATION_CHAT_SCRIPT = """
+(vacancyId) => {
+    const item = Array.from(
+        document.querySelectorAll('[data-qa="negotiations-item"]')
+    ).find((candidate) => {
+        const link = candidate.querySelector('a[href*="/vacancy/"]');
+        return link && new URL(link.href, location.href).pathname === `/vacancy/${vacancyId}`;
+    });
+    const button = item?.querySelector('[data-qa="open_chat"]');
+    if (!button) return false;
+    button.click();
+    return true;
+}
+"""
+
+CHAT_MESSAGES_SCRIPT = """
+(vacancyId) => Array.from(
+    document.querySelectorAll(
+        '[data-qa^="chatik-chat-message-"]:not([data-qa$="-text"])'
+    )
+).map((message) => {
+    const qa = message.getAttribute('data-qa') || '';
+    const own = Boolean(
+        message.querySelector('[data-qa="desktop-message-menu-wrapper"], ' +
+            '[data-qa="chat-bubble-icon-read"]')
+    );
+    return {
+        vacancyId,
+        messageId: qa.replace('chatik-chat-message-', ''),
+        direction: own ? 'OUTGOING' : 'INCOMING',
+        body: (
+            message.querySelector('[data-qa="chat-bubble-text"]')?.textContent || ''
+        ).trim(),
+        displayedTime: (
+            message.querySelector('[data-qa="chat-buble-display-time"]')?.textContent || ''
+        ).trim(),
+    };
+}).filter((message) => message.messageId && message.body)
+"""
+
 ALLOWED_SEARCH_FILTERS = frozenset(
     {
         "currency",
@@ -612,6 +674,81 @@ class VisibleHhBrowser:
             education=self._optional_string(payload, "education"),
         )
 
+    def read_application_statuses(self) -> tuple[HhNegotiationData, ...]:
+        page = self._open_negotiations()
+        payload = page.evaluate(NEGOTIATIONS_SCRIPT)
+        if not isinstance(payload, list) or not all(isinstance(item, dict) for item in payload):
+            raise RuntimeError("hh.ru вернул некорректный список откликов")
+        statuses: list[HhNegotiationData] = []
+        for item in payload:
+            vacancy_id = self._vacancy_id_from_href(self._optional_string(item, "vacancyHref"))
+            if not vacancy_id:
+                continue
+            status_qa = self._optional_string(item, "statusQa").casefold()
+            status_label = self._optional_string(item, "statusLabel")
+            statuses.append(
+                HhNegotiationData(
+                    vacancy_id=vacancy_id,
+                    status=self._negotiation_status(status_qa, status_label),
+                    status_label=status_label or "Отклик отправлен",
+                    chat_available=item.get("chatAvailable") is True,
+                )
+            )
+        return tuple(statuses)
+
+    def read_recruiter_messages(
+        self,
+        vacancy_ids: tuple[str, ...],
+    ) -> tuple[HhChatMessageData, ...]:
+        selected_ids = {value.strip() for value in vacancy_ids if value.strip()}
+        if not selected_ids:
+            return ()
+        negotiations = {
+            item.vacancy_id: item
+            for item in self.read_application_statuses()
+            if item.chat_available and item.vacancy_id in selected_ids
+        }
+        messages: list[HhChatMessageData] = []
+        for vacancy_id in negotiations:
+            page = self._open_negotiations()
+            opened = page.evaluate(OPEN_NEGOTIATION_CHAT_SCRIPT, vacancy_id)
+            if opened is not True:
+                continue
+            frame = self._wait_for_chat_frame(page)
+            if frame is None:
+                continue
+            payload = frame.evaluate(CHAT_MESSAGES_SCRIPT, vacancy_id)
+            if not isinstance(payload, list) or not all(isinstance(item, dict) for item in payload):
+                raise RuntimeError("hh.ru вернул некорректную переписку")
+            for item in payload:
+                raw_direction = self._required_string(item, "direction", "направления сообщения")
+                try:
+                    direction = MessageDirection(raw_direction)
+                except ValueError as error:
+                    raise RuntimeError("hh.ru вернул неизвестное направление сообщения") from error
+                messages.append(
+                    HhChatMessageData(
+                        vacancy_id=self._required_string(
+                            item,
+                            "vacancyId",
+                            "идентификатора вакансии сообщения",
+                        ),
+                        hh_id=self._required_string(
+                            item,
+                            "messageId",
+                            "идентификатора сообщения",
+                        ),
+                        direction=direction,
+                        body=self._required_string(item, "body", "текста сообщения"),
+                        displayed_time=self._optional_string(item, "displayedTime"),
+                    )
+                )
+            close = page.locator('[data-qa="chatik-close-chatik"]')
+            if close.count() == 1:
+                close.first.click(no_wait_after=True)
+                page.wait_for_timeout(500)
+        return tuple(messages)
+
     def apply_to_vacancy(
         self,
         source_url: str,
@@ -834,43 +971,23 @@ class VisibleHhBrowser:
         exact_body = body.strip()
         if not exact_body:
             raise ValueError("Текст сообщения не может быть пустым")
-        _vacancy_id, normalized_url = self._vacancy_id_and_url(source_url)
-        page = self._require_page()
+        vacancy_id, _normalized_url = self._vacancy_id_and_url(source_url)
         try:
-            page.goto(normalized_url, wait_until="domcontentloaded")
-            page.wait_for_timeout(1_500)
+            page = self._open_negotiations()
+        except (HhSyncBlockedError, RuntimeError):
+            return MessageSendResult(MessageSendOutcome.FAILED)
+        try:
+            opened = page.evaluate(OPEN_NEGOTIATION_CHAT_SCRIPT, vacancy_id)
         except PlaywrightError:
             return MessageSendResult(MessageSendOutcome.FAILED)
-        if not self.is_authenticated():
+        if opened is not True:
             return MessageSendResult(MessageSendOutcome.FAILED)
-        if self._any_visible(page, '[data-qa*="captcha"], iframe[src*="captcha"]'):
-            return MessageSendResult(MessageSendOutcome.FAILED)
-
-        chat = page.locator(
-            'a[data-qa*="chat"], a[href*="/chat/"], '
-            'a[href*="/applicant/negotiations/"], '
-            'button[data-qa*="chat"], button:has-text("Перейти в чат")'
-        )
-        if chat.count() != 1:
-            return MessageSendResult(MessageSendOutcome.FAILED)
-        chat_url = chat.first.get_attribute("href")
-        try:
-            if chat_url:
-                page.goto(urljoin(page.url, chat_url), wait_until="domcontentloaded")
-            else:
-                chat.first.click(no_wait_after=True)
-            page.wait_for_timeout(1_500)
-        except PlaywrightError:
+        frame = self._wait_for_chat_frame(page)
+        if frame is None:
             return MessageSendResult(MessageSendOutcome.FAILED)
 
-        editor = page.locator(
-            'textarea[data-qa*="chat"], textarea[placeholder*="сообщ"], '
-            '[contenteditable="true"][data-qa*="chat"]'
-        )
-        submit = page.locator(
-            'button[data-qa*="chat"][data-qa*="send"], '
-            'button[aria-label*="Отправ"], button:has-text("Отправить")'
-        )
+        editor = frame.locator('[data-qa="chatik-new-message-text"]')
+        submit = frame.locator('[data-qa="chatik-do-send-message"]')
         if (
             editor.count() != 1
             or submit.count() != 1
@@ -894,19 +1011,12 @@ class VisibleHhBrowser:
         except PlaywrightError:
             return MessageSendResult(MessageSendOutcome.UNKNOWN_RESULT)
 
-        if self._message_visible(page, exact_body):
+        if self._message_visible(frame, exact_body):
             return MessageSendResult(
                 MessageSendOutcome.SENT,
                 self._message_external_id(response),
             )
-        if response is None:
-            return MessageSendResult(MessageSendOutcome.UNKNOWN_RESULT)
-        if 200 <= response.status < 300:
-            return MessageSendResult(
-                MessageSendOutcome.SENT,
-                self._message_external_id(response),
-            )
-        if 400 <= response.status < 500:
+        if response is not None and 400 <= response.status < 500:
             return MessageSendResult(MessageSendOutcome.FAILED)
         return MessageSendResult(MessageSendOutcome.UNKNOWN_RESULT)
 
@@ -947,6 +1057,64 @@ class VisibleHhBrowser:
             )
         except PlaywrightError:
             return False
+
+    def _open_negotiations(self) -> Page:
+        page = self._require_page()
+        parsed = urlparse(self._resumes_url)
+        url = urlunparse((parsed.scheme, parsed.netloc, "/applicant/negotiations", "", "", ""))
+        try:
+            page.goto(url, wait_until="domcontentloaded")
+            page.wait_for_timeout(1_500)
+        except PlaywrightError as error:
+            raise RuntimeError("Страница откликов hh.ru не загрузилась") from error
+        if not self.is_authenticated():
+            raise HhSyncBlockedError("AUTH_REQUIRED", "Требуется повторный вход в hh.ru")
+        if self._any_visible(page, '[data-qa*="captcha"], iframe[src*="captcha"]'):
+            raise HhSyncBlockedError("CAPTCHA_REQUIRED", "hh.ru запросил проверку")
+        body_text = page.locator("body").inner_text()
+        if self._contains_any(
+            body_text,
+            "подозрительная активность",
+            "аккаунт заблокирован",
+            "слишком много запросов",
+        ):
+            raise HhSyncBlockedError(
+                "ACCOUNT_WARNING",
+                "hh.ru показал предупреждение аккаунта",
+            )
+        return page
+
+    def _wait_for_chat_frame(self, page: Page) -> Frame | None:
+        attempts = max(min(self._timeout_ms // 500, 20), 1)
+        for _attempt in range(attempts):
+            frame = next(
+                (candidate for candidate in page.frames if "chatik.hh.ru/chat/" in candidate.url),
+                None,
+            )
+            if frame is not None:
+                return frame
+            page.wait_for_timeout(500)
+        return None
+
+    @staticmethod
+    def _negotiation_status(status_qa: str, status_label: str) -> HhNegotiationStatus:
+        folded = f"{status_qa} {status_label}".casefold()
+        if "discard" in folded or "отказ" in folded:
+            return HhNegotiationStatus.REJECTED
+        if (
+            "interview" in folded
+            or "invitation" in folded
+            or "собеседован" in folded
+            or "приглашен" in folded
+        ):
+            return HhNegotiationStatus.INVITED
+        if "closed" in folded or "архив" in folded:
+            return HhNegotiationStatus.CLOSED
+        if "not-viewed" in folded or "не просмотрен" in folded:
+            return HhNegotiationStatus.APPLIED
+        if "viewed" in folded or "просмотрен" in folded:
+            return HhNegotiationStatus.VIEWED
+        return HhNegotiationStatus.APPLIED
 
     @staticmethod
     def _is_application_submission_response(response: Response) -> bool:
@@ -1007,7 +1175,7 @@ class VisibleHhBrowser:
         return ""
 
     @staticmethod
-    def _message_visible(page: Page, body: str) -> bool:
+    def _message_visible(page: Page | Frame, body: str) -> bool:
         try:
             page_text = page.locator("body").inner_text()
         except PlaywrightError:
@@ -1324,7 +1492,11 @@ class VisibleHhBrowser:
     def _vacancy_id_from_href(href: str | None) -> str:
         if not href:
             return ""
-        parts = urlparse(href).path.strip("/").split("/")
+        parsed = urlparse(href)
+        hostname = parsed.hostname or ""
+        if hostname and hostname != "hh.ru" and not hostname.endswith(".hh.ru"):
+            return ""
+        parts = parsed.path.strip("/").split("/")
         return parts[1] if len(parts) >= 2 and parts[0] == "vacancy" else ""
 
     @staticmethod

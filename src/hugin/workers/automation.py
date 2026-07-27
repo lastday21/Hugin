@@ -10,6 +10,7 @@ from hugin.domain.automation import (
     AutomationJobKind,
     AutomationJobRecord,
     AutomationJobResult,
+    AutomationJobState,
 )
 from hugin.services.automation import AutomationSchedulerService
 
@@ -70,7 +71,14 @@ class AutomationWorker:
         try:
             with database.sessions.begin() as session:
                 scheduler = AutomationSchedulerService(session)
-                scheduler.ensure_configured_jobs(self._account_id, now)
+                configured = scheduler.ensure_configured_jobs(self._account_id, now)
+                for configured_job in configured:
+                    if (
+                        configured_job.state is AutomationJobState.BLOCKED
+                        and configured_job.last_error_code == "SOURCE_NOT_CONNECTED"
+                        and configured_job.kind in self._handlers
+                    ):
+                        scheduler.unblock(configured_job.key, now)
                 scheduler.recover_stale(now)
             with database.sessions.begin() as session:
                 job = AutomationSchedulerService(session).claim_due(now)

@@ -6,11 +6,12 @@ from pathlib import Path
 from typing import cast
 
 import pytest
-from playwright.sync_api import Error, Locator, Page, TimeoutError
+from playwright.sync_api import Error, Frame, Locator, Page, TimeoutError
 
 from hugin.adapters import hh_browser as browser_module
 from hugin.adapters.hh_browser import VisibleHhBrowser
 from hugin.domain.communications import MessageSendOutcome
+from hugin.domain.content import MessageDirection
 from hugin.domain.hh import (
     HhApplyStatus,
     HhFormReviewStatus,
@@ -20,6 +21,11 @@ from hugin.domain.hh import (
     HhScreeningField,
     HhScreeningForm,
     screening_form_hash,
+)
+from hugin.domain.hh_sync import (
+    HhNegotiationData,
+    HhNegotiationStatus,
+    HhSyncBlockedError,
 )
 from hugin.services.hh_login import HhCredentials, LoginStatus
 
@@ -104,6 +110,10 @@ class FakePage:
         self.application_payload: object = None
         self.fill_payload: object = None
         self.fill_result: object = {"filled": [], "skipped": []}
+        self.negotiations_payload: object = []
+        self.opened_chat = True
+        self.opened_vacancy_ids: list[str] = []
+        self.frames: list[Frame] = []
         self.response = FakeResponse()
         self.goto_response: FakeResponse | None = None
         self.goto_final_url: str | None = None
@@ -132,6 +142,12 @@ class FakePage:
         if expression == browser_module.FILL_APPLICATION_FORM_SCRIPT:
             self.fill_payload = argument
             return self.fill_result
+        if expression == browser_module.NEGOTIATIONS_SCRIPT:
+            return self.negotiations_payload
+        if expression == browser_module.OPEN_NEGOTIATION_CHAT_SCRIPT:
+            assert isinstance(argument, str)
+            self.opened_vacancy_ids.append(argument)
+            return self.opened_chat
         if "ResumeProfileFront-InitialState" in expression:
             return self.profile_payload
         if "vacancy-serp__vacancy" in expression:
@@ -149,6 +165,29 @@ class FakePage:
         assert callable(predicate)
         assert predicate(self.response)
         return FakeResponseInfo(self.response)
+
+
+class FakeFrame:
+    def __init__(
+        self,
+        *,
+        url: str = "https://chatik.hh.ru/chat/101",
+        messages_payload: object = None,
+    ) -> None:
+        self.url = url
+        self.locators: dict[str, FakeLocator] = {}
+        self.messages_payload = [] if messages_payload is None else messages_payload
+        self.evaluated_vacancy_ids: list[str] = []
+
+    def locator(self, selector: str) -> FakeLocator:
+        return self.locators.setdefault(selector, FakeLocator(0))
+
+    def evaluate(self, expression: str, argument: object = None) -> object:
+        if expression != browser_module.CHAT_MESSAGES_SCRIPT:
+            raise AssertionError("unexpected frame script")
+        assert isinstance(argument, str)
+        self.evaluated_vacancy_ids.append(argument)
+        return self.messages_payload
 
 
 class FakeRequest:
@@ -433,6 +472,114 @@ def test_resume_details_are_read_without_contacts(tmp_path: Path) -> None:
         skills="Python PostgreSQL Docker",
         education="Высшее образование",
     )
+
+
+def test_application_statuses_are_read_from_negotiations(tmp_path: Path) -> None:
+    page = FakePage("https://hh.ru/applicant/resumes")
+    page.negotiations_payload = [
+        {
+            "vacancyHref": "/vacancy/101",
+            "statusQa": "negotiations-tag negotiations-item-not-viewed",
+            "statusLabel": "Не просмотрен",
+            "chatAvailable": True,
+        },
+        {
+            "vacancyHref": "https://hh.ru/vacancy/202",
+            "statusQa": "negotiations-tag negotiations-item-discard",
+            "statusLabel": "Отказ",
+            "chatAvailable": False,
+        },
+        {
+            "vacancyHref": "https://example.com/vacancy/303",
+            "statusQa": "",
+            "statusLabel": "",
+            "chatAvailable": False,
+        },
+    ]
+
+    statuses = make_browser(page, tmp_path).read_application_statuses()
+
+    assert statuses == (
+        HhNegotiationData(
+            vacancy_id="101",
+            status=HhNegotiationStatus.APPLIED,
+            status_label="Не просмотрен",
+            chat_available=True,
+        ),
+        HhNegotiationData(
+            vacancy_id="202",
+            status=HhNegotiationStatus.REJECTED,
+            status_label="Отказ",
+        ),
+    )
+    assert page.goto_calls[-1][0] == "https://hh.ru/applicant/negotiations"
+
+
+def test_recruiter_messages_are_read_from_tracked_chats(tmp_path: Path) -> None:
+    page = FakePage("https://hh.ru/applicant/resumes")
+    page.negotiations_payload = [
+        {
+            "vacancyHref": "/vacancy/101",
+            "statusQa": "negotiations-tag negotiations-item-viewed",
+            "statusLabel": "Просмотрен",
+            "chatAvailable": True,
+        },
+        {
+            "vacancyHref": "/vacancy/999",
+            "statusQa": "",
+            "statusLabel": "",
+            "chatAvailable": True,
+        },
+    ]
+    frame = FakeFrame(
+        messages_payload=[
+            {
+                "vacancyId": "101",
+                "messageId": "message-1",
+                "direction": "INCOMING",
+                "body": "Приглашаем на собеседование.",
+                "displayedTime": "10:15",
+            },
+            {
+                "vacancyId": "101",
+                "messageId": "message-2",
+                "direction": "OUTGOING",
+                "body": "Спасибо!",
+                "displayedTime": "10:20",
+            },
+        ]
+    )
+    page.frames = [cast(Frame, frame)]
+
+    messages = make_browser(page, tmp_path).read_recruiter_messages(("101",))
+
+    assert [(item.hh_id, item.direction, item.body) for item in messages] == [
+        ("message-1", MessageDirection.INCOMING, "Приглашаем на собеседование."),
+        ("message-2", MessageDirection.OUTGOING, "Спасибо!"),
+    ]
+    assert page.opened_vacancy_ids == ["101"]
+    assert frame.evaluated_vacancy_ids == ["101"]
+
+
+@pytest.mark.parametrize(
+    ("body_text", "expected_code"),
+    [
+        ("Подозрительная активность. Подтвердите аккаунт.", "ACCOUNT_WARNING"),
+        ("Аккаунт заблокирован", "ACCOUNT_WARNING"),
+    ],
+)
+def test_status_check_reports_account_warning(
+    tmp_path: Path,
+    body_text: str,
+    expected_code: str,
+) -> None:
+    page = FakePage("https://hh.ru/applicant/resumes")
+    page.locators["body"] = FakeLocator(text=body_text)
+
+    with pytest.raises(HhSyncBlockedError) as error:
+        make_browser(page, tmp_path).read_application_statuses()
+
+    assert error.value.code == expected_code
 
 
 def test_application_with_questions_is_not_submitted(tmp_path: Path) -> None:
@@ -901,24 +1048,11 @@ def test_repeat_application_form_is_not_submitted(tmp_path: Path) -> None:
 
 def test_confirmed_recruiter_message_is_sent_once(tmp_path: Path) -> None:
     page = FakePage("https://hh.ru/applicant/resumes")
-    chat_selector = (
-        'a[data-qa*="chat"], a[href*="/chat/"], '
-        'a[href*="/applicant/negotiations/"], '
-        'button[data-qa*="chat"], button:has-text("Перейти в чат")'
-    )
-    editor_selector = (
-        'textarea[data-qa*="chat"], textarea[placeholder*="сообщ"], '
-        '[contenteditable="true"][data-qa*="chat"]'
-    )
-    submit_selector = (
-        'button[data-qa*="chat"][data-qa*="send"], '
-        'button[aria-label*="Отправ"], button:has-text("Отправить")'
-    )
-    page.locators[chat_selector] = FakeLocator(href="/chat/101")
-    page.locators[editor_selector] = FakeLocator()
-    page.locators[submit_selector] = FakeLocator()
-    page.locators["body"] = FakeLocator(text="Спасибо, буду на связи.")
-    page.locators['[data-qa*="captcha"], iframe[src*="captcha"]'] = FakeLocator(0)
+    frame = FakeFrame()
+    frame.locators['[data-qa="chatik-new-message-text"]'] = FakeLocator()
+    frame.locators['[data-qa="chatik-do-send-message"]'] = FakeLocator()
+    frame.locators["body"] = FakeLocator(text="Спасибо, буду на связи.")
+    page.frames = [cast(Frame, frame)]
     page.response.url = "https://hh.ru/chat/101/messages"
     page.response.body = '{"id":"message-7"}'
 
@@ -929,14 +1063,17 @@ def test_confirmed_recruiter_message_is_sent_once(tmp_path: Path) -> None:
 
     assert result.outcome is MessageSendOutcome.SENT
     assert result.external_id == "message-7"
-    assert page.locators[editor_selector].filled == ["Спасибо, буду на связи."]
-    assert page.locators[submit_selector].clicked == 1
-    assert page.locators[submit_selector].no_wait_after == [True]
+    assert page.opened_vacancy_ids == ["101"]
+    assert frame.locators['[data-qa="chatik-new-message-text"]'].filled == [
+        "Спасибо, буду на связи."
+    ]
+    assert frame.locators['[data-qa="chatik-do-send-message"]'].clicked == 1
+    assert frame.locators['[data-qa="chatik-do-send-message"]'].no_wait_after == [True]
 
 
 def test_recruiter_message_is_not_sent_without_unique_chat(tmp_path: Path) -> None:
     page = FakePage("https://hh.ru/applicant/resumes")
-    page.locators['[data-qa*="captcha"], iframe[src*="captcha"]'] = FakeLocator(0)
+    page.opened_chat = False
 
     result = make_browser(page, tmp_path).send_recruiter_message(
         "https://hh.ru/vacancy/101",

@@ -154,6 +154,56 @@ class CommunicationRepository:
             raise RuntimeError("Не удалось получить новое входящее сообщение")
         return _message_record(model)
 
+    def save_synced_message(
+        self,
+        *,
+        application_id: int,
+        hh_id: str,
+        direction: MessageDirection,
+        body: str,
+        occurred_at: datetime,
+    ) -> tuple[RecruiterMessageRecord, bool]:
+        self._require_application(application_id)
+        selected_at = as_utc(occurred_at)
+        incoming = direction is MessageDirection.INCOMING
+        statement = (
+            insert(RecruiterMessageModel)
+            .values(
+                application_id=application_id,
+                hh_id=hh_id,
+                direction=direction,
+                body=body,
+                state=(RecruiterMessageState.RECEIVED if incoming else RecruiterMessageState.SENT),
+                version=1,
+                received_at=selected_at if incoming else None,
+                sent_at=selected_at if not incoming else None,
+            )
+            .on_conflict_do_nothing(
+                constraint="uq_recruiter_messages_application_hh_id",
+            )
+            .returning(RecruiterMessageModel.id)
+        )
+        message_id = self._session.scalar(statement)
+        created = message_id is not None
+        if message_id is None:
+            model = self._session.scalar(
+                select(RecruiterMessageModel).where(
+                    RecruiterMessageModel.application_id == application_id,
+                    RecruiterMessageModel.hh_id == hh_id,
+                )
+            )
+            if model is None:
+                raise RuntimeError("Не удалось получить синхронизированное сообщение")
+            if model.direction is not direction or model.body != body:
+                raise CommunicationStateError(
+                    "Идентификатор сообщения hh.ru уже связан с другим содержимым"
+                )
+        else:
+            model = self._session.get(RecruiterMessageModel, message_id)
+            if model is None:
+                raise RuntimeError("Не удалось получить новое сообщение hh.ru")
+        return _message_record(model), created
+
     def mark_incoming_read(
         self,
         account_id: int,

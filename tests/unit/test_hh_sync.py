@@ -1,0 +1,180 @@
+# ruff: noqa: RUF001
+
+from __future__ import annotations
+
+from datetime import UTC, datetime
+
+import pytest
+
+from hugin.core.settings import Settings
+from hugin.database import create_database, upgrade_database
+from hugin.domain.applications import ApplicationState
+from hugin.domain.content import MessageDirection, RecruiterMessageState
+from hugin.domain.hh_sync import (
+    HhChatMessageData,
+    HhNegotiationData,
+    HhNegotiationStatus,
+)
+from hugin.domain.vacancies import VacancyData
+from hugin.repositories import (
+    AccountRepository,
+    ApplicationRepository,
+    ResumeRepository,
+    VacancyRepository,
+)
+from hugin.repositories.communications import CommunicationRepository
+from hugin.services.hh_sync import HhSynchronizationService
+
+pytestmark = pytest.mark.integration
+
+
+def test_hh_statuses_and_messages_are_synchronized_idempotently(
+    settings: Settings,
+) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    checked_at = datetime(2026, 7, 27, 8, 30, tzinfo=UTC)
+    try:
+        with database.sessions.begin() as session:
+            account = AccountRepository(session).create("Синхронизация")
+            resume = ResumeRepository(session).upsert(
+                account.id,
+                "sync-resume",
+                "Python backend",
+            )
+            vacancies = VacancyRepository(session)
+            applications = ApplicationRepository(session)
+            first_vacancy = vacancies.upsert(
+                VacancyData(
+                    hh_id="sync-101",
+                    title="Python-разработчик",
+                    source_url="https://hh.ru/vacancy/sync-101",
+                )
+            )
+            second_vacancy = vacancies.upsert(
+                VacancyData(
+                    hh_id="sync-202",
+                    title="Инженер",
+                    source_url="https://hh.ru/vacancy/sync-202",
+                )
+            )
+            first = applications.create_apply_intent(
+                account.id,
+                first_vacancy.id,
+                resume.id,
+            )
+            second = applications.create_apply_intent(
+                account.id,
+                second_vacancy.id,
+                resume.id,
+            )
+
+        with database.sessions.begin() as session:
+            service = HhSynchronizationService(session)
+            assert service.tracked_vacancy_ids(account.id) == ("sync-202", "sync-101")
+            applied = service.synchronize_statuses(
+                account_id=account.id,
+                statuses=(
+                    HhNegotiationData(
+                        "sync-101",
+                        HhNegotiationStatus.VIEWED,
+                        "Просмотрен",
+                        True,
+                    ),
+                    HhNegotiationData(
+                        "sync-202",
+                        HhNegotiationStatus.REJECTED,
+                        "Отказ",
+                    ),
+                    HhNegotiationData(
+                        "not-tracked",
+                        HhNegotiationStatus.INVITED,
+                        "Приглашение",
+                    ),
+                ),
+                checked_at=checked_at,
+            )
+            assert applied == {
+                "tracked": 2,
+                "received": 3,
+                "matched": 2,
+                "updated": 4,
+                "invitations": 0,
+            }
+            assert ApplicationRepository(session).get(first.id).state is ApplicationState.VIEWED
+            assert ApplicationRepository(session).get(second.id).state is ApplicationState.REJECTED
+
+            invited = service.synchronize_statuses(
+                account_id=account.id,
+                statuses=(
+                    HhNegotiationData(
+                        "sync-101",
+                        HhNegotiationStatus.INVITED,
+                        "Собеседование",
+                        True,
+                    ),
+                ),
+                checked_at=checked_at,
+            )
+            assert invited["updated"] == 1
+            assert invited["invitations"] == 1
+            repeated = service.synchronize_statuses(
+                account_id=account.id,
+                statuses=(
+                    HhNegotiationData(
+                        "sync-101",
+                        HhNegotiationStatus.APPLIED,
+                        "Не просмотрен",
+                        True,
+                    ),
+                ),
+                checked_at=checked_at,
+            )
+            assert repeated["updated"] == 0
+            assert ApplicationRepository(session).get(first.id).state is ApplicationState.INVITED
+
+            messages = (
+                HhChatMessageData(
+                    vacancy_id="sync-101",
+                    hh_id="message-1",
+                    direction=MessageDirection.INCOMING,
+                    body=(
+                        "Приглашаем на собеседование. "
+                        "Выберите время: https://calendar.example.com/interview."
+                    ),
+                ),
+                HhChatMessageData(
+                    vacancy_id="sync-101",
+                    hh_id="message-2",
+                    direction=MessageDirection.OUTGOING,
+                    body="Спасибо, подтверждаю.",
+                ),
+            )
+            first_sync = service.synchronize_messages(
+                account_id=account.id,
+                messages=messages,
+                checked_at=checked_at,
+            )
+            second_sync = service.synchronize_messages(
+                account_id=account.id,
+                messages=messages,
+                checked_at=checked_at,
+            )
+            assert first_sync["created"] == 2
+            assert first_sync["incoming"] == 1
+            assert first_sync["outgoing"] == 1
+            assert first_sync["attention"] == 1
+            assert second_sync["created"] == 0
+
+            communication = CommunicationRepository(session)
+            stored_messages = communication.list_messages_for_account(account.id)
+            assert len(stored_messages) == 2
+            assert {message.state for message in stored_messages} == {
+                RecruiterMessageState.RECEIVED,
+                RecruiterMessageState.SENT,
+            }
+            invitations = communication.list_invitations_for_account(account.id)
+            assert len(invitations) == 2
+            assert invitations[0].booking_url == "https://calendar.example.com/interview"
+    finally:
+        database.close()

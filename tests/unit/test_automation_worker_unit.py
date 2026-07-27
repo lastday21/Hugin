@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from dataclasses import replace
 from datetime import UTC, datetime
 
 import pytest
@@ -59,8 +60,10 @@ class FakeDatabase:
 class FakeScheduler:
     def __init__(self, job: AutomationJobRecord | None) -> None:
         self.job = job
+        self.ensured_jobs: tuple[AutomationJobRecord, ...] = ()
         self.configured: list[tuple[int, datetime | None]] = []
         self.recovered: list[datetime | None] = []
+        self.unblocked: list[tuple[str, datetime | None]] = []
         self.blocked: list[tuple[str, str, str, datetime | None]] = []
         self.failed: list[tuple[str, str, str, datetime | None]] = []
         self.completed: list[tuple[str, AutomationJobResult, datetime | None]] = []
@@ -69,11 +72,15 @@ class FakeScheduler:
         self,
         account_id: int,
         now: datetime | None = None,
-    ) -> None:
+    ) -> tuple[AutomationJobRecord, ...]:
         self.configured.append((account_id, now))
+        return self.ensured_jobs
 
     def recover_stale(self, now: datetime | None = None) -> None:
         self.recovered.append(now)
+
+    def unblock(self, job_key: str, now: datetime | None = None) -> None:
+        self.unblocked.append((job_key, now))
 
     def claim_due(self, now: datetime | None = None) -> AutomationJobRecord | None:
         del now
@@ -200,6 +207,28 @@ def test_worker_start_stop_and_restart_are_idempotent(
     assert len(upgrades) == 2
     assert len(threads) == 2
     worker.stop()
+
+
+def test_connected_handler_unblocks_previous_missing_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime(2026, 7, 27, 8, 0, tzinfo=UTC)
+    scheduler = FakeScheduler(None)
+    scheduler.ensured_jobs = (
+        replace(
+            make_job(AutomationJobKind.MESSAGES),
+            state=AutomationJobState.BLOCKED,
+            last_error_code="SOURCE_NOT_CONNECTED",
+        ),
+    )
+    patch_worker_storage(monkeypatch, scheduler)
+    worker = AutomationWorker(
+        Settings(environment="test"),
+        handlers={AutomationJobKind.MESSAGES: lambda _job: {}},
+    )
+
+    assert not worker.run_once(now)
+    assert scheduler.unblocked == [("messages:1", now)]
 
 
 @pytest.mark.parametrize(("account_id", "poll_seconds"), [(0, 2.0), (1, 0.0)])

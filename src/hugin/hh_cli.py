@@ -12,11 +12,13 @@ from hugin.adapters.credentials import WindowsCredentialStore
 from hugin.adapters.hh_browser import VisibleHhBrowser
 from hugin.core.settings import Settings, get_settings
 from hugin.database import create_database, upgrade_database
+from hugin.domain.automation import AutomationJobState
 from hugin.domain.directions import EmploymentForm, SearchRegion, WorkFormat
 from hugin.domain.hh import HhApplyResult, HhApplyStatus, HhProfileData
 from hugin.domain.resumes import ProfileQuestionCandidate
 from hugin.domain.time import local_day_start_utc, local_timezone_name
 from hugin.services.application_automation import ApplicationAutomationService
+from hugin.services.automation import AutomationSchedulerService
 from hugin.services.career_directions import (
     COMMON_REGIONS,
     CareerDirectionService,
@@ -39,6 +41,18 @@ STATUS_MESSAGES = {
     LoginStatus.INVALID_CREDENTIALS: "hh.ru отклонил логин или пароль.",
     LoginStatus.MANUAL_ACTION_REQUIRED: "Завершите вход в открытом окне.",
 }
+
+LOGIN_BLOCK_CODES = frozenset(
+    {
+        "AUTH_REQUIRED",
+        "CAPTCHA_REQUIRED",
+        "CREDENTIALS_REQUIRED",
+        "CONFIRMATION_REQUIRED",
+        "INVALID_CREDENTIALS",
+        "MANUAL_ACTION_REQUIRED",
+        "ACCOUNT_WARNING",
+    }
+)
 
 DISPLAY_TRANSLATION: dict[int, str] = {
     ord("\u00a0"): " ",
@@ -305,6 +319,7 @@ def run(argv: Sequence[str] | None = None) -> int:
                 authenticated = True
         if not authenticated:
             return 2
+        _resume_after_login(settings, arguments.account_id)
         if arguments.command == "login":
             return 0
         profile = browser.read_profile()
@@ -458,6 +473,23 @@ def run(argv: Sequence[str] | None = None) -> int:
     for resume in synchronized.resumes:
         print(f"- {resume.title} ({resume.hh_id})")
     return 0
+
+
+def _resume_after_login(settings: Settings, account_id: int) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    try:
+        with database.sessions.begin() as session:
+            ApplicationAutomationService(session).resume_after_authentication()
+            scheduler = AutomationSchedulerService(session)
+            for job in scheduler.list_for_account(account_id):
+                if (
+                    job.state is AutomationJobState.BLOCKED
+                    and job.last_error_code in LOGIN_BLOCK_CODES
+                ):
+                    scheduler.unblock(job.key)
+    finally:
+        database.close()
 
 
 def _run_search_settings(arguments: argparse.Namespace) -> int:

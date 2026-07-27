@@ -15,6 +15,7 @@ import pytest
 
 from hugin import hh_cli
 from hugin.core.settings import Settings
+from hugin.domain.automation import AutomationJobState
 from hugin.domain.directions import EmploymentForm, SearchRegion, VacancyState, WorkFormat
 from hugin.domain.hh import (
     HhApplyResult,
@@ -176,6 +177,7 @@ def install_fakes(
 ) -> None:
     monkeypatch.setattr(hh_cli, "WindowsCredentialStore", lambda: store)
     monkeypatch.setattr(hh_cli, "VisibleHhBrowser", FakeBrowser)
+    monkeypatch.setattr(hh_cli, "_resume_after_login", lambda _settings, _account_id: None)
     monkeypatch.setattr(
         hh_cli,
         "get_settings",
@@ -252,6 +254,58 @@ def test_login_without_credentials_fails_cleanly(
     install_fakes(monkeypatch, tmp_path, FakeStore())
 
     assert hh_cli.run(["login"]) == 2
+
+
+def test_successful_login_resumes_protected_checks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = FakeDatabase()
+    resumed: list[bool] = []
+    unblocked: list[str] = []
+
+    class FakeApplicationAutomationService:
+        def __init__(self, _session: object) -> None:
+            pass
+
+        def resume_after_authentication(self) -> None:
+            resumed.append(True)
+
+    class FakeScheduler:
+        def __init__(self, _session: object) -> None:
+            pass
+
+        def list_for_account(self, account_id: int) -> tuple[SimpleNamespace, ...]:
+            assert account_id == 2
+            return (
+                SimpleNamespace(
+                    key="messages:2",
+                    state=AutomationJobState.BLOCKED,
+                    last_error_code="AUTH_REQUIRED",
+                ),
+                SimpleNamespace(
+                    key="statuses:2",
+                    state=AutomationJobState.BLOCKED,
+                    last_error_code="SOURCE_NOT_CONNECTED",
+                ),
+            )
+
+        def unblock(self, job_key: str) -> None:
+            unblocked.append(job_key)
+
+    monkeypatch.setattr(hh_cli, "upgrade_database", lambda _settings: None)
+    monkeypatch.setattr(hh_cli, "create_database", lambda _settings: database)
+    monkeypatch.setattr(
+        hh_cli,
+        "ApplicationAutomationService",
+        FakeApplicationAutomationService,
+    )
+    monkeypatch.setattr(hh_cli, "AutomationSchedulerService", FakeScheduler)
+
+    hh_cli._resume_after_login(Settings(environment="test"), 2)
+
+    assert resumed == [True]
+    assert unblocked == ["messages:2"]
+    assert database.closed
 
 
 def test_sync_reads_profile_and_saves_it(
