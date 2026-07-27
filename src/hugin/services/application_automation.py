@@ -181,17 +181,21 @@ class ApplicationAutomationService:
 
     def claim_next(
         self,
-        direction_id: int,
+        direction_id: int | None = None,
         *,
+        account_id: int | None = None,
         require_cover_letter: bool = False,
     ) -> ApplyJob | None:
         task = self._queue.claim_next(
+            account_id=account_id,
             direction_id=direction_id,
             require_ready_cover_letter=require_cover_letter,
         )
         if task is None:
             return None
         application = self._applications.get(task.application_id)
+        if account_id is not None and application.account_id != account_id:
+            raise RuntimeError("Задание отклика относится к другому аккаунту")
         if application.direction_id is None:
             raise RuntimeError("Направление отклика отсутствует")
         cover_letter = self._session.scalar(

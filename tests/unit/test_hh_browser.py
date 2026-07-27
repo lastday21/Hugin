@@ -10,6 +10,7 @@ from playwright.sync_api import Error, Locator, Page, TimeoutError
 
 from hugin.adapters import hh_browser as browser_module
 from hugin.adapters.hh_browser import VisibleHhBrowser
+from hugin.domain.communications import MessageSendOutcome
 from hugin.domain.hh import (
     HhApplyStatus,
     HhFormReviewStatus,
@@ -771,7 +772,7 @@ def test_changed_form_is_not_refilled(tmp_path: Path) -> None:
     assert page.fill_payload is None
 
 
-def test_application_is_prepared_without_submitting(tmp_path: Path) -> None:
+def test_application_is_submitted_once_after_all_checks(tmp_path: Path) -> None:
     page = FakePage("https://hh.ru/applicant/resumes")
     page.application_payload = {
         "questions": [],
@@ -793,12 +794,13 @@ def test_application_is_prepared_without_submitting(tmp_path: Path) -> None:
         cover_letter="Содержательное письмо",
     )
 
-    assert result.status is HhApplyStatus.MANUAL_REVIEW_REQUIRED
-    assert result.confirmation == "Форма заполнена, автоматическая отправка отключена"
+    assert result.status is HhApplyStatus.APPLIED
+    assert result.confirmation == "hh.ru подтвердил отправку отклика"
     assert result.warnings == ("Город не указан",)
     assert page.locators[toggle_selector].clicked == 1
     assert page.locators[letter_selector].filled == ["Содержательное письмо"]
-    assert page.locators[submit_selector].clicked == 0
+    assert page.locators[submit_selector].clicked == 1
+    assert page.locators[submit_selector].no_wait_after == [True]
 
 
 def test_application_respects_retry_after_header(tmp_path: Path) -> None:
@@ -826,7 +828,7 @@ def test_application_respects_retry_after_header(tmp_path: Path) -> None:
     assert result.retry_after_seconds == 120
 
 
-def test_application_does_not_wait_for_submission_confirmation(tmp_path: Path) -> None:
+def test_application_uses_history_when_response_body_is_unavailable(tmp_path: Path) -> None:
     page = FakePage("https://hh.ru/applicant/resumes")
     page.application_payload = {
         "questions": [],
@@ -836,6 +838,7 @@ def test_application_does_not_wait_for_submission_confirmation(tmp_path: Path) -
     }
     page.locators['[data-qa="vacancy-response-popup-form-letter-input"]'] = FakeLocator()
     page.locators['[data-qa="vacancy-response-submit-popup"]'] = FakeLocator()
+    page.locators['a[href*="/vacancy/"]'] = FakeLocator(href="/vacancy/123")
     page.response.text_error = Error("response body unavailable")
 
     result = make_browser(page, tmp_path).apply_to_vacancy(
@@ -844,11 +847,12 @@ def test_application_does_not_wait_for_submission_confirmation(tmp_path: Path) -
         cover_letter="Письмо",
     )
 
-    assert result.status is HhApplyStatus.MANUAL_REVIEW_REQUIRED
-    assert page.locators['[data-qa="vacancy-response-submit-popup"]'].clicked == 0
+    assert result.status is HhApplyStatus.APPLIED
+    assert result.confirmation == "Отклик найден в истории hh.ru"
+    assert page.locators['[data-qa="vacancy-response-submit-popup"]'].clicked == 1
 
 
-def test_application_does_not_open_negotiations_to_infer_submission(tmp_path: Path) -> None:
+def test_application_marks_unknown_result_without_confirmation(tmp_path: Path) -> None:
     page = FakePage("https://hh.ru/applicant/resumes")
     page.application_payload = {
         "questions": [],
@@ -860,7 +864,7 @@ def test_application_does_not_open_negotiations_to_infer_submission(tmp_path: Pa
     page.locators['[data-qa="vacancy-response-popup-form-letter-input"]'] = FakeLocator()
     page.locators['[data-qa="vacancy-response-submit-popup"]'] = FakeLocator()
     page.locators["body"] = FakeLocator(text="Форма отклика")
-    page.locators['a[href*="/vacancy/"]'] = FakeLocator(href="/vacancy/123")
+    page.locators['a[href*="/vacancy/"]'] = FakeLocator(href="/vacancy/999")
 
     result = make_browser(page, tmp_path).apply_to_vacancy(
         "https://hh.ru/vacancy/123",
@@ -868,8 +872,10 @@ def test_application_does_not_open_negotiations_to_infer_submission(tmp_path: Pa
         cover_letter="Письмо",
     )
 
-    assert result.status is HhApplyStatus.MANUAL_REVIEW_REQUIRED
-    assert page.locators['[data-qa="vacancy-response-submit-popup"]'].clicked == 0
+    assert result.status is HhApplyStatus.UNKNOWN_RESULT
+    assert "нажата один раз" in result.confirmation
+    assert page.locators['[data-qa="vacancy-response-submit-popup"]'].clicked == 1
+    assert page.goto_calls[-1][0] == "https://hh.ru/applicant/negotiations"
 
 
 def test_repeat_application_form_is_not_submitted(tmp_path: Path) -> None:
@@ -891,6 +897,53 @@ def test_repeat_application_form_is_not_submitted(tmp_path: Path) -> None:
 
     assert result.status is HhApplyStatus.ALREADY_APPLIED
     assert submit.clicked == 0
+
+
+def test_confirmed_recruiter_message_is_sent_once(tmp_path: Path) -> None:
+    page = FakePage("https://hh.ru/applicant/resumes")
+    chat_selector = (
+        'a[data-qa*="chat"], a[href*="/chat/"], '
+        'a[href*="/applicant/negotiations/"], '
+        'button[data-qa*="chat"], button:has-text("Перейти в чат")'
+    )
+    editor_selector = (
+        'textarea[data-qa*="chat"], textarea[placeholder*="сообщ"], '
+        '[contenteditable="true"][data-qa*="chat"]'
+    )
+    submit_selector = (
+        'button[data-qa*="chat"][data-qa*="send"], '
+        'button[aria-label*="Отправ"], button:has-text("Отправить")'
+    )
+    page.locators[chat_selector] = FakeLocator(href="/chat/101")
+    page.locators[editor_selector] = FakeLocator()
+    page.locators[submit_selector] = FakeLocator()
+    page.locators["body"] = FakeLocator(text="Спасибо, буду на связи.")
+    page.locators['[data-qa*="captcha"], iframe[src*="captcha"]'] = FakeLocator(0)
+    page.response.url = "https://hh.ru/chat/101/messages"
+    page.response.body = '{"id":"message-7"}'
+
+    result = make_browser(page, tmp_path).send_recruiter_message(
+        "https://hh.ru/vacancy/101",
+        " Спасибо, буду на связи. ",
+    )
+
+    assert result.outcome is MessageSendOutcome.SENT
+    assert result.external_id == "message-7"
+    assert page.locators[editor_selector].filled == ["Спасибо, буду на связи."]
+    assert page.locators[submit_selector].clicked == 1
+    assert page.locators[submit_selector].no_wait_after == [True]
+
+
+def test_recruiter_message_is_not_sent_without_unique_chat(tmp_path: Path) -> None:
+    page = FakePage("https://hh.ru/applicant/resumes")
+    page.locators['[data-qa*="captcha"], iframe[src*="captcha"]'] = FakeLocator(0)
+
+    result = make_browser(page, tmp_path).send_recruiter_message(
+        "https://hh.ru/vacancy/101",
+        "Здравствуйте!",
+    )
+
+    assert result.outcome is MessageSendOutcome.FAILED
 
 
 def test_email_and_password_are_filled(tmp_path: Path) -> None:

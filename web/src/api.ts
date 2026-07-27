@@ -92,6 +92,10 @@ export function loadVacancy(vacancyId: string): Promise<VacancyCard> {
   );
 }
 
+export function loadCommunications(): Promise<Communications> {
+  return request<Communications>(`/api/communications?account_id=${ACCOUNT_ID}`);
+}
+
 export async function changeQueueState(action: "pause" | "resume"): Promise<string> {
   const session = await request<{ key: string }>("/api/session");
   const result = await request<{ state: string }>(`/api/queue/${action}`, {

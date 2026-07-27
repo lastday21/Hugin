@@ -231,7 +231,6 @@ class CommunicationRepository:
         if model.state in {
             RecruiterMessageState.CONFIRMED,
             RecruiterMessageState.SENT,
-            RecruiterMessageState.FAILED,
             RecruiterMessageState.UNKNOWN_RESULT,
         }:
             return _message_record(model)

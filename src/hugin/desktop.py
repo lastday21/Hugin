@@ -15,14 +15,20 @@ from urllib.error import URLError
 from urllib.parse import urlsplit
 from urllib.request import ProxyHandler, build_opener
 
+from sqlalchemy import select
+
 from hugin.adapters.credentials import WindowsCredentialStore
 from hugin.adapters.hh_browser import VisibleHhBrowser
+from hugin.adapters.hh_messages import HhBrowserMessageSender
 from hugin.core.settings import Settings, get_settings
 from hugin.database import create_database, upgrade_database
+from hugin.database.models import ApplicationModel, VacancyModel
+from hugin.domain.content import RecruiterMessageState
 from hugin.domain.hh import HhFormReviewStatus
 from hugin.services.communications import CommunicationService, RecordingMessageSender
 from hugin.services.hh_login import HhLoginService, LoginStatus
 from hugin.services.screening_forms import ScreeningDraftService
+from hugin.workers.applications import ApplicationWorker
 from hugin.workers.automation import AutomationWorker
 from hugin.workers.hh_search import HhSearchJobHandler
 
@@ -116,6 +122,110 @@ class DesktopBridge:
             return self._result("UNAVAILABLE", "Ссылка записи небезопасна")
         opened = webbrowser.open(invitation.booking_url.strip(), new=2)
         return self._result("READY" if opened else "UNAVAILABLE", "Ссылка открыта")
+
+    def send_reply(
+        self,
+        message_id: int,
+        content_hash: str,
+        content_version: int,
+    ) -> dict[str, object]:
+        if message_id < 1 or content_version < 1:
+            return self._result("UNAVAILABLE", "Некорректная версия сообщения")
+        selected_hash = content_hash.strip().lower()
+        if len(selected_hash) != 64:
+            return self._result("UNAVAILABLE", "Некорректный отпечаток сообщения")
+        upgrade_database(self._settings)
+        database = create_database(self._settings)
+        try:
+            with database.sessions.begin() as session:
+                service = CommunicationService(session, RecordingMessageSender())
+                message = next(
+                    (item for item in service.messages(self._account_id) if item.id == message_id),
+                    None,
+                )
+                if message is None:
+                    return self._result("UNAVAILABLE", "Сообщение не найдено")
+                if (
+                    message.content_hash != selected_hash
+                    or message.content_version != content_version
+                ):
+                    return self._result(
+                        "UNAVAILABLE",
+                        "Текст изменился. Проверьте и подтвердите новую версию.",
+                    )
+                if message.state is not RecruiterMessageState.CONFIRMED:
+                    return self._result(
+                        "UNAVAILABLE",
+                        "Сначала явно подтвердите точный текст ответа.",
+                    )
+                source_url = session.scalar(
+                    select(VacancyModel.source_url)
+                    .join(
+                        ApplicationModel,
+                        ApplicationModel.vacancy_id == VacancyModel.id,
+                    )
+                    .where(
+                        ApplicationModel.id == message.application_id,
+                        ApplicationModel.account_id == self._account_id,
+                    )
+                )
+        finally:
+            database.close()
+        if not source_url:
+            return self._result("UNAVAILABLE", "Ссылка на вакансию не найдена")
+
+        with (
+            self._lock,
+            VisibleHhBrowser(
+                self._settings.browser_profile_dir(self._account_id),
+                self._settings.hh_login_url,
+                self._settings.hh_resumes_url,
+                self._settings.hh_search_url,
+                self._settings.hh_browser_timeout_ms,
+            ) as browser,
+        ):
+            login = HhLoginService(WindowsCredentialStore()).authenticate(
+                self._account_id,
+                browser,
+            )
+            if not login.authenticated:
+                return self._result(
+                    login.status.value.upper(),
+                    "Завершите вход в hh.ru и повторите отправку подтверждённого ответа.",
+                )
+            database = create_database(self._settings)
+            try:
+                with database.sessions.begin() as session:
+                    sent = CommunicationService(
+                        session,
+                        HhBrowserMessageSender(browser, source_url),
+                    ).send_confirmed(
+                        account_id=self._account_id,
+                        message_id=message_id,
+                        content_version=content_version,
+                        content_hash=selected_hash,
+                    )
+            finally:
+                database.close()
+        results = {
+            RecruiterMessageState.SENT: (
+                "SENT",
+                "Ответ отправлен и сохранён.",
+            ),
+            RecruiterMessageState.FAILED: (
+                "FAILED",
+                "hh.ru отклонил отправку ответа.",
+            ),
+            RecruiterMessageState.UNKNOWN_RESULT: (
+                "UNKNOWN_RESULT",
+                "Результат отправки не подтверждён. Повтор заблокирован до сверки.",
+            ),
+        }
+        status, message_text = results.get(
+            sent.state,
+            ("UNAVAILABLE", "Ответ не был отправлен."),
+        )
+        return self._result(status, message_text)
 
     def close(self) -> None:
         return None
@@ -295,8 +405,13 @@ def main() -> None:
             )
         },
     )
+    application_worker = ApplicationWorker(
+        settings,
+        browser_lock=browser_lock,
+    )
     bridge = DesktopBridge(settings, browser_lock=browser_lock)
     worker.start()
+    application_worker.start()
     try:
         webview.create_window(
             "Hugin — поиск работы",
@@ -310,6 +425,7 @@ def main() -> None:
         webview.start(debug=False)
     finally:
         bridge.close()
+        application_worker.stop()
         worker.stop()
 
 

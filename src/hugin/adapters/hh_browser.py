@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import re
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -8,7 +10,7 @@ from email.utils import parsedate_to_datetime
 from math import ceil
 from pathlib import Path
 from types import TracebackType
-from urllib.parse import urlencode, urlparse, urlunparse
+from urllib.parse import urlencode, urljoin, urlparse, urlunparse
 
 from playwright.sync_api import (
     BrowserContext,
@@ -25,6 +27,7 @@ from playwright.sync_api import (
     TimeoutError as PlaywrightTimeoutError,
 )
 
+from hugin.domain.communications import MessageSendOutcome, MessageSendResult
 from hugin.domain.hh import (
     HhApplyResult,
     HhApplyStatus,
@@ -682,10 +685,51 @@ class VisibleHhBrowser:
         if submit.count() != 1 or not submit.first.is_enabled():
             return HhApplyResult(HhApplyStatus.RETRYABLE_ERROR, page.url)
 
+        vacancy_id, normalized_url = self._vacancy_id_and_url(source_url)
+        parsed = urlparse(normalized_url)
+        response: Response | None = None
+        try:
+            with page.expect_response(
+                self._is_application_submission_response,
+                timeout=self._timeout_ms,
+            ) as response_info:
+                submit.first.click(no_wait_after=True)
+            response = response_info.value
+            page.wait_for_timeout(1_500)
+        except PlaywrightTimeoutError:
+            pass
+        except PlaywrightError as error:
+            return HhApplyResult(
+                HhApplyStatus.UNKNOWN_RESULT,
+                page.url,
+                f"После нажатия hh.ru не подтвердил результат: {type(error).__name__}",
+                warnings=initial.warnings,
+            )
+
+        confirmation = self._application_confirmation(page, response)
+        if confirmation:
+            return HhApplyResult(
+                HhApplyStatus.APPLIED,
+                page.url,
+                confirmation,
+                warnings=initial.warnings,
+            )
+        if self._vacancy_in_negotiations(
+            page,
+            parsed.scheme,
+            parsed.netloc,
+            vacancy_id,
+        ):
+            return HhApplyResult(
+                HhApplyStatus.APPLIED,
+                page.url,
+                "Отклик найден в истории hh.ru",
+                warnings=initial.warnings,
+            )
         return HhApplyResult(
-            HhApplyStatus.MANUAL_REVIEW_REQUIRED,
+            HhApplyStatus.UNKNOWN_RESULT,
             page.url,
-            "Форма заполнена, автоматическая отправка отключена",
+            "Кнопка нажата один раз, но hh.ru не подтвердил результат",
             warnings=initial.warnings,
         )
 
@@ -782,6 +826,90 @@ class VisibleHhBrowser:
             message="Анкета заполнена, но не отправлена",
         )
 
+    def send_recruiter_message(
+        self,
+        source_url: str,
+        body: str,
+    ) -> MessageSendResult:
+        exact_body = body.strip()
+        if not exact_body:
+            raise ValueError("Текст сообщения не может быть пустым")
+        _vacancy_id, normalized_url = self._vacancy_id_and_url(source_url)
+        page = self._require_page()
+        try:
+            page.goto(normalized_url, wait_until="domcontentloaded")
+            page.wait_for_timeout(1_500)
+        except PlaywrightError:
+            return MessageSendResult(MessageSendOutcome.FAILED)
+        if not self.is_authenticated():
+            return MessageSendResult(MessageSendOutcome.FAILED)
+        if self._any_visible(page, '[data-qa*="captcha"], iframe[src*="captcha"]'):
+            return MessageSendResult(MessageSendOutcome.FAILED)
+
+        chat = page.locator(
+            'a[data-qa*="chat"], a[href*="/chat/"], '
+            'a[href*="/applicant/negotiations/"], '
+            'button[data-qa*="chat"], button:has-text("Перейти в чат")'
+        )
+        if chat.count() != 1:
+            return MessageSendResult(MessageSendOutcome.FAILED)
+        chat_url = chat.first.get_attribute("href")
+        try:
+            if chat_url:
+                page.goto(urljoin(page.url, chat_url), wait_until="domcontentloaded")
+            else:
+                chat.first.click(no_wait_after=True)
+            page.wait_for_timeout(1_500)
+        except PlaywrightError:
+            return MessageSendResult(MessageSendOutcome.FAILED)
+
+        editor = page.locator(
+            'textarea[data-qa*="chat"], textarea[placeholder*="сообщ"], '
+            '[contenteditable="true"][data-qa*="chat"]'
+        )
+        submit = page.locator(
+            'button[data-qa*="chat"][data-qa*="send"], '
+            'button[aria-label*="Отправ"], button:has-text("Отправить")'
+        )
+        if (
+            editor.count() != 1
+            or submit.count() != 1
+            or not editor.first.is_enabled()
+            or not submit.first.is_enabled()
+        ):
+            return MessageSendResult(MessageSendOutcome.FAILED)
+        editor.first.fill(exact_body)
+
+        response: Response | None = None
+        try:
+            with page.expect_response(
+                self._is_message_submission_response,
+                timeout=self._timeout_ms,
+            ) as response_info:
+                submit.first.click(no_wait_after=True)
+            response = response_info.value
+            page.wait_for_timeout(1_500)
+        except PlaywrightTimeoutError:
+            pass
+        except PlaywrightError:
+            return MessageSendResult(MessageSendOutcome.UNKNOWN_RESULT)
+
+        if self._message_visible(page, exact_body):
+            return MessageSendResult(
+                MessageSendOutcome.SENT,
+                self._message_external_id(response),
+            )
+        if response is None:
+            return MessageSendResult(MessageSendOutcome.UNKNOWN_RESULT)
+        if 200 <= response.status < 300:
+            return MessageSendResult(
+                MessageSendOutcome.SENT,
+                self._message_external_id(response),
+            )
+        if 400 <= response.status < 500:
+            return MessageSendResult(MessageSendOutcome.FAILED)
+        return MessageSendResult(MessageSendOutcome.UNKNOWN_RESULT)
+
     @staticmethod
     def _retry_after_seconds(response: Response) -> int | None:
         try:
@@ -819,6 +947,85 @@ class VisibleHhBrowser:
             )
         except PlaywrightError:
             return False
+
+    @staticmethod
+    def _is_application_submission_response(response: Response) -> bool:
+        try:
+            method = response.request.method.upper()
+            parsed = urlparse(response.url)
+        except (AttributeError, ValueError):
+            return False
+        return (
+            method == "POST"
+            and (parsed.hostname == "hh.ru" or (parsed.hostname or "").endswith(".hh.ru"))
+            and "vacancy_response" in parsed.path
+        )
+
+    @staticmethod
+    def _is_message_submission_response(response: Response) -> bool:
+        try:
+            method = response.request.method.upper()
+            parsed = urlparse(response.url)
+        except (AttributeError, ValueError):
+            return False
+        path = parsed.path.casefold()
+        return (
+            method == "POST"
+            and (parsed.hostname == "hh.ru" or (parsed.hostname or "").endswith(".hh.ru"))
+            and ("message" in path or "chat" in path)
+        )
+
+    def _application_confirmation(
+        self,
+        page: Page,
+        response: Response | None,
+    ) -> str:
+        body_text = ""
+        with suppress(PlaywrightError):
+            body_text = page.locator("body").inner_text()
+        if self._contains_any(
+            body_text,
+            "отклик отправлен",
+            "отклик успешно отправлен",
+            "вы откликнулись",
+            "отклик принят",
+        ):
+            return "hh.ru подтвердил отправку отклика"
+        if response is None or not 200 <= response.status < 300:
+            return ""
+        try:
+            response_text = response.text()
+        except PlaywrightError:
+            return ""
+        compact = re.sub(r"\s+", "", response_text).casefold()
+        if (
+            '"success":true' in compact
+            or '"status":"success"' in compact
+            or '"result":"success"' in compact
+        ):
+            return "hh.ru подтвердил отправку отклика"
+        return ""
+
+    @staticmethod
+    def _message_visible(page: Page, body: str) -> bool:
+        try:
+            page_text = page.locator("body").inner_text()
+        except PlaywrightError:
+            return False
+        return " ".join(body.split()) in " ".join(page_text.split())
+
+    @staticmethod
+    def _message_external_id(response: Response | None) -> str | None:
+        if response is None:
+            return None
+        try:
+            payload = json.loads(response.text())
+        except (json.JSONDecodeError, PlaywrightError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        value = payload.get("id") or payload.get("message_id")
+        return str(value)[:128] if isinstance(value, (int, str)) and str(value).strip() else None
 
     def is_authenticated(self) -> bool:
         page = self._require_page()

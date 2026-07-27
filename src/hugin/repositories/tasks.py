@@ -113,6 +113,7 @@ class QueueTaskRepository:
         self,
         now: datetime | None = None,
         *,
+        account_id: int | None = None,
         direction_id: int | None = None,
         require_ready_cover_letter: bool = False,
     ) -> TaskRecord | None:
@@ -133,6 +134,8 @@ class QueueTaskRepository:
             )
             .limit(1)
         )
+        if account_id is not None:
+            statement = statement.where(ApplicationModel.account_id == account_id)
         if direction_id is not None:
             statement = statement.where(ApplicationModel.direction_id == direction_id)
         if require_ready_cover_letter:

@@ -17,6 +17,7 @@ import pytest
 from hugin import desktop
 from hugin.core.settings import Settings
 from hugin.domain import HhFormReviewResult, HhFormReviewStatus, HhScreeningForm
+from hugin.domain.content import RecruiterMessageState
 from hugin.services.hh_login import LoginResult, LoginStatus
 
 
@@ -261,6 +262,62 @@ def test_bridge_opens_only_saved_secure_invitation_link(
     assert opened == ["https://calendar.example.com/interview"]
 
 
+def test_bridge_sends_only_exact_confirmed_reply(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ReplySession:
+        def scalar(self, _statement: object) -> str:
+            return "https://hh.ru/vacancy/101"
+
+    class ReplySessions:
+        def begin(self) -> object:
+            return nullcontext(ReplySession())
+
+    class ReplyDatabase:
+        def __init__(self) -> None:
+            self.sessions = ReplySessions()
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    class FakeCommunicationService:
+        def __init__(self, _session: object, _sender: object) -> None:
+            pass
+
+        def messages(self, _account_id: int) -> tuple[SimpleNamespace, ...]:
+            return (
+                SimpleNamespace(
+                    id=7,
+                    application_id=11,
+                    content_hash="a" * 64,
+                    content_version=2,
+                    state=RecruiterMessageState.CONFIRMED,
+                ),
+            )
+
+        def send_confirmed(self, **values: object) -> SimpleNamespace:
+            assert values == {
+                "account_id": 1,
+                "message_id": 7,
+                "content_version": 2,
+                "content_hash": "a" * 64,
+            }
+            return SimpleNamespace(state=RecruiterMessageState.SENT)
+
+    monkeypatch.setattr(desktop, "upgrade_database", lambda _settings: None)
+    monkeypatch.setattr(desktop, "create_database", lambda _settings: ReplyDatabase())
+    monkeypatch.setattr(desktop, "CommunicationService", FakeCommunicationService)
+    monkeypatch.setattr(desktop, "VisibleHhBrowser", FakeBrowser)
+    bridge = desktop.DesktopBridge(Settings(environment="test"))
+
+    assert bridge.send_reply(7, "bad", 2)["status"] == "UNAVAILABLE"
+    assert bridge.send_reply(7, "a" * 64, 2) == {
+        "status": "SENT",
+        "message": "Ответ отправлен и сохранён.",
+    }
+
+
 def test_project_directory_and_health_probe(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -388,11 +445,17 @@ def test_main_starts_window_and_always_closes_bridge(monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(desktop, "import_module", lambda _name: FakeWebview())
     monkeypatch.setattr(desktop, "DesktopBridge", FakeBridge)
     monkeypatch.setattr(desktop, "AutomationWorker", FakeWorker)
+    monkeypatch.setattr(desktop, "ApplicationWorker", FakeWorker)
 
     desktop.main()
 
     assert events[0] == "services"
-    assert events[-3:] == [("start", False), "close", "worker-stop"]
+    assert events[-4:] == [
+        ("start", False),
+        "close",
+        "worker-stop",
+        "worker-stop",
+    ]
     assert created[0][0] == ("Hugin — поиск работы", settings.desktop_api_url)
 
 

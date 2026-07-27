@@ -322,6 +322,11 @@ declare global {
         open_form: (vacancyId: string) => Promise<BridgeResult>;
         open_invitation: (invitationId: number) => Promise<BridgeResult>;
         open_url: (url: string) => Promise<BridgeResult>;
+        send_reply: (
+          messageId: number,
+          contentHash: string,
+          contentVersion: number,
+        ) => Promise<BridgeResult>;
       };
     };
   }

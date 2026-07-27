@@ -38,6 +38,7 @@ import {
   changeQueueState,
   dismissProfileQuestion,
   importResume,
+  loadCommunications,
   loadVacancy,
   loadWorkspace,
   markConversationRead,
@@ -1683,20 +1684,31 @@ function CommunicationsView({
     if (!reply?.content_hash || busy) return;
     if (
       !window.confirm(
-        "Подтвердить именно этот текст ответа? После изменения текста подтверждение будет снято.",
+        "Отправить работодателю именно этот текст? После подтверждения Hugin нажмёт кнопку отправки на hh.ru один раз.",
       )
     ) {
       return;
     }
     setBusy(true);
     try {
-      onChanged(
-        await confirmReply(reply.id, reply.content_hash, reply.content_version),
+      if (reply.state !== "CONFIRMED") {
+        onChanged(
+          await confirmReply(reply.id, reply.content_hash, reply.content_version),
+        );
+      }
+      if (!window.pywebview?.api) {
+        throw new Error("Отправка доступна только в оконном приложении Hugin");
+      }
+      const result = await window.pywebview.api.send_reply(
+        reply.id,
+        reply.content_hash,
+        reply.content_version,
       );
-      onToast({
-        kind: "success",
-        message: "Текст подтверждён. Автоматическая отправка не выполнялась.",
-      });
+      onChanged(await loadCommunications());
+      if (result.status !== "SENT") {
+        throw new Error(result.message);
+      }
+      onToast({ kind: "success", message: result.message });
     } catch (reason) {
       onToast({ kind: "error", message: readableError(reason) });
     } finally {
@@ -1871,8 +1883,8 @@ function CommunicationsView({
                     <div className="reply-actions">
                       <span>
                         {reply?.state === "CONFIRMED"
-                          ? "Этот текст подтверждён, но не отправлен."
-                          : "Сначала сохраните текст, затем подтвердите его."}
+                          ? "Текст подтверждён и готов к отправке."
+                          : "Сохраните текст и проверьте его перед отправкой."}
                       </span>
                       <button
                         type="button"
@@ -1888,12 +1900,13 @@ function CommunicationsView({
                         disabled={
                           busy ||
                           !reply?.content_hash ||
-                          draft.trim() !== reply.body ||
-                          reply.state === "CONFIRMED"
+                          draft.trim() !== reply.body
                         }
                         onClick={() => void confirmDraft()}
                       >
-                        Подтвердить текст
+                        {reply?.state === "CONFIRMED"
+                          ? "Отправить подтверждённый"
+                          : "Подтвердить и отправить"}
                       </button>
                     </div>
                   </div>
@@ -1981,7 +1994,7 @@ function latestEditableReply(conversation: Conversation) {
     .find(
       (message) =>
         message.direction === "OUTGOING" &&
-        ["DRAFT", "REVIEW_REQUIRED", "CONFIRMED"].includes(message.state),
+        ["DRAFT", "REVIEW_REQUIRED", "CONFIRMED", "FAILED"].includes(message.state),
     );
 }
 
