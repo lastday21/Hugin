@@ -106,6 +106,23 @@ export async function changeQueueState(action: "pause" | "resume"): Promise<stri
   return result.state;
 }
 
+export async function changeSearchState(action: "pause" | "resume"): Promise<void> {
+  const session = await request<{ key: string }>("/api/session");
+  await request(`/api/search/${action}`, {
+    method: "POST",
+    headers: { "X-Hugin-Session": session.key },
+  });
+}
+
+export async function updateResourceSavingMode(enabled: boolean): Promise<void> {
+  const session = await request<{ key: string }>("/api/session");
+  await request("/api/background/resource-saving", {
+    method: "PUT",
+    headers: { "X-Hugin-Session": session.key },
+    body: JSON.stringify({ enabled }),
+  });
+}
+
 export async function reconcileApplication(
   taskId: number,
   status: "APPLIED" | "NOT_FOUND",
@@ -295,6 +312,21 @@ export async function updateAiPromptSettings(
       method: "PUT",
       headers: { "X-Hugin-Session": session.key },
       body: JSON.stringify(values),
+    },
+  );
+}
+
+export async function updateAiModelSettings(
+  model: string,
+  reasoningEffort: string,
+): Promise<Communications> {
+  const session = await request<{ key: string }>("/api/session");
+  return request<Communications>(
+    `/api/communications/ai-model?account_id=${ACCOUNT_ID}`,
+    {
+      method: "PUT",
+      headers: { "X-Hugin-Session": session.key },
+      body: JSON.stringify({ model, reasoning_effort: reasoningEffort }),
     },
   );
 }

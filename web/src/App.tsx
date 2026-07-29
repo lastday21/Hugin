@@ -37,6 +37,7 @@ import {
 } from "react";
 import {
   changeQueueState,
+  changeSearchState,
   dismissProfileQuestion,
   importResume,
   loadCommunications,
@@ -50,10 +51,12 @@ import {
   saveReplyDraft,
   saveProfileAnswer,
   resetAiPromptSettings,
+  updateAiModelSettings,
   updateAiPromptSettings,
   updateNotificationSettings,
   updateDirection,
   updateQueueSettings,
+  updateResourceSavingMode,
   confirmReply,
 } from "./api";
 import {
@@ -64,6 +67,7 @@ import {
   type DashboardWidget,
 } from "./dashboardPreferences";
 import type {
+  AiModelSettings,
   AiPromptSettings,
   AiPromptValues,
   Communications,
@@ -621,12 +625,14 @@ export default function App() {
                   dashboard={workspace.dashboard}
                   directionOptions={workspace.directionOptions}
                   notificationSettings={workspace.communications.notification_settings}
+                  aiModelSettings={workspace.communications.ai_model_settings}
                   aiPromptSettings={workspace.communications.ai_prompt_settings}
                   widgets={widgets}
                   onToggleWidget={toggleWidget}
                   onResetWidgets={resetWidgets}
                   onSettingsSaved={applyQueueSettings}
                   onDirectionSaved={applyDirectionSettings}
+                  onRefresh={() => void refresh(false)}
                   onNotificationsSaved={(communications) =>
                     setWorkspace((current) =>
                       current ? { ...current, communications } : current,
@@ -722,6 +728,7 @@ function DashboardView({
 }) {
   const { dashboard, queue, forms } = workspace;
   const [changingState, setChangingState] = useState(false);
+  const [changingSearch, setChangingSearch] = useState(false);
 
   async function controlQueue(action: "pause" | "resume"): Promise<void> {
     if (changingState) return;
@@ -730,13 +737,36 @@ function DashboardView({
       await changeQueueState(action);
       onToast({
         kind: "success",
-        message: action === "pause" ? "Очередь поставлена на паузу" : "Очередь продолжила работу",
+        message:
+          action === "pause"
+            ? "Новые отклики приостановлены"
+            : "Отправка новых откликов продолжена",
       });
       onRefresh();
     } catch (reason) {
       onToast({ kind: "error", message: readableError(reason) });
     } finally {
       setChangingState(false);
+    }
+  }
+
+  async function controlSearch(action: "pause" | "resume"): Promise<void> {
+    if (changingSearch) return;
+    setChangingSearch(true);
+    try {
+      await changeSearchState(action);
+      onToast({
+        kind: "success",
+        message:
+          action === "pause"
+            ? "Новые поиски остановлены; текущая проверка завершит безопасный шаг"
+            : "Поиск вакансий возобновлён",
+      });
+      onRefresh();
+    } catch (reason) {
+      onToast({ kind: "error", message: readableError(reason) });
+    } finally {
+      setChangingSearch(false);
     }
   }
 
@@ -760,6 +790,21 @@ function DashboardView({
           )}
         </div>
         <div className="system-action">
+          <button
+            type="button"
+            className="secondary-button"
+            disabled={changingSearch}
+            onClick={() =>
+              void controlSearch(dashboard.search_enabled ? "pause" : "resume")
+            }
+          >
+            <Search size={19} aria-hidden="true" />
+            {changingSearch
+              ? "Сохраняем…"
+              : dashboard.search_enabled
+                ? "Остановить поиск"
+                : "Возобновить поиск"}
+          </button>
           {dashboard.system_state === "RUNNING" && (
             <button
               type="button"
@@ -768,7 +813,7 @@ function DashboardView({
               onClick={() => void controlQueue("pause")}
             >
               <CirclePause size={19} aria-hidden="true" />
-              {changingState ? "Ставим на паузу…" : "Поставить на паузу"}
+              {changingState ? "Приостанавливаем…" : "Приостановить отклики"}
             </button>
           )}
           {dashboard.system_state === "PAUSED" && (
@@ -779,7 +824,7 @@ function DashboardView({
               onClick={() => void controlQueue("resume")}
             >
               <CirclePlay size={19} aria-hidden="true" />
-              {changingState ? "Запускаем…" : "Продолжить работу"}
+              {changingState ? "Продолжаем…" : "Продолжить отклики"}
             </button>
           )}
           {dashboard.system_state !== "RUNNING" &&
@@ -898,7 +943,16 @@ function BackgroundStatusBar({ dashboard }: { dashboard: Dashboard }) {
         <span>{presentation.description}</span>
       </div>
       {background.next_search_at && background.state === "RUNNING" && (
-        <small>Следующий поиск — {formatDate(background.next_search_at)}</small>
+        <small>
+          Следующий поиск — {formatDate(background.next_search_at)}
+          {dashboard.resource_saving_mode ? " · бережный режим" : ""}
+        </small>
+      )}
+      {!dashboard.search_enabled && (
+        <small>
+          Поиск вакансий остановлен
+          {dashboard.resource_saving_mode ? " · бережный режим включён" : ""}
+        </small>
       )}
     </section>
   );
@@ -911,14 +965,14 @@ function systemPresentation(state: SystemState, queueLength: number) {
   switch (state) {
     case "RUNNING":
       return {
-        title: "Очередь включена",
+        title: "Отклики включены",
         description: queueText,
         tone: "positive",
         icon: CheckCircle2,
       };
     case "PAUSED":
       return {
-        title: "Очередь на паузе",
+        title: "Отклики приостановлены",
         description: "Новые отклики не отправляются",
         tone: "neutral",
         icon: CirclePause,
@@ -2610,24 +2664,28 @@ function SettingsView({
   dashboard,
   directionOptions,
   notificationSettings,
+  aiModelSettings,
   aiPromptSettings,
   widgets,
   onToggleWidget,
   onResetWidgets,
   onSettingsSaved,
   onDirectionSaved,
+  onRefresh,
   onNotificationsSaved,
   onToast,
 }: {
   dashboard: Dashboard;
   directionOptions: DirectionOptions;
   notificationSettings: NotificationSettings;
+  aiModelSettings: AiModelSettings;
   aiPromptSettings: AiPromptSettings;
   widgets: DashboardWidget[];
   onToggleWidget: (widget: DashboardWidget) => void;
   onResetWidgets: () => void;
   onSettingsSaved: (settings: QueueSettings) => void;
   onDirectionSaved: (direction: DirectionSummary) => void;
+  onRefresh: () => void;
   onNotificationsSaved: (communications: Communications) => void;
   onToast: (toast: Toast) => void;
 }) {
@@ -2684,14 +2742,34 @@ function SettingsView({
         </div>
       </section>
 
+      <section className="settings-card" aria-labelledby="background-mode-title">
+        <div className="section-heading">
+          <div>
+            <span className="eyebrow">Фоновая работа</span>
+            <h2 id="background-mode-title">Нагрузка на компьютер</h2>
+            <p>Бережный режим работает медленнее, но реже запускает проверки hh.ru.</p>
+          </div>
+        </div>
+        <ResourceSavingModeControl
+          enabled={dashboard.resource_saving_mode}
+          onSaved={onRefresh}
+          onToast={onToast}
+        />
+      </section>
+
       <section className="settings-card wide" aria-labelledby="ai-prompts-title">
         <div className="section-heading">
           <div>
             <span className="eyebrow">Нейросеть</span>
-            <h2 id="ai-prompts-title">Инструкции для текстов</h2>
-            <p>Используется YandexGPT. Настройки скрыты, пока они не нужны.</p>
+            <h2 id="ai-prompts-title">Модель и инструкции</h2>
+            <p>Выберите модель для новых текстов. Дополнительные инструкции можно изменить ниже.</p>
           </div>
         </div>
+        <AiModelSelector
+          settings={aiModelSettings}
+          onSaved={onNotificationsSaved}
+          onToast={onToast}
+        />
         <AiPromptSettingsForm
           settings={aiPromptSettings}
           onSaved={onNotificationsSaved}
@@ -2714,6 +2792,159 @@ function SettingsView({
         />
       </section>
     </div>
+  );
+}
+
+function ResourceSavingModeControl({
+  enabled,
+  onSaved,
+  onToast,
+}: {
+  enabled: boolean;
+  onSaved: () => void;
+  onToast: (toast: Toast) => void;
+}) {
+  const [busy, setBusy] = useState(false);
+
+  async function change(next: boolean): Promise<void> {
+    if (busy) return;
+    setBusy(true);
+    try {
+      await updateResourceSavingMode(next);
+      onSaved();
+      onToast({
+        kind: "success",
+        message: next ? "Бережный режим включён" : "Обычный режим включён",
+      });
+    } catch (reason) {
+      onToast({ kind: "error", message: readableError(reason) });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="resource-saving-control">
+      <label className="direction-active-control">
+        <span className="check-control">
+          <input
+            type="checkbox"
+            checked={enabled}
+            disabled={busy}
+            onChange={(event) => void change(event.target.checked)}
+          />
+          <span aria-hidden="true" />
+        </span>
+        <span>
+          <strong>Бережный режим</strong>
+          <small>
+            Поиск — не чаще раза в 4 часа, сообщения — раз в 15 минут, статусы — раз в час.
+          </small>
+        </span>
+      </label>
+      <p>
+        Браузер остаётся обычным и доступным пользователю, но при фоновой проверке
+        открывается свёрнутым. Если hh.ru попросит вход или дополнительную проверку,
+        окно можно развернуть вручную.
+      </p>
+    </div>
+  );
+}
+
+function AiModelSelector({
+  settings,
+  onSaved,
+  onToast,
+}: {
+  settings: AiModelSettings;
+  onSaved: (communications: Communications) => void;
+  onToast: (toast: Toast) => void;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function save(model: string, reasoningEffort: string, message: string): Promise<void> {
+    if (busy) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const communications = await updateAiModelSettings(model, reasoningEffort);
+      onSaved(communications);
+      onToast({ kind: "success", message });
+    } catch (reason) {
+      setError(readableError(reason));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <fieldset className="ai-model-selector" disabled={busy}>
+      <legend>Модель для всех новых текстов</legend>
+      <div className="ai-model-options">
+        {settings.options.map((option) => (
+          <label
+            className={option.value === settings.selected ? "selected" : ""}
+            key={option.value}
+          >
+            <input
+              type="radio"
+              name="ai-model"
+              value={option.value}
+              checked={option.value === settings.selected}
+              onChange={() =>
+                void save(
+                  option.value,
+                  settings.reasoning_effort,
+                  `Выбрана модель ${option.title}`,
+                )
+              }
+            />
+            <span>
+              <strong>{option.title}</strong>
+              <small>{option.description}</small>
+            </span>
+          </label>
+        ))}
+      </div>
+      <label className="ai-reasoning-select">
+        <span>
+          <strong>Глубина обработки</strong>
+          <small>Глубокий режим выбран по умолчанию для более тщательных текстов.</small>
+        </span>
+        <select
+          value={settings.reasoning_effort}
+          onChange={(event) => {
+            const option = settings.reasoning_options.find(
+              (item) => item.value === event.target.value,
+            );
+            if (option) {
+              void save(
+                settings.selected,
+                option.value,
+                `Выбран режим «${option.title}»`,
+              );
+            }
+          }}
+        >
+          {settings.reasoning_options.map((option) => (
+            <option key={option.value} value={option.value}>
+              {option.title} — {option.description}
+            </option>
+          ))}
+        </select>
+      </label>
+      <small className="ai-model-note">
+        Выбор применяется к резюме, сопроводительным письмам и черновикам ответов. Готовые тексты
+        не изменяются. Для Qwen выбранный режим является приоритетом, окончательную глубину
+        модель определяет сама.
+      </small>
+      {error && (
+        <p className="settings-submit-error" role="alert">
+          {error}
+        </p>
+      )}
+    </fieldset>
   );
 }
 
@@ -2930,8 +3161,10 @@ function NotificationSettingsForm({
   const [emailEnabled, setEmailEnabled] = useState(settings.email_enabled);
   const [events, setEvents] = useState(initialEvents);
   const [saving, setSaving] = useState(false);
-  const [telegramToken, setTelegramToken] = useState("");
-  const [telegramChat, setTelegramChat] = useState("");
+  const [telegramBotConfigured, setTelegramBotConfigured] = useState(false);
+  const [telegramConnected, setTelegramConnected] = useState(false);
+  const [telegramBotUsername, setTelegramBotUsername] = useState("hugin_workbot");
+  const [telegramStatusLoading, setTelegramStatusLoading] = useState(true);
   const [smtpHost, setSmtpHost] = useState("");
   const [smtpPort, setSmtpPort] = useState("587");
   const [smtpUsername, setSmtpUsername] = useState("");
@@ -2960,6 +3193,32 @@ function NotificationSettingsForm({
     setEmailEnabled(settings.email_enabled);
     setEvents(incoming);
   }, [dirty, saving, settings]);
+
+  useEffect(() => {
+    let active = true;
+    async function loadTelegramStatus(): Promise<void> {
+      if (!window.pywebview?.api) {
+        if (active) setTelegramStatusLoading(false);
+        return;
+      }
+      try {
+        const result = await window.pywebview.api.notification_credentials_status();
+        if (!active) return;
+        if (result.status === "UNAVAILABLE") throw new Error(result.message);
+        setTelegramBotConfigured(result.telegram_bot_configured === true);
+        setTelegramConnected(result.telegram_configured === true);
+        setTelegramBotUsername(result.telegram_bot_username ?? "hugin_workbot");
+      } catch (reason) {
+        if (active) setError(readableError(reason));
+      } finally {
+        if (active) setTelegramStatusLoading(false);
+      }
+    }
+    void loadTelegramStatus();
+    return () => {
+      active = false;
+    };
+  }, []);
 
   function toggleEvent(eventId: string): void {
     setEvents((current) =>
@@ -3004,22 +3263,39 @@ function NotificationSettingsForm({
     }
   }
 
-  async function saveTelegram(): Promise<void> {
+  async function connectTelegram(): Promise<void> {
     if (!window.pywebview?.api || credentialsSaving) {
-      setError("Настройка Telegram доступна в оконном приложении Hugin.");
+      setError("Подключение Telegram доступно в оконном приложении Hugin.");
       return;
     }
     setCredentialsSaving(true);
     setError(null);
     try {
-      const result = await window.pywebview.api.save_telegram_notifications(
-        telegramToken,
-        telegramChat,
-      );
+      const result = await window.pywebview.api.connect_telegram_notifications();
       if (result.status !== "READY") throw new Error(result.message);
-      setTelegramToken("");
-      setTelegramChat("");
+      setTelegramConnected(true);
       setTelegramEnabled(true);
+      setTelegramBotUsername(result.telegram_bot_username ?? telegramBotUsername);
+      onToast({
+        kind: "success",
+        message: `${result.message} Сохраните нужные виды уведомлений ниже.`,
+      });
+    } catch (reason) {
+      setError(readableError(reason));
+    } finally {
+      setCredentialsSaving(false);
+    }
+  }
+
+  async function disconnectTelegram(): Promise<void> {
+    if (!window.pywebview?.api || credentialsSaving) return;
+    setCredentialsSaving(true);
+    setError(null);
+    try {
+      const result = await window.pywebview.api.disconnect_telegram_notifications();
+      if (result.status !== "READY") throw new Error(result.message);
+      setTelegramConnected(false);
+      setTelegramEnabled(false);
       onToast({ kind: "success", message: result.message });
     } catch (reason) {
       setError(readableError(reason));
@@ -3070,18 +3346,23 @@ function NotificationSettingsForm({
             description: "Показывать на этом компьютере.",
             enabled: windowsEnabled,
             setEnabled: setWindowsEnabled,
+            disabled: false,
           },
           {
             title: "Telegram",
-            description: "Отправлять через подключённого бота.",
+            description: telegramConnected
+              ? `Отправлять через @${telegramBotUsername}.`
+              : "Сначала подключите чат с ботом ниже.",
             enabled: telegramEnabled,
             setEnabled: setTelegramEnabled,
+            disabled: !telegramConnected,
           },
           {
             title: "Электронная почта",
             description: "Отправлять на сохранённый адрес.",
             enabled: emailEnabled,
             setEnabled: setEmailEnabled,
+            disabled: false,
           },
         ].map((channel) => (
           <label className="notification-master" key={channel.title}>
@@ -3089,6 +3370,7 @@ function NotificationSettingsForm({
               <input
                 type="checkbox"
                 checked={channel.enabled}
+                disabled={channel.disabled}
                 onChange={(event) => {
                   channel.setEnabled(event.target.checked);
                   setError(null);
@@ -3105,36 +3387,74 @@ function NotificationSettingsForm({
       </div>
 
       <div className="notification-connection-grid">
-        <details className="notification-connection">
-          <summary>Подключить Telegram</summary>
-          <div>
-            <label>
-              <span>Токен бота</span>
-              <input
-                type="password"
-                autoComplete="off"
-                value={telegramToken}
-                onChange={(event) => setTelegramToken(event.target.value)}
-              />
-            </label>
-            <label>
-              <span>Номер чата</span>
-              <input
-                type="text"
-                value={telegramChat}
-                onChange={(event) => setTelegramChat(event.target.value)}
-              />
-            </label>
-            <button
-              type="button"
-              className="secondary-button"
-              disabled={credentialsSaving}
-              onClick={() => void saveTelegram()}
+        <section className="notification-connection telegram-connection">
+          <div className="telegram-connection-heading">
+            <span>
+              <strong>Telegram</strong>
+              <small>@{telegramBotUsername}</small>
+            </span>
+            <span
+              className={
+                telegramConnected
+                  ? "status-pill positive"
+                  : telegramBotConfigured
+                    ? "status-pill warning"
+                    : "status-pill"
+              }
             >
-              Сохранить Telegram
-            </button>
+              {telegramStatusLoading
+                ? "Проверяем"
+                : telegramConnected
+                  ? "Подключён"
+                  : telegramBotConfigured
+                    ? "Ждёт подключения"
+                    : "Временно недоступен"}
+            </span>
           </div>
-        </details>
+
+          {telegramConnected ? (
+            <div className="telegram-connected-actions">
+              <p>Hugin может отправлять важные события в личный чат с ботом.</p>
+              <button
+                type="button"
+                className="quiet-button"
+                disabled={credentialsSaving}
+                onClick={() => void disconnectTelegram()}
+              >
+                Отключить чат
+              </button>
+            </div>
+          ) : telegramBotConfigured ? (
+            <div className="telegram-connect-actions">
+              <p>
+                Нажмите кнопку, затем в Telegram нажмите «Старт». Hugin сам привяжет этот аккаунт
+                и пришлёт проверочное сообщение.
+              </p>
+              <button
+                type="button"
+                className="primary-button"
+                disabled={credentialsSaving}
+                onClick={() => void connectTelegram()}
+              >
+                {credentialsSaving ? "Ждём нажатия «Старт»…" : "Подключить Telegram"}
+              </button>
+            </div>
+          ) : (
+            <div className="telegram-connect-actions">
+              <p>
+                Служба Telegram пока недоступна. Токена бота в Hugin нет: после запуска службы
+                здесь появится обычная кнопка подключения.
+              </p>
+              <button
+                type="button"
+                className="secondary-button"
+                disabled
+              >
+                Telegram временно недоступен
+              </button>
+            </div>
+          )}
+        </section>
         <details className="notification-connection">
           <summary>Подключить электронную почту</summary>
           <div>
@@ -3224,7 +3544,8 @@ function NotificationSettingsForm({
 
       <div className="notification-settings-footer">
         <span className="notification-unavailable">
-          Telegram и почта используют данные из защищённого хранилища Windows.
+          Hugin хранит только ограниченный ключ подключённого чата. Токен бота остаётся в отдельной
+          службе.
         </span>
         {error && (
           <span className="settings-submit-error" role="alert">

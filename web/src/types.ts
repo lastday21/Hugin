@@ -67,6 +67,8 @@ export interface BackgroundStatus {
 export interface Dashboard {
   account_label: string;
   system_state: SystemState;
+  search_enabled: boolean;
+  resource_saving_mode: boolean;
   next_apply_at: string | null;
   daily_limit: number;
   delay_min_seconds: number;
@@ -262,6 +264,7 @@ export interface Communications {
   unread_messages: number;
   unseen_invitations: number;
   notification_settings: NotificationSettings;
+  ai_model_settings: AiModelSettings;
   ai_prompt_settings: AiPromptSettings;
 }
 
@@ -280,6 +283,19 @@ export interface AiPromptValues {
 
 export interface AiPromptSettings extends AiPromptValues {
   defaults: AiPromptValues;
+}
+
+export interface AiModelOption {
+  value: string;
+  title: string;
+  description: string;
+}
+
+export interface AiModelSettings {
+  selected: string;
+  options: AiModelOption[];
+  reasoning_effort: string;
+  reasoning_options: AiModelOption[];
 }
 
 export interface VacancyQuestion {
@@ -324,7 +340,9 @@ export interface BridgeResult {
   message: string;
   filled?: number;
   skipped?: number;
+  telegram_bot_configured?: boolean;
   telegram_configured?: boolean;
+  telegram_bot_username?: string;
   email_configured?: boolean;
   body?: string;
 }
@@ -343,10 +361,8 @@ declare global {
         ) => Promise<BridgeResult>;
         generate_reply: (applicationId: number) => Promise<BridgeResult>;
         notification_credentials_status: () => Promise<BridgeResult>;
-        save_telegram_notifications: (
-          botToken: string,
-          chatId: string,
-        ) => Promise<BridgeResult>;
+        connect_telegram_notifications: () => Promise<BridgeResult>;
+        disconnect_telegram_notifications: () => Promise<BridgeResult>;
         save_email_notifications: (
           smtpHost: string,
           smtpPort: number,
