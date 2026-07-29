@@ -8,12 +8,11 @@ from typing import Protocol, cast
 
 
 @dataclass(frozen=True, slots=True)
-class TelegramCredentials:
-    bot_token: str
-    chat_id: str
+class TelegramGatewayCredentials:
+    access_token: str
 
     def __repr__(self) -> str:
-        return "TelegramCredentials(bot_token='***', chat_id='***')"
+        return "TelegramGatewayCredentials(access_token='***')"
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,6 +43,11 @@ class KeyringBackend(Protocol):
 
 
 class WindowsNotificationCredentialStore:
+    _TELEGRAM_LEGACY_KEY = "telegram"
+    _TELEGRAM_TOKEN_KEY = "telegram.bot_token"
+    _TELEGRAM_CHAT_KEY = "telegram.chat_id"
+    _TELEGRAM_GATEWAY_KEY = "telegram.gateway_access_token"
+
     def __init__(
         self,
         backend: KeyringBackend | None = None,
@@ -52,27 +56,25 @@ class WindowsNotificationCredentialStore:
         self._backend = backend
         self._service_name = service_name
 
-    def save_telegram(self, credentials: TelegramCredentials) -> None:
-        token = credentials.bot_token.strip()
-        chat_id = credentials.chat_id.strip()
-        if not token or not chat_id:
-            raise ValueError("Укажите токен бота и номер чата Telegram")
-        self._save("telegram", {"bot_token": token, "chat_id": chat_id})
+    def save_telegram_gateway(self, credentials: TelegramGatewayCredentials) -> None:
+        access_token = credentials.access_token.strip()
+        if not access_token:
+            raise ValueError("Служба Telegram не выдала ключ подключения")
+        self._get_backend().set_password(
+            self._service_name,
+            self._TELEGRAM_GATEWAY_KEY,
+            access_token,
+        )
+        self._delete_direct_telegram_credentials()
 
-    def load_telegram(self) -> TelegramCredentials | None:
-        value = self._load("telegram")
-        if value is None:
+    def load_telegram_gateway(self) -> TelegramGatewayCredentials | None:
+        access_token = self._load_required_text(
+            self._TELEGRAM_GATEWAY_KEY,
+            "Сохранённое подключение Telegram повреждено",
+        )
+        if access_token is None:
             return None
-        try:
-            token = value["bot_token"]
-            chat_id = value["chat_id"]
-            if not isinstance(token, str) or not token.strip():
-                raise TypeError
-            if not isinstance(chat_id, str) or not chat_id.strip():
-                raise TypeError
-            return TelegramCredentials(token.strip(), chat_id.strip())
-        except (KeyError, TypeError, ValueError) as error:
-            raise RuntimeError("Настройки Telegram повреждены") from error
+        return TelegramGatewayCredentials(access_token)
 
     def save_email(self, credentials: EmailCredentials) -> None:
         host = credentials.smtp_host.strip()
@@ -131,7 +133,13 @@ class WindowsNotificationCredentialStore:
             raise RuntimeError("Настройки электронной почты повреждены") from error
 
     def delete_telegram(self) -> bool:
-        return self._delete("telegram")
+        deleted = [
+            self._delete(self._TELEGRAM_GATEWAY_KEY),
+            self._delete(self._TELEGRAM_TOKEN_KEY),
+            self._delete(self._TELEGRAM_CHAT_KEY),
+            self._delete(self._TELEGRAM_LEGACY_KEY),
+        ]
+        return any(deleted)
 
     def delete_email(self) -> bool:
         return self._delete("email")
@@ -154,6 +162,23 @@ class WindowsNotificationCredentialStore:
         if not isinstance(value, dict):
             raise RuntimeError("Сохранённые настройки уведомлений повреждены")
         return cast(dict[str, object], value)
+
+    def _delete_direct_telegram_credentials(self) -> bool:
+        deleted = [
+            self._delete(self._TELEGRAM_TOKEN_KEY),
+            self._delete(self._TELEGRAM_CHAT_KEY),
+            self._delete(self._TELEGRAM_LEGACY_KEY),
+        ]
+        return any(deleted)
+
+    def _load_required_text(self, key: str, error_message: str) -> str | None:
+        value = self._get_backend().get_password(self._service_name, key)
+        if value is None:
+            return None
+        selected = value.strip()
+        if not selected:
+            raise RuntimeError(error_message)
+        return selected
 
     def _delete(self, key: str) -> bool:
         backend = self._get_backend()

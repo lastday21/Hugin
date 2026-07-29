@@ -100,14 +100,30 @@ class AutomationJobRepository:
         )
         return tuple(_job_record(model) for model in models)
 
-    def claim_due(self, now: datetime | None = None) -> AutomationJobRecord | None:
+    def list_by_kind(
+        self,
+        kind: AutomationJobKind,
+    ) -> tuple[AutomationJobRecord, ...]:
+        models = self._session.scalars(
+            select(AutomationJobModel)
+            .where(AutomationJobModel.kind == kind)
+            .order_by(AutomationJobModel.account_id, AutomationJobModel.key)
+        )
+        return tuple(_job_record(model) for model in models)
+
+    def claim_due(
+        self,
+        now: datetime | None = None,
+        *,
+        search_enabled: bool = True,
+    ) -> AutomationJobRecord | None:
         selected_at = as_utc(now or datetime.now(UTC))
         priority = case(
             (AutomationJobModel.kind == AutomationJobKind.MESSAGES, 0),
             (AutomationJobModel.kind == AutomationJobKind.STATUSES, 1),
             else_=2,
         )
-        model = self._session.scalar(
+        statement = (
             select(AutomationJobModel)
             .where(
                 AutomationJobModel.state.in_(CLAIMABLE_STATES),
@@ -122,6 +138,9 @@ class AutomationJobRepository:
             .with_for_update(skip_locked=True)
             .limit(1)
         )
+        if not search_enabled:
+            statement = statement.where(AutomationJobModel.kind != AutomationJobKind.SEARCH)
+        model = self._session.scalar(statement)
         if model is None:
             return None
         model.state = AutomationJobState.RUNNING

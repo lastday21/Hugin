@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 
@@ -36,21 +37,21 @@ def test_worker_routes_each_channel(
     sent: list[tuple[str, str]] = []
 
     class Sender:
-        def __init__(self, *_args: object) -> None:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
             pass
 
         def send(self, content: NotificationContent) -> None:
             sent.append((type(self).__name__, content.body))
 
     class Credentials:
-        def load_telegram(self) -> object:
+        def load_telegram_gateway(self) -> object:
             return object()
 
         def load_email(self) -> object:
             return object()
 
     monkeypatch.setattr(worker_module, "WindowsToastSender", Sender)
-    monkeypatch.setattr(worker_module, "TelegramNotificationSender", Sender)
+    monkeypatch.setattr(worker_module, "TelegramGatewayNotificationSender", Sender)
     monkeypatch.setattr(worker_module, "EmailNotificationSender", Sender)
     monkeypatch.setattr(worker_module, "WindowsNotificationCredentialStore", Credentials)
     worker = worker_module.NotificationWorker(Settings(environment="test"))
@@ -63,12 +64,27 @@ def test_worker_routes_each_channel(
     assert all(body == "Новое сообщение" for _sender, body in sent)
 
 
+def test_worker_requires_connected_telegram_gateway(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Credentials:
+        def load_telegram_gateway(self) -> None:
+            return None
+
+    monkeypatch.setattr(worker_module, "WindowsNotificationCredentialStore", Credentials)
+    worker = worker_module.NotificationWorker(Settings(environment="test"))
+
+    with pytest.raises(RuntimeError, match="Telegram не настроен"):
+        worker._send(notification(NotificationChannel.TELEGRAM))
+
+
 def test_worker_retries_failed_delivery(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     selected = notification(NotificationChannel.WINDOWS)
     recorded: list[tuple[str, object]] = []
-    worker = worker_module.NotificationWorker(Settings(environment="test"))
+    worker = worker_module.NotificationWorker(Settings(environment="test", data_dir=tmp_path))
     monkeypatch.setattr(
         worker,
         "_send",
@@ -137,6 +153,7 @@ def test_worker_rejects_invalid_configuration() -> None:
 
 def test_worker_start_stop_are_idempotent(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     upgraded: list[Settings] = []
 
@@ -166,7 +183,7 @@ def test_worker_start_stop_are_idempotent(
 
     monkeypatch.setattr(worker_module, "upgrade_database", upgraded.append)
     monkeypatch.setattr(threading, "Thread", create_thread)
-    settings = Settings(environment="test")
+    settings = Settings(environment="test", data_dir=tmp_path)
     worker = worker_module.NotificationWorker(settings)
 
     worker.start()

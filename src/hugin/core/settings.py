@@ -40,6 +40,11 @@ class Settings(BaseSettings):
     hh_resumes_url: str = "https://hh.ru/applicant/resumes"
     hh_search_url: str = "https://hh.ru/search/vacancy"
     hh_browser_timeout_ms: int = Field(default=60_000, ge=1_000, le=120_000)
+    hh_background_detail_limit: int = Field(default=5, ge=1, le=50)
+    telegram_bot_username: Literal["hugin_workbot"] = "hugin_workbot"
+    telegram_gateway_url: str = "http://127.0.0.1:8020"
+    telegram_gateway_timeout_seconds: int = Field(default=15, ge=1, le=60)
+    telegram_connection_timeout_seconds: int = Field(default=120, ge=30, le=300)
     yandex_ai_api_key: SecretStr = SecretStr("")
     yandex_ai_folder_id: str = ""
     yandex_ai_model: str = "aliceai-llm/latest"

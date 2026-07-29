@@ -1173,6 +1173,8 @@ class ApplicationSettingsModel(Base):
     search_interval_minutes: Mapped[int] = mapped_column(Integer, default=120, nullable=False)
     message_interval_minutes: Mapped[int] = mapped_column(Integer, default=5, nullable=False)
     status_interval_minutes: Mapped[int] = mapped_column(Integer, default=30, nullable=False)
+    search_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    resource_saving_mode: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     hh_apply_daily_limit: Mapped[int] = mapped_column(Integer, default=25, nullable=False)
     hh_apply_delay_min_seconds: Mapped[int] = mapped_column(Integer, default=30, nullable=False)
     hh_apply_delay_max_seconds: Mapped[int] = mapped_column(Integer, default=60, nullable=False)

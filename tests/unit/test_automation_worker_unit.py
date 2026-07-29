@@ -4,6 +4,7 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 
@@ -162,6 +163,7 @@ class FakeThread:
 
 def test_worker_start_stop_and_restart_are_idempotent(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     upgrades: list[Settings] = []
     threads: list[FakeThread] = []
@@ -181,7 +183,7 @@ def test_worker_start_stop_and_restart_are_idempotent(
 
     monkeypatch.setattr(worker_module, "upgrade_database", upgrade_database)
     monkeypatch.setattr("hugin.workers.automation.threading.Thread", create_thread)
-    settings = Settings(environment="test")
+    settings = Settings(environment="test", data_dir=tmp_path)
     worker = AutomationWorker(settings)
 
     assert not worker.running
@@ -256,6 +258,7 @@ def test_worker_returns_false_when_no_job_is_due(
 
 def test_worker_blocks_job_when_handler_reports_required_action(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     now = datetime(2026, 7, 26, 8, 0, tzinfo=UTC)
     job = make_job()
@@ -266,7 +269,7 @@ def test_worker_blocks_job_when_handler_reports_required_action(
         raise AutomationJobBlocked("  CAPTCHA_REQUIRED  ", "Пройдите проверку")
 
     worker = AutomationWorker(
-        Settings(environment="test"),
+        Settings(environment="test", data_dir=tmp_path),
         handlers={AutomationJobKind.MESSAGES: blocked},
     )
 
@@ -284,6 +287,7 @@ class SilentFailure(RuntimeError):
 
 def test_worker_records_unexpected_handler_exception(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     now = datetime(2026, 7, 26, 8, 0, tzinfo=UTC)
     job = make_job()
@@ -294,7 +298,7 @@ def test_worker_records_unexpected_handler_exception(
         raise SilentFailure
 
     worker = AutomationWorker(
-        Settings(environment="test"),
+        Settings(environment="test", data_dir=tmp_path),
         handlers={AutomationJobKind.MESSAGES: fail},
     )
 
@@ -310,6 +314,7 @@ def test_worker_records_unexpected_handler_exception(
 
 def test_worker_completes_successful_handler(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     now = datetime(2026, 7, 26, 8, 0, tzinfo=UTC)
     job = make_job()
@@ -320,7 +325,7 @@ def test_worker_completes_successful_handler(
         return {"checked": 3}
 
     worker = AutomationWorker(
-        Settings(environment="test"),
+        Settings(environment="test", data_dir=tmp_path),
         handlers={AutomationJobKind.MESSAGES: complete},
     )
 
@@ -332,13 +337,14 @@ def test_worker_completes_successful_handler(
 
 def test_worker_blocks_job_without_connected_handler(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     now = datetime(2026, 7, 26, 8, 0, tzinfo=UTC)
     job = make_job(AutomationJobKind.SEARCH)
     scheduler = FakeScheduler(job)
     patch_worker_storage(monkeypatch, scheduler)
 
-    assert AutomationWorker(Settings(environment="test")).run_once(now)
+    assert AutomationWorker(Settings(environment="test", data_dir=tmp_path)).run_once(now)
     assert len(scheduler.blocked) == 1
     assert scheduler.blocked[0][0] == job.key
     assert scheduler.blocked[0][1] == "SOURCE_NOT_CONNECTED"

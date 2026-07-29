@@ -89,6 +89,23 @@ class AiPromptSettingsResponse(AiPromptValuesResponse):
     defaults: AiPromptValuesResponse
 
 
+class AiModelOptionResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    value: str
+    title: str
+    description: str
+
+
+class AiModelSettingsResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    selected: str
+    options: tuple[AiModelOptionResponse, ...]
+    reasoning_effort: str
+    reasoning_options: tuple[AiModelOptionResponse, ...]
+
+
 class CommunicationsResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -97,6 +114,7 @@ class CommunicationsResponse(BaseModel):
     unread_messages: int
     unseen_invitations: int
     notification_settings: NotificationSettingsResponse
+    ai_model_settings: AiModelSettingsResponse
     ai_prompt_settings: AiPromptSettingsResponse
 
 
@@ -128,6 +146,13 @@ class AiPromptSettingsUpdate(BaseModel):
     resume: str = Field(min_length=1, max_length=MAX_PROMPT_LENGTH)
     cover_letter: str = Field(min_length=1, max_length=MAX_PROMPT_LENGTH)
     recruiter_reply: str = Field(min_length=1, max_length=MAX_PROMPT_LENGTH)
+
+
+class AiModelSettingsUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    model: str = Field(min_length=1, max_length=128)
+    reasoning_effort: str = Field(min_length=1, max_length=16)
 
 
 router = APIRouter(prefix="/api/communications", tags=["communications"])
@@ -319,6 +344,24 @@ def update_ai_prompt_settings(
             resume=values.resume,
             cover_letter=values.cover_letter,
             recruiter_reply=values.recruiter_reply,
+        )
+        return CommunicationsResponse.model_validate(updated)
+    except (LookupError, ValueError) as error:
+        raise _communication_error(error) from error
+
+
+@router.put("/ai-model", response_model=CommunicationsResponse)
+def update_ai_model_settings(
+    values: AiModelSettingsUpdate,
+    session: WriteSession,
+    _guard: SessionGuard,
+    account_id: int = Query(default=1, ge=1),
+) -> CommunicationsResponse:
+    try:
+        updated = UiCommunicationService(session).update_ai_model_settings(
+            account_id=account_id,
+            model=values.model,
+            reasoning_effort=values.reasoning_effort,
         )
         return CommunicationsResponse.model_validate(updated)
     except (LookupError, ValueError) as error:

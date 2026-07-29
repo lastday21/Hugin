@@ -18,9 +18,13 @@ from hugin.database.models import (
 from hugin.domain.content import InvitationState, MessageDirection, RecruiterMessageState
 from hugin.domain.directions import ConfigPayload
 from hugin.services.ai_prompts import (
+    AI_MODEL_OPTIONS,
+    AI_REASONING_OPTIONS,
     DEFAULT_AI_PROMPTS,
+    AiModelOption,
     AiPromptSettings,
     AiPromptSettingsService,
+    AiReasoningOption,
 )
 
 WINDOWS_NOTIFICATION_EVENTS = (
@@ -84,6 +88,7 @@ class UiCommunications:
     unread_messages: int
     unseen_invitations: int
     notification_settings: UiNotificationSettings
+    ai_model_settings: UiAiModelSettings
     ai_prompt_settings: UiAiPromptSettings
 
 
@@ -93,6 +98,14 @@ class UiNotificationSettings:
     telegram_enabled: bool
     email_enabled: bool
     routing: dict[str, tuple[str, ...]]
+
+
+@dataclass(frozen=True, slots=True)
+class UiAiModelSettings:
+    selected: str
+    options: tuple[AiModelOption, ...]
+    reasoning_effort: str
+    reasoning_options: tuple[AiReasoningOption, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -210,8 +223,21 @@ class UiCommunicationService:
                 email_enabled=settings.email_enabled,
                 routing=self._routing(settings.notification_routing),
             ),
+            ai_model_settings=self._ai_model_settings(),
             ai_prompt_settings=self._ai_prompt_settings(),
         )
+
+    def update_ai_model_settings(
+        self,
+        *,
+        account_id: int,
+        model: str,
+        reasoning_effort: str,
+    ) -> UiCommunications:
+        if self._session.get(HhAccountModel, account_id) is None:
+            raise LookupError("Аккаунт hh.ru не найден")
+        AiPromptSettingsService(self._session).update_model(model, reasoning_effort)
+        return self.get(account_id)
 
     def update_ai_prompt_settings(
         self,
@@ -305,6 +331,15 @@ class UiCommunicationService:
             cover_letter=current.cover_letter,
             recruiter_reply=current.recruiter_reply,
             defaults=DEFAULT_AI_PROMPTS,
+        )
+
+    def _ai_model_settings(self) -> UiAiModelSettings:
+        settings = AiPromptSettingsService(self._session)
+        return UiAiModelSettings(
+            selected=settings.get_model(),
+            options=AI_MODEL_OPTIONS,
+            reasoning_effort=settings.get_reasoning_effort(),
+            reasoning_options=AI_REASONING_OPTIONS,
         )
 
     @staticmethod

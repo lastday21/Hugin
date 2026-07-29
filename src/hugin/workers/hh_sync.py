@@ -47,6 +47,7 @@ class HhSyncJobHandler:
                     self._settings.hh_resumes_url,
                     self._settings.hh_search_url,
                     self._settings.hh_browser_timeout_ms,
+                    start_minimized=True,
                 ) as browser,
             ):
                 login = HhLoginService(WindowsCredentialStore()).authenticate(

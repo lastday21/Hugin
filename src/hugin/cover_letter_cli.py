@@ -19,6 +19,7 @@ from hugin.database.models import (
     CoverLetterModel,
     VacancyModel,
 )
+from hugin.services.ai_prompts import AiPromptSettingsService
 from hugin.services.application_automation import ApplicationAutomationService
 from hugin.services.cover_letter import SYSTEM_PROMPT, CoverLetterService
 
@@ -125,8 +126,14 @@ def run(argv: Sequence[str] | None = None) -> int:
                         print(f"Причина: {letter.failure_reason}")
                 return 0
 
-            client = _client(settings, store)
             with database.sessions.begin() as session:
+                ai_settings = AiPromptSettingsService(session)
+                client = _client(
+                    settings,
+                    store,
+                    model=ai_settings.get_model(),
+                    reasoning_effort=ai_settings.get_reasoning_effort(),
+                )
                 queued = ApplicationAutomationService(session).prepare_for_account_id(
                     account_id=arguments.account_id,
                     direction_name=arguments.direction,
@@ -170,6 +177,9 @@ def run(argv: Sequence[str] | None = None) -> int:
 def _client(
     settings: Settings,
     store: WindowsYandexAICredentialStore,
+    *,
+    model: str | None = None,
+    reasoning_effort: str = "high",
 ) -> YandexAIClient:
     environment_key = settings.yandex_ai_api_key.get_secret_value().strip()
     if environment_key:
@@ -188,9 +198,10 @@ def _client(
     return YandexAIClient(
         credentials.api_key,
         credentials.folder_id,
-        credentials.model,
+        model or credentials.model,
         settings.yandex_ai_base_url,
         settings.yandex_ai_timeout_seconds,
+        reasoning_effort=reasoning_effort,
     )
 
 

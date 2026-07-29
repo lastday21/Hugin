@@ -63,8 +63,8 @@ def run(argv: Sequence[str] | None = None) -> int:
             print("Настройки YandexGPT удалены." if deleted else "Сохраненных настроек нет.")
             return 0
 
-        client = _client(settings, store)
         if arguments.command == "test":
+            client = _client(settings, store)
             response = client.complete(
                 SYSTEM_PROMPT,
                 "Ответь одним словом: готово",
@@ -86,11 +86,18 @@ def run(argv: Sequence[str] | None = None) -> int:
                 return input("Ответ: ")
 
             with database.sessions.begin() as session:
+                ai_settings = AiPromptSettingsService(session)
+                client = _client(
+                    settings,
+                    store,
+                    model=ai_settings.get_model(),
+                    reasoning_effort=ai_settings.get_reasoning_effort(),
+                )
                 result = ResumeImprovementService(
                     session,
                     settings.data_dir,
                     client,
-                    AiPromptSettingsService(session).get().resume,
+                    ai_settings.get().resume,
                 ).improve(
                     arguments.account_id,
                     ask,
@@ -117,6 +124,9 @@ def run(argv: Sequence[str] | None = None) -> int:
 def _client(
     settings: Settings,
     store: WindowsYandexAICredentialStore,
+    *,
+    model: str | None = None,
+    reasoning_effort: str = "high",
 ) -> YandexAIClient:
     environment_key = settings.yandex_ai_api_key.get_secret_value().strip()
     if environment_key:
@@ -135,9 +145,10 @@ def _client(
     return YandexAIClient(
         credentials.api_key,
         credentials.folder_id,
-        credentials.model,
+        model or credentials.model,
         settings.yandex_ai_base_url,
         settings.yandex_ai_timeout_seconds,
+        reasoning_effort=reasoning_effort,
     )
 
 

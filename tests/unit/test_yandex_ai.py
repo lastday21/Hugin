@@ -114,6 +114,46 @@ def test_yandex_client_preserves_full_model_uri(monkeypatch: pytest.MonkeyPatch)
     assert json.loads(captured[0].data.decode())["model"] == "gpt://other/model"
 
 
+def test_yandex_client_uses_deep_reasoning_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[urllib.request.Request] = []
+
+    def urlopen(request: urllib.request.Request, **_kwargs: object) -> FakeResponse:
+        captured.append(request)
+        return FakeResponse([b'data: {"choices":[{"message":{"content":"ok"}}]}\n'])
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    client = YandexAIClient("key", "folder", "qwen3-235b-a22b-fp8/latest")
+
+    assert client.complete("system", "user") == "ok"
+    assert isinstance(captured[0].data, bytes)
+    body = json.loads(captured[0].data.decode())
+    assert body["reasoning_effort"] == "high"
+
+
+def test_yandex_client_uses_selected_reasoning_effort(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[urllib.request.Request] = []
+
+    def urlopen(request: urllib.request.Request, **_kwargs: object) -> FakeResponse:
+        captured.append(request)
+        return FakeResponse([b'data: {"choices":[{"message":{"content":"ok"}}]}\n'])
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    client = YandexAIClient("key", "folder", reasoning_effort="medium")
+
+    assert client.complete("system", "user") == "ok"
+    assert isinstance(captured[0].data, bytes)
+    assert json.loads(captured[0].data.decode())["reasoning_effort"] == "medium"
+
+
+def test_yandex_client_rejects_unknown_reasoning_effort() -> None:
+    with pytest.raises(ValueError, match="Режим обработки"):
+        YandexAIClient("key", "folder", reasoning_effort="unknown")
+
+
 @pytest.mark.parametrize(
     ("error", "message"),
     [

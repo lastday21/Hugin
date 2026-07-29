@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from typing import ClassVar, cast
 
@@ -71,6 +72,7 @@ class FakeApplicationService:
 
 def prepare_worker(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
     *,
     job_handler: applications.ApplicationJobHandler | None = None,
 ) -> applications.ApplicationWorker:
@@ -81,7 +83,7 @@ def prepare_worker(
         FakeApplicationService,
     )
     return applications.ApplicationWorker(
-        Settings(environment="test"),
+        Settings(environment="test", data_dir=tmp_path),
         letter_preparer=lambda _account_id: 0,
         job_handler=job_handler,
     )
@@ -97,6 +99,7 @@ def setup_function() -> None:
 
 def test_worker_processes_ready_application_and_records_delay(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     job = cast(
         ApplyJob,
@@ -111,7 +114,7 @@ def test_worker_processes_ready_application_and_records_delay(
         handled.append(selected)
         return HhApplyResult(HhApplyStatus.APPLIED, "https://hh.ru/vacancy/101")
 
-    worker = prepare_worker(monkeypatch, job_handler=handle)
+    worker = prepare_worker(monkeypatch, tmp_path, job_handler=handle)
     now = datetime(2026, 7, 27, 10, 0, tzinfo=UTC)
 
     assert worker.run_once(now)
@@ -124,7 +127,10 @@ def test_worker_processes_ready_application_and_records_delay(
     assert recorded_at == now
 
 
-def test_worker_does_not_claim_after_daily_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_worker_does_not_claim_after_daily_limit(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
     FakeApplicationService.sent_today = 25
     FakeApplicationService.job = cast(
         ApplyJob,
@@ -132,13 +138,16 @@ def test_worker_does_not_claim_after_daily_limit(monkeypatch: pytest.MonkeyPatch
             vacancy=SimpleNamespace(source_url="https://hh.ru/vacancy/101"),
         ),
     )
-    worker = prepare_worker(monkeypatch)
+    worker = prepare_worker(monkeypatch, tmp_path)
 
     assert not worker.run_once(datetime(2026, 7, 27, 10, 0, tzinfo=UTC))
     assert FakeApplicationService.recorded == []
 
 
-def test_worker_marks_exception_after_claim_as_unknown(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_worker_marks_exception_after_claim_as_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
     job = cast(
         ApplyJob,
         SimpleNamespace(
@@ -150,7 +159,7 @@ def test_worker_marks_exception_after_claim_as_unknown(monkeypatch: pytest.Monke
     def fail(_job: ApplyJob) -> HhApplyResult:
         raise RuntimeError("page closed")
 
-    worker = prepare_worker(monkeypatch, job_handler=fail)
+    worker = prepare_worker(monkeypatch, tmp_path, job_handler=fail)
 
     assert worker.run_once(datetime(2026, 7, 27, 10, 0, tzinfo=UTC))
     _, result, delay, _ = FakeApplicationService.recorded[0]
@@ -158,8 +167,11 @@ def test_worker_marks_exception_after_claim_as_unknown(monkeypatch: pytest.Monke
     assert delay is None
 
 
-def test_worker_recovers_interrupted_jobs_before_start(monkeypatch: pytest.MonkeyPatch) -> None:
-    worker = prepare_worker(monkeypatch)
+def test_worker_recovers_interrupted_jobs_before_start(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    worker = prepare_worker(monkeypatch, tmp_path)
     monkeypatch.setattr(applications, "upgrade_database", lambda _settings: None)
     monkeypatch.setattr(worker, "_run", lambda: None)
 
@@ -173,7 +185,7 @@ def test_worker_runs_authenticated_browser_job(monkeypatch: pytest.MonkeyPatch) 
     calls: list[tuple[str, str, str]] = []
 
     class FakeBrowser:
-        def __init__(self, *_args: object) -> None:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
             pass
 
         def __enter__(self) -> FakeBrowser:
@@ -230,7 +242,7 @@ def test_worker_maps_incomplete_login_without_applying(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class FakeBrowser:
-        def __init__(self, *_args: object) -> None:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
             pass
 
         def __enter__(self) -> FakeBrowser:
@@ -296,8 +308,23 @@ def test_worker_prepares_one_letter_for_active_direction(
             }
             return SimpleNamespace(generated=1, reused=0)
 
-    monkeypatch.setattr(applications, "create_database", lambda _settings: LetterDatabase())
-    monkeypatch.setattr(applications, "configured_yandex_ai_client", lambda _settings: object())
+        monkeypatch.setattr(applications, "create_database", lambda _settings: LetterDatabase())
+        monkeypatch.setattr(
+            applications,
+            "AiPromptSettingsService",
+            lambda _session: SimpleNamespace(
+                get_model=lambda: "selected-model",
+                get_reasoning_effort=lambda: "high",
+            ),
+        )
+        monkeypatch.setattr(
+            applications,
+            "configured_yandex_ai_client",
+            lambda _settings, *, model, reasoning_effort: {("selected-model", "high"): object()}[
+                (model, reasoning_effort)
+            ],
+        )
+
     monkeypatch.setattr(applications, "CoverLetterService", FakeLetterService)
     worker = applications.ApplicationWorker(
         Settings(environment="test"),

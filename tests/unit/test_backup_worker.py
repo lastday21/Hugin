@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+from pathlib import Path
 
 import pytest
 
@@ -51,7 +52,10 @@ def test_worker_uses_saved_retention_and_resolves_incident(
     assert values == [14]
 
 
-def test_worker_start_stop_and_validation(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_worker_start_stop_and_validation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
     with pytest.raises(ValueError):
         worker_module.BackupWorker(Settings(environment="test"), poll_seconds=0)
 
@@ -79,7 +83,7 @@ def test_worker_start_stop_and_validation(monkeypatch: pytest.MonkeyPatch) -> No
         return created
 
     monkeypatch.setattr(threading, "Thread", thread)
-    worker = worker_module.BackupWorker(Settings(environment="test"))
+    worker = worker_module.BackupWorker(Settings(environment="test", data_dir=tmp_path))
     worker.start()
     worker.start()
     assert worker.running
@@ -91,6 +95,7 @@ def test_worker_start_stop_and_validation(monkeypatch: pytest.MonkeyPatch) -> No
 
 def test_worker_loop_reports_only_new_error_and_continues(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     events: list[object] = []
 
@@ -108,7 +113,11 @@ def test_worker_loop_reports_only_new_error_and_continues(
         def send(self, content: object) -> None:
             events.append(("toast", content))
 
-    worker = worker_module.BackupWorker(Settings(environment="test"), poll_seconds=2)
+    worker = worker_module.BackupWorker(
+        Settings(environment="test", data_dir=tmp_path),
+        poll_seconds=2,
+    )
+    monkeypatch.setattr(worker, "_log_retention_days", lambda: 90)
     worker._stop = Stop()  # type: ignore[assignment]
     monkeypatch.setattr(
         worker,
@@ -139,6 +148,7 @@ def test_worker_loop_reports_only_new_error_and_continues(
 
 def test_worker_loop_resolves_failure_after_success(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     events: list[object] = []
 
@@ -152,7 +162,11 @@ def test_worker_loop_resolves_failure_after_success(
             events.append(("wait", seconds))
             self.stopped = True
 
-    worker = worker_module.BackupWorker(Settings(environment="test"), poll_seconds=3)
+    worker = worker_module.BackupWorker(
+        Settings(environment="test", data_dir=tmp_path),
+        poll_seconds=3,
+    )
+    monkeypatch.setattr(worker, "_log_retention_days", lambda: 90)
     worker._stop = Stop()  # type: ignore[assignment]
     worker._last_reported_error = "old"
     monkeypatch.setattr(worker, "run_once", lambda: False)

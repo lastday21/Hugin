@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+from pathlib import Path
 from uuid import uuid4
 
 import pytest
@@ -11,7 +12,7 @@ from hugin.database import postgresql_url
 
 
 @pytest.fixture
-def settings() -> Iterator[Settings]:
+def settings(tmp_path: Path) -> Iterator[Settings]:
     base = Settings(environment="test")
     database_name = f"hugin_test_{uuid4().hex}"
     admin = create_engine(
@@ -23,7 +24,12 @@ def settings() -> Iterator[Settings]:
     try:
         with admin.connect() as connection:
             connection.execute(text(f'CREATE DATABASE "{database_name}"'))
-        yield base.model_copy(update={"database_name": database_name})
+        yield base.model_copy(
+            update={
+                "database_name": database_name,
+                "data_dir": tmp_path / "data",
+            }
+        )
     finally:
         with admin.connect() as connection:
             connection.execute(

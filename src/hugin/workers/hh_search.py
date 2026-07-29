@@ -24,7 +24,10 @@ class HhSearchJobHandler:
         self._settings = settings
         self._account_id = account_id
         self._browser_lock = browser_lock or threading.Lock()
-        self._cycle = BackgroundSearchCycle(settings)
+        self._cycle = BackgroundSearchCycle(
+            settings,
+            detail_limit=settings.hh_background_detail_limit,
+        )
 
     def __call__(self, job: AutomationJobRecord) -> AutomationJobResult:
         if job.kind is not self.kind or job.search_query_id is None:
@@ -40,6 +43,7 @@ class HhSearchJobHandler:
                 self._settings.hh_resumes_url,
                 self._settings.hh_search_url,
                 self._settings.hh_browser_timeout_ms,
+                start_minimized=True,
             ) as browser,
         ):
             login = HhLoginService(WindowsCredentialStore()).authenticate(

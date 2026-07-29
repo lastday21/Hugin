@@ -48,8 +48,13 @@ def make_job(
 
 
 class FakeBrowser:
-    def __init__(self, arguments: tuple[object, ...]) -> None:
+    def __init__(
+        self,
+        arguments: tuple[object, ...],
+        keyword_arguments: dict[str, object],
+    ) -> None:
         self.arguments = arguments
+        self.keyword_arguments = keyword_arguments
         self.entered = False
         self.exited = False
 
@@ -110,8 +115,8 @@ def prepare_handler(
     credential_store = object()
     cycle = FakeCycle({"found": 4, "queued": 2})
 
-    def create_browser(*arguments: object) -> FakeBrowser:
-        browser = FakeBrowser(arguments)
+    def create_browser(*arguments: object, **keyword_arguments: object) -> FakeBrowser:
+        browser = FakeBrowser(arguments, keyword_arguments)
         browsers.append(browser)
         return browser
 
@@ -122,7 +127,8 @@ def prepare_handler(
         assert store is credential_store
         return FakeLoginService(status, store, login_calls)
 
-    def create_cycle(_settings: Settings) -> FakeCycle:
+    def create_cycle(_settings: Settings, *, detail_limit: int) -> FakeCycle:
+        assert detail_limit == 5
         return cycle
 
     monkeypatch.setattr(search_worker_module, "VisibleHhBrowser", create_browser)
@@ -218,3 +224,4 @@ def test_search_handler_runs_cycle_after_successful_login(
     assert cycle.calls == [(1, 7, browsers[0])]
     assert browsers[0].arguments[0] == Settings(environment="test").browser_profile_dir(1)
     assert browsers[0].arguments[-1] == Settings(environment="test").hh_browser_timeout_ms
+    assert browsers[0].keyword_arguments == {"start_minimized": True}

@@ -1,16 +1,17 @@
 from __future__ import annotations
 
 import base64
-import json
 import smtplib
 import ssl
 import subprocess
 from dataclasses import dataclass
 from email.message import EmailMessage
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
 
-from hugin.adapters.notification_credentials import EmailCredentials, TelegramCredentials
+from hugin.adapters.notification_credentials import (
+    EmailCredentials,
+    TelegramGatewayCredentials,
+)
+from hugin.adapters.telegram_gateway import TelegramGatewayClient
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,37 +62,26 @@ class WindowsToastSender:
             raise RuntimeError("Windows не приняла уведомление")
 
 
-class TelegramNotificationSender:
-    def __init__(self, credentials: TelegramCredentials, timeout_seconds: int = 15) -> None:
+class TelegramGatewayNotificationSender:
+    def __init__(
+        self,
+        gateway_url: str,
+        credentials: TelegramGatewayCredentials,
+        timeout_seconds: int = 15,
+    ) -> None:
+        self._gateway_url = gateway_url
         self._credentials = credentials
         self._timeout_seconds = timeout_seconds
 
     def send(self, content: NotificationContent) -> None:
-        payload = json.dumps(
-            {
-                "chat_id": self._credentials.chat_id,
-                "text": f"{content.title}\n\n{content.body}",
-                "disable_web_page_preview": True,
-            },
-            ensure_ascii=False,
-        ).encode()
-        request = Request(
-            f"https://api.telegram.org/bot{self._credentials.bot_token}/sendMessage",
-            data=payload,
-            headers={"Content-Type": "application/json"},
-            method="POST",
+        TelegramGatewayClient(
+            self._gateway_url,
+            timeout_seconds=self._timeout_seconds,
+        ).send(
+            self._credentials.access_token,
+            content.title,
+            content.body,
         )
-        try:
-            with urlopen(request, timeout=self._timeout_seconds) as response:
-                body = response.read()
-        except (HTTPError, URLError, TimeoutError) as error:
-            raise RuntimeError("Telegram не принял уведомление") from error
-        try:
-            result = json.loads(body)
-        except json.JSONDecodeError as error:
-            raise RuntimeError("Telegram вернул некорректный ответ") from error
-        if not isinstance(result, dict) or result.get("ok") is not True:
-            raise RuntimeError("Telegram не подтвердил доставку уведомления")
 
 
 class EmailNotificationSender:

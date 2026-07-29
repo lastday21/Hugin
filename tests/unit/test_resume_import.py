@@ -100,6 +100,13 @@ def test_resume_import_is_idempotent_and_questions_are_reusable(
             assert "available_from" in question_keys
             assert "work_format" not in question_keys
 
+            with pytest.raises(ValueError, match="повреждённые символы"):
+                ProfileQuestionService(session).answer(
+                    account.id,
+                    "salary_expectation",
+                    "п»ї??????????? ? ????????",
+                )
+
             ProfileQuestionService(session).answer(
                 account.id,
                 "salary_expectation",

@@ -46,6 +46,20 @@ def test_yandex_client_uses_protected_store() -> None:
     assert client.model_name == "stored/latest"
 
 
+def test_yandex_client_uses_selected_model() -> None:
+    settings = Settings(environment="test")
+    store = FakeStore(YandexAICredentials("secret", "folder", "stored/latest"))
+
+    client = configured_yandex_ai_client(
+        settings,
+        cast(WindowsYandexAICredentialStore, store),
+        model="qwen3-235b-a22b-fp8/latest",
+        reasoning_effort="high",
+    )
+
+    assert client.model_name == "qwen3-235b-a22b-fp8/latest"
+
+
 def test_yandex_client_requires_complete_configuration() -> None:
     with pytest.raises(ValueError, match="FOLDER_ID"):
         configured_yandex_ai_client(

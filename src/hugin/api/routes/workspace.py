@@ -10,7 +10,12 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from hugin.api.dependencies import read_session, require_session_key, write_session
-from hugin.database.models import ApplicationModel, ApplicationTaskModel, VacancyModel
+from hugin.database.models import (
+    ApplicationModel,
+    ApplicationSettingsModel,
+    ApplicationTaskModel,
+    VacancyModel,
+)
 from hugin.domain.applications import (
     ApplicationReconciliationResult,
     ReconciliationStatus,
@@ -18,6 +23,7 @@ from hugin.domain.applications import (
 from hugin.domain.content import AnswerSource
 from hugin.domain.directions import EmploymentForm, SearchRegion, WorkFormat
 from hugin.services.application_reconciliation import ApplicationReconciliationService
+from hugin.services.automation import AutomationSchedulerService
 from hugin.services.career_directions import (
     COMMON_REGIONS,
     RUSSIA_REGION,
@@ -99,6 +105,8 @@ class DashboardResponse(BaseModel):
 
     account_label: str
     system_state: str
+    search_enabled: bool
+    resource_saving_mode: bool
     next_apply_at: datetime | None
     daily_limit: int
     delay_min_seconds: int
@@ -265,6 +273,17 @@ class SessionResponse(BaseModel):
     key: str
 
 
+class BackgroundPreferencesResponse(BaseModel):
+    search_enabled: bool
+    resource_saving_mode: bool
+
+
+class ResourceSavingUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = Field(strict=True)
+
+
 router = APIRouter(prefix="/api", tags=["workspace"])
 ReadSession = Annotated[Session, Depends(read_session)]
 WriteSession = Annotated[Session, Depends(write_session)]
@@ -285,6 +304,46 @@ def dashboard(
         return DashboardResponse.model_validate(UiWorkspaceService(session).dashboard(account_id))
     except LookupError as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
+
+
+@router.post("/search/pause", response_model=BackgroundPreferencesResponse)
+def pause_search(
+    session: WriteSession,
+    _guard: SessionGuard,
+) -> BackgroundPreferencesResponse:
+    try:
+        settings = AutomationSchedulerService(session).pause_search()
+    except LookupError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    return _background_preferences(settings)
+
+
+@router.post("/search/resume", response_model=BackgroundPreferencesResponse)
+def resume_search(
+    session: WriteSession,
+    _guard: SessionGuard,
+) -> BackgroundPreferencesResponse:
+    try:
+        settings = AutomationSchedulerService(session).resume_search()
+    except LookupError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    return _background_preferences(settings)
+
+
+@router.put(
+    "/background/resource-saving",
+    response_model=BackgroundPreferencesResponse,
+)
+def update_resource_saving(
+    values: ResourceSavingUpdate,
+    session: WriteSession,
+    _guard: SessionGuard,
+) -> BackgroundPreferencesResponse:
+    try:
+        settings = AutomationSchedulerService(session).set_resource_saving_mode(values.enabled)
+    except LookupError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    return _background_preferences(settings)
 
 
 @router.get("/directions/options", response_model=DirectionOptionsResponse)
@@ -525,4 +584,13 @@ def update_queue_settings(
         daily_limit=saved.daily_limit,
         delay_min_seconds=saved.delay_min_seconds,
         delay_max_seconds=saved.delay_max_seconds,
+    )
+
+
+def _background_preferences(
+    settings: ApplicationSettingsModel,
+) -> BackgroundPreferencesResponse:
+    return BackgroundPreferencesResponse(
+        search_enabled=settings.search_enabled,
+        resource_saving_mode=settings.resource_saving_mode,
     )

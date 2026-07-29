@@ -30,7 +30,9 @@ def seed_search_query(settings: Settings) -> tuple[int, int]:
         database.close()
 
 
-def test_scheduler_uses_exact_intervals_and_does_not_catch_up(settings: Settings) -> None:
+def test_scheduler_uses_resource_saving_intervals_and_does_not_catch_up(
+    settings: Settings,
+) -> None:
     account_id, query_id = seed_search_query(settings)
     database = create_database(settings)
     due_at = datetime(2026, 7, 26, 8, 0, tzinfo=UTC)
@@ -46,9 +48,9 @@ def test_scheduler_uses_exact_intervals_and_does_not_catch_up(settings: Settings
                 now=due_at,
             )
 
-            assert messages.interval_seconds == 5 * 60
-            assert statuses.interval_seconds == 30 * 60
-            assert search.interval_seconds == 120 * 60
+            assert messages.interval_seconds == 15 * 60
+            assert statuses.interval_seconds == 60 * 60
+            assert search.interval_seconds == 240 * 60
             assert messages.next_run_at == statuses.next_run_at == search.next_run_at == due_at
 
         messages_finished_at = due_at + timedelta(hours=2, seconds=10)
@@ -66,7 +68,7 @@ def test_scheduler_uses_exact_intervals_and_does_not_catch_up(settings: Settings
             assert completed.state is AutomationJobState.WAITING
             assert completed.last_success_at == messages_finished_at
             assert completed.last_result == {"new_messages": 2}
-            assert completed.next_run_at == messages_finished_at + timedelta(minutes=5)
+            assert completed.next_run_at == messages_finished_at + timedelta(minutes=15)
 
         statuses_finished_at = messages_finished_at + timedelta(seconds=10)
         with database.sessions.begin() as session:
@@ -75,7 +77,7 @@ def test_scheduler_uses_exact_intervals_and_does_not_catch_up(settings: Settings
             assert claimed is not None
             assert claimed.kind is AutomationJobKind.STATUSES
             completed = scheduler.complete(claimed.key, now=statuses_finished_at)
-            assert completed.next_run_at == statuses_finished_at + timedelta(minutes=30)
+            assert completed.next_run_at == statuses_finished_at + timedelta(minutes=60)
 
         search_finished_at = statuses_finished_at + timedelta(seconds=10)
         with database.sessions.begin() as session:
@@ -84,7 +86,7 @@ def test_scheduler_uses_exact_intervals_and_does_not_catch_up(settings: Settings
             assert claimed is not None
             assert claimed.kind is AutomationJobKind.SEARCH
             completed = scheduler.complete(claimed.key, now=search_finished_at)
-            assert completed.next_run_at == search_finished_at + timedelta(minutes=120)
+            assert completed.next_run_at == search_finished_at + timedelta(minutes=240)
     finally:
         database.close()
 
@@ -230,5 +232,143 @@ def test_blocked_and_disabled_jobs_are_not_claimed(settings: Settings) -> None:
             claimed = scheduler.claim_due(due_at + timedelta(days=1))
             assert claimed is not None
             assert claimed.kind is AutomationJobKind.MESSAGES
+    finally:
+        database.close()
+
+
+def test_search_pause_finishes_running_job_then_disables_and_resumes(
+    settings: Settings,
+) -> None:
+    account_id, query_id = seed_search_query(settings)
+    database = create_database(settings)
+    started_at = datetime(2026, 7, 26, 13, 0, tzinfo=UTC)
+
+    try:
+        with database.sessions.begin() as session:
+            scheduler = AutomationSchedulerService(session)
+            scheduler.ensure_search_job(
+                account_id=account_id,
+                search_query_id=query_id,
+                interval_minutes=120,
+                now=started_at,
+            )
+            running = scheduler.claim_due(started_at)
+            assert running is not None
+            assert running.kind is AutomationJobKind.SEARCH
+            assert running.state is AutomationJobState.RUNNING
+
+        paused_at = started_at + timedelta(minutes=1)
+        with database.sessions.begin() as session:
+            scheduler = AutomationSchedulerService(session)
+            settings_row = scheduler.pause_search(paused_at)
+            still_running = scheduler.list_for_account(account_id)[0]
+
+            assert settings_row.search_enabled is False
+            assert still_running.state is AutomationJobState.RUNNING
+
+        finished_at = paused_at + timedelta(minutes=1)
+        with database.sessions.begin() as session:
+            completed = AutomationSchedulerService(session).complete(
+                running.key,
+                {"found": 3},
+                finished_at,
+            )
+
+            assert completed.state is AutomationJobState.DISABLED
+            assert completed.next_run_at is None
+            assert completed.last_success_at == finished_at
+            assert completed.last_result == {"found": 3}
+
+        with database.sessions.begin() as session:
+            scheduler = AutomationSchedulerService(session)
+            assert scheduler.claim_due(finished_at + timedelta(days=1)) is None
+            resumed = scheduler.resume_search(finished_at + timedelta(days=1))
+            search = next(
+                job
+                for job in scheduler.list_for_account(account_id)
+                if job.kind is AutomationJobKind.SEARCH
+            )
+
+            assert resumed.search_enabled is True
+            assert search.state is AutomationJobState.WAITING
+            assert search.next_run_at == finished_at + timedelta(days=1)
+    finally:
+        database.close()
+
+
+def test_resource_saving_staggers_new_search_jobs_and_preserves_saved_schedule(
+    settings: Settings,
+) -> None:
+    account_id, _query_id = seed_search_query(settings)
+    database = create_database(settings)
+    scheduled_at = datetime(2026, 7, 26, 14, 0, tzinfo=UTC)
+
+    try:
+        with database.sessions.begin() as session:
+            direction = DirectionRepository(session).create(account_id, "Интеграции")
+            DirectionRepository(session).add_query(
+                direction.id,
+                "Python API",
+                schedule_minutes=90,
+            )
+
+        with database.sessions.begin() as session:
+            scheduler = AutomationSchedulerService(session)
+            jobs = scheduler.ensure_configured_jobs(account_id, scheduled_at)
+            searches = sorted(
+                (job for job in jobs if job.kind is AutomationJobKind.SEARCH),
+                key=lambda job: job.search_query_id or 0,
+            )
+            messages = next(job for job in jobs if job.kind is AutomationJobKind.MESSAGES)
+            statuses = next(job for job in jobs if job.kind is AutomationJobKind.STATUSES)
+
+            assert [job.interval_seconds for job in searches] == [240 * 60, 240 * 60]
+            assert [job.next_run_at for job in searches] == [
+                scheduled_at,
+                scheduled_at + timedelta(minutes=5),
+            ]
+            assert messages.interval_seconds == 15 * 60
+            assert statuses.interval_seconds == 60 * 60
+
+        later = scheduled_at + timedelta(hours=1)
+        with database.sessions.begin() as session:
+            scheduler = AutomationSchedulerService(session)
+            scheduler.ensure_configured_jobs(account_id, later)
+            searches = sorted(
+                (
+                    job
+                    for job in scheduler.list_for_account(account_id)
+                    if job.kind is AutomationJobKind.SEARCH
+                ),
+                key=lambda job: job.search_query_id or 0,
+            )
+            assert [job.next_run_at for job in searches] == [
+                scheduled_at,
+                scheduled_at + timedelta(minutes=5),
+            ]
+
+        with database.sessions.begin() as session:
+            scheduler = AutomationSchedulerService(session)
+            saved = scheduler.set_resource_saving_mode(False, later)
+            jobs = scheduler.list_for_account(account_id)
+            searches = sorted(
+                (job for job in jobs if job.kind is AutomationJobKind.SEARCH),
+                key=lambda job: job.search_query_id or 0,
+            )
+
+            assert saved.resource_saving_mode is False
+            assert [job.interval_seconds for job in searches] == [120 * 60, 90 * 60]
+            assert [job.next_run_at for job in searches] == [
+                scheduled_at,
+                scheduled_at + timedelta(minutes=5),
+            ]
+            assert (
+                next(job for job in jobs if job.kind is AutomationJobKind.MESSAGES).interval_seconds
+                == 5 * 60
+            )
+            assert (
+                next(job for job in jobs if job.kind is AutomationJobKind.STATUSES).interval_seconds
+                == 30 * 60
+            )
     finally:
         database.close()

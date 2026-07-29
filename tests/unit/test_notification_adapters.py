@@ -1,25 +1,21 @@
-# ruff: noqa: RUF001
-
 from __future__ import annotations
 
 import json
 from email.message import EmailMessage
 from types import SimpleNamespace
-from typing import ClassVar, cast
-from urllib.request import Request
+from typing import ClassVar
 
 import pytest
 
-from hugin.adapters import notifications as notification_module
 from hugin.adapters.notification_credentials import (
     EmailCredentials,
-    TelegramCredentials,
+    TelegramGatewayCredentials,
     WindowsNotificationCredentialStore,
 )
 from hugin.adapters.notifications import (
     EmailNotificationSender,
     NotificationContent,
-    TelegramNotificationSender,
+    TelegramGatewayNotificationSender,
     WindowsToastSender,
 )
 
@@ -41,7 +37,7 @@ class FakeKeyring:
 def test_notification_credentials_round_trip_without_exposing_secrets() -> None:
     backend = FakeKeyring()
     store = WindowsNotificationCredentialStore(backend)
-    telegram = TelegramCredentials("token:secret", "-100123")
+    telegram = TelegramGatewayCredentials("hgt_connection.secret")
     email = EmailCredentials(
         "smtp.example.com",
         587,
@@ -51,16 +47,107 @@ def test_notification_credentials_round_trip_without_exposing_secrets() -> None:
         "recipient@example.com",
     )
 
-    store.save_telegram(telegram)
+    store.save_telegram_gateway(telegram)
     store.save_email(email)
 
-    assert store.load_telegram() == telegram
+    assert (
+        backend.values[("Hugin.notifications", "telegram.gateway_access_token")]
+        == "hgt_connection.secret"
+    )
+    assert ("Hugin.notifications", "telegram") not in backend.values
+    assert store.load_telegram_gateway() == telegram
     assert store.load_email() == email
     assert "secret" not in repr(telegram)
     assert "secret" not in repr(email)
     assert store.delete_telegram()
     assert not store.delete_telegram()
     assert store.delete_email()
+
+
+def test_gateway_connection_removes_old_direct_telegram_secrets() -> None:
+    backend = FakeKeyring()
+    store = WindowsNotificationCredentialStore(backend)
+    backend.values[("Hugin.notifications", "telegram.bot_token")] = "old-token"
+    backend.values[("Hugin.notifications", "telegram.chat_id")] = "123"
+    backend.values[("Hugin.notifications", "telegram")] = "old-payload"
+
+    credentials = TelegramGatewayCredentials("hgt_connection.secret")
+    store.save_telegram_gateway(credentials)
+
+    assert store.load_telegram_gateway() == credentials
+    assert ("Hugin.notifications", "telegram.bot_token") not in backend.values
+    assert ("Hugin.notifications", "telegram.chat_id") not in backend.values
+    assert ("Hugin.notifications", "telegram") not in backend.values
+
+
+def test_gateway_connection_rejects_empty_and_corrupted_values() -> None:
+    backend = FakeKeyring()
+    store = WindowsNotificationCredentialStore(backend)
+
+    with pytest.raises(ValueError, match="ключ подключения"):
+        store.save_telegram_gateway(TelegramGatewayCredentials(" "))
+
+    backend.values[("Hugin.notifications", "telegram.gateway_access_token")] = " "
+    with pytest.raises(RuntimeError, match="повреждено"):
+        store.load_telegram_gateway()
+
+
+def test_notification_store_rejects_invalid_email_payloads() -> None:
+    backend = FakeKeyring()
+    store = WindowsNotificationCredentialStore(backend)
+
+    with pytest.raises(ValueError, match="не полностью"):
+        store.save_email(EmailCredentials("", 587, "", "", "", "to@example.com"))
+    with pytest.raises(ValueError, match="порт"):
+        store.save_email(
+            EmailCredentials(
+                "smtp.example.com",
+                0,
+                "user",
+                "password",
+                "from@example.com",
+                "to@example.com",
+            )
+        )
+    assert store.load_email() is None
+
+    backend.values[("Hugin.notifications", "email")] = "{"
+    with pytest.raises(RuntimeError, match="повреждены"):
+        store.load_email()
+    backend.values[("Hugin.notifications", "email")] = "[]"
+    with pytest.raises(RuntimeError, match="повреждены"):
+        store.load_email()
+
+    malformed = {
+        "smtp_host": "",
+        "smtp_port": 587,
+        "username": "user",
+        "password": "password",
+        "sender": "from@example.com",
+        "recipient": "to@example.com",
+        "starttls": True,
+    }
+    for key, value in (
+        ("smtp_host", ""),
+        ("smtp_port", 0),
+        ("username", 1),
+        ("sender", 1),
+        ("recipient", ""),
+        ("starttls", "yes"),
+    ):
+        payload = {**malformed, "smtp_host": "smtp.example.com", key: value}
+        backend.values[("Hugin.notifications", "email")] = json.dumps(payload)
+        with pytest.raises(RuntimeError, match="повреждены"):
+            store.load_email()
+
+
+def test_notification_store_requires_windows_without_injected_backend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("hugin.adapters.notification_credentials.sys.platform", "linux")
+
+    with pytest.raises(RuntimeError, match="Windows"):
+        WindowsNotificationCredentialStore().load_telegram_gateway()
 
 
 def test_windows_sender_accepts_only_successful_system_call(
@@ -86,39 +173,33 @@ def test_windows_sender_accepts_only_successful_system_call(
         WindowsToastSender().send(NotificationContent("Hugin", "Ошибка"))
 
 
-def test_telegram_sender_requires_positive_confirmation(
+def test_telegram_sender_uses_gateway_without_bot_token(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    captured: list[dict[str, object]] = []
+    captured: list[tuple[str, int, str, str, str]] = []
 
-    class Response:
-        def __enter__(self) -> Response:
-            return self
+    class Client:
+        def __init__(self, gateway_url: str, *, timeout_seconds: int) -> None:
+            self.gateway_url = gateway_url
+            self.timeout_seconds = timeout_seconds
 
-        def __exit__(self, *_args: object) -> None:
-            pass
+        def send(self, access_token: str, title: str, body: str) -> None:
+            captured.append((self.gateway_url, self.timeout_seconds, access_token, title, body))
 
-        def read(self) -> bytes:
-            return b'{"ok":true,"result":{"message_id":7}}'
-
-    def urlopen(request: object, *, timeout: int) -> Response:
-        assert timeout == 15
-        payload = cast(Request, request).data
-        assert payload is not None
-        captured.append(json.loads(cast(bytes, payload)))
-        return Response()
-
-    monkeypatch.setattr(notification_module, "urlopen", urlopen)
-    TelegramNotificationSender(TelegramCredentials("token", "chat")).send(
-        NotificationContent("Приглашение", "Отклик: Python")
-    )
+    monkeypatch.setattr("hugin.adapters.notifications.TelegramGatewayClient", Client)
+    TelegramGatewayNotificationSender(
+        "https://telegram.example",
+        TelegramGatewayCredentials("hgt_connection.secret"),
+    ).send(NotificationContent("Приглашение", "Отклик: Python"))
 
     assert captured == [
-        {
-            "chat_id": "chat",
-            "text": "Приглашение\n\nОтклик: Python",
-            "disable_web_page_preview": True,
-        }
+        (
+            "https://telegram.example",
+            15,
+            "hgt_connection.secret",
+            "Приглашение",
+            "Отклик: Python",
+        )
     ]
 
 

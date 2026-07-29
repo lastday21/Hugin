@@ -471,11 +471,13 @@ class ProfileQuestionService:
         return tuple(ProfileQuestionCandidate(model.key, model.question_text) for model in models)
 
     def answer(self, account_id: int, key: str, answer: str) -> None:
-        value = answer.strip()
+        value = answer.strip().lstrip("\ufeff").strip()
         if not value:
             raise ValueError("Ответ не может быть пустым")
         if len(value) > 4000:
             raise ValueError("Ответ слишком длинный")
+        if "???" in value or "\ufffd" in value or value.startswith(("ï»¿", "п»ї")):
+            raise ValueError("Ответ содержит повреждённые символы; введите его заново")
 
         profile = self._profile(account_id)
         question = self._session.scalar(

@@ -1,15 +1,21 @@
+from pathlib import Path
+
 import pytest
 
 from hugin import __main__ as cli
 from hugin.core.settings import Settings
 
 
-def test_main_starts_local_server(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_main_starts_local_server(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
     settings = Settings(
         environment="test",
         api_host="127.0.0.1",
         api_port=8123,
         log_level="WARNING",
+        data_dir=tmp_path,
     )
     calls: list[tuple[str, dict[str, object]]] = []
     upgraded: list[Settings] = []

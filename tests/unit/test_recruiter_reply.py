@@ -22,7 +22,11 @@ from hugin.domain.communications import (
     CommunicationStateError,
 )
 from hugin.domain.content import ConfirmationState, RecruiterMessageState
-from hugin.services.ai_prompts import AiPromptSettingsService
+from hugin.services.ai_prompts import (
+    ALICE_AI_MODEL,
+    QWEN3_AI_MODEL,
+    AiPromptSettingsService,
+)
 from hugin.services.communications import CommunicationService, RecordingMessageSender
 from hugin.services.recruiter_reply import RecruiterReplyService
 from tests.unit.test_communications import create_application
@@ -190,6 +194,15 @@ def test_ai_prompt_settings_validate_update_and_reset(settings: Settings) -> Non
         with database.sessions.begin() as session:
             service = AiPromptSettingsService(session)
             defaults = service.get()
+            assert service.get_model() == ALICE_AI_MODEL
+            assert service.get_reasoning_effort() == "high"
+            assert service.update_model(QWEN3_AI_MODEL, "medium") == QWEN3_AI_MODEL
+            assert service.get_model() == QWEN3_AI_MODEL
+            assert service.get_reasoning_effort() == "medium"
+            with pytest.raises(ValueError, match="недоступная модель"):
+                service.update_model("unknown/latest")
+            with pytest.raises(ValueError, match="режим обработки"):
+                service.update_model(QWEN3_AI_MODEL, "unknown")
             updated = service.update(
                 resume="  Делай резюме короче.  ",
                 cover_letter="Пиши без шаблонов.",
@@ -211,5 +224,7 @@ def test_ai_prompt_settings_validate_update_and_reset(settings: Settings) -> Non
                 )
             assert service.reset() == defaults
             assert service.get() == defaults
+            assert service.get_model() == QWEN3_AI_MODEL
+            assert service.get_reasoning_effort() == "medium"
     finally:
         database.close()

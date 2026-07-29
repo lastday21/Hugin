@@ -11,6 +11,9 @@ from hugin.core.settings import Settings
 def configured_yandex_ai_client(
     settings: Settings,
     store: WindowsYandexAICredentialStore | None = None,
+    *,
+    model: str | None = None,
+    reasoning_effort: str = "high",
 ) -> YandexAIClient:
     environment_key = settings.yandex_ai_api_key.get_secret_value().strip()
     if environment_key:
@@ -29,7 +32,8 @@ def configured_yandex_ai_client(
     return YandexAIClient(
         credentials.api_key,
         credentials.folder_id,
-        credentials.model,
+        model or credentials.model,
         settings.yandex_ai_base_url,
         settings.yandex_ai_timeout_seconds,
+        reasoning_effort=reasoning_effort,
     )

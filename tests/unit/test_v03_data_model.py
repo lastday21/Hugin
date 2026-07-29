@@ -237,6 +237,8 @@ def test_v03_schema_persists_required_entities(settings: Settings) -> None:
 
             assert settings_row is not None
             assert settings_row.hh_apply_daily_limit == 25
+            assert settings_row.search_enabled is True
+            assert settings_row.resource_saving_mode is True
             assert mapping is not None
             assert mapping.role.value == "PRIMARY"
             assert query_model is not None

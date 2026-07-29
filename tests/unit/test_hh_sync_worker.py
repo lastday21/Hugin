@@ -55,7 +55,7 @@ class FakeBrowser:
     statuses: ClassVar[tuple[HhNegotiationData, ...]] = ()
     requested_ids: ClassVar[tuple[str, ...] | None] = None
 
-    def __init__(self, *_args: object) -> None:
+    def __init__(self, *_args: object, **_kwargs: object) -> None:
         pass
 
     def __enter__(self) -> FakeBrowser:

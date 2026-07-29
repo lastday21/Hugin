@@ -18,6 +18,7 @@ from hugin.domain.communications import (
     MessageSendRequest,
 )
 from hugin.domain.content import NotificationChannel, RecruiterMessageState
+from hugin.services.ai_prompts import ALICE_AI_MODEL, QWEN3_AI_MODEL
 from hugin.services.communications import CommunicationService, RecordingMessageSender
 from hugin.services.ui_communications import UiCommunicationService
 from tests.unit.test_communications import create_application
@@ -273,12 +274,65 @@ def test_ai_prompt_settings_api_updates_and_resets(settings: Settings) -> None:
     try:
         session_key = request(app, "GET", "/api/session").json()["key"]
         headers = {"X-Hugin-Session": session_key}
-        current = request(
+        communications = request(
             app,
             "GET",
             f"/api/communications?account_id={account_id}",
-        ).json()["ai_prompt_settings"]
+        ).json()
+        current = communications["ai_prompt_settings"]
         assert current["resume"] == current["defaults"]["resume"]
+        models = communications["ai_model_settings"]
+        assert models["selected"] == ALICE_AI_MODEL
+        assert models["reasoning_effort"] == "high"
+        assert [option["value"] for option in models["options"]] == [
+            ALICE_AI_MODEL,
+            QWEN3_AI_MODEL,
+        ]
+        assert [option["value"] for option in models["reasoning_options"]] == [
+            "low",
+            "medium",
+            "high",
+        ]
+        model_path = f"/api/communications/ai-model?account_id={account_id}"
+        assert (
+            request(
+                app,
+                "PUT",
+                model_path,
+                json={"model": QWEN3_AI_MODEL, "reasoning_effort": "high"},
+            ).status_code
+            == 403
+        )
+        assert (
+            request(
+                app,
+                "PUT",
+                model_path,
+                headers=headers,
+                json={"model": "unknown/latest", "reasoning_effort": "high"},
+            ).status_code
+            == 422
+        )
+        selected = request(
+            app,
+            "PUT",
+            model_path,
+            headers=headers,
+            json={"model": QWEN3_AI_MODEL, "reasoning_effort": "medium"},
+        )
+        assert selected.status_code == 200
+        assert selected.json()["ai_model_settings"]["selected"] == QWEN3_AI_MODEL
+        assert selected.json()["ai_model_settings"]["reasoning_effort"] == "medium"
+        assert (
+            request(
+                app,
+                "PUT",
+                model_path,
+                headers=headers,
+                json={"model": QWEN3_AI_MODEL, "reasoning_effort": "unknown"},
+            ).status_code
+            == 422
+        )
         assert request(app, "PUT", path, json=current["defaults"]).status_code == 403
         assert (
             request(
@@ -318,6 +372,8 @@ def test_ai_prompt_settings_api_updates_and_resets(settings: Settings) -> None:
         assert reset.status_code == 200
         prompts = reset.json()["ai_prompt_settings"]
         assert prompts["resume"] == prompts["defaults"]["resume"]
+        assert reset.json()["ai_model_settings"]["selected"] == QWEN3_AI_MODEL
+        assert reset.json()["ai_model_settings"]["reasoning_effort"] == "medium"
         assert (
             request(
                 app,

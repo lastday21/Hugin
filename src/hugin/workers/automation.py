@@ -6,6 +6,7 @@ from datetime import datetime
 
 from hugin.core.settings import Settings
 from hugin.database import create_database, upgrade_database
+from hugin.diagnostics import OperationJournal, error_details
 from hugin.domain.automation import (
     AutomationJobKind,
     AutomationJobRecord,
@@ -31,6 +32,7 @@ class AutomationWorker:
         account_id: int = 1,
         handlers: Mapping[AutomationJobKind, AutomationJobHandler] | None = None,
         poll_seconds: float = 2.0,
+        journal: OperationJournal | None = None,
     ) -> None:
         if account_id < 1:
             raise ValueError("Идентификатор аккаунта должен быть положительным")
@@ -40,6 +42,7 @@ class AutomationWorker:
         self._account_id = account_id
         self._handlers = dict(handlers or {})
         self._poll_seconds = poll_seconds
+        self._journal = journal or OperationJournal(settings.data_dir)
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -50,7 +53,17 @@ class AutomationWorker:
     def start(self) -> None:
         if self.running:
             return
-        upgrade_database(self._settings)
+        starting = self._journal.start(
+            "automation",
+            "worker.lifecycle",
+            action="start",
+            account_id=self._account_id,
+        )
+        try:
+            upgrade_database(self._settings)
+        except Exception as error:
+            starting.fail(error)
+            raise
         self._stop.clear()
         self._thread = threading.Thread(
             target=self._run,
@@ -58,6 +71,7 @@ class AutomationWorker:
             daemon=True,
         )
         self._thread.start()
+        starting.succeed()
 
     def stop(self, timeout_seconds: float = 10.0) -> None:
         self._stop.set()
@@ -65,6 +79,13 @@ class AutomationWorker:
         if thread is not None and thread.is_alive():
             thread.join(timeout_seconds)
         self._thread = None
+        self._journal.record(
+            "automation",
+            "worker.lifecycle",
+            status="completed",
+            action="stop",
+            account_id=self._account_id,
+        )
 
     def run_once(self, now: datetime | None = None) -> bool:
         database = create_database(self._settings)
@@ -85,6 +106,16 @@ class AutomationWorker:
             if job is None:
                 return False
 
+            run = self._journal.start(
+                "automation",
+                "scheduled_job",
+                account_id=job.account_id,
+                job_key=job.key,
+                job_kind=job.kind.value,
+                search_query_id=job.search_query_id,
+                interval_seconds=job.interval_seconds,
+                previous_failures=job.consecutive_failures,
+            )
             handler = self._handlers.get(job.kind)
             if handler is None:
                 with database.sessions.begin() as session:
@@ -94,6 +125,7 @@ class AutomationWorker:
                         error_message=self._missing_handler_message(job.kind),
                         now=now,
                     )
+                run.block(error_code="SOURCE_NOT_CONNECTED")
                 return True
 
             try:
@@ -106,6 +138,7 @@ class AutomationWorker:
                         error_message=str(error),
                         now=now,
                     )
+                run.block(error_code=error.code, error_message=str(error))
             except Exception as error:
                 with database.sessions.begin() as session:
                     AutomationSchedulerService(session).fail(
@@ -114,16 +147,29 @@ class AutomationWorker:
                         error_message=str(error) or "Фоновая проверка завершилась ошибкой",
                         now=now,
                     )
+                run.fail(error)
             else:
                 with database.sessions.begin() as session:
                     AutomationSchedulerService(session).complete(job.key, result, now)
+                run.succeed(result=result)
             return True
         finally:
             database.close()
 
     def _run(self) -> None:
         while not self._stop.is_set():
-            worked = self.run_once()
+            try:
+                worked = self.run_once()
+            except Exception as error:
+                self._journal.record(
+                    "automation",
+                    "worker.loop",
+                    status="failed",
+                    level="ERROR",
+                    account_id=self._account_id,
+                    **error_details(error),
+                )
+                worked = False
             if not worked:
                 self._stop.wait(self._poll_seconds)
 

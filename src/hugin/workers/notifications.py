@@ -9,11 +9,12 @@ from hugin.adapters.notification_credentials import WindowsNotificationCredentia
 from hugin.adapters.notifications import (
     EmailNotificationSender,
     NotificationContent,
-    TelegramNotificationSender,
+    TelegramGatewayNotificationSender,
     WindowsToastSender,
 )
 from hugin.core.settings import Settings
 from hugin.database import create_database, upgrade_database
+from hugin.diagnostics import OperationJournal, error_details
 from hugin.domain.communications import NotificationRecord
 from hugin.domain.content import NotificationChannel
 from hugin.repositories.communications import CommunicationRepository
@@ -27,6 +28,7 @@ class NotificationWorker:
         *,
         account_id: int = 1,
         poll_seconds: float = 2.0,
+        journal: OperationJournal | None = None,
     ) -> None:
         if account_id < 1:
             raise ValueError("Идентификатор аккаунта должен быть положительным")
@@ -35,6 +37,7 @@ class NotificationWorker:
         self._settings = settings
         self._account_id = account_id
         self._poll_seconds = poll_seconds
+        self._journal = journal or OperationJournal(settings.data_dir)
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -45,7 +48,17 @@ class NotificationWorker:
     def start(self) -> None:
         if self.running:
             return
-        upgrade_database(self._settings)
+        starting = self._journal.start(
+            "notifications",
+            "worker.lifecycle",
+            action="start",
+            account_id=self._account_id,
+        )
+        try:
+            upgrade_database(self._settings)
+        except Exception as error:
+            starting.fail(error)
+            raise
         self._stop.clear()
         self._thread = threading.Thread(
             target=self._run,
@@ -53,6 +66,7 @@ class NotificationWorker:
             daemon=True,
         )
         self._thread.start()
+        starting.succeed()
 
     def stop(self, timeout_seconds: float = 10.0) -> None:
         self._stop.set()
@@ -60,6 +74,13 @@ class NotificationWorker:
         if thread is not None and thread.is_alive():
             thread.join(timeout_seconds)
         self._thread = None
+        self._journal.record(
+            "notifications",
+            "worker.lifecycle",
+            status="completed",
+            action="stop",
+            account_id=self._account_id,
+        )
 
     def run_once(self, now: datetime | None = None) -> bool:
         selected_at = now or datetime.now(UTC)
@@ -73,6 +94,16 @@ class NotificationWorker:
         if notification is None:
             return False
 
+        run = self._journal.start(
+            "notifications",
+            "send",
+            account_id=self._account_id,
+            notification_id=notification.id,
+            application_id=notification.application_id,
+            incident_id=notification.incident_id,
+            event_type=notification.event_type,
+            channel=notification.channel.value,
+        )
         try:
             self._send(notification)
         except Exception as error:
@@ -81,8 +112,10 @@ class NotificationWorker:
                 type(error).__name__,
                 selected_at + timedelta(minutes=5),
             )
+            run.fail(error, retry_in_minutes=5)
         else:
             self._record_success(notification.id, selected_at)
+            run.succeed()
         return True
 
     def _send(self, notification: NotificationRecord) -> None:
@@ -98,10 +131,14 @@ class NotificationWorker:
             return
         credentials = WindowsNotificationCredentialStore()
         if notification.channel is NotificationChannel.TELEGRAM:
-            telegram = credentials.load_telegram()
+            telegram = credentials.load_telegram_gateway()
             if telegram is None:
                 raise RuntimeError("Telegram не настроен")
-            TelegramNotificationSender(telegram).send(content)
+            TelegramGatewayNotificationSender(
+                self._settings.telegram_gateway_url,
+                telegram,
+                timeout_seconds=self._settings.telegram_gateway_timeout_seconds,
+            ).send(content)
             return
         email = credentials.load_email()
         if email is None:
@@ -138,6 +175,17 @@ class NotificationWorker:
 
     def _run(self) -> None:
         while not self._stop.is_set():
-            worked = self.run_once()
+            try:
+                worked = self.run_once()
+            except Exception as error:
+                self._journal.record(
+                    "notifications",
+                    "worker.loop",
+                    status="failed",
+                    level="ERROR",
+                    account_id=self._account_id,
+                    **error_details(error),
+                )
+                worked = False
             if not worked:
                 self._stop.wait(self._poll_seconds)

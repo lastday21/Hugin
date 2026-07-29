@@ -34,6 +34,7 @@ hugin-resume-improve = "hugin.resume_improvement_cli:main"
 hugin-letters = "hugin.cover_letter_cli:main"
 hugin-forms = "hugin.screening_cli:main"
 hugin-backup = "hugin.backup_cli:main"
+hugin-journal = "hugin.journal_cli:main"
 hugin-desktop = "hugin.desktop:launch"
 
 [dependency-groups]

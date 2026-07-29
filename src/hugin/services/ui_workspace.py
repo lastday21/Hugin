@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 from hugin.database.models import (
     ApplicationEventModel,
     ApplicationModel,
+    ApplicationSettingsModel,
     ApplicationTaskModel,
     AutomationJobModel,
     CareerDirectionModel,
@@ -108,6 +109,8 @@ class UiIncident:
 class UiDashboard:
     account_label: str
     system_state: str
+    search_enabled: bool
+    resource_saving_mode: bool
     next_apply_at: datetime | None
     daily_limit: int
     delay_min_seconds: int
@@ -225,6 +228,9 @@ class UiWorkspaceService:
 
     def dashboard(self, account_id: int) -> UiDashboard:
         account = self._account(account_id)
+        settings = self._session.get(ApplicationSettingsModel, 1)
+        if settings is None:
+            raise LookupError("Настройки приложения не найдены")
         queue = QueueService(self._session).status()
         applied_today = ApplicationRepository(self._session).count_applied_since(
             account_id,
@@ -326,6 +332,8 @@ class UiWorkspaceService:
         return UiDashboard(
             account_label=account.label,
             system_state=queue.system.state.value,
+            search_enabled=settings.search_enabled,
+            resource_saving_mode=settings.resource_saving_mode,
             next_apply_at=queue.system.next_apply_at,
             daily_limit=queue.policy.daily_limit,
             delay_min_seconds=queue.policy.delay_min_seconds,

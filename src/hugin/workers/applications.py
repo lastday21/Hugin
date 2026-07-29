@@ -12,8 +12,10 @@ from hugin.adapters.hh_browser import VisibleHhBrowser
 from hugin.core.settings import Settings
 from hugin.database import create_database, upgrade_database
 from hugin.database.models import CareerDirectionModel
+from hugin.diagnostics import OperationJournal, error_details
 from hugin.domain.hh import HhApplyResult, HhApplyStatus
 from hugin.domain.time import as_utc, local_day_start_utc, local_timezone_name
+from hugin.services.ai_prompts import AiPromptSettingsService
 from hugin.services.application_automation import (
     ApplicationAutomationService,
     ApplyJob,
@@ -36,6 +38,7 @@ class ApplicationWorker:
         poll_seconds: float = 5.0,
         job_handler: ApplicationJobHandler | None = None,
         letter_preparer: LetterQueuePreparer | None = None,
+        journal: OperationJournal | None = None,
     ) -> None:
         if account_id < 1:
             raise ValueError("Идентификатор аккаунта должен быть положительным")
@@ -47,6 +50,7 @@ class ApplicationWorker:
         self._poll_seconds = poll_seconds
         self._job_handler = job_handler or self._run_job
         self._letter_preparer = letter_preparer or self._prepare_letters
+        self._journal = journal or OperationJournal(settings.data_dir)
         self._next_letter_attempt_at: datetime | None = None
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -58,11 +62,21 @@ class ApplicationWorker:
     def start(self) -> None:
         if self.running:
             return
-        upgrade_database(self._settings)
-        database = create_database(self._settings)
+        starting = self._journal.start(
+            "applications",
+            "worker.lifecycle",
+            action="start",
+            account_id=self._account_id,
+        )
+        try:
+            upgrade_database(self._settings)
+            database = create_database(self._settings)
+        except Exception as error:
+            starting.fail(error)
+            raise
         try:
             with database.sessions.begin() as session:
-                ApplicationAutomationService(session).recover_interrupted()
+                recovered = ApplicationAutomationService(session).recover_interrupted()
         finally:
             database.close()
         self._stop.clear()
@@ -72,6 +86,7 @@ class ApplicationWorker:
             daemon=True,
         )
         self._thread.start()
+        starting.succeed(recovered_tasks=recovered)
 
     def stop(self, timeout_seconds: float = 10.0) -> None:
         self._stop.set()
@@ -79,6 +94,13 @@ class ApplicationWorker:
         if thread is not None and thread.is_alive():
             thread.join(timeout_seconds)
         self._thread = None
+        self._journal.record(
+            "applications",
+            "worker.lifecycle",
+            status="completed",
+            action="stop",
+            account_id=self._account_id,
+        )
 
     def run_once(self, now: datetime | None = None) -> bool:
         selected_at = as_utc(now or datetime.now(UTC))
@@ -86,20 +108,52 @@ class ApplicationWorker:
         if job is None and self._may_prepare_letters(selected_at):
             try:
                 prepared = self._letter_preparer(self._account_id)
-            except (LookupError, RuntimeError, ValueError):
+            except (LookupError, RuntimeError, ValueError) as error:
+                self._journal.record(
+                    "applications",
+                    "cover_letters.prepare",
+                    status="failed",
+                    level="ERROR",
+                    account_id=self._account_id,
+                    retry_in_minutes=15,
+                    **error_details(error),
+                )
                 self._next_letter_attempt_at = selected_at + timedelta(minutes=15)
             else:
                 self._next_letter_attempt_at = (
                     selected_at + timedelta(minutes=5) if prepared == 0 else selected_at
                 )
                 if prepared:
+                    self._journal.record(
+                        "applications",
+                        "cover_letters.prepare",
+                        status="completed",
+                        account_id=self._account_id,
+                        prepared=prepared,
+                    )
                     job = self._claim(selected_at)
         if job is None:
             return False
 
+        task = getattr(job, "task", None)
+        application = getattr(job, "application", None)
+        vacancy = getattr(job, "vacancy", None)
+        resume = getattr(job, "resume", None)
+        run = self._journal.start(
+            "applications",
+            "apply",
+            account_id=self._account_id,
+            task_id=getattr(task, "id", None),
+            application_id=getattr(application, "id", None),
+            vacancy_id=getattr(vacancy, "hh_id", None),
+            resume_id=getattr(resume, "id", None),
+        )
+        handler_error: Exception | None = None
         try:
             result = self._job_handler(job)
         except Exception as error:
+            handler_error = error
+            run.fail(error, result_status=HhApplyStatus.UNKNOWN_RESULT.value)
             result = HhApplyResult(
                 HhApplyStatus.UNKNOWN_RESULT,
                 job.vacancy.source_url,
@@ -128,8 +182,19 @@ class ApplicationWorker:
                     apply_delay=apply_delay,
                     now=finished_at,
                 )
+        except Exception as error:
+            if handler_error is None:
+                run.fail(error, result_status=result.status.value, stage="record_result")
+            raise
         finally:
             database.close()
+        if handler_error is None:
+            run.succeed(
+                result_status=result.status.value,
+                questions=len(result.questions),
+                warnings=len(result.warnings),
+                retry_after_seconds=result.retry_after_seconds,
+            )
         return True
 
     def _claim(self, now: datetime) -> ApplyJob | None:
@@ -153,10 +218,15 @@ class ApplicationWorker:
             database.close()
 
     def _prepare_letters(self, account_id: int) -> int:
-        client = configured_yandex_ai_client(self._settings)
         database = create_database(self._settings)
         try:
             with database.sessions.begin() as session:
+                ai_settings = AiPromptSettingsService(session)
+                client = configured_yandex_ai_client(
+                    self._settings,
+                    model=ai_settings.get_model(),
+                    reasoning_effort=ai_settings.get_reasoning_effort(),
+                )
                 direction_names = tuple(
                     session.scalars(
                         select(CareerDirectionModel.name)
@@ -190,6 +260,7 @@ class ApplicationWorker:
                 self._settings.hh_resumes_url,
                 self._settings.hh_search_url,
                 self._settings.hh_browser_timeout_ms,
+                start_minimized=True,
             ) as browser,
         ):
             login = HhLoginService(WindowsCredentialStore()).authenticate(
@@ -222,6 +293,17 @@ class ApplicationWorker:
 
     def _run(self) -> None:
         while not self._stop.is_set():
-            worked = self.run_once()
+            try:
+                worked = self.run_once()
+            except Exception as error:
+                self._journal.record(
+                    "applications",
+                    "worker.loop",
+                    status="failed",
+                    level="ERROR",
+                    account_id=self._account_id,
+                    **error_details(error),
+                )
+                worked = False
             if not worked:
                 self._stop.wait(self._poll_seconds)

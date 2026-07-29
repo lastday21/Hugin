@@ -6,8 +6,8 @@ import subprocess
 import threading
 import time
 import webbrowser
-from collections.abc import Iterator
-from contextlib import contextmanager
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager, suppress
 from importlib import import_module
 from pathlib import Path
 from typing import Protocol, cast
@@ -22,18 +22,26 @@ from hugin.adapters.hh_browser import VisibleHhBrowser
 from hugin.adapters.hh_messages import HhBrowserMessageSender
 from hugin.adapters.notification_credentials import (
     EmailCredentials,
-    TelegramCredentials,
+    TelegramGatewayCredentials,
     WindowsNotificationCredentialStore,
 )
 from hugin.adapters.postgres_backup import DockerPostgresBackupAdapter
+from hugin.adapters.telegram_gateway import (
+    TelegramGatewayAuthorizationError,
+    TelegramGatewayClient,
+    TelegramGatewayError,
+    TelegramGatewayTimeout,
+)
 from hugin.adapters.yandex_ai import YandexAIError
 from hugin.core.settings import Settings, get_settings
 from hugin.database import create_database, upgrade_database
 from hugin.database.models import ApplicationModel, VacancyModel
+from hugin.diagnostics import OperationJournal, error_details
 from hugin.domain.automation import AutomationJobKind
 from hugin.domain.communications import CommunicationNotFoundError, CommunicationStateError
 from hugin.domain.content import RecruiterMessageState
 from hugin.domain.hh import HhFormReviewStatus
+from hugin.services.ai_prompts import AiPromptSettingsService
 from hugin.services.backups import BackupService
 from hugin.services.communications import CommunicationService, RecordingMessageSender
 from hugin.services.hh_login import HhLoginService, LoginStatus
@@ -50,6 +58,12 @@ from hugin.workers.notifications import NotificationWorker
 
 class WebviewWindow(Protocol):
     def destroy(self) -> None: ...
+
+
+class BackgroundWorker(Protocol):
+    def start(self) -> None: ...
+
+    def stop(self, timeout_seconds: float = 10.0) -> None: ...
 
 
 class WebviewModule(Protocol):
@@ -89,16 +103,29 @@ class DesktopBridge:
         account_id: int = 1,
         *,
         browser_lock: threading.Lock | None = None,
+        journal: OperationJournal | None = None,
     ) -> None:
         self._settings = settings
         self._account_id = account_id
         self._lock = browser_lock or threading.Lock()
+        self._telegram_lock = threading.Lock()
+        self._journal = journal or OperationJournal(settings.data_dir)
 
     def open_form(self, vacancy_id: str) -> dict[str, object]:
-        with self._lock:
-            return self._open_form(vacancy_id.strip())
+        def action() -> dict[str, object]:
+            with self._lock:
+                return self._open_form(vacancy_id.strip())
+
+        return self._record_action(
+            "screening_form.open",
+            action,
+            vacancy_id=vacancy_id.strip(),
+        )
 
     def open_url(self, url: str) -> dict[str, object]:
+        return self._record_action("hh_link.open", lambda: self._open_url(url))
+
+    def _open_url(self, url: str) -> dict[str, object]:
         value = url.strip()
         if not value.startswith(("https://hh.ru/", "https://www.hh.ru/")):
             return self._result("UNAVAILABLE", "Разрешены только ссылки hh.ru")
@@ -106,6 +133,13 @@ class DesktopBridge:
         return self._result("READY" if opened else "UNAVAILABLE", "Ссылка открыта")
 
     def open_invitation(self, invitation_id: int) -> dict[str, object]:
+        return self._record_action(
+            "invitation.open",
+            lambda: self._open_invitation(invitation_id),
+            invitation_id=invitation_id,
+        )
+
+    def _open_invitation(self, invitation_id: int) -> dict[str, object]:
         if invitation_id < 1:
             return self._result("UNAVAILABLE", "Некорректный номер приглашения")
         upgrade_database(self._settings)
@@ -139,6 +173,19 @@ class DesktopBridge:
         return self._result("READY" if opened else "UNAVAILABLE", "Ссылка открыта")
 
     def send_reply(
+        self,
+        message_id: int,
+        content_hash: str,
+        content_version: int,
+    ) -> dict[str, object]:
+        return self._record_action(
+            "recruiter_reply.send",
+            lambda: self._send_reply(message_id, content_hash, content_version),
+            message_id=message_id,
+            content_version=content_version,
+        )
+
+    def _send_reply(
         self,
         message_id: int,
         content_hash: str,
@@ -243,14 +290,26 @@ class DesktopBridge:
         return self._result(status, message_text)
 
     def generate_reply(self, application_id: int) -> dict[str, object]:
+        return self._record_action(
+            "recruiter_reply.generate",
+            lambda: self._generate_reply(application_id),
+            application_id=application_id,
+        )
+
+    def _generate_reply(self, application_id: int) -> dict[str, object]:
         if application_id < 1:
             return self._result("UNAVAILABLE", "Некорректный номер отклика")
         try:
-            client = configured_yandex_ai_client(self._settings)
             upgrade_database(self._settings)
             database = create_database(self._settings)
             try:
                 with database.sessions.begin() as session:
+                    ai_settings = AiPromptSettingsService(session)
+                    client = configured_yandex_ai_client(
+                        self._settings,
+                        model=ai_settings.get_model(),
+                        reasoning_effort=ai_settings.get_reasoning_effort(),
+                    )
                     draft = RecruiterReplyService(session, client).generate(
                         account_id=self._account_id,
                         application_id=application_id,
@@ -274,30 +333,113 @@ class DesktopBridge:
     def notification_credentials_status(self) -> dict[str, object]:
         store = WindowsNotificationCredentialStore()
         try:
-            telegram = store.load_telegram() is not None
+            telegram = store.load_telegram_gateway()
             email = store.load_email() is not None
         except RuntimeError as error:
             return {
                 **self._result("UNAVAILABLE", str(error)),
+                "telegram_bot_configured": False,
                 "telegram_configured": False,
+                "telegram_bot_username": self._settings.telegram_bot_username,
                 "email_configured": False,
             }
+        gateway = self._telegram_gateway_client()
+        try:
+            gateway_status = gateway.status()
+        except TelegramGatewayError:
+            return {
+                **self._result("READY", "Служба Telegram сейчас недоступна"),
+                "telegram_bot_configured": False,
+                "telegram_configured": False,
+                "telegram_bot_username": self._settings.telegram_bot_username,
+                "email_configured": email,
+            }
+        telegram_connected = False
+        bot_username = gateway_status.bot_username
+        if gateway_status.bot_ready and telegram is not None:
+            try:
+                connection = gateway.connection_status(telegram.access_token)
+            except TelegramGatewayAuthorizationError:
+                store.delete_telegram()
+            except TelegramGatewayError:
+                pass
+            else:
+                telegram_connected = True
+                bot_username = connection.bot_username
         return {
             **self._result("READY", "Настройки уведомлений проверены"),
-            "telegram_configured": telegram,
+            "telegram_bot_configured": gateway_status.bot_ready,
+            "telegram_configured": telegram_connected,
+            "telegram_bot_username": bot_username,
             "email_configured": email,
         }
 
-    def save_telegram_notifications(self, bot_token: str, chat_id: str) -> dict[str, object]:
+    def connect_telegram_notifications(self) -> dict[str, object]:
+        return self._record_action(
+            "telegram.chat.connect",
+            self._connect_telegram_with_lock,
+            connection_mode="telegram_start",
+        )
+
+    def _connect_telegram_with_lock(self) -> dict[str, object]:
+        if not self._telegram_lock.acquire(blocking=False):
+            return self._result("BUSY", "Подключение Telegram уже выполняется")
         try:
-            WindowsNotificationCredentialStore().save_telegram(
-                TelegramCredentials(bot_token, chat_id)
-            )
-        except (RuntimeError, ValueError) as error:
+            return self._connect_telegram_notifications()
+        finally:
+            self._telegram_lock.release()
+
+    def disconnect_telegram_notifications(self) -> dict[str, object]:
+        return self._record_action(
+            "telegram.chat.disconnect",
+            self._disconnect_telegram_notifications,
+        )
+
+    def _disconnect_telegram_notifications(self) -> dict[str, object]:
+        try:
+            store = WindowsNotificationCredentialStore()
+            credentials = store.load_telegram_gateway()
+            if credentials is not None:
+                self._telegram_gateway_client().disconnect(credentials.access_token)
+            store.delete_telegram()
+            gateway_status = self._telegram_gateway_client().status()
+        except (RuntimeError, TelegramGatewayError, ValueError) as error:
             return self._result("UNAVAILABLE", str(error))
-        return self._result("READY", "Telegram сохранён в защищённом хранилище Windows")
+        return self._result(
+            "READY",
+            "Чат Telegram отключён.",
+            telegram_bot_configured=gateway_status.bot_ready,
+            telegram_configured=False,
+            telegram_bot_username=gateway_status.bot_username,
+        )
 
     def save_email_notifications(
+        self,
+        smtp_host: str,
+        smtp_port: int,
+        username: str,
+        password: str,
+        sender: str,
+        recipient: str,
+        starttls: bool,
+    ) -> dict[str, object]:
+        return self._record_action(
+            "email.credentials.save",
+            lambda: self._save_email_notifications(
+                smtp_host,
+                smtp_port,
+                username,
+                password,
+                sender,
+                recipient,
+                starttls,
+            ),
+            smtp_host=smtp_host,
+            smtp_port=smtp_port,
+            starttls=starttls,
+        )
+
+    def _save_email_notifications(
         self,
         smtp_host: str,
         smtp_port: int,
@@ -327,7 +469,50 @@ class DesktopBridge:
         )
 
     def close(self) -> None:
-        return None
+        self._journal.record(
+            "desktop",
+            "bridge.lifecycle",
+            status="completed",
+            action="close",
+            account_id=self._account_id,
+        )
+
+    def _connect_telegram_notifications(self) -> dict[str, object]:
+        try:
+            store = WindowsNotificationCredentialStore()
+            client = self._telegram_gateway_client()
+            pairing = client.create_pairing()
+            try:
+                opened = webbrowser.open(pairing.start_url, new=2)
+            except (OSError, webbrowser.Error):
+                opened = False
+            if not opened:
+                return self._result(
+                    "UNAVAILABLE",
+                    "Не удалось открыть Telegram. Откройте бота вручную и повторите.",
+                )
+            connection = client.wait_for_connection(
+                pairing,
+                timeout_seconds=self._settings.telegram_connection_timeout_seconds,
+            )
+            store.save_telegram_gateway(TelegramGatewayCredentials(connection.access_token))
+        except TelegramGatewayTimeout as error:
+            return self._result("TIMEOUT", str(error))
+        except (RuntimeError, TelegramGatewayError, ValueError) as error:
+            return self._result("UNAVAILABLE", str(error))
+        return self._result(
+            "READY",
+            "Telegram подключён. Проверочное сообщение отправлено.",
+            telegram_bot_configured=True,
+            telegram_configured=True,
+            telegram_bot_username=connection.bot_username,
+        )
+
+    def _telegram_gateway_client(self) -> TelegramGatewayClient:
+        return TelegramGatewayClient(
+            self._settings.telegram_gateway_url,
+            timeout_seconds=self._settings.telegram_gateway_timeout_seconds,
+        )
 
     def _open_form(self, vacancy_id: str) -> dict[str, object]:
         if not vacancy_id or len(vacancy_id) > 64:
@@ -407,6 +592,34 @@ class DesktopBridge:
             "filled": len(review.filled_keys),
             "skipped": len(review.skipped_keys),
         }
+
+    def _record_action(
+        self,
+        event: str,
+        action: Callable[[], dict[str, object]],
+        **details: object,
+    ) -> dict[str, object]:
+        run = self._journal.start(
+            "desktop",
+            event,
+            account_id=self._account_id,
+            action_details=details,
+        )
+        try:
+            result = action()
+        except Exception as error:
+            run.fail(error)
+            raise
+        status = str(result.get("status", "UNKNOWN"))
+        result_details = {
+            "result_status": status,
+            "result_message": result.get("message"),
+        }
+        if status in {"READY", "SENT"}:
+            run.succeed(**result_details)
+        else:
+            run.block(**result_details)
+        return result
 
     @staticmethod
     def _result(
@@ -505,13 +718,22 @@ def show_launch_error(message: str) -> None:
 
 def main() -> None:
     settings = get_settings()
-    ensure_services(settings)
+    journal = OperationJournal(settings.data_dir)
+    starting = journal.start(
+        "desktop",
+        "application.start",
+        environment=settings.environment,
+    )
     try:
+        ensure_services(settings)
         webview = cast(WebviewModule, import_module("webview"))
     except ImportError as error:
-        raise RuntimeError(
-            "Установите оконную часть: uv sync --extra desktop --extra browser"
-        ) from error
+        failure = RuntimeError("Установите оконную часть: uv sync --extra desktop --extra browser")
+        starting.fail(failure)
+        raise failure from error
+    except Exception as error:
+        starting.fail(error)
+        raise
     browser_lock = threading.Lock()
     search_handler = HhSearchJobHandler(
         settings,
@@ -534,19 +756,31 @@ def main() -> None:
             AutomationJobKind.MESSAGES: messages_handler,
             AutomationJobKind.STATUSES: statuses_handler,
         },
+        journal=journal,
     )
     application_worker = ApplicationWorker(
         settings,
         browser_lock=browser_lock,
+        journal=journal,
     )
-    notification_worker = NotificationWorker(settings)
-    backup_worker = BackupWorker(settings)
-    bridge = DesktopBridge(settings, browser_lock=browser_lock)
-    worker.start()
-    application_worker.start()
-    notification_worker.start()
-    backup_worker.start()
+    notification_worker = NotificationWorker(settings, journal=journal)
+    backup_worker = BackupWorker(settings, journal=journal)
+    bridge = DesktopBridge(
+        settings,
+        browser_lock=browser_lock,
+        journal=journal,
+    )
+    workers: tuple[BackgroundWorker, ...] = (
+        worker,
+        application_worker,
+        notification_worker,
+        backup_worker,
+    )
+    started_workers: list[BackgroundWorker] = []
     try:
+        for background_worker in workers:
+            background_worker.start()
+            started_workers.append(background_worker)
         webview.create_window(
             "Hugin — поиск работы",
             settings.desktop_api_url,
@@ -556,13 +790,25 @@ def main() -> None:
             min_size=(1080, 700),
             background_color="#f4f7f5",
         )
+    except Exception as error:
+        starting.fail(error)
+        bridge.close()
+        for background_worker in reversed(started_workers):
+            background_worker.stop()
+        raise
+    starting.succeed(workers=len(started_workers))
+    session = journal.start("desktop", "application.session")
+    try:
         webview.start(debug=False)
+    except Exception as error:
+        session.fail(error)
+        raise
+    else:
+        session.succeed()
     finally:
         bridge.close()
-        backup_worker.stop()
-        notification_worker.stop()
-        application_worker.stop()
-        worker.stop()
+        for background_worker in reversed(started_workers):
+            background_worker.stop()
 
 
 def launch() -> None:
@@ -570,6 +816,15 @@ def launch() -> None:
         with single_desktop_instance():
             main()
     except Exception as error:
+        with suppress(Exception):
+            settings = get_settings()
+            OperationJournal(settings.data_dir).record(
+                "desktop",
+                "application.launch",
+                status="failed",
+                level="ERROR",
+                **error_details(error),
+            )
         show_launch_error(str(error))
 
 

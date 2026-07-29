@@ -1253,10 +1253,34 @@ def test_context_starts_visible_persistent_browser(
         assert page.navigation_timeout == 4_000
         assert chromium.calls[0]["headless"] is False
         assert chromium.calls[0]["no_viewport"] is True
+        assert chromium.calls[0]["args"] == ["--start-maximized"]
 
     assert (tmp_path / "profile").is_dir()
     assert context.closed
     assert playwright.stopped
+
+
+def test_background_context_starts_minimized_with_quiet_chromium(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    page = FakePage()
+    context = FakeContext(page)
+    chromium = FakeChromium(context)
+    playwright = FakePlaywright(chromium)
+    monkeypatch.setattr(browser_module, "sync_playwright", lambda: FakeStarter(playwright))
+
+    with VisibleHhBrowser(
+        tmp_path / "profile",
+        "https://hh.ru/account/login",
+        "https://hh.ru/applicant/resumes",
+        "https://hh.ru/search/vacancy",
+        4_000,
+        start_minimized=True,
+    ):
+        arguments = cast(list[str], chromium.calls[0]["args"])
+        assert arguments[0] == "--start-minimized"
+        assert "--mute-audio" in arguments
+        assert "--start-maximized" not in arguments
 
 
 def test_failed_browser_start_stops_playwright(

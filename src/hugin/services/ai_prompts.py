@@ -10,6 +10,57 @@ from hugin.database.models import ApplicationSettingsModel
 from hugin.domain.directions import ConfigPayload
 
 MAX_PROMPT_LENGTH = 4000
+ALICE_AI_MODEL = "aliceai-llm/latest"
+QWEN3_AI_MODEL = "qwen3-235b-a22b-fp8/latest"
+DEFAULT_AI_MODEL = ALICE_AI_MODEL
+DEFAULT_REASONING_EFFORT = "high"
+
+
+@dataclass(frozen=True, slots=True)
+class AiModelOption:
+    value: str
+    title: str
+    description: str
+
+
+@dataclass(frozen=True, slots=True)
+class AiReasoningOption:
+    value: str
+    title: str
+    description: str
+
+
+AI_MODEL_OPTIONS = (
+    AiModelOption(
+        value=ALICE_AI_MODEL,
+        title="Alice AI",
+        description="Лучше подходит для естественных писем и диалогов.",
+    ),
+    AiModelOption(
+        value=QWEN3_AI_MODEL,
+        title="Qwen 3 235B",
+        description="Мощная альтернативная модель для сложных текстов.",
+    ),
+)
+AI_MODEL_VALUES = frozenset(option.value for option in AI_MODEL_OPTIONS)
+AI_REASONING_OPTIONS = (
+    AiReasoningOption(
+        value="low",
+        title="Быстрый",
+        description="Ответ быстрее и дешевле.",
+    ),
+    AiReasoningOption(
+        value="medium",
+        title="Сбалансированный",
+        description="Баланс скорости и качества.",
+    ),
+    AiReasoningOption(
+        value="high",
+        title="Глубокий",
+        description="Приоритет качества и тщательной проверки.",
+    ),
+)
+AI_REASONING_VALUES = frozenset(option.value for option in AI_REASONING_OPTIONS)
 
 DEFAULT_RESUME_PROMPT = (
     "Пиши кратко и предметно, используй активные формулировки. "
@@ -60,6 +111,40 @@ class AiPromptSettingsService:
             ),
         )
 
+    def get_model(self) -> str:
+        stored = self._settings().ai_prompt_overrides
+        value = stored.get("model")
+        if isinstance(value, str):
+            selected = value.strip()
+            if selected in AI_MODEL_VALUES:
+                return selected
+        return DEFAULT_AI_MODEL
+
+    def get_reasoning_effort(self) -> str:
+        stored = self._settings().ai_prompt_overrides
+        value = stored.get("reasoning_effort")
+        if isinstance(value, str):
+            selected = value.strip()
+            if selected in AI_REASONING_VALUES:
+                return selected
+        return DEFAULT_REASONING_EFFORT
+
+    def update_model(self, model: str, reasoning_effort: str | None = None) -> str:
+        selected = model.strip()
+        if selected not in AI_MODEL_VALUES:
+            raise ValueError("Выбрана недоступная модель")
+        settings = self._settings()
+        values = dict(settings.ai_prompt_overrides)
+        values["model"] = selected
+        if reasoning_effort is not None:
+            effort = reasoning_effort.strip()
+            if effort not in AI_REASONING_VALUES:
+                raise ValueError("Выбран недоступный режим обработки")
+            values["reasoning_effort"] = effort
+        settings.ai_prompt_overrides = values
+        self._session.flush()
+        return selected
+
     def update(
         self,
         *,
@@ -73,18 +158,24 @@ class AiPromptSettingsService:
             recruiter_reply=self._validated(recruiter_reply, "ответов работодателю"),
         )
         settings = self._settings()
-        values: ConfigPayload = {
-            "resume": selected.resume,
-            "cover_letter": selected.cover_letter,
-            "recruiter_reply": selected.recruiter_reply,
-        }
+        values: ConfigPayload = dict(settings.ai_prompt_overrides)
+        values.update(
+            {
+                "resume": selected.resume,
+                "cover_letter": selected.cover_letter,
+                "recruiter_reply": selected.recruiter_reply,
+            }
+        )
         settings.ai_prompt_overrides = values
         self._session.flush()
         return selected
 
     def reset(self) -> AiPromptSettings:
         settings = self._settings()
-        settings.ai_prompt_overrides = {}
+        values = dict(settings.ai_prompt_overrides)
+        for key in ("resume", "cover_letter", "recruiter_reply"):
+            values.pop(key, None)
+        settings.ai_prompt_overrides = values
         self._session.flush()
         return DEFAULT_AI_PROMPTS
 

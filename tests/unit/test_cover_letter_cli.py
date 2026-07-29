@@ -128,7 +128,21 @@ def test_prepare_creates_letters_without_browser_or_hh_submission(
     monkeypatch.setattr(cover_letter_cli, "get_settings", lambda: Settings())
     monkeypatch.setattr(cover_letter_cli, "upgrade_database", lambda _settings: None)
     monkeypatch.setattr(cover_letter_cli, "create_database", lambda _settings: database)
-    monkeypatch.setattr(cover_letter_cli, "_client", lambda _settings, _store: object())
+    monkeypatch.setattr(
+        cover_letter_cli,
+        "AiPromptSettingsService",
+        lambda _session: SimpleNamespace(
+            get_model=lambda: "selected-model",
+            get_reasoning_effort=lambda: "high",
+        ),
+    )
+    monkeypatch.setattr(
+        cover_letter_cli,
+        "_client",
+        lambda _settings, _store, *, model, reasoning_effort: {
+            ("selected-model", "high"): object()
+        }[(model, reasoning_effort)],
+    )
     monkeypatch.setattr(cover_letter_cli, "ApplicationAutomationService", FakeAutomation)
     monkeypatch.setattr(cover_letter_cli, "CoverLetterService", FakeLetters)
 
@@ -244,7 +258,7 @@ def test_client_loads_environment_and_protected_store(
     received: list[tuple[object, ...]] = []
 
     class FakeClient:
-        def __init__(self, *args: object) -> None:
+        def __init__(self, *args: object, **_kwargs: object) -> None:
             received.append(args)
 
     monkeypatch.setattr(cover_letter_cli, "YandexAIClient", FakeClient)

@@ -165,6 +165,12 @@ def test_run_uses_separate_service_and_reports_paths(
         def __init__(self, _session: object) -> None:
             pass
 
+        def get_model(self) -> str:
+            return "qwen3-235b-a22b-fp8/latest"
+
+        def get_reasoning_effort(self) -> str:
+            return "high"
+
         def get(self) -> object:
             return type(
                 "PromptSettings",

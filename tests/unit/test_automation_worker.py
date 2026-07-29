@@ -59,9 +59,9 @@ def test_worker_runs_due_jobs_once_without_catch_up(settings: Settings) -> None:
             messages = next(job for job in jobs if job.kind is AutomationJobKind.MESSAGES)
             statuses = next(job for job in jobs if job.kind is AutomationJobKind.STATUSES)
             assert messages.state is AutomationJobState.WAITING
-            assert messages.next_run_at == now + timedelta(minutes=5)
+            assert messages.next_run_at == now + timedelta(minutes=15)
             assert statuses.state is AutomationJobState.WAITING
-            assert statuses.next_run_at == now + timedelta(minutes=30)
+            assert statuses.next_run_at == now + timedelta(minutes=60)
     finally:
         database.close()
 

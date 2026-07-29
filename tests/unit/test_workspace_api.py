@@ -249,6 +249,8 @@ def test_workspace_endpoints_return_real_data_and_protect_changes(settings: Sett
         assert dashboard.status_code == 200
         dashboard_data = dashboard.json()
         assert dashboard_data["account_label"] == "Тимур"
+        assert dashboard_data["search_enabled"] is True
+        assert dashboard_data["resource_saving_mode"] is True
         assert dashboard_data["applied_today"] == 1
         assert dashboard_data["remaining_today"] == 24
         assert dashboard_data["delay_min_seconds"] == 30
@@ -344,6 +346,52 @@ def test_workspace_endpoints_return_real_data_and_protect_changes(settings: Sett
         resumed = request(app, "POST", "/api/queue/resume", headers=headers)
         assert resumed.status_code == 200
         assert resumed.json()["state"] == "RUNNING"
+
+        assert request(app, "POST", "/api/search/pause").status_code == 403
+        search_paused = request(app, "POST", "/api/search/pause", headers=headers)
+        assert search_paused.status_code == 200
+        assert search_paused.json() == {
+            "search_enabled": False,
+            "resource_saving_mode": True,
+        }
+        search_resumed = request(app, "POST", "/api/search/resume", headers=headers)
+        assert search_resumed.status_code == 200
+        assert search_resumed.json() == {
+            "search_enabled": True,
+            "resource_saving_mode": True,
+        }
+
+        resource_path = "/api/background/resource-saving"
+        assert request(app, "PUT", resource_path, json={"enabled": False}).status_code == 403
+        resource_saving = request(
+            app,
+            "PUT",
+            resource_path,
+            headers=headers,
+            json={"enabled": False},
+        )
+        assert resource_saving.status_code == 200
+        assert resource_saving.json() == {
+            "search_enabled": True,
+            "resource_saving_mode": False,
+        }
+        assert (
+            request(
+                app,
+                "PUT",
+                resource_path,
+                headers=headers,
+                json={"enabled": "нет"},
+            ).status_code
+            == 422
+        )
+        background_dashboard = request(
+            app,
+            "GET",
+            f"/api/dashboard?account_id={account_id}",
+        ).json()
+        assert background_dashboard["search_enabled"] is True
+        assert background_dashboard["resource_saving_mode"] is False
 
         database = create_database(settings)
         try:

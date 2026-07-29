@@ -438,12 +438,15 @@ class VisibleHhBrowser:
         resumes_url: str,
         search_url: str,
         timeout_ms: int,
+        *,
+        start_minimized: bool = False,
     ) -> None:
         self._profile_dir = profile_dir
         self._login_url = login_url
         self._resumes_url = resumes_url
         self._search_url = search_url
         self._timeout_ms = timeout_ms
+        self._start_minimized = start_minimized
         self._playwright: Playwright | None = None
         self._context: BrowserContext | None = None
         self._page: Page | None = None
@@ -452,20 +455,49 @@ class VisibleHhBrowser:
         self._profile_dir.mkdir(parents=True, exist_ok=True)
         self._playwright = sync_playwright().start()
         try:
+            chromium_args = (
+                [
+                    "--start-minimized",
+                    "--mute-audio",
+                ]
+                if self._start_minimized
+                else ["--start-maximized"]
+            )
             self._context = self._playwright.chromium.launch_persistent_context(
                 str(self._profile_dir),
                 headless=False,
                 no_viewport=True,
-                args=["--start-maximized"],
+                args=chromium_args,
             )
             self._page = self._context.pages[0] if self._context.pages else self._context.new_page()
             self._page.set_default_timeout(self._timeout_ms)
             self._page.set_default_navigation_timeout(self._timeout_ms)
+            self._minimize_window()
         except Exception:
             self._playwright.stop()
             self._playwright = None
             raise
         return self
+
+    def _minimize_window(self) -> None:
+        if not self._start_minimized or self._context is None or self._page is None:
+            return
+        with suppress(PlaywrightError, AttributeError, KeyError, TypeError):
+            session = self._context.new_cdp_session(self._page)
+            try:
+                window = session.send("Browser.getWindowForTarget")
+                window_id = window["windowId"]
+                if not isinstance(window_id, int):
+                    raise TypeError
+                session.send(
+                    "Browser.setWindowBounds",
+                    {
+                        "windowId": window_id,
+                        "bounds": {"windowState": "minimized"},
+                    },
+                )
+            finally:
+                session.detach()
 
     def __exit__(
         self,

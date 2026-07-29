@@ -4,6 +4,8 @@ import json
 import urllib.error
 import urllib.request
 
+REASONING_EFFORTS = frozenset({"low", "medium", "high"})
+
 
 class YandexAIError(RuntimeError):
     pass
@@ -18,6 +20,7 @@ class YandexAIClient:
         base_url: str = "https://ai.api.cloud.yandex.net/v1",
         timeout_seconds: int = 120,
         temperature: float = 0.1,
+        reasoning_effort: str = "high",
     ) -> None:
         self._api_key = api_key.strip()
         self._folder_id = folder_id.strip()
@@ -25,6 +28,7 @@ class YandexAIClient:
         self._base_url = base_url.rstrip("/")
         self._timeout_seconds = timeout_seconds
         self._temperature = temperature
+        self._reasoning_effort = reasoning_effort.strip()
         if not self._api_key:
             raise ValueError("Не указан ключ Yandex AI Studio")
         if not self._folder_id:
@@ -35,6 +39,8 @@ class YandexAIClient:
             raise ValueError("Время ожидания YandexGPT должно быть от 1 до 300 секунд")
         if not 0 <= temperature <= 2:
             raise ValueError("Температура YandexGPT должна быть от 0 до 2")
+        if self._reasoning_effort not in REASONING_EFFORTS:
+            raise ValueError("Режим обработки должен быть low, medium или high")
 
     @property
     def model_name(self) -> str:
@@ -49,6 +55,7 @@ class YandexAIClient:
             ],
             "stream": True,
             "temperature": self._temperature,
+            "reasoning_effort": self._reasoning_effort,
         }
         request = urllib.request.Request(
             f"{self._base_url}/chat/completions",
