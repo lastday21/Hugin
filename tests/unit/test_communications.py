@@ -109,7 +109,7 @@ def test_communications_migration_preserves_existing_rows(settings: Settings) ->
         database.close()
 
     upgrade_database(settings)
-    assert current_revision(settings) == "0015_background_controls"
+    assert current_revision(settings) == "0016_safe_application_defaults"
     check_database_schema(settings)
 
     migrated = create_database(settings)

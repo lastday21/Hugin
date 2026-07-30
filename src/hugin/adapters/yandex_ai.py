@@ -4,6 +4,8 @@ import json
 import urllib.error
 import urllib.request
 
+from hugin.diagnostics import OperationJournal
+
 REASONING_EFFORTS = frozenset({"low", "medium", "high"})
 
 
@@ -21,6 +23,8 @@ class YandexAIClient:
         timeout_seconds: int = 120,
         temperature: float = 0.1,
         reasoning_effort: str = "high",
+        journal: OperationJournal | None = None,
+        operation: str = "unspecified",
     ) -> None:
         self._api_key = api_key.strip()
         self._folder_id = folder_id.strip()
@@ -29,6 +33,8 @@ class YandexAIClient:
         self._timeout_seconds = timeout_seconds
         self._temperature = temperature
         self._reasoning_effort = reasoning_effort.strip()
+        self._journal = journal
+        self._operation = operation.strip() or "unspecified"
         if not self._api_key:
             raise ValueError("Не указан ключ Yandex AI Studio")
         if not self._folder_id:
@@ -72,6 +78,19 @@ class YandexAIClient:
             method="POST",
         )
         chunks: list[str] = []
+        usage: dict[str, int] = {}
+        run = (
+            self._journal.start(
+                "yandex_ai",
+                "model.complete",
+                operation=self._operation,
+                model=self._model,
+                model_calls=1,
+                input_characters=len(system_prompt) + len(user_prompt),
+            )
+            if self._journal is not None
+            else None
+        )
         try:
             with urllib.request.urlopen(request, timeout=self._timeout_seconds) as response:
                 for raw_line in response:
@@ -81,24 +100,54 @@ class YandexAIClient:
                     payload = line.removeprefix("data:").strip()
                     if payload == "[DONE]":
                         break
+                    parsed_usage = self._parse_usage(payload)
+                    if parsed_usage:
+                        usage = parsed_usage
                     chunk = self._parse_chunk(payload)
                     if chunk:
                         chunks.append(chunk)
         except urllib.error.HTTPError as error:
             detail = error.read().decode("utf-8", errors="replace")[:1000]
-            raise YandexAIError(
-                f"Yandex AI Studio вернул ошибку HTTP {error.code}: {detail}"
-            ) from error
+            failure = YandexAIError(f"Yandex AI Studio вернул ошибку HTTP {error.code}: {detail}")
+            if run is not None:
+                run.fail(failure)
+            raise failure from error
         except urllib.error.URLError as error:
-            raise YandexAIError(f"Yandex AI Studio недоступен: {error.reason}") from error
+            failure = YandexAIError(f"Yandex AI Studio недоступен: {error.reason}")
+            if run is not None:
+                run.fail(failure)
+            raise failure from error
         except TimeoutError as error:
-            raise YandexAIError("Истекло время ожидания ответа YandexGPT") from error
+            failure = YandexAIError("Истекло время ожидания ответа YandexGPT")
+            if run is not None:
+                run.fail(failure)
+            raise failure from error
         except OSError as error:
-            raise YandexAIError(f"Ошибка запроса к YandexGPT: {error}") from error
+            failure = YandexAIError(f"Ошибка запроса к YandexGPT: {error}")
+            if run is not None:
+                run.fail(failure)
+            raise failure from error
 
         result = "".join(chunks).strip()
         if not result:
-            raise YandexAIError("YandexGPT вернул пустой ответ")
+            failure = YandexAIError("YandexGPT вернул пустой ответ")
+            if run is not None:
+                run.fail(failure)
+            raise failure
+        if run is not None:
+            usage_details: dict[str, object] = {
+                "usage_reported": bool(usage),
+            }
+            if usage:
+                usage_details["usage_unit"] = "tokens"
+            run.succeed(
+                operation=self._operation,
+                model=self._model,
+                model_calls=1,
+                output_characters=len(result),
+                **usage_details,
+                **usage,
+            )
         return result
 
     def _model_uri(self) -> str:
@@ -122,3 +171,28 @@ class YandexAIClient:
         if isinstance(message, dict):
             return str(message.get("content") or "")
         return ""
+
+    @staticmethod
+    def _parse_usage(payload: str) -> dict[str, int]:
+        try:
+            data = json.loads(payload)
+        except json.JSONDecodeError:
+            return {}
+        raw = data.get("usage")
+        if not isinstance(raw, dict):
+            return {}
+        aliases = {
+            "prompt_units": ("prompt_tokens", "input_tokens", "inputTextTokens"),
+            "completion_units": (
+                "completion_tokens",
+                "output_tokens",
+                "completionTokens",
+            ),
+            "total_units": ("total_tokens", "totalTokens"),
+        }
+        result: dict[str, int] = {}
+        for target, names in aliases.items():
+            value = next((raw.get(name) for name in names if name in raw), None)
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                result[target] = value
+        return result

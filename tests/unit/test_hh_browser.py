@@ -939,6 +939,8 @@ def test_application_is_submitted_once_after_all_checks(tmp_path: Path) -> None:
         "https://hh.ru/vacancy/123",
         expected_resume_title="Python backend разработчик",
         cover_letter="Содержательное письмо",
+        submit=True,
+        submit_guard=lambda: True,
     )
 
     assert result.status is HhApplyStatus.APPLIED
@@ -969,6 +971,8 @@ def test_application_respects_retry_after_header(tmp_path: Path) -> None:
         "https://hh.ru/vacancy/123",
         expected_resume_title="Python backend разработчик",
         cover_letter="Письмо",
+        submit=True,
+        submit_guard=lambda: True,
     )
 
     assert result.status is HhApplyStatus.RETRYABLE_ERROR
@@ -992,6 +996,8 @@ def test_application_uses_history_when_response_body_is_unavailable(tmp_path: Pa
         "https://hh.ru/vacancy/123",
         expected_resume_title="Python backend разработчик",
         cover_letter="Письмо",
+        submit=True,
+        submit_guard=lambda: True,
     )
 
     assert result.status is HhApplyStatus.APPLIED
@@ -1017,12 +1023,87 @@ def test_application_marks_unknown_result_without_confirmation(tmp_path: Path) -
         "https://hh.ru/vacancy/123",
         expected_resume_title="Python backend разработчик",
         cover_letter="Письмо",
+        submit=True,
+        submit_guard=lambda: True,
     )
 
     assert result.status is HhApplyStatus.UNKNOWN_RESULT
     assert "нажата один раз" in result.confirmation
     assert page.locators['[data-qa="vacancy-response-submit-popup"]'].clicked == 1
     assert page.goto_calls[-1][0] == "https://hh.ru/applicant/negotiations"
+
+
+def test_application_preview_fills_letter_without_submit(tmp_path: Path) -> None:
+    page = FakePage("https://hh.ru/applicant/resumes")
+    page.application_payload = {
+        "questions": [],
+        "warnings": [],
+        "resumeTitle": "Python backend разработчик",
+        "bodyText": "Форма отклика",
+    }
+    letter_selector = '[data-qa="vacancy-response-popup-form-letter-input"]'
+    submit_selector = '[data-qa="vacancy-response-submit-popup"]'
+    page.locators[letter_selector] = FakeLocator()
+    page.locators[submit_selector] = FakeLocator()
+
+    result = make_browser(page, tmp_path).apply_to_vacancy(
+        "https://hh.ru/vacancy/123",
+        expected_resume_title="Python backend разработчик",
+        cover_letter="Письмо для проверки",
+    )
+
+    assert result.status is HhApplyStatus.MANUAL_REVIEW_REQUIRED
+    assert page.locators[letter_selector].filled == ["Письмо для проверки"]
+    assert page.locators[submit_selector].clicked == 0
+
+
+def test_application_submit_guard_is_checked_before_click(tmp_path: Path) -> None:
+    page = FakePage("https://hh.ru/applicant/resumes")
+    page.application_payload = {
+        "questions": [],
+        "warnings": [],
+        "resumeTitle": "Python backend разработчик",
+        "bodyText": "Форма отклика",
+    }
+    letter_selector = '[data-qa="vacancy-response-popup-form-letter-input"]'
+    submit_selector = '[data-qa="vacancy-response-submit-popup"]'
+    page.locators[letter_selector] = FakeLocator()
+    page.locators[submit_selector] = FakeLocator()
+
+    result = make_browser(page, tmp_path).apply_to_vacancy(
+        "https://hh.ru/vacancy/123",
+        expected_resume_title="Python backend разработчик",
+        cover_letter="Письмо для проверки",
+        submit=True,
+        submit_guard=lambda: False,
+    )
+
+    assert result.status is HhApplyStatus.MANUAL_REVIEW_REQUIRED
+    assert page.locators[submit_selector].clicked == 0
+
+
+def test_application_cannot_submit_without_guard(tmp_path: Path) -> None:
+    page = FakePage("https://hh.ru/applicant/resumes")
+    page.application_payload = {
+        "questions": [],
+        "warnings": [],
+        "resumeTitle": "Python backend разработчик",
+        "bodyText": "Форма отклика",
+    }
+    letter_selector = '[data-qa="vacancy-response-popup-form-letter-input"]'
+    submit_selector = '[data-qa="vacancy-response-submit-popup"]'
+    page.locators[letter_selector] = FakeLocator()
+    page.locators[submit_selector] = FakeLocator()
+
+    result = make_browser(page, tmp_path).apply_to_vacancy(
+        "https://hh.ru/vacancy/123",
+        expected_resume_title="Python backend разработчик",
+        cover_letter="Письмо для проверки",
+        submit=True,
+    )
+
+    assert result.status is HhApplyStatus.MANUAL_REVIEW_REQUIRED
+    assert page.locators[submit_selector].clicked == 0
 
 
 def test_repeat_application_form_is_not_submitted(tmp_path: Path) -> None:

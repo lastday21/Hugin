@@ -19,6 +19,8 @@ from hugin.database.models import (
     CoverLetterModel,
     VacancyModel,
 )
+from hugin.diagnostics import OperationJournal
+from hugin.domain.content import cover_letter_instruction_version
 from hugin.services.ai_prompts import AiPromptSettingsService
 from hugin.services.application_automation import ApplicationAutomationService
 from hugin.services.cover_letter import SYSTEM_PROMPT, CoverLetterService
@@ -80,7 +82,7 @@ def run(argv: Sequence[str] | None = None) -> int:
             print("Настройки YandexGPT сохранены в защищенном хранилище Windows.")
             return 0
         if arguments.command == "test":
-            client = _client(settings, store)
+            client = _client(settings, store, operation="connection_check")
             response = client.complete(SYSTEM_PROMPT, "Ответь одним словом: готово")
             print(f"YandexGPT доступен: {client.model_name}: {response}")
             return 0
@@ -101,6 +103,9 @@ def run(argv: Sequence[str] | None = None) -> int:
                 return 0
             if arguments.command == "show":
                 with database.sessions.begin() as session:
+                    instruction_version = cover_letter_instruction_version(
+                        AiPromptSettingsService(session).get().cover_letter
+                    )
                     row = session.execute(
                         select(CoverLetterModel, VacancyModel)
                         .join(
@@ -111,6 +116,7 @@ def run(argv: Sequence[str] | None = None) -> int:
                         .where(
                             ApplicationModel.account_id == arguments.account_id,
                             VacancyModel.hh_id == arguments.vacancy_id,
+                            CoverLetterModel.instruction_version == instruction_version,
                         )
                         .order_by(CoverLetterModel.id.desc())
                         .limit(1)
@@ -133,6 +139,7 @@ def run(argv: Sequence[str] | None = None) -> int:
                     store,
                     model=ai_settings.get_model(),
                     reasoning_effort=ai_settings.get_reasoning_effort(),
+                    operation="cover_letter",
                 )
                 queued = ApplicationAutomationService(session).prepare_for_account_id(
                     account_id=arguments.account_id,
@@ -154,6 +161,7 @@ def run(argv: Sequence[str] | None = None) -> int:
             "reused": "переиспользовано для связанной публикации",
             "existing": "уже готово",
             "failed": "ошибка",
+            "blocked": "пропущено без нового обращения к модели",
         }
         for item in result.items:
             line = f"- № {item.hh_id}, {item.title}: {labels[item.action]}"
@@ -180,6 +188,7 @@ def _client(
     *,
     model: str | None = None,
     reasoning_effort: str = "high",
+    operation: str = "unspecified",
 ) -> YandexAIClient:
     environment_key = settings.yandex_ai_api_key.get_secret_value().strip()
     if environment_key:
@@ -202,6 +211,8 @@ def _client(
         settings.yandex_ai_base_url,
         settings.yandex_ai_timeout_seconds,
         reasoning_effort=reasoning_effort,
+        journal=OperationJournal(settings.data_dir),
+        operation=operation,
     )
 
 

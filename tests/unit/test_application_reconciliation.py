@@ -55,7 +55,6 @@ def create_unknown_task(session: Session, suffix: str) -> tuple[int, int]:
         TaskState.UNKNOWN_RESULT,
         error_code="RESULT_NOT_CONFIRMED",
     )
-    SystemStateRepository(session).transition(SystemState.PAUSED)
     return application.id, task.id
 
 

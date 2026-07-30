@@ -127,6 +127,48 @@ def test_leading_role_is_not_rejected() -> None:
     assert result.category is RuleCategory.MATCH
 
 
+@pytest.mark.parametrize(
+    "title",
+    [
+        "Архитектор-разработчик Python",
+        "Tech Lead / Backend Architect (Python)",
+        "Tech Lead / Руководитель команды разработки Python",
+    ],
+)
+def test_hands_on_python_leadership_title_is_not_a_hard_rejection(title: str) -> None:
+    result = PythonBackendRules().evaluate(
+        VacancyData(
+            f"lead-{title}",
+            title,
+            "https://hh.ru/vacancy/lead",
+            description=(
+                "Разрабатывать backend на Python, писать модули и тесты, "
+                "реализовывать микросервисы и интеграции."
+            ),
+            key_skills=("Python", "FastAPI", "PostgreSQL"),
+        )
+    )
+
+    assert result.category is RuleCategory.MATCH
+
+
+def test_python_test_automation_in_responsibilities_is_routed_to_it() -> None:
+    vacancy = VacancyData(
+        "python-load-tests",
+        "Ведущий инженер по тестированию",
+        "https://hh.ru/vacancy/python-load-tests",
+        responsibilities=("Разрабатывать сценарии нагрузочного тестирования на Locust и Python."),
+        key_skills=("Python", "Locust"),
+    )
+
+    routed = PythonBackendRules().evaluate(vacancy)
+    accepted = AdjacentItRules().evaluate(vacancy)
+
+    assert routed.category is RuleCategory.ROUTED
+    assert routed.target_scope is DirectionScope.IT_ADJACENT
+    assert accepted.category is RuleCategory.MATCH
+
+
 def test_python_automation_with_llm_is_a_match() -> None:
     vacancy = VacancyData(
         "7",
@@ -244,7 +286,7 @@ def test_mandatory_work_format_conflict_is_rejected() -> None:
     assert any("формат работы" in reason for reason in result.reasons)
 
 
-def test_mandatory_relocation_to_elabuga_is_allowed() -> None:
+def test_mandatory_relocation_is_rejected_when_candidate_is_not_ready() -> None:
     result = PythonBackendRules().evaluate(
         VacancyData(
             "relocation",
@@ -255,10 +297,43 @@ def test_mandatory_relocation_to_elabuga_is_allowed() -> None:
                 "в Республику Татарстан, город Елабуга."
             ),
         ),
-        RuleContext(regions=(SearchRegion("1", "Москва"), SearchRegion("2", "Санкт-Петербург"))),
+        RuleContext(
+            regions=(SearchRegion("1", "Москва"), SearchRegion("2", "Санкт-Петербург")),
+            relocation_allowed=False,
+        ),
+    )
+
+    assert result.category is RuleCategory.REJECTED
+    assert any("переезд" in reason for reason in result.reasons)
+
+
+def test_mandatory_relocation_is_allowed_when_candidate_confirmed_it() -> None:
+    result = PythonBackendRules().evaluate(
+        VacancyData(
+            "relocation-confirmed",
+            "Python разработчик",
+            "https://hh.ru/vacancy/relocation-confirmed",
+            description="Python backend. Обязательная релокация в город Казань.",
+        ),
+        RuleContext(relocation_allowed=True),
     )
 
     assert result.category is RuleCategory.MATCH
+
+
+def test_mandatory_far_east_relocation_is_rejected_even_when_relocation_allowed() -> None:
+    result = PythonBackendRules().evaluate(
+        VacancyData(
+            "relocation-far-east-confirmed",
+            "Python разработчик",
+            "https://hh.ru/vacancy/relocation-far-east-confirmed",
+            description="Python backend. Обязательная релокация во Владивосток.",
+        ),
+        RuleContext(relocation_allowed=True),
+    )
+
+    assert result.category is RuleCategory.REJECTED
+    assert any("переезд" in reason for reason in result.reasons)
 
 
 @pytest.mark.parametrize("city", ["Владивосток", "Хабаровск"])
@@ -273,7 +348,7 @@ def test_mandatory_relocation_to_far_east_is_rejected(city: str) -> None:
     )
 
     assert result.category is RuleCategory.REJECTED
-    assert any("Дальний Восток" in reason for reason in result.reasons)
+    assert any("переезд" in reason for reason in result.reasons)
 
 
 def test_fullstack_is_owned_by_it_even_with_python_backend() -> None:
@@ -319,4 +394,121 @@ def test_unrelated_mandatory_dotnet_stack_is_rejected_in_it() -> None:
     )
 
     assert result.category is RuleCategory.REJECTED
-    assert any("подтверждённым опытом" in reason for reason in result.reasons)
+    assert any("другой основной стек" in reason for reason in result.reasons)
+
+
+@pytest.mark.parametrize(
+    "title",
+    [
+        "Senior Java Developer",
+        "Backend C# Developer",
+        "Golang разработчик",
+        "Node.js Backend Developer / NestJS",
+        "Embedded C++ разработчик",
+    ],
+)
+def test_other_primary_stack_is_rejected_even_with_generic_skill_overlap(title: str) -> None:
+    result = PythonBackendRules().evaluate(
+        VacancyData(
+            f"other-{title}",
+            title,
+            "https://hh.ru/vacancy/other-stack",
+            description="Backend, REST API, PostgreSQL, Docker и Linux.",
+            required_qualifications="Обязателен основной стек из названия.",
+            key_skills=("PostgreSQL", "Docker", "Linux"),
+        ),
+        RuleContext(skills=("Python, FastAPI, PostgreSQL, Docker, Linux",)),
+    )
+
+    assert result.category is RuleCategory.REJECTED
+    assert any("другой основной стек" in reason for reason in result.reasons)
+
+
+@pytest.mark.parametrize(
+    ("title", "description", "stack"),
+    [
+        (
+            "Стажер-backend developer",
+            (
+                "Основной стек — NodeJS, TypeScript, NestJS и Rust. "
+                "Python указан лишь как пример базового языка."
+            ),
+            "Node.js/TypeScript",
+        ),
+        (
+            "Senior Backend (Rust/C++/Python)",
+            ("Основной язык — Rust; Python используется для legacy и вспомогательных сервисов."),
+            "Rust",
+        ),
+    ],
+)
+def test_python_as_secondary_language_does_not_hide_primary_stack(
+    title: str,
+    description: str,
+    stack: str,
+) -> None:
+    result = PythonBackendRules().evaluate(
+        VacancyData(
+            f"secondary-{stack}",
+            title,
+            "https://hh.ru/vacancy/secondary",
+            description=description,
+            key_skills=("Python", "Docker"),
+        ),
+        RuleContext(skills=("Python, FastAPI, PostgreSQL, Docker",)),
+    )
+
+    assert result.category is RuleCategory.REJECTED
+    assert any(stack in reason for reason in result.reasons)
+
+
+def test_not_only_python_phrase_is_not_treated_as_secondary_language() -> None:
+    result = PythonBackendRules().evaluate(
+        VacancyData(
+            "python-not-only",
+            "Python-разработчик",
+            "https://hh.ru/vacancy/python-not-only",
+            description=(
+                "Ищем Python-разработчика, который умеет не только писать код, "
+                "но и проектировать backend-сервисы на FastAPI."
+            ),
+            key_skills=("Python", "FastAPI", "PostgreSQL"),
+        ),
+        RuleContext(skills=("Python, FastAPI, PostgreSQL",)),
+    )
+
+    assert result.category is RuleCategory.MATCH
+
+
+def test_mandatory_primary_1c_stack_is_rejected() -> None:
+    result = PythonBackendRules().evaluate(
+        VacancyData(
+            "primary-1c",
+            "Архитектор ERP системы",
+            "https://hh.ru/vacancy/primary-1c",
+            description=(
+                "Глубокая разработка в 1С (основной стек). "
+                "Python применяется только для внешних расчётных модулей."
+            ),
+            key_skills=("1С: Предприятие 8", "Python"),
+        ),
+        RuleContext(skills=("Python, FastAPI, PostgreSQL",)),
+    )
+
+    assert result.category is RuleCategory.REJECTED
+    assert any("1С" in reason for reason in result.reasons)
+
+
+def test_mixed_go_and_python_backend_title_is_not_rejected_as_other_stack() -> None:
+    result = PythonBackendRules().evaluate(
+        VacancyData(
+            "mixed-stack",
+            "Backend Go / Python разработчик",
+            "https://hh.ru/vacancy/mixed-stack",
+            description="Разработка сервисов на Python и Go.",
+            key_skills=("Python", "Go", "PostgreSQL"),
+        ),
+        RuleContext(skills=("Python, FastAPI, PostgreSQL",)),
+    )
+
+    assert result.category is RuleCategory.MATCH

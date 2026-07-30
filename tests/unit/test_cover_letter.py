@@ -17,21 +17,30 @@ from hugin.database.models import (
 from hugin.domain.content import ConfirmationState, CoverLetterState
 from hugin.domain.directions import VacancyState
 from hugin.domain.hh import HhApplyResult, HhApplyStatus
+from hugin.domain.tasks import SystemState
 from hugin.domain.vacancies import VacancyData
-from hugin.repositories import AccountRepository, DirectionRepository, ResumeRepository
+from hugin.repositories import (
+    AccountRepository,
+    DirectionRepository,
+    ResumeRepository,
+    SystemStateRepository,
+)
 from hugin.repositories.vacancies import VacancyRepository
 from hugin.services.application_automation import ApplicationAutomationService
 from hugin.services.cover_letter import (
     MAX_LETTER_LENGTH,
     CoverLetterService,
     CoverLetterValidationError,
+    _ensure_relevant_evidence,
     _relevant_excerpt,
     _SelectedFact,
+    _without_future_plans,
     _work_experience_excerpt,
     build_cover_letter_prompt,
     normalize_cover_letter,
     validate_cover_letter,
 )
+from hugin.services.vacancy_analysis import RULES_VERSION
 
 pytestmark = pytest.mark.integration
 
@@ -54,9 +63,10 @@ def _letter() -> str:
         "Разрабатывал серверные приложения на Python с FastAPI и PostgreSQL, поэтому знаком "
         "с задачами развития серверной части и интеграций. В одном из проектов реализовал "
         "прикладную логику сервиса и настроил автоматические проверки, чтобы изменения можно "
-        "было безопасно проверять перед выпуском. Этот опыт позволит быстро включиться в "
-        "похожие задачи и разбираться в существующем коде.\n\n"
-        "Буду рад подробнее обсудить задачи команды и рассказать о реализованных решениях."
+        "было безопасно проверять перед выпуском. При доработке таких служб отделял "
+        "прикладную логику от доступа к данным и проверял обработку ошибок.\n\n"
+        "Буду рад подробнее обсудить задачи серверной части и рассказать о реализованных "
+        "решениях."
     )
 
 
@@ -118,6 +128,7 @@ def _prepare_data(
                 "accepted": True,
                 "reasons": ["совпадают Python, FastAPI и PostgreSQL"],
             },
+            rules_version=RULES_VERSION,
         )
 
     profile = CandidateProfileModel(
@@ -209,6 +220,7 @@ def test_yandex_letter_uses_only_confirmed_facts_and_is_saved(settings: Settings
             assert repeated.already_ready == 1
             assert len(model.prompts) == 1
 
+            SystemStateRepository(session).transition(SystemState.RUNNING)
             job = ApplicationAutomationService(session).claim_next(
                 direction_id,
                 require_cover_letter=True,
@@ -368,6 +380,105 @@ def _fact() -> tuple[_SelectedFact, ...]:
 
 
 @pytest.mark.parametrize(
+    "description",
+    [
+        "В сопроводительном письме обязательно ответьте на три вопроса.",
+        "В отклике укажите ожидаемый доход и доступную дату начала.",
+        "Отклик должен содержать ссылки на два примера кода.",
+        "Обязательно напишите в отклике кодовое слово и ожидаемый доход.",
+        "Без ответов на вопросы отклик не рассматривается.",
+    ],
+)
+def test_mandatory_letter_answers_require_manual_review(description: str) -> None:
+    vacancy = _vacancy()
+    vacancy.description = description
+
+    with pytest.raises(CoverLetterValidationError) as error:
+        _ensure_relevant_evidence(vacancy, _fact())
+
+    assert error.value.code == "MANUAL_INPUT_REQUIRED"
+
+
+def test_relevance_guard_accepts_confirmed_strong_skill() -> None:
+    vacancy = _vacancy()
+    vacancy.title = "Разработчик хранилища"
+    vacancy.key_skills = ["Redis"]
+    facts = (
+        _SelectedFact(
+            id=1,
+            category="work_experience",
+            content="Использовал Redis для хранения активной корзины.",
+        ),
+    )
+
+    _ensure_relevant_evidence(vacancy, facts)
+
+
+def test_relevance_guard_accepts_two_specific_task_terms() -> None:
+    vacancy = _vacancy()
+    vacancy.title = "Инженер платежей"
+    vacancy.key_skills = []
+    vacancy.responsibilities = "Обработка платежей и внешние интеграции."
+    facts = (
+        _SelectedFact(
+            id=1,
+            category="work_experience",
+            content="Реализовал обработку платежей и внешние интеграции.",
+        ),
+    )
+
+    _ensure_relevant_evidence(vacancy, facts)
+
+
+def test_relevance_guard_rejects_unrelated_confirmed_facts() -> None:
+    vacancy = _vacancy()
+    vacancy.title = "Java-разработчик"
+    vacancy.key_skills = ["Java", "Spring"]
+
+    with pytest.raises(CoverLetterValidationError) as error:
+        _ensure_relevant_evidence(vacancy, _fact())
+
+    assert error.value.code == "NO_RELEVANT_EVIDENCE"
+
+
+def test_unchanged_manual_failure_does_not_block_next_vacancy(
+    settings: Settings,
+) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    model = FakeModel([_letter()])
+    try:
+        with database.sessions.begin() as session:
+            account_id, _, _, vacancy_ids = _prepare_data(
+                session,
+                with_duplicate=True,
+            )
+            first_vacancy = session.get(VacancyModel, vacancy_ids[0])
+            assert first_vacancy is not None
+            first_vacancy.description = (
+                "В сопроводительном письме обязательно ответьте на отдельные вопросы."
+            )
+
+            first = CoverLetterService(session, model).prepare(
+                account_id=account_id,
+                direction_name="Python backend",
+                limit=1,
+            )
+            second = CoverLetterService(session, model).prepare(
+                account_id=account_id,
+                direction_name="Python backend",
+                limit=1,
+            )
+
+            assert first.failed == 1
+            assert second.generated == 1
+            assert any(item.action == "blocked" for item in second.items)
+            assert len(model.prompts) == 1
+    finally:
+        database.close()
+
+
+@pytest.mark.parametrize(
     ("text", "code"),
     [
         ("", "EMPTY"),
@@ -486,7 +597,7 @@ def test_work_experience_context_keeps_project_boundaries() -> None:
 
     excerpt = _work_experience_excerpt(
         content,
-        {"python", "llm", "speechkit", "новости"},
+        {"llm", "speechkit", "новости", "аудио"},
         3000,
     )
 
@@ -494,6 +605,69 @@ def test_work_experience_context_keeps_project_boundaries() -> None:
     assert "генерировал аудио из текста через SpeechKit" in excerpt
     assert '<experience_item type="PROJECT" label="Аналитик">' in excerpt
     assert "собирал новости и формировал отчет через LLM" in excerpt
+
+
+def test_future_technology_is_removed_from_letter_context() -> None:
+    content = """Разработчик
+- Разрабатываю сервис на Python и FastAPI.
+- Заложил возможность публикации событий в Kafka как опциональную фичу.
+Стек: Python, FastAPI, Kafka, PostgreSQL."""
+
+    cleaned = _without_future_plans(content)
+
+    assert "Kafka" not in cleaned
+    assert "Python" in cleaned
+    assert "FastAPI" in cleaned
+
+
+def test_irrelevant_cloud_details_are_rejected() -> None:
+    text = (
+        "Здравствуйте!\n\nРазрабатывал серверные приложения на Python и FastAPI, работал "
+        "с PostgreSQL и настраивал автоматические проверки. Также создавал прототипы в "
+        "Yandex Cloud и подключал AI Studio, хотя эти средства не относятся к основным "
+        "задачам команды. Реализовывал прикладную логику и обработку ошибок.\n\n"
+        "Буду рад подробнее обсудить серверную часть и интеграции."
+    )
+    facts = (
+        _SelectedFact(
+            1,
+            "work_experience",
+            "Python, FastAPI, PostgreSQL, Yandex Cloud и AI Studio.",
+        ),
+    )
+
+    with pytest.raises(CoverLetterValidationError) as error:
+        validate_cover_letter(text, _vacancy(), facts)
+
+    assert error.value.code == "IRRELEVANT_DETAIL"
+
+
+@pytest.mark.parametrize(
+    ("technology", "description"),
+    [
+        ("gRPC", "Разработка межсервисных интеграций через gRPC."),
+        ("OpenTelemetry", "Настройка трассировки через OpenTelemetry."),
+        ("Yandex Cloud", "Разработка облачных служб в Yandex Cloud."),
+        ("OpenAI", "Разработка ИИ-служб с использованием OpenAI."),
+    ],
+)
+def test_relevant_but_unconfirmed_technology_is_rejected(
+    technology: str,
+    description: str,
+) -> None:
+    text = (
+        "Здравствуйте!\n\nРазрабатывал серверные приложения на Python и FastAPI, работал "
+        f"с PostgreSQL. В проекте также применял {technology} для задач этой команды. "
+        "Реализовывал прикладную логику, обработку ошибок и автоматические проверки.\n\n"
+        "Буду рад подробнее обсудить задачи серверной части и реализованные решения."
+    )
+    vacancy = _vacancy()
+    vacancy.description = description
+
+    with pytest.raises(CoverLetterValidationError) as error:
+        validate_cover_letter(text, vacancy, _fact())
+
+    assert error.value.code == "UNCONFIRMED_SPECIALIST_TERM"
 
 
 def test_specialist_term_boundaries_do_not_match_storage() -> None:

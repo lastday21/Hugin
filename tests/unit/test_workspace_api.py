@@ -159,7 +159,7 @@ def seed_workspace(settings: Settings) -> tuple[int, str, str]:
                     direction_id=direction.id,
                     resume_id=resume.id,
                     text="Здравствуйте! Готов обсудить задачи команды.",
-                    instruction_version="ui-test",
+                    instruction_version="cover_letter_v11_ui-test",
                     model_name="test",
                     state=CoverLetterState.READY,
                 )
@@ -655,7 +655,9 @@ def test_unknown_result_is_reconciled_only_by_explicit_choice(settings: Settings
                 TaskState.UNKNOWN_RESULT,
                 error_code="RESULT_NOT_CONFIRMED",
             )
-            SystemStateRepository(session).transition(SystemState.PAUSED)
+            system = SystemStateRepository(session)
+            if system.get().state is not SystemState.PAUSED:
+                system.transition(SystemState.PAUSED)
     finally:
         database.close()
 

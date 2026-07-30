@@ -31,6 +31,7 @@ from hugin.database.models import (
 from hugin.domain.applications import ApplicationEventType
 from hugin.domain.automation import AutomationJobKind, AutomationJobState
 from hugin.domain.content import (
+    CURRENT_COVER_LETTER_INSTRUCTION,
     CoverLetterState,
     IncidentState,
     InvitationState,
@@ -268,6 +269,10 @@ class UiWorkspaceService:
                 .where(
                     ApplicationModel.account_id == account_id,
                     CoverLetterModel.state == CoverLetterState.READY,
+                    CoverLetterModel.instruction_version.startswith(
+                        f"{CURRENT_COVER_LETTER_INSTRUCTION}_",
+                        autoescape=True,
+                    ),
                 )
             )
             or 0
@@ -412,7 +417,13 @@ class UiWorkspaceService:
         self._account(account_id)
         letter_state = (
             select(CoverLetterModel.state)
-            .where(CoverLetterModel.application_id == ApplicationModel.id)
+            .where(
+                CoverLetterModel.application_id == ApplicationModel.id,
+                CoverLetterModel.instruction_version.startswith(
+                    f"{CURRENT_COVER_LETTER_INSTRUCTION}_",
+                    autoescape=True,
+                ),
+            )
             .order_by(CoverLetterModel.id.desc())
             .limit(1)
             .correlate(ApplicationModel)
@@ -602,6 +613,10 @@ class UiWorkspaceService:
                 ApplicationModel.account_id == account_id,
                 ApplicationModel.vacancy_id == vacancy.id,
                 CoverLetterModel.text.is_not(None),
+                CoverLetterModel.instruction_version.startswith(
+                    f"{CURRENT_COVER_LETTER_INSTRUCTION}_",
+                    autoescape=True,
+                ),
             )
             .order_by(CoverLetterModel.id.desc())
             .limit(1)

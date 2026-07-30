@@ -31,10 +31,19 @@ class SearchCycleBrowser(Protocol):
 
 
 class BackgroundSearchCycle:
-    def __init__(self, settings: Settings, *, detail_limit: int = 20) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        page_limit: int = 3,
+        detail_limit: int = 20,
+    ) -> None:
+        if page_limit < 1:
+            raise ValueError("Количество страниц поиска должно быть положительным")
         if detail_limit < 1:
             raise ValueError("Ограничение подробной загрузки должно быть положительным")
         self._settings = settings
+        self._page_limit = page_limit
         self._detail_limit = detail_limit
 
     def run(
@@ -48,35 +57,37 @@ class BackgroundSearchCycle:
         profile = browser.read_profile()
         if profile.external_id != account_external_id:
             raise RuntimeError("Аккаунт в браузере выбран неверно")
-        search_runs = tuple(
-            (
-                task,
-                browser.search_vacancies(
-                    task.query,
-                    area=task.area,
-                    filters=task.filters,
-                    page_number=0,
-                ),
-            )
-            for task in tasks
-        )
-
+        search_runs: list[tuple[VacancySearchTask, tuple[VacancySearchResult, ...]]] = []
         database = create_database(self._settings)
         try:
             with database.sessions.begin() as session:
                 HhProfileSyncService(session).synchronize(profile)
-                for task, result in search_runs:
-                    JobSearchSyncService(session).synchronize(
-                        account_external_id=profile.external_id,
-                        direction_name=direction_name,
-                        resume_title=None,
-                        query=task.query,
+            for task in tasks:
+                pages: list[VacancySearchResult] = []
+                for page_number in range(self._page_limit):
+                    result = browser.search_vacancies(
+                        task.query,
                         area=task.area,
-                        region=task.region_name,
-                        search_query_id=task.search_query_id,
                         filters=task.filters,
-                        vacancies=result.vacancies,
+                        page_number=page_number,
                     )
+                    if not result.vacancies:
+                        break
+                    pages.append(result)
+                    with database.sessions.begin() as session:
+                        JobSearchSyncService(session).synchronize(
+                            account_external_id=profile.external_id,
+                            direction_name=direction_name,
+                            resume_title=None,
+                            query=task.query,
+                            area=task.area,
+                            region=task.region_name,
+                            search_query_id=task.search_query_id,
+                            filters=task.filters,
+                            vacancies=result.vacancies,
+                        )
+                search_runs.append((task, tuple(pages)))
+            with database.sessions.begin() as session:
                 pending = VacancyAnalysisService(session).pending(
                     account_external_id=profile.external_id,
                     direction_name=direction_name,
@@ -103,6 +114,10 @@ class BackgroundSearchCycle:
                         direction_name=direction_name,
                         vacancies=tuple(detailed),
                     )
+                analysis.reanalyze(
+                    account_external_id=profile.external_id,
+                    direction_name=direction_name,
+                )
                 prepared = ApplicationAutomationService(session).prepare(
                     account_external_id=profile.external_id,
                     direction_name=direction_name,
@@ -112,11 +127,15 @@ class BackgroundSearchCycle:
             database.close()
 
         unique_vacancies = {
-            vacancy.hh_id for _task, result in search_runs for vacancy in result.vacancies
+            vacancy.hh_id
+            for _task, pages in search_runs
+            for result in pages
+            for vacancy in result.vacancies
         }
         return {
             "search_variants": len(search_runs),
-            "found": sum(result.found for _task, result in search_runs),
+            "pages_loaded": sum(len(pages) for _task, pages in search_runs),
+            "found": sum(pages[0].found for _task, pages in search_runs if pages),
             "unique_vacancies": len(unique_vacancies),
             "details_loaded": len(detailed),
             "details_failed": failed_details,

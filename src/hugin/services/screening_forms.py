@@ -24,8 +24,10 @@ from hugin.domain.content import (
     ConfirmationState,
     CoverLetterState,
     ScreeningFormState,
+    cover_letter_instruction_version,
 )
 from hugin.domain.hh import HhScreeningField, HhScreeningForm, screening_form_hash
+from hugin.services.ai_prompts import AiPromptSettingsService
 
 
 @dataclass(frozen=True, slots=True)
@@ -292,6 +294,10 @@ class ScreeningDraftService:
                 CoverLetterModel.application_id == application.id,
                 CoverLetterModel.state == CoverLetterState.READY,
                 CoverLetterModel.text.is_not(None),
+                CoverLetterModel.instruction_version
+                == cover_letter_instruction_version(
+                    AiPromptSettingsService(self._session).get().cover_letter
+                ),
             )
             .order_by(CoverLetterModel.id.desc())
             .limit(1)

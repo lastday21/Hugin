@@ -40,6 +40,7 @@ class Settings(BaseSettings):
     hh_resumes_url: str = "https://hh.ru/applicant/resumes"
     hh_search_url: str = "https://hh.ru/search/vacancy"
     hh_browser_timeout_ms: int = Field(default=60_000, ge=1_000, le=120_000)
+    hh_background_search_pages: int = Field(default=3, ge=1, le=20)
     hh_background_detail_limit: int = Field(default=5, ge=1, le=50)
     telegram_bot_username: Literal["hugin_workbot"] = "hugin_workbot"
     telegram_gateway_url: str = "http://127.0.0.1:8020"

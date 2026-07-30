@@ -127,7 +127,13 @@ def prepare_handler(
         assert store is credential_store
         return FakeLoginService(status, store, login_calls)
 
-    def create_cycle(_settings: Settings, *, detail_limit: int) -> FakeCycle:
+    def create_cycle(
+        _settings: Settings,
+        *,
+        page_limit: int,
+        detail_limit: int,
+    ) -> FakeCycle:
+        assert page_limit == 3
         assert detail_limit == 5
         return cycle
 

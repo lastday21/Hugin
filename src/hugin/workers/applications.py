@@ -104,8 +104,8 @@ class ApplicationWorker:
 
     def run_once(self, now: datetime | None = None) -> bool:
         selected_at = as_utc(now or datetime.now(UTC))
-        job = self._claim(selected_at)
-        if job is None and self._may_prepare_letters(selected_at):
+        job, may_prepare_letters = self._claim(selected_at)
+        if job is None and may_prepare_letters and self._may_prepare_letters(selected_at):
             try:
                 prepared = self._letter_preparer(self._account_id)
             except (LookupError, RuntimeError, ValueError) as error:
@@ -131,7 +131,7 @@ class ApplicationWorker:
                         account_id=self._account_id,
                         prepared=prepared,
                     )
-                    job = self._claim(selected_at)
+                    job, _ = self._claim(selected_at)
         if job is None:
             return False
 
@@ -197,11 +197,13 @@ class ApplicationWorker:
             )
         return True
 
-    def _claim(self, now: datetime) -> ApplyJob | None:
+    def _claim(self, now: datetime) -> tuple[ApplyJob | None, bool]:
         database = create_database(self._settings)
         try:
             with database.sessions.begin() as session:
                 service = ApplicationAutomationService(session)
+                if not service.applications_enabled():
+                    return None, False
                 local_now = now.astimezone()
                 policy = service.policy(local_timezone_name(local_now))
                 sent_today = service.applied_since(
@@ -209,10 +211,13 @@ class ApplicationWorker:
                     local_day_start_utc(local_now),
                 )
                 if sent_today >= policy.daily_limit:
-                    return None
-                return service.claim_next(
-                    account_id=self._account_id,
-                    require_cover_letter=True,
+                    return None, False
+                return (
+                    service.claim_next(
+                        account_id=self._account_id,
+                        require_cover_letter=True,
+                    ),
+                    True,
                 )
         finally:
             database.close()
@@ -221,11 +226,15 @@ class ApplicationWorker:
         database = create_database(self._settings)
         try:
             with database.sessions.begin() as session:
+                automation = ApplicationAutomationService(session)
+                if not automation.applications_enabled():
+                    return 0
                 ai_settings = AiPromptSettingsService(session)
                 client = configured_yandex_ai_client(
                     self._settings,
                     model=ai_settings.get_model(),
                     reasoning_effort=ai_settings.get_reasoning_effort(),
+                    operation="cover_letter",
                 )
                 direction_names = tuple(
                     session.scalars(
@@ -239,6 +248,9 @@ class ApplicationWorker:
                 )
                 prepared = 0
                 for direction_name in direction_names:
+                    session.expire_all()
+                    if not automation.applications_enabled():
+                        return prepared
                     result = CoverLetterService(session, client).prepare(
                         account_id=account_id,
                         direction_name=direction_name,
@@ -286,7 +298,17 @@ class ApplicationWorker:
                 job.vacancy.source_url,
                 expected_resume_title=job.resume.title,
                 cover_letter=job.cover_letter,
+                submit=True,
+                submit_guard=self._applications_enabled,
             )
+
+    def _applications_enabled(self) -> bool:
+        database = create_database(self._settings)
+        try:
+            with database.sessions.begin() as session:
+                return ApplicationAutomationService(session).applications_enabled()
+        finally:
+            database.close()
 
     def _may_prepare_letters(self, now: datetime) -> bool:
         return self._next_letter_attempt_at is None or self._next_letter_attempt_at <= now

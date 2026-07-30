@@ -15,6 +15,7 @@ import pytest
 
 from hugin import hh_cli
 from hugin.core.settings import Settings
+from hugin.diagnostics import OperationJournal
 from hugin.domain.automation import AutomationJobState
 from hugin.domain.directions import EmploymentForm, SearchRegion, VacancyState, WorkFormat
 from hugin.domain.hh import (
@@ -71,6 +72,7 @@ class FakeBrowser:
         self.opened = False
         self.details_read: list[str] = []
         self.applications: list[tuple[str, str, str]] = []
+        self.application_submit_modes: list[bool] = []
         FakeBrowser.created = self
 
     def __enter__(self) -> FakeBrowser:
@@ -149,9 +151,19 @@ class FakeBrowser:
         *,
         expected_resume_title: str,
         cover_letter: str,
+        submit: bool = False,
+        submit_guard: object = None,
     ) -> HhApplyResult:
+        assert callable(submit_guard)
         self.applications.append((source_url, expected_resume_title, cover_letter))
-        return HhApplyResult(HhApplyStatus.APPLIED, source_url, "успешно")
+        self.application_submit_modes.append(submit)
+        if submit:
+            return HhApplyResult(HhApplyStatus.APPLIED, source_url, "успешно")
+        return HhApplyResult(
+            HhApplyStatus.MANUAL_REVIEW_REQUIRED,
+            source_url,
+            "форма заполнена без отправки",
+        )
 
 
 class FakeDatabase:
@@ -889,10 +901,12 @@ def test_analyze_loads_details_and_prints_rule_reasons(
     assert FakeBrowser.created.details_read == ["https://hh.ru/vacancy/vacancy-1"]
 
 
+@pytest.mark.parametrize("send", [False, True])
 def test_apply_runs_queue_and_records_confirmed_result(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
+    send: bool,
 ) -> None:
     FakeBrowser.authenticated = True
     install_fakes(monkeypatch, tmp_path, FakeStore())
@@ -946,9 +960,11 @@ def test_apply_runs_queue_and_records_confirmed_result(
             direction_id: int,
             *,
             require_cover_letter: bool = False,
+            allow_paused_review: bool = False,
         ) -> SimpleNamespace | None:
             assert direction_id == 3
             assert require_cover_letter
+            assert allow_paused_review is (not send)
             return self.jobs.pop(0) if self.jobs else None
 
         def record_result(
@@ -958,9 +974,10 @@ def test_apply_runs_queue_and_records_confirmed_result(
             **kwargs: object,
         ) -> SimpleNamespace:
             assert queued_job is job
-            assert result.status is HhApplyStatus.APPLIED
-            assert kwargs["apply_delay"] is not None
-            return SimpleNamespace(sent=True, blocking=False, next_apply_at=None)
+            expected = HhApplyStatus.APPLIED if send else HhApplyStatus.MANUAL_REVIEW_REQUIRED
+            assert result.status is expected
+            assert (kwargs["apply_delay"] is not None) is send
+            return SimpleNamespace(sent=send, blocking=False, next_apply_at=None)
 
     monkeypatch.setattr(hh_cli, "upgrade_database", lambda settings: None)
     monkeypatch.setattr(hh_cli, "create_database", lambda settings: database)
@@ -970,13 +987,39 @@ def test_apply_runs_queue_and_records_confirmed_result(
         lambda session: SimpleNamespace(synchronize=lambda profile: None),
     )
     monkeypatch.setattr(hh_cli, "ApplicationAutomationService", FakeAutomationService)
+    lifecycle: list[str] = []
 
-    assert hh_cli.run(["apply", "--direction", "Python backend", "--limit", "1"]) == 0
+    def confirm_preview(_prompt: str) -> str:
+        lifecycle.append("input")
+        return ""
+
+    def close_browser(
+        _browser: FakeBrowser,
+        _exc_type: type[BaseException] | None,
+        _exc_value: BaseException | None,
+        _traceback: TracebackType | None,
+    ) -> None:
+        lifecycle.append("exit")
+
+    monkeypatch.setattr("builtins.input", confirm_preview)
+    monkeypatch.setattr(FakeBrowser, "__exit__", close_browser)
+
+    arguments = ["apply", "--direction", "Python backend", "--limit", "1"]
+    if send:
+        arguments.append("--send")
+    assert hh_cli.run(arguments) == 0
 
     output = capsys.readouterr().out
-    assert "Новых подтверждённых откликов: 1" in output
-    assert "Python developer: отклик подтверждён" in output
+    assert f"Новых подтверждённых откликов: {int(send)}" in output
+    if send:
+        assert "Python developer: отклик подтверждён" in output
+        assert lifecycle == ["exit"]
+    else:
+        assert "Python developer: форма подготовлена для ручной проверки" in output
+        assert "Кнопка отправки не нажата" in output
+        assert lifecycle == ["input", "exit"]
     assert FakeBrowser.created is not None
+    assert FakeBrowser.created.application_submit_modes == [send]
     assert FakeBrowser.created.applications == [
         (
             "https://hh.ru/vacancy/100",
@@ -984,6 +1027,9 @@ def test_apply_runs_queue_and_records_confirmed_result(
             "Письмо",
         )
     ]
+    entries = list(OperationJournal(tmp_path).entries(component="applications"))
+    event = "manual.send" if send else "manual.preview"
+    assert any(entry["event"] == event for entry in entries)
 
 
 def test_apply_keeps_queue_available_when_one_result_is_unknown(
@@ -1039,8 +1085,10 @@ def test_apply_keeps_queue_available_when_one_result_is_unknown(
             direction_id: int,
             *,
             require_cover_letter: bool = False,
+            allow_paused_review: bool = False,
         ) -> SimpleNamespace | None:
             assert require_cover_letter
+            assert not allow_paused_review
             return self.jobs.pop(0) if self.jobs else None
 
         def record_result(
@@ -1067,7 +1115,7 @@ def test_apply_keeps_queue_available_when_one_result_is_unknown(
     monkeypatch.setattr(hh_cli, "ApplicationAutomationService", FakeAutomationService)
     monkeypatch.setattr(FakeBrowser, "apply_to_vacancy", fail_application)
 
-    assert hh_cli.run(["apply", "--direction", "Python backend", "--limit", "1"]) == 0
+    assert hh_cli.run(["apply", "--direction", "Python backend", "--limit", "1", "--send"]) == 0
 
 
 def test_main_uses_process_exit(monkeypatch: pytest.MonkeyPatch) -> None:

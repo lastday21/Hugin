@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from sqlalchemy import func, select, update
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.orm import Session
 
 from hugin.database.models import (
@@ -11,11 +11,13 @@ from hugin.database.models import (
     ApplicationSettingsModel,
     ApplicationTaskModel,
     CoverLetterModel,
+    DirectionVacancyModel,
     SystemStateModel,
     VacancyModel,
 )
 from hugin.domain.applications import ApplicationEventType, EventPayload
-from hugin.domain.content import CoverLetterState
+from hugin.domain.content import CURRENT_COVER_LETTER_INSTRUCTION, CoverLetterState
+from hugin.domain.directions import VacancyState
 from hugin.domain.state_machines import ensure_system_transition, ensure_task_transition
 from hugin.domain.tasks import (
     ApplicationPolicyRecord,
@@ -116,6 +118,8 @@ class QueueTaskRepository:
         account_id: int | None = None,
         direction_id: int | None = None,
         require_ready_cover_letter: bool = False,
+        cover_letter_instruction_version: str | None = None,
+        vacancy_rules_version: str | None = None,
     ) -> TaskRecord | None:
         selected_at = as_utc(now or datetime.now(UTC))
         statement = (
@@ -138,13 +142,33 @@ class QueueTaskRepository:
             statement = statement.where(ApplicationModel.account_id == account_id)
         if direction_id is not None:
             statement = statement.where(ApplicationModel.direction_id == direction_id)
+        if vacancy_rules_version is not None:
+            statement = statement.join(
+                DirectionVacancyModel,
+                and_(
+                    DirectionVacancyModel.direction_id == ApplicationModel.direction_id,
+                    DirectionVacancyModel.vacancy_id == ApplicationModel.vacancy_id,
+                ),
+            ).where(
+                DirectionVacancyModel.state == VacancyState.QUEUED,
+                DirectionVacancyModel.rules_version == vacancy_rules_version,
+            )
         if require_ready_cover_letter:
+            instruction_filter = (
+                CoverLetterModel.instruction_version == cover_letter_instruction_version
+                if cover_letter_instruction_version is not None
+                else CoverLetterModel.instruction_version.startswith(
+                    f"{CURRENT_COVER_LETTER_INSTRUCTION}_",
+                    autoescape=True,
+                )
+            )
             statement = statement.where(
                 select(CoverLetterModel.id)
                 .where(
                     CoverLetterModel.application_id == ApplicationModel.id,
                     CoverLetterModel.state == CoverLetterState.READY,
                     CoverLetterModel.text.is_not(None),
+                    instruction_filter,
                 )
                 .exists()
             )
@@ -166,6 +190,64 @@ class QueueTaskRepository:
             .returning(ApplicationTaskModel)
         )
         return _task_record(task) if task is not None else None
+
+    def requeue_after_rule_change(
+        self,
+        task_id: int,
+        *,
+        priority_score: float,
+    ) -> TaskRecord:
+        task = self._session.get(ApplicationTaskModel, task_id)
+        if (
+            task is None
+            or task.state is not TaskState.SKIPPED
+            or task.last_error_code != "VACANCY_RULES_CHANGED"
+        ):
+            raise ValueError("Задание не было остановлено изменением правил")
+        task.state = TaskState.PENDING
+        task.priority_score = priority_score
+        task.scheduled_at = datetime.now(UTC)
+        task.last_error_code = None
+        self._session.flush()
+        return _task_record(task)
+
+    def skip_ineligible(
+        self,
+        direction_id: int,
+        *,
+        rules_version: str,
+    ) -> int:
+        task_ids = tuple(
+            self._session.scalars(
+                select(ApplicationTaskModel.id)
+                .join(
+                    ApplicationModel,
+                    ApplicationModel.id == ApplicationTaskModel.application_id,
+                )
+                .join(
+                    DirectionVacancyModel,
+                    and_(
+                        DirectionVacancyModel.direction_id == ApplicationModel.direction_id,
+                        DirectionVacancyModel.vacancy_id == ApplicationModel.vacancy_id,
+                    ),
+                )
+                .where(
+                    ApplicationModel.direction_id == direction_id,
+                    ApplicationTaskModel.state.in_(READY_STATES),
+                    or_(
+                        DirectionVacancyModel.state != VacancyState.QUEUED,
+                        DirectionVacancyModel.rules_version != rules_version,
+                    ),
+                )
+            )
+        )
+        for task_id in task_ids:
+            self.transition(
+                task_id,
+                TaskState.SKIPPED,
+                error_code="VACANCY_RULES_CHANGED",
+            )
+        return len(task_ids)
 
     def recover_running(self) -> list[TaskRecord]:
         task_ids = self._session.scalars(

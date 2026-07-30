@@ -6,6 +6,7 @@ from hugin.adapters.yandex_credentials import (
     YandexAICredentials,
 )
 from hugin.core.settings import Settings
+from hugin.diagnostics import OperationJournal
 
 
 def configured_yandex_ai_client(
@@ -14,6 +15,7 @@ def configured_yandex_ai_client(
     *,
     model: str | None = None,
     reasoning_effort: str = "high",
+    operation: str = "unspecified",
 ) -> YandexAIClient:
     environment_key = settings.yandex_ai_api_key.get_secret_value().strip()
     if environment_key:
@@ -36,4 +38,6 @@ def configured_yandex_ai_client(
         settings.yandex_ai_base_url,
         settings.yandex_ai_timeout_seconds,
         reasoning_effort=reasoning_effort,
+        journal=OperationJournal(settings.data_dir),
+        operation=operation,
     )

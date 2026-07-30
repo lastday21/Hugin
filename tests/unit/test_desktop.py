@@ -370,8 +370,12 @@ def test_bridge_generates_editable_reply_draft(
     monkeypatch.setattr(
         desktop,
         "configured_yandex_ai_client",
-        lambda _settings, *, model, reasoning_effort: (
-            "configured-model" if model == "selected-model" and reasoning_effort == "high" else None
+        lambda _settings, *, model, reasoning_effort, operation: (
+            "configured-model"
+            if model == "selected-model"
+            and reasoning_effort == "high"
+            and operation == "recruiter_reply"
+            else None
         ),
     )
     monkeypatch.setattr(desktop, "RecruiterReplyService", FakeReplyService)
@@ -387,7 +391,7 @@ def test_bridge_generates_editable_reply_draft(
     monkeypatch.setattr(
         desktop,
         "configured_yandex_ai_client",
-        lambda _settings, *, model, reasoning_effort: (_ for _ in ()).throw(
+        lambda _settings, *, model, reasoning_effort, operation: (_ for _ in ()).throw(
             LookupError(f"YandexGPT не настроен: {model}, режим {reasoning_effort}")
         ),
     )

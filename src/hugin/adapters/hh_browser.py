@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -787,6 +788,8 @@ class VisibleHhBrowser:
         *,
         expected_resume_title: str,
         cover_letter: str,
+        submit: bool = False,
+        submit_guard: Callable[[], bool] | None = None,
     ) -> HhApplyResult:
         response_url = self._application_response_url(source_url)
         page = self._require_page()
@@ -820,8 +823,11 @@ class VisibleHhBrowser:
             return HhApplyResult(HhApplyStatus.VACANCY_CLOSED, page.url)
         if self._contains_any(body_text, "вы уже откликались", "отклик уже отправлен"):
             return HhApplyResult(HhApplyStatus.ALREADY_APPLIED, page.url, body_text[:1000])
-        submit = page.locator('[data-qa="vacancy-response-submit-popup"]')
-        if submit.count() == 1 and self._contains_any(submit.first.inner_text(), "повторно"):
+        submit_button = page.locator('[data-qa="vacancy-response-submit-popup"]')
+        if submit_button.count() == 1 and self._contains_any(
+            submit_button.first.inner_text(),
+            "повторно",
+        ):
             return HhApplyResult(HhApplyStatus.ALREADY_APPLIED, page.url, body_text[:1000])
         if initial.questions:
             return HhApplyResult(
@@ -851,8 +857,15 @@ class VisibleHhBrowser:
             letter.first.wait_for(state="visible", timeout=self._timeout_ms)
             letter.first.fill(cover_letter.strip())
 
-        if submit.count() != 1 or not submit.first.is_enabled():
+        if submit_button.count() != 1 or not submit_button.first.is_enabled():
             return HhApplyResult(HhApplyStatus.RETRYABLE_ERROR, page.url)
+        if not submit or submit_guard is None or not submit_guard():
+            return HhApplyResult(
+                HhApplyStatus.MANUAL_REVIEW_REQUIRED,
+                page.url,
+                "Форма заполнена и оставлена открытой без отправки",
+                warnings=initial.warnings,
+            )
 
         vacancy_id, normalized_url = self._vacancy_id_and_url(source_url)
         parsed = urlparse(normalized_url)
@@ -862,7 +875,7 @@ class VisibleHhBrowser:
                 self._is_application_submission_response,
                 timeout=self._timeout_ms,
             ) as response_info:
-                submit.first.click(no_wait_after=True)
+                submit_button.first.click(no_wait_after=True)
             response = response_info.value
             page.wait_for_timeout(1_500)
         except PlaywrightTimeoutError:

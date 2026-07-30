@@ -8,6 +8,7 @@ from hugin.database import create_database, upgrade_database
 from hugin.database.models import (
     AnswerTemplateModel,
     CandidateProfileModel,
+    CoverLetterModel,
     ScreeningFormModel,
     VerifiedFactModel,
 )
@@ -19,6 +20,7 @@ from hugin.domain import (
     ScreeningFormState,
     VacancyData,
 )
+from hugin.domain.content import CoverLetterState
 from hugin.repositories import AccountRepository, ApplicationRepository, ResumeRepository
 from hugin.repositories.vacancies import VacancyRepository
 from hugin.services.screening_forms import ScreeningDraftService
@@ -47,6 +49,17 @@ def test_draft_uses_only_confirmed_safe_answers_and_replaces_changed_form(
                 account.id,
                 vacancy.id,
                 resume.id,
+            )
+            session.add(
+                CoverLetterModel(
+                    application_id=application.id,
+                    vacancy_id=vacancy.id,
+                    resume_id=resume.id,
+                    text="Устаревшее письмо",
+                    instruction_version="cover_letter_v10_old",
+                    model_name="old-model",
+                    state=CoverLetterState.READY,
+                )
             )
             profile = CandidateProfileModel(
                 account_id=account.id,
@@ -124,6 +137,7 @@ def test_draft_uses_only_confirmed_safe_answers_and_replaces_changed_form(
             assert draft.questions[0].source is AnswerSource.PROFILE
             assert draft.questions[1].source is AnswerSource.BANK
             assert draft.unanswered_count == 2
+            assert draft.cover_letter is None
             pending = ScreeningDraftService(session).list_pending(account.id)
             assert len(pending) == 1
             assert pending[0].form_id == draft.form_id

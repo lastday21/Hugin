@@ -67,8 +67,7 @@ def test_queue_respects_system_state_and_priority(settings: Settings) -> None:
             high = tasks.enqueue(high_id, priority_score=80, scheduled_at=now)
 
             system = SystemStateRepository(session)
-            assert system.get().state is SystemState.RUNNING
-            assert system.transition(SystemState.PAUSED).state is SystemState.PAUSED
+            assert system.get().state is SystemState.PAUSED
             assert QueueService(session).claim_next(now) is None
             assert system.transition(SystemState.RUNNING).state is SystemState.RUNNING
 
@@ -197,7 +196,9 @@ def test_queue_policy_gate_and_manual_pause_are_persistent(settings: Settings) -
             assert queue.policy().daily_limit == 30
             assert queue.policy("Europe/Moscow").timezone_name == "Europe/Moscow"
 
-            SystemStateRepository(session).set_next_apply_at(now + timedelta(seconds=40))
+            system = SystemStateRepository(session)
+            system.transition(SystemState.RUNNING)
+            system.set_next_apply_at(now + timedelta(seconds=40))
             assert queue.claim_next(now) is None
             assert queue.claim_next(now + timedelta(seconds=40)) is not None
 

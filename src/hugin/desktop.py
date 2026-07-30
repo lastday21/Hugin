@@ -309,6 +309,7 @@ class DesktopBridge:
                         self._settings,
                         model=ai_settings.get_model(),
                         reasoning_effort=ai_settings.get_reasoning_effort(),
+                        operation="recruiter_reply",
                     )
                     draft = RecruiterReplyService(session, client).generate(
                         account_id=self._account_id,

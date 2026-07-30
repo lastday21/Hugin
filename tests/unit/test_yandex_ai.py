@@ -6,12 +6,14 @@ import urllib.request
 from collections.abc import Iterator
 from email.message import Message
 from io import BytesIO
+from pathlib import Path
 from types import TracebackType
 from typing import Self
 
 import pytest
 
 from hugin.adapters.yandex_ai import YandexAIClient, YandexAIError
+from hugin.diagnostics import OperationJournal
 
 
 class FakeResponse:
@@ -61,6 +63,49 @@ def test_yandex_client_streams_private_completion(monkeypatch: pytest.MonkeyPatc
     assert body["stream"] is True
     assert body["temperature"] == 0.1
     assert body["messages"][1]["content"] == "Пользовательский запрос"
+
+
+def test_yandex_client_journals_call_and_reported_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    chunks = [
+        {"choices": [{"delta": {"content": "Готово"}}]},
+        {
+            "choices": [{"delta": {"content": ""}}],
+            "usage": {
+                "prompt_tokens": 12,
+                "completion_tokens": 3,
+                "total_tokens": 15,
+            },
+        },
+    ]
+    monkeypatch.setattr(
+        urllib.request,
+        "urlopen",
+        lambda *_args, **_kwargs: FakeResponse(
+            [*(f"data: {json.dumps(chunk)}\n".encode() for chunk in chunks), b"data: [DONE]\n"]
+        ),
+    )
+    journal = OperationJournal(tmp_path)
+    client = YandexAIClient(
+        "key",
+        "folder",
+        journal=journal,
+        operation="connection_check",
+    )
+
+    assert client.complete("system", "user") == "Готово"
+
+    entries = list(journal.entries())
+    completed = next(entry for entry in entries if entry["status"] == "completed")
+    assert completed["component"] == "yandex_ai"
+    assert completed["event"] == "model.complete"
+    assert completed["details"]["prompt_units"] == 12
+    assert completed["details"]["completion_units"] == 3
+    assert completed["details"]["total_units"] == 15
+    assert completed["details"]["usage_reported"] is True
+    assert completed["details"]["usage_unit"] == "tokens"
 
 
 def test_yandex_client_rejects_empty_response(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -176,7 +221,10 @@ def test_yandex_client_reports_network_failures(
         YandexAIClient("key", "folder").complete("system", "user")
 
 
-def test_yandex_client_reports_http_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_yandex_client_reports_http_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
     error = urllib.error.HTTPError(
         "https://example.test",
         401,
@@ -191,7 +239,18 @@ def test_yandex_client_reports_http_failure(monkeypatch: pytest.MonkeyPatch) -> 
     monkeypatch.setattr(urllib.request, "urlopen", urlopen)
 
     with pytest.raises(YandexAIError, match="HTTP 401"):
-        YandexAIClient("key", "folder").complete("system", "user")
+        YandexAIClient(
+            "key",
+            "folder",
+            journal=OperationJournal(tmp_path),
+            operation="connection_check",
+        ).complete("system", "user")
+
+    failed = next(
+        entry for entry in OperationJournal(tmp_path).entries() if entry["status"] == "failed"
+    )
+    assert failed["event"] == "model.complete"
+    assert failed["details"]["error_type"] == "YandexAIError"
 
 
 @pytest.mark.parametrize(
@@ -205,3 +264,27 @@ def test_yandex_client_reports_http_failure(monkeypatch: pytest.MonkeyPatch) -> 
 )
 def test_yandex_chunk_parser_handles_supported_shapes(payload: str, expected: str) -> None:
     assert YandexAIClient._parse_chunk(payload) == expected
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        ("not-json", {}),
+        ("{}", {}),
+        ('{"usage":[]}', {}),
+        (
+            '{"usage":{"input_tokens":4,"output_tokens":2,"totalTokens":6}}',
+            {"prompt_units": 4, "completion_units": 2, "total_units": 6},
+        ),
+        (
+            '{"usage":{"inputTextTokens":3,"completionTokens":1,'
+            '"total_tokens":4,"prompt_tokens":true,"output_tokens":-1}}',
+            {"total_units": 4},
+        ),
+    ],
+)
+def test_yandex_usage_parser_accepts_only_non_negative_integer_counters(
+    payload: str,
+    expected: dict[str, int],
+) -> None:
+    assert YandexAIClient._parse_usage(payload) == expected

@@ -26,6 +26,7 @@ class HhSearchJobHandler:
         self._browser_lock = browser_lock or threading.Lock()
         self._cycle = BackgroundSearchCycle(
             settings,
+            page_limit=settings.hh_background_search_pages,
             detail_limit=settings.hh_background_detail_limit,
         )
 

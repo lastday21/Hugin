@@ -552,7 +552,7 @@ class SystemStateModel(Base):
             length=24,
             values_callable=enum_values,
         ),
-        default=SystemState.RUNNING,
+        default=SystemState.PAUSED,
         nullable=False,
     )
     next_apply_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

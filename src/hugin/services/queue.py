@@ -39,6 +39,8 @@ class QueueService:
         account_id: int | None = None,
         direction_id: int | None = None,
         require_ready_cover_letter: bool = False,
+        cover_letter_instruction_version: str | None = None,
+        vacancy_rules_version: str | None = None,
     ) -> TaskRecord | None:
         selected_at = now or datetime.now(UTC)
         system = self._system.get()
@@ -53,6 +55,8 @@ class QueueService:
             account_id=account_id,
             direction_id=direction_id,
             require_ready_cover_letter=require_ready_cover_letter,
+            cover_letter_instruction_version=cover_letter_instruction_version,
+            vacancy_rules_version=vacancy_rules_version,
         )
 
     def policy(self, timezone_name: str | None = None) -> ApplicationPolicyRecord:

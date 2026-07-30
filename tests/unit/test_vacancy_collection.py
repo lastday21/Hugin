@@ -219,5 +219,19 @@ def test_fullstack_found_by_python_is_routed_to_it_without_duplicate_task(
             assert repeated.created == 0
             assert repeated.existing == 1
             assert session.scalar(select(func.count()).select_from(ApplicationModel)) == 1
+            assert (
+                directions.get_tracked_vacancy(it_direction.id, stored.id).state
+                is VacancyState.QUEUED
+            )
+
+            VacancyAnalysisService(session).reanalyze(
+                account_external_id="account-routing",
+                direction_name="Python backend",
+            )
+
+            assert (
+                directions.get_tracked_vacancy(it_direction.id, stored.id).state
+                is VacancyState.QUEUED
+            )
     finally:
         database.close()

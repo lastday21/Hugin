@@ -24,17 +24,24 @@ from hugin.database.models import (
     VerifiedFactModel,
 )
 from hugin.domain.applications import ApplicationState
-from hugin.domain.content import ConfirmationState, CoverLetterState
+from hugin.domain.content import (
+    CURRENT_COVER_LETTER_INSTRUCTION,
+    ConfirmationState,
+    CoverLetterState,
+    cover_letter_instruction_version,
+)
+from hugin.domain.directions import VacancyState
 from hugin.domain.tasks import TaskState
 from hugin.services.ai_prompts import AiPromptSettingsService, with_user_prompt
 from hugin.services.resume_improvement import ResumeBlockExtractor
+from hugin.services.vacancy_analysis import RULES_VERSION
 
 PROMPT_PURPOSE = "cover_letter"
-PROMPT_VERSION = 10
-INSTRUCTION_VERSION = "cover_letter_v10"
+PROMPT_VERSION = 11
+INSTRUCTION_VERSION = CURRENT_COVER_LETTER_INSTRUCTION
 MIN_LETTER_LENGTH = 350
 MAX_LETTER_LENGTH = 2000
-MAX_FACT_CONTEXT_LENGTH = 12_000
+MAX_FACT_CONTEXT_LENGTH = 7_000
 
 SYSTEM_PROMPT = """Ты пишешь индивидуальные сопроводительные письма на русском языке для
 отклика через hh.ru на ИТ-вакансии. Письмо должно звучать как сообщение живого специалиста,
@@ -49,6 +56,9 @@ SYSTEM_PROMPT = """Ты пишешь индивидуальные сопрово
 не переноси задачи, технологии и результаты между такими элементами. Если обязательного навыка
 нет в подтвержденных фактах, не заявляй и не подразумевай опыт с ним. Описание назначения проекта
 не является действием кандидата: выполненными считай только действия, прямо названные в источнике.
+Сохраняй статус и время действия из источника: «разрабатываю», «интегрирую» и «добавляю»
+нельзя превращать в «разработал», «интегрировал» и «добавил». Планы, будущие и необязательные
+возможности не являются опытом и не должны попадать в письмо.
 Не называй предыдущих работодателей кандидата. Верни только готовое письмо без заголовка,
 пояснений и разметки."""
 
@@ -85,6 +95,9 @@ _TEMPLATE_PHRASES = (
     "в вашем описании",
     "уверен, что",
     "этот опыт напрямую пригодится",
+    "этот опыт позволит",
+    "быстро включусь",
+    "как мой опыт",
     "такая работа требует",
 )
 _SPECIALIST_TERM_PATTERNS = (
@@ -95,6 +108,19 @@ _SPECIALIST_TERM_PATTERNS = (
     re.compile(r"\blanggraph\b", re.IGNORECASE),
     re.compile(r"\blangchain\b", re.IGNORECASE),
     re.compile(r"(?<![A-Za-z])nlp(?![A-Za-z])", re.IGNORECASE),
+)
+_CONFIRMED_TECHNOLOGY_PATTERNS = (
+    *_SPECIALIST_TERM_PATTERNS,
+    re.compile(r"\byandex cloud\b|яндекс клауд", re.IGNORECASE),
+    re.compile(r"\bopenai\b", re.IGNORECASE),
+    re.compile(r"\bai studio\b", re.IGNORECASE),
+    re.compile(r"\bspeechkit\b", re.IGNORECASE),
+    re.compile(r"(?<![A-Za-z])llm(?![A-Za-z])", re.IGNORECASE),
+    re.compile(r"(?<![A-Za-z])grpc(?![A-Za-z])", re.IGNORECASE),
+    re.compile(r"\bopentelemetry\b", re.IGNORECASE),
+    re.compile(r"\bjaeger\b", re.IGNORECASE),
+    re.compile(r"\bprometheus\b", re.IGNORECASE),
+    re.compile(r"\bkafka\b", re.IGNORECASE),
 )
 _PLACEHOLDERS = re.compile(
     r"(?:\[[^\]\n]{1,80}\]|\{[^}\n]{1,80}\}|<[^>\n]{1,80}>|"
@@ -119,6 +145,114 @@ _COMPANY_REFERENCE = re.compile(
     re.IGNORECASE,
 )
 _TOKEN = re.compile(r"[A-Za-zА-Яа-яЁё][A-Za-zА-Яа-яЁё0-9+#.-]{2,}")
+_FUTURE_LINE = re.compile(
+    r"\b(?:планир\w*|в будущем|будущ\w*|опциональн\w*|предстоит|"
+    r"возможност\w+\s+(?:добавить|расшир)|заложил\w*\s+возможност)\b",
+    re.IGNORECASE,
+)
+_FUTURE_TECHNOLOGIES = ("Kafka", "RabbitMQ", "Kubernetes", "Temporal")
+_RELEVANCE_STOP_WORDS = {
+    "backend",
+    "developer",
+    "engineer",
+    "junior",
+    "middle",
+    "senior",
+    "работа",
+    "работать",
+    "разработка",
+    "разработчик",
+    "задачи",
+    "опыт",
+    "команда",
+    "сервис",
+    "сервисы",
+    "система",
+    "системы",
+    "требования",
+    "обязанности",
+    "знание",
+    "навыки",
+}
+_STRONG_RELEVANCE_TERMS = {
+    "python",
+    "fastapi",
+    "django",
+    "flask",
+    "postgresql",
+    "redis",
+    "sqlalchemy",
+    "asyncio",
+    "pytest",
+    "celery",
+    "grpc",
+    "websocket",
+    "docker",
+    "etl",
+    "llm",
+    "speechkit",
+}
+_CONTEXTUAL_DETAILS = (
+    (
+        re.compile(
+            r"\b(?:yandex cloud|яндекс клауд|openai|ai studio|speechkit|llm)\b",
+            re.IGNORECASE,
+        ),
+        (
+            "yandex",
+            "яндекс",
+            "cloud",
+            "облач",
+            "openai",
+            "ai studio",
+            "speechkit",
+            "llm",
+            "nlp",
+            "искусственн",
+            "реч",
+        ),
+        "облачные и ИИ-инструменты не относятся к задачам вакансии",
+    ),
+    (
+        re.compile(r"\b(?:opentelemetry|jaeger|prometheus)\b", re.IGNORECASE),
+        (
+            "opentelemetry",
+            "jaeger",
+            "prometheus",
+            "мониторинг",
+            "метрик",
+            "трассиров",
+            "наблюдаем",
+        ),
+        "средства наблюдения не относятся к задачам вакансии",
+    ),
+    (
+        re.compile(r"(?<![A-Za-z])grpc(?![A-Za-z])", re.IGNORECASE),
+        ("grpc", "микросервис", "межсервис", "rpc"),
+        "gRPC не относится к задачам вакансии",
+    ),
+)
+_MANDATORY_LETTER_INPUT = re.compile(
+    r"(?:"
+    r"в\s+(?:сопроводительном(?:\s+письме)?|отклике)"
+    r"[\s\S]{0,60}?"
+    r"(?:обязательн\w*|укажите|ответьте|напишите|расскажите)|"
+    r"(?:сопроводительное\s+письмо|отклик)"
+    r"[\s\S]{0,60}?"
+    r"(?:долж\w+\s+содержать|без\s+(?:этих|обязательных)\s+пункт)|"
+    r"(?:обязательно\s+)?(?:укажите|ответьте|напишите|расскажите)"
+    r"[\s\S]{0,50}?"
+    r"в\s+(?:сопроводительном(?:\s+письме)?|отклике)|"
+    r"без\s+ответ\w*[\s\S]{0,40}?отклик[\s\S]{0,30}?не\s+рассматри"
+    r")",
+    re.IGNORECASE,
+)
+_PERMANENT_PREPARATION_FAILURES = frozenset(
+    {
+        "MANUAL_INPUT_REQUIRED",
+        "NO_RELEVANT_EVIDENCE",
+    }
+)
 _ACTION_LINE = re.compile(
     r"\b(?:разработ|реализ|настро|интегр|автоматиз|созда|поддерж|проектир|тестир|"
     r"оптимиз|анализир|внедр)",
@@ -246,6 +380,9 @@ class CoverLetterService:
             if item.action == "existing":
                 already_ready += 1
                 continue
+            if item.action == "blocked":
+                items.append(item)
+                continue
             items.append(item)
             attempted += 1
             if attempted >= limit:
@@ -334,6 +471,19 @@ class CoverLetterService:
             and letter.model_name == model.model_name
         ):
             return self._item(candidate, CoverLetterState.READY, "existing")
+        if (
+            letter is not None
+            and letter.state is CoverLetterState.FAILED
+            and letter.failure_reason in _PERMANENT_PREPARATION_FAILURES
+            and letter.context_hash == context_hash
+            and letter.model_name == model.model_name
+        ):
+            return self._item(
+                candidate,
+                CoverLetterState.FAILED,
+                "blocked",
+                "Причина прежнего отказа не изменилась; модель не вызывалась",
+            )
 
         letter = self._pending_letter(
             letter,
@@ -342,6 +492,16 @@ class CoverLetterService:
             context_hash,
             instruction_version,
         )
+        try:
+            _ensure_relevant_evidence(candidate.vacancy, facts)
+        except CoverLetterValidationError as error:
+            self._save_failed(letter, error.code)
+            return self._item(
+                candidate,
+                CoverLetterState.FAILED,
+                "failed",
+                str(error),
+            )
         source = self._duplicate_source(candidate, instruction_version)
         if source is not None and source.text:
             source_fact_ids = tuple(
@@ -447,6 +607,8 @@ class CoverLetterService:
                 ApplicationModel.direction_id == direction_id,
                 ApplicationModel.state == ApplicationState.APPLYING,
                 ApplicationTaskModel.state.in_(_READY_TASK_STATES),
+                DirectionVacancyModel.state == VacancyState.QUEUED,
+                DirectionVacancyModel.rules_version == RULES_VERSION,
             )
         )
         if vacancy_hh_id is not None:
@@ -515,10 +677,13 @@ class CoverLetterService:
         )
         selected: list[_SelectedFact] = []
         remaining = MAX_FACT_CONTEXT_LENGTH
-        for fact in ranked[:6]:
+        for fact in ranked[:4]:
             if remaining < 200:
                 break
-            per_fact_limit = min(7000 if fact.category == "work_experience" else 3500, remaining)
+            per_fact_limit = min(
+                4500 if fact.category == "work_experience" else 2500,
+                remaining,
+            )
             safe_content = _without_contact_lines(fact.content)
             if fact.category == "work_experience":
                 content = _work_experience_excerpt(
@@ -655,8 +820,7 @@ class CoverLetterService:
 
     @staticmethod
     def _instruction_version(user_instruction: str) -> str:
-        fingerprint = hashlib.sha256(user_instruction.encode("utf-8")).hexdigest()[:12]
-        return f"{INSTRUCTION_VERSION}_{fingerprint}"
+        return cover_letter_instruction_version(user_instruction)
 
     @staticmethod
     def _item(
@@ -726,6 +890,8 @@ def build_cover_letter_prompt(
   только действия, технологии и результат, которые прямо относятся к нему в подтвержденном тексте;
 - не превращай назначение продукта в выполненную работу: например, фраза «помогает с поиском»
   не означает, что кандидат разрабатывал поиск или подключал поисковый API;
+- сохраняй время и статус действий из источника: незавершённые действия нельзя описывать как
+  завершённые, а планы и необязательные возможности нельзя выдавать за сделанный результат;
 - если в подтвержденных фактах нет требуемой технологии или вида задач, не утверждай, что кандидат
   работал с ними, не упоминай эту технологию в письме и не маскируй отсутствие опыта фразой
   «этот опыт напрямую пригодится»;
@@ -737,6 +903,10 @@ def build_cover_letter_prompt(
   «в своей работе я активно применяю» или «уверенно владею»;
 - не используй общие рекламные фразы, похвалу компании, шаблонные заглушки и сведения
   из своих знаний;
+- упоминай Yandex Cloud, AI Studio, SpeechKit и LLM только для вакансий, где облачные,
+  речевые или ИИ-задачи входят в работу; сама настройка этих инструментов работодателю не важна;
+- упоминай gRPC, трассировку и метрики только тогда, когда интеграции или наблюдение прямо
+  относятся к задачам вакансии;
 - не называй предыдущих работодателей кандидата;
 - не указывай число лет, показатели и результаты, если их нет в подтвержденных фактах;
 - заверши спокойным предложением подробнее обсудить задачи и релевантные проекты.
@@ -810,11 +980,17 @@ def validate_cover_letter(
         )
 
     fact_text = "\n".join(fact.content for fact in facts)
-    for pattern in _SPECIALIST_TERM_PATTERNS:
+    vacancy_text = _vacancy_text(vacancy).casefold()
+    for pattern, vacancy_markers, reason in _CONTEXTUAL_DETAILS:
+        if pattern.search(text) is not None and not any(
+            marker in vacancy_text for marker in vacancy_markers
+        ):
+            raise CoverLetterValidationError("IRRELEVANT_DETAIL", reason)
+    for pattern in _CONFIRMED_TECHNOLOGY_PATTERNS:
         if pattern.search(text) is not None and pattern.search(fact_text) is None:
             raise CoverLetterValidationError(
                 "UNCONFIRMED_SPECIALIST_TERM",
-                "В письме появился специальный термин, которого нет в подтвержденных фактах",
+                "В письме появилась технология, которой нет в подтвержденных фактах",
             )
     allowed_numbers = set(_NUMBER.findall(fact_text))
     allowed_numbers.update(_NUMBER.findall(vacancy.title))
@@ -935,6 +1111,7 @@ def _work_experience_excerpt(
     vacancy_tokens: set[str],
     limit: int,
 ) -> str:
+    content = _without_future_plans(content)
     try:
         structure = ResumeBlockExtractor().extract(f"Опыт работы\n{content.strip()}\nОбразование")
     except ValueError:
@@ -962,7 +1139,7 @@ def _work_experience_excerpt(
             continue
         selected.append(rendered)
         used += len(rendered) + 2
-        if len(selected) >= 9:
+        if len(selected) >= 2:
             break
     if not selected:
         for _overlap, _index, rendered in ranked:
@@ -970,3 +1147,65 @@ def _work_experience_excerpt(
                 selected.append(rendered)
                 break
     return "\n\n".join(selected)
+
+
+def _without_future_plans(content: str) -> str:
+    future_technologies: set[str] = set()
+    kept: list[str] = []
+    for line in content.splitlines():
+        if _FUTURE_LINE.search(line) is not None:
+            lowered = line.casefold()
+            future_technologies.update(
+                technology
+                for technology in _FUTURE_TECHNOLOGIES
+                if technology.casefold() in lowered
+            )
+            continue
+        kept.append(line)
+    cleaned = "\n".join(kept)
+    for technology in future_technologies:
+        cleaned = re.sub(
+            rf"(?<![\w-]){re.escape(technology)}(?![\w-])\s*,?\s*",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+    return cleaned
+
+
+def _ensure_relevant_evidence(
+    vacancy: VacancyModel,
+    facts: tuple[_SelectedFact, ...],
+) -> None:
+    if _MANDATORY_LETTER_INPUT.search(_vacancy_text(vacancy)) is not None:
+        raise CoverLetterValidationError(
+            "MANUAL_INPUT_REQUIRED",
+            "Работодатель требует отдельные ответы в отклике; нужна ручная проверка, "
+            "модель не вызывалась",
+        )
+    fact_tokens = _tokens("\n".join(fact.content for fact in facts))
+    title_tokens = _tokens(vacancy.title)
+    focus_tokens = _tokens(
+        " ".join(
+            filter(
+                None,
+                (
+                    vacancy.title,
+                    " ".join(vacancy.key_skills),
+                    vacancy.required_qualifications,
+                    vacancy.responsibilities,
+                ),
+            )
+        )
+    )
+    overlap = (focus_tokens & fact_tokens) - _RELEVANCE_STOP_WORDS
+    strong_overlap = overlap & _STRONG_RELEVANCE_TERMS
+    if "python" in title_tokens and "python" in fact_tokens:
+        return
+    if strong_overlap or len(overlap) >= 2:
+        return
+    raise CoverLetterValidationError(
+        "NO_RELEVANT_EVIDENCE",
+        "Для основных задач вакансии не найдено достаточно подтверждённого опыта; "
+        "письмо не создавалось",
+    )

@@ -12,6 +12,7 @@ from hugin.adapters.credentials import WindowsCredentialStore
 from hugin.adapters.hh_browser import VisibleHhBrowser
 from hugin.core.settings import Settings, get_settings
 from hugin.database import create_database, upgrade_database
+from hugin.diagnostics import OperationJournal
 from hugin.domain.automation import AutomationJobState
 from hugin.domain.directions import EmploymentForm, SearchRegion, WorkFormat
 from hugin.domain.hh import HhApplyResult, HhApplyStatus, HhProfileData
@@ -194,7 +195,10 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("pause", help="приостановить новые отклики")
     subparsers.add_parser("resume", help="продолжить обработку очереди")
 
-    apply = subparsers.add_parser("apply", help="подготовить подходящие отклики к проверке")
+    apply = subparsers.add_parser(
+        "apply",
+        help="заполнить один отклик для проверки без отправки",
+    )
     apply.add_argument("--account-id", type=positive_int, default=1)
     apply.add_argument("--direction", required=True, help="название направления")
     apply.add_argument("--limit", type=positive_int, default=5, help="не более откликов за запуск")
@@ -202,6 +206,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--exclude-stretch",
         action="store_true",
         help="не отправлять пограничные вакансии",
+    )
+    apply.add_argument(
+        "--send",
+        action="store_true",
+        help="действительно нажимать кнопку отправки; без флага форма только заполняется",
     )
     return parser
 
@@ -405,6 +414,16 @@ def run(argv: Sequence[str] | None = None) -> int:
         for vacancy in tuple(unique_vacancies.values())[:10]:
             employer = f" — {_display_text(vacancy.employer_name)}" if vacancy.employer_name else ""
             print(f"- {_display_text(vacancy.title)}{employer}")
+        OperationJournal(settings.data_dir).record(
+            "search",
+            "manual.search",
+            status="completed",
+            account_id=arguments.account_id,
+            direction=arguments.direction,
+            search_variants=len(search_tasks),
+            pages_loaded=len(synchronized_runs),
+            unique_vacancies=len(unique_vacancies),
+        )
         return 0
 
     if arguments.command == "analyze":
@@ -459,6 +478,21 @@ def run(argv: Sequence[str] | None = None) -> int:
             )
         for title, failure_message in failures:
             print(f"- Пропущена вакансия «{title}»: {failure_message}")
+        OperationJournal(settings.data_dir).record(
+            "search",
+            "manual.analyze",
+            status="completed",
+            account_id=arguments.account_id,
+            direction=arguments.direction,
+            details_loaded=len(vacancy_details),
+            details_failed=len(failures),
+            analyzed=len(analyzed),
+            matched=matched,
+            stretch=stretch,
+            routed=routed,
+            rejected=rejected,
+            queued=queued.created,
+        )
         return 0
 
     database = create_database(settings)
@@ -555,6 +589,13 @@ def _run_queue_control(arguments: argparse.Namespace) -> int:
     finally:
         database.close()
 
+    if arguments.command in {"pause", "resume", "configure-queue"}:
+        OperationJournal(settings.data_dir).record(
+            "applications",
+            f"queue.{arguments.command}",
+            status="completed",
+            state=status.system.state.value,
+        )
     state_names = {
         "RUNNING": "работает",
         "PAUSED": "приостановлена",
@@ -820,7 +861,9 @@ def _run_applications(
             print("Дневное ограничение исчерпано, новые отклики не отправлены.")
             return 0
 
-        while sent < arguments.limit:
+        attempts = 0
+        attempt_limit = arguments.limit if arguments.send else 1
+        while attempts < attempt_limit:
             with database.sessions.begin() as session:
                 runtime_service = ApplicationAutomationService(session)
                 runtime_policy = runtime_service.policy()
@@ -831,9 +874,11 @@ def _run_applications(
                 job = runtime_service.claim_next(
                     prepared.direction_id,
                     require_cover_letter=True,
+                    allow_paused_review=not arguments.send,
                 )
             if job is None:
                 break
+            attempts += 1
             if not job.cover_letter:
                 raise RuntimeError("Готовое сопроводительное письмо отсутствует")
             try:
@@ -841,6 +886,8 @@ def _run_applications(
                     job.vacancy.source_url,
                     expected_resume_title=job.resume.title,
                     cover_letter=job.cover_letter,
+                    submit=arguments.send,
+                    submit_guard=lambda: _applications_enabled(settings),
                 )
             except Exception as error:
                 result = HhApplyResult(
@@ -864,6 +911,14 @@ def _run_applications(
                     result,
                     apply_delay=apply_delay,
                 )
+            OperationJournal(settings.data_dir).record(
+                "applications",
+                "manual.send" if arguments.send else "manual.preview",
+                status="completed",
+                vacancy_id=getattr(job.vacancy, "hh_id", ""),
+                result_status=result.status.value,
+                sent=recorded.sent,
+            )
             status_text = _apply_status_text(result.status)
             print(f"- {job.vacancy.title}: {status_text}.")
             if result.questions:
@@ -872,6 +927,10 @@ def _run_applications(
                 sent += 1
             if recorded.blocking:
                 blocking = True
+                break
+            if not arguments.send:
+                print("  Форма заполнена. Кнопка отправки не нажата.")
+                input("  Проверьте форму в браузере и нажмите Enter, чтобы закрыть окно: ")
                 break
             if recorded.sent and sent < arguments.limit and recorded.next_apply_at is not None:
                 wait_seconds = max(
@@ -888,6 +947,15 @@ def _run_applications(
         print("Работа остановлена: требуется проверить состояние hh.ru.")
         return 3
     return 0
+
+
+def _applications_enabled(settings: Settings) -> bool:
+    database = create_database(settings)
+    try:
+        with database.sessions.begin() as session:
+            return ApplicationAutomationService(session).applications_enabled()
+    finally:
+        database.close()
 
 
 def _apply_status_text(status: HhApplyStatus) -> str:

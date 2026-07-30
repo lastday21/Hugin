@@ -42,7 +42,7 @@ def test_migration_reaches_baseline(settings: Settings) -> None:
         database.close()
 
     upgrade_database(settings)
-    assert current_revision(settings) == "0015_background_controls"
+    assert current_revision(settings) == "0016_safe_application_defaults"
     check_database_schema(settings)
 
     downgrade_database(settings)
@@ -58,9 +58,49 @@ def test_database_cli_manages_schema(
 
     assert cli.main(["upgrade"]) == 0
     assert cli.main(["current"]) == 0
-    assert capsys.readouterr().out.strip() == "0015_background_controls"
+    assert capsys.readouterr().out.strip() == "0016_safe_application_defaults"
     assert cli.main(["check"]) == 0
     assert cli.main(["downgrade"]) == 0
+
+
+def test_safe_defaults_migration_pauses_existing_queue(settings: Settings) -> None:
+    upgrade_database(settings, "0015_background_controls")
+    database = create_database(settings)
+    try:
+        with database.engine.begin() as connection:
+            connection.execute(
+                text(
+                    "UPDATE system_state "
+                    "SET state = 'RUNNING', next_apply_at = CURRENT_TIMESTAMP "
+                    "WHERE id = 1"
+                )
+            )
+    finally:
+        database.close()
+
+    upgrade_database(settings)
+    migrated = create_database(settings)
+    try:
+        with migrated.engine.connect() as connection:
+            state, next_apply_at = connection.execute(
+                text("SELECT state, next_apply_at FROM system_state WHERE id = 1")
+            ).one()
+
+        assert state == "PAUSED"
+        assert next_apply_at is None
+    finally:
+        migrated.close()
+
+    downgrade_database(settings, "0015_background_controls")
+    downgraded = create_database(settings)
+    try:
+        with downgraded.engine.connect() as connection:
+            state = connection.execute(
+                text("SELECT state FROM system_state WHERE id = 1")
+            ).scalar_one()
+        assert state == "PAUSED"
+    finally:
+        downgraded.close()
 
 
 def test_direction_migration_preserves_existing_application(settings: Settings) -> None:
@@ -99,6 +139,6 @@ def test_direction_migration_preserves_existing_application(settings: Settings) 
             ).one()
 
         assert row == ("Imported data", "legacy-resume", "APPLYING")
-        assert current_revision(settings) == "0015_background_controls"
+        assert current_revision(settings) == "0016_safe_application_defaults"
     finally:
         migrated.close()

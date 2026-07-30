@@ -257,7 +257,10 @@ class VacancyRepository:
                 DirectionVacancyModel.direction_id == direction_id,
                 VacancyModel.details_fetched_at.is_(None),
             )
-            .order_by(VacancyModel.id)
+            .order_by(
+                VacancyModel.published_at.desc().nulls_last(),
+                VacancyModel.id.desc(),
+            )
             .limit(limit)
         )
         return [_to_record(model) for model in models]

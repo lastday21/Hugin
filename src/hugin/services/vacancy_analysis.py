@@ -6,8 +6,11 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import ClassVar
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from hugin.database.models import CandidateProfileModel, VerifiedFactModel
+from hugin.domain.content import ConfirmationState
 from hugin.domain.directions import (
     AccountRecord,
     DirectionRecord,
@@ -22,7 +25,7 @@ from hugin.repositories.vacancies import VacancyRepository
 from hugin.services.career_directions import CareerDirectionService
 from hugin.services.vacancy_duplicates import VacancyDuplicateDetector
 
-RULES_VERSION = "python_it_v3"
+RULES_VERSION = "python_it_v6"
 
 
 class RuleCategory(StrEnum):
@@ -39,6 +42,7 @@ class RuleContext:
     regions: tuple[SearchRegion, ...] = ()
     minimum_salary: int | None = None
     desired_salary: int | None = None
+    relocation_allowed: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,6 +135,21 @@ class VacancyRoleRouter:
                 " ".join(vacancy.key_skills).casefold(),
             )
         )
+        testing_title = any(
+            marker in title for marker in ("тестирован", "тестировщик", "qa engineer", "qa-инженер")
+        )
+        automated_testing = any(
+            marker in complete_text
+            for marker in (
+                "автоматизац",
+                "автотест",
+                "test automation",
+                "locust",
+                "pytest",
+            )
+        )
+        if testing_title and automated_testing and "python" in complete_text:
+            return DirectionScope.IT_ADJACENT
         if any(marker in title for marker in cls._adjacent_title_markers):
             return DirectionScope.IT_ADJACENT
         has_python = "python" in complete_text
@@ -159,8 +178,26 @@ class PythonBackendRules:
         ("ml engineer", "другое направление: машинное обучение"),
         ("ручной тестировщик", "работа не связана с написанием кода"),
         ("manual qa", "работа не связана с написанием кода"),
+        ("тестирован", "другое направление: проверка качества"),
+        ("qa engineer", "другое направление: проверка качества"),
+        ("qa-инженер", "другое направление: проверка качества"),
+        ("тестировщик", "другое направление: проверка качества"),
         ("fullstack", "другое основное направление: полная разработка"),
         ("mobile", "другое основное направление: мобильная разработка"),
+        ("frontend", "другое основное направление: клиентская разработка"),
+        ("front-end", "другое основное направление: клиентская разработка"),
+        ("фронтенд", "другое основное направление: клиентская разработка"),
+        ("embedded", "другое основное направление: встроенные системы"),
+        ("встраиваем", "другое основное направление: встроенные системы"),
+        ("информационной безопасности", "другое основное направление: безопасность"),
+        ("information security", "другое основное направление: безопасность"),
+        ("безопасност", "другое основное направление: безопасность"),
+        ("security", "другое основное направление: безопасность"),
+        ("системный администратор", "другое основное направление: системное администрирование"),
+        ("ит-инфраструктур", "другое основное направление: ИТ-инфраструктура"),
+        ("серверным платформ", "другое основное направление: ИТ-инфраструктура"),
+        ("robotics", "другое основное направление: робототехника"),
+        ("робототех", "другое основное направление: робототехника"),
     )
     _stretch_specializations: ClassVar[tuple[str, ...]] = (
         "ai agent",
@@ -249,8 +286,30 @@ class PythonBackendRules:
         has_development = any(marker in complete_text for marker in self._development_markers)
         for marker, reason in self._excluded_specializations:
             if marker in title:
+                if marker in {
+                    "тестирован",
+                    "qa engineer",
+                    "qa-инженер",
+                    "тестировщик",
+                } and any(
+                    automation in complete_text
+                    for automation in (
+                        "автоматизац",
+                        "автотест",
+                        "automation",
+                        "locust",
+                        "pytest",
+                    )
+                ):
+                    continue
                 rejected.append(reason)
                 break
+        other_stack = self._primary_other_stack(title)
+        if other_stack is not None and "python" not in title:
+            rejected.append(f"другой основной стек в названии: {other_stack}")
+        mandatory_other_stack = self._mandatory_other_stack(" ".join((requirements, description)))
+        if mandatory_other_stack is not None:
+            rejected.append(f"другой обязательный основной стек: {mandatory_other_stack}")
         if not has_development:
             rejected.append("работа не связана с написанием кода или технической автоматизацией")
 
@@ -284,9 +343,23 @@ class PythonBackendRules:
             reasons.append(
                 "уровень роли учтён как риск, но не блокирует отклик без анализа обязанностей"
             )
+        elif any(
+            marker in title
+            for marker in (
+                "техлид",
+                "архитектор",
+                "architect",
+                "руководитель",
+                "head of",
+            )
+        ):
+            reasons.append(
+                "руководящая или архитектурная составляющая учтена как риск, "
+                "но само название не блокирует вакансию"
+            )
 
         if self._relocation_conflicts(complete_text, context):
-            rejected.append("обязательный переезд на Дальний Восток не входит в настройки")
+            rejected.append("обязательный переезд противоречит подтверждённым настройкам")
 
         format_score = self._work_format_score(vacancy, context)
         if format_score is not None:
@@ -417,8 +490,85 @@ class PythonBackendRules:
                 ".net developer",
                 "разработчик c#",
                 "разработчик .net",
+                "node.js",
+                "nodejs",
+                "nestjs",
+                "c++",
+                "rust",
             )
         )
+
+    @staticmethod
+    def _primary_other_stack(title: str) -> str | None:
+        patterns = (
+            (r"\bjava\b", "Java"),
+            (r"(?<!\w)c#(?!\w)|(?<!\w)\.net(?!\w)|\bdotnet\b", "C#/.NET"),
+            (r"\bgolang\b|\bgo\b", "Go"),
+            (r"\bnode(?:\.js)?\b|\bnestjs\b", "Node.js"),
+            (r"\bphp\b", "PHP"),
+            (r"(?<!\w)c\+\+(?!\w)", "C++"),
+            (r"\b1[сc]\b", "1С"),
+            (r"\brust\b", "Rust"),
+            (r"\btypescript\b|\bjavascript\b", "JavaScript/TypeScript"),
+            (r"\breact\b|\bvue(?:\.js)?\b|\bangular\b", "клиентский JavaScript"),
+        )
+        return next(
+            (label for pattern, label in patterns if re.search(pattern, title) is not None),
+            None,
+        )
+
+    @staticmethod
+    def _mandatory_other_stack(text: str) -> str | None:
+        stack_patterns = (
+            (
+                r"(?:(?:node(?:\.js)?|nodejs|nestjs|typescript|\bts\b)"
+                r".{0,70}основн\w+\s+(?:язык|стек)|"
+                r"основн\w+\s+(?:язык|стек).{0,70}"
+                r"(?:node(?:\.js)?|nodejs|nestjs|typescript|\bts\b))",
+                "Node.js/TypeScript",
+            ),
+            (
+                r"(?:\bjava\b.{0,70}основн\w+\s+(?:язык|стек)|"
+                r"основн\w+\s+(?:язык|стек).{0,70}\bjava\b)",
+                "Java",
+            ),
+            (
+                r"(?:(?:c#|\.net).{0,70}основн\w+\s+(?:язык|стек)|"
+                r"основн\w+\s+(?:язык|стек).{0,70}(?:c#|\.net))",
+                "C#/.NET",
+            ),
+            (
+                r"(?:(?:golang|\bgo\b).{0,70}основн\w+\s+(?:язык|стек)|"
+                r"основн\w+\s+(?:язык|стек).{0,70}(?:golang|\bgo\b))",
+                "Go",
+            ),
+            (
+                r"(?:\brust\b.{0,70}основн\w+\s+(?:язык|стек)|"
+                r"основн\w+\s+(?:язык|стек).{0,70}\brust\b)",
+                "Rust",
+            ),
+            (
+                r"(?:(?:1[сc])\b.{0,70}основн\w+\s+(?:язык|стек)|"
+                r"основн\w+\s+(?:язык|стек).{0,70}(?:1[сc])\b)",
+                "1С",
+            ),
+        )
+        primary_stack = next(
+            (label for pattern, label in stack_patterns if re.search(pattern, text) is not None),
+            None,
+        )
+        if primary_stack is not None:
+            return primary_stack
+        if (
+            re.search(
+                r"\bpython\b.{0,60}(?:(?<!не\s)только|лишь|legacy|вспомогательн|"
+                r"границ\w*\s+(?:ml|ai)|пример\w*\s+базов\w+\s+язык)",
+                text,
+            )
+            is not None
+        ):
+            return "Python указан только как вспомогательный язык"
+        return None
 
     @staticmethod
     def _tokens(text: str) -> set[str]:
@@ -486,7 +636,7 @@ class PythonBackendRules:
         )
         if not mandatory:
             return False
-        return any(
+        far_east = any(
             marker in text
             for marker in (
                 "дальний восток",
@@ -505,6 +655,11 @@ class PythonBackendRules:
                 "благовещенск",
             )
         )
+        if far_east:
+            return True
+        if context.relocation_allowed is not None:
+            return not context.relocation_allowed
+        return False
 
     @staticmethod
     def _salary_score(vacancy: VacancyData, context: RuleContext) -> float | None:
@@ -575,7 +730,30 @@ class AdjacentItRules(PythonBackendRules):
         ("analyst", "другое направление: аналитика без разработки"),
         ("ручной тестировщик", "работа не связана с написанием кода"),
         ("manual qa", "работа не связана с написанием кода"),
+        ("тестирован", "другое направление: проверка качества"),
+        ("qa engineer", "другое направление: проверка качества"),
+        ("qa-инженер", "другое направление: проверка качества"),
+        ("тестировщик", "другое направление: проверка качества"),
         ("mobile", "другое основное направление: мобильная разработка"),
+        ("frontend", "другое основное направление: клиентская разработка"),
+        ("front-end", "другое основное направление: клиентская разработка"),
+        ("фронтенд", "другое основное направление: клиентская разработка"),
+        ("embedded", "другое основное направление: встроенные системы"),
+        ("встраиваем", "другое основное направление: встроенные системы"),
+        ("информационной безопасности", "другое основное направление: безопасность"),
+        ("information security", "другое основное направление: безопасность"),
+        ("безопасност", "другое основное направление: безопасность"),
+        ("security", "другое основное направление: безопасность"),
+        ("системный администратор", "другое основное направление: системное администрирование"),
+        ("ит-инфраструктур", "другое основное направление: ИТ-инфраструктура"),
+        ("серверным платформ", "другое основное направление: ИТ-инфраструктура"),
+        ("robotics", "другое основное направление: робототехника"),
+        ("робототех", "другое основное направление: робототехника"),
+        ("power bi", "другое основное направление: отчётность"),
+        ("разработчик sql", "другое основное направление: разработка баз данных"),
+        ("sql developer", "другое основное направление: разработка баз данных"),
+        ("преподаватель", "другое основное направление: обучение"),
+        ("продаж", "работа не связана с разработкой"),
     )
 
     @staticmethod
@@ -677,7 +855,24 @@ class VacancyAnalysisService:
                 RuleCategory.MATCH,
                 reasons or ("решение изменено пользователем",),
             )
-            return VacancyAnalysisResult(stored, evaluation, VacancyState.ANALYZED)
+            state = (
+                VacancyState.QUEUED
+                if tracked.state is VacancyState.QUEUED
+                else VacancyState.ANALYZED
+            )
+            self._directions.apply_rules(
+                direction.id,
+                stored.id,
+                state=state,
+                score=evaluation.score,
+                details={
+                    **tracked.rules_details,
+                    "category": RuleCategory.MATCH.value,
+                    "accepted": True,
+                },
+                rules_version=RULES_VERSION,
+            )
+            return VacancyAnalysisResult(stored, evaluation, state)
 
         candidates = self._vacancies.list_duplicate_candidates(stored)
         duplicate = self._duplicates.find(stored, candidates)
@@ -706,8 +901,14 @@ class VacancyAnalysisService:
             state = VacancyState.CLOSED
         elif evaluation.category is RuleCategory.ROUTED:
             state = VacancyState.SKIPPED
+        elif evaluation.accepted:
+            state = (
+                VacancyState.QUEUED
+                if tracked.state is VacancyState.QUEUED
+                else VacancyState.ANALYZED
+            )
         else:
-            state = VacancyState.ANALYZED if evaluation.accepted else VacancyState.FILTERED_OUT
+            state = VacancyState.FILTERED_OUT
 
         self._directions.apply_rules(
             direction.id,
@@ -791,7 +992,33 @@ class VacancyAnalysisService:
             regions=regions,
             minimum_salary=settings.minimum_salary,
             desired_salary=settings.desired_salary,
+            relocation_allowed=self._relocation_allowed(account_id),
         )
+
+    def _relocation_allowed(self, account_id: int) -> bool | None:
+        values = tuple(
+            self._session.scalars(
+                select(VerifiedFactModel.content)
+                .join(
+                    CandidateProfileModel,
+                    CandidateProfileModel.id == VerifiedFactModel.profile_id,
+                )
+                .where(
+                    CandidateProfileModel.account_id == account_id,
+                    VerifiedFactModel.category == "mobility",
+                    VerifiedFactModel.state == ConfirmationState.CONFIRMED,
+                )
+                .order_by(VerifiedFactModel.id.desc())
+            )
+        )
+        content = " ".join(values).casefold()
+        if not content:
+            return None
+        if "не готов к переезду" in content or "переезд не рассматри" in content:
+            return False
+        if "готов к переезду" in content:
+            return True
+        return None
 
     @staticmethod
     def _data(stored: VacancyRecord) -> VacancyData:

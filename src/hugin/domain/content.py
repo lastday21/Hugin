@@ -1,4 +1,12 @@
+import hashlib
 from enum import StrEnum
+
+CURRENT_COVER_LETTER_INSTRUCTION = "cover_letter_v11"
+
+
+def cover_letter_instruction_version(user_instruction: str) -> str:
+    fingerprint = hashlib.sha256(user_instruction.encode("utf-8")).hexdigest()[:12]
+    return f"{CURRENT_COVER_LETTER_INSTRUCTION}_{fingerprint}"
 
 
 class ConfirmationState(StrEnum):

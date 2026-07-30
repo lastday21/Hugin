@@ -12,6 +12,7 @@ from hugin.adapters.yandex_credentials import (
 )
 from hugin.core.settings import Settings, get_settings
 from hugin.database import create_database, upgrade_database
+from hugin.diagnostics import OperationJournal
 from hugin.services.ai_prompts import AiPromptSettingsService
 from hugin.services.resume_improvement import (
     ResumeImprovementService,
@@ -64,7 +65,7 @@ def run(argv: Sequence[str] | None = None) -> int:
             return 0
 
         if arguments.command == "test":
-            client = _client(settings, store)
+            client = _client(settings, store, operation="connection_check")
             response = client.complete(
                 SYSTEM_PROMPT,
                 "Ответь одним словом: готово",
@@ -92,6 +93,7 @@ def run(argv: Sequence[str] | None = None) -> int:
                     store,
                     model=ai_settings.get_model(),
                     reasoning_effort=ai_settings.get_reasoning_effort(),
+                    operation="resume_improvement",
                 )
                 result = ResumeImprovementService(
                     session,
@@ -127,6 +129,7 @@ def _client(
     *,
     model: str | None = None,
     reasoning_effort: str = "high",
+    operation: str = "unspecified",
 ) -> YandexAIClient:
     environment_key = settings.yandex_ai_api_key.get_secret_value().strip()
     if environment_key:
@@ -149,6 +152,8 @@ def _client(
         settings.yandex_ai_base_url,
         settings.yandex_ai_timeout_seconds,
         reasoning_effort=reasoning_effort,
+        journal=OperationJournal(settings.data_dir),
+        operation=operation,
     )
 
 

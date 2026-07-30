@@ -12,7 +12,10 @@ from hugin.domain.applications import (
     ApplicationState,
     EventPayload,
 )
-from hugin.domain.content import CoverLetterState
+from hugin.domain.content import (
+    CoverLetterState,
+    cover_letter_instruction_version,
+)
 from hugin.domain.directions import (
     AccountRecord,
     DirectionVacancyRecord,
@@ -30,9 +33,10 @@ from hugin.repositories.directions import (
 )
 from hugin.repositories.tasks import QueueTaskRepository, SystemStateRepository
 from hugin.repositories.vacancies import VacancyRepository
+from hugin.services.ai_prompts import AiPromptSettingsService
 from hugin.services.queue import QueueService
 from hugin.services.screening_forms import ScreeningDraftService
-from hugin.services.vacancy_analysis import RuleCategory
+from hugin.services.vacancy_analysis import RULES_VERSION, RuleCategory
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,7 +122,8 @@ class ApplicationAutomationService:
         for tracked in self._directions.list_tracked_vacancies(direction.id):
             category = tracked.rules_details.get("category")
             if (
-                tracked.state not in {VacancyState.ANALYZED, VacancyState.QUEUED}
+                tracked.rules_version != RULES_VERSION
+                or tracked.state not in {VacancyState.ANALYZED, VacancyState.QUEUED}
                 or category not in allowed
             ):
                 continue
@@ -137,7 +142,22 @@ class ApplicationAutomationService:
                     )
                     created += 1
                 else:
-                    if task is not None and task.state not in {
+                    if (
+                        task is not None
+                        and task.state is TaskState.SKIPPED
+                        and task.last_error_code == "VACANCY_RULES_CHANGED"
+                    ):
+                        self._tasks.requeue_after_rule_change(
+                            task.id,
+                            priority_score=self._priority(tracked),
+                        )
+                        self._directions.set_vacancy_state(
+                            direction.id,
+                            tracked.vacancy_id,
+                            VacancyState.QUEUED,
+                        )
+                        created += 1
+                    elif task is not None and task.state not in {
                         TaskState.COMPLETED,
                         TaskState.SKIPPED,
                     }:
@@ -161,6 +181,7 @@ class ApplicationAutomationService:
                 VacancyState.QUEUED,
             )
             created += 1
+        self._tasks.skip_ineligible(direction.id, rules_version=RULES_VERSION)
         return PreparationResult(account.id, direction.id, resume, created, existing)
 
     @staticmethod
@@ -179,18 +200,38 @@ class ApplicationAutomationService:
     def policy(self, timezone_name: str | None = None) -> ApplicationPolicyRecord:
         return self._queue.policy(timezone_name)
 
+    def applications_enabled(self) -> bool:
+        return self._system.get().state is SystemState.RUNNING
+
     def claim_next(
         self,
         direction_id: int | None = None,
         *,
         account_id: int | None = None,
         require_cover_letter: bool = False,
+        allow_paused_review: bool = False,
     ) -> ApplyJob | None:
-        task = self._queue.claim_next(
-            account_id=account_id,
-            direction_id=direction_id,
-            require_ready_cover_letter=require_cover_letter,
+        instruction_version = cover_letter_instruction_version(
+            AiPromptSettingsService(self._session).get().cover_letter
         )
+        if allow_paused_review:
+            if self._system.get().state is not SystemState.PAUSED:
+                raise RuntimeError("Проверка без отправки доступна только на паузе")
+            task = self._tasks.claim_next(
+                account_id=account_id,
+                direction_id=direction_id,
+                require_ready_cover_letter=require_cover_letter,
+                cover_letter_instruction_version=instruction_version,
+                vacancy_rules_version=RULES_VERSION,
+            )
+        else:
+            task = self._queue.claim_next(
+                account_id=account_id,
+                direction_id=direction_id,
+                require_ready_cover_letter=require_cover_letter,
+                cover_letter_instruction_version=instruction_version,
+                vacancy_rules_version=RULES_VERSION,
+            )
         if task is None:
             return None
         application = self._applications.get(task.application_id)
@@ -204,6 +245,7 @@ class ApplicationAutomationService:
                 CoverLetterModel.application_id == application.id,
                 CoverLetterModel.state == CoverLetterState.READY,
                 CoverLetterModel.text.is_not(None),
+                CoverLetterModel.instruction_version == instruction_version,
             )
             .order_by(CoverLetterModel.id.desc())
             .limit(1)
@@ -229,8 +271,7 @@ class ApplicationAutomationService:
         current = self._system.get().state
         if current not in {SystemState.AUTH_REQUIRED, SystemState.CAPTCHA_REQUIRED}:
             return
-        target = SystemState.PAUSED if self._tasks.has_unknown_result() else SystemState.RUNNING
-        self._system.transition(target)
+        self._system.transition(SystemState.PAUSED)
 
     def record_result(
         self,
@@ -348,12 +389,16 @@ class ApplicationAutomationService:
         )
 
     def _mark_cover_letter_sent(self, application_id: int, sent_at: datetime) -> None:
+        instruction_version = cover_letter_instruction_version(
+            AiPromptSettingsService(self._session).get().cover_letter
+        )
         letter = self._session.scalar(
             select(CoverLetterModel)
             .where(
                 CoverLetterModel.application_id == application_id,
                 CoverLetterModel.state == CoverLetterState.READY,
                 CoverLetterModel.text.is_not(None),
+                CoverLetterModel.instruction_version == instruction_version,
             )
             .order_by(CoverLetterModel.id.desc())
             .limit(1)

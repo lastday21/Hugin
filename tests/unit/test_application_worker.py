@@ -31,6 +31,7 @@ class FakeDatabase:
 
 class FakeApplicationService:
     job: ClassVar[object | None] = None
+    enabled: ClassVar[bool] = True
     sent_today: ClassVar[int] = 0
     daily_limit: ClassVar[int] = 25
     recorded: ClassVar[list[tuple[ApplyJob, HhApplyResult, timedelta | None, datetime]]] = []
@@ -49,6 +50,9 @@ class FakeApplicationService:
             delay_min_seconds=30,
             delay_max_seconds=60,
         )
+
+    def applications_enabled(self) -> bool:
+        return self.enabled
 
     def applied_since(self, _account_id: int, _since: datetime) -> int:
         return self.sent_today
@@ -75,6 +79,7 @@ def prepare_worker(
     tmp_path: Path,
     *,
     job_handler: applications.ApplicationJobHandler | None = None,
+    letter_preparer: applications.LetterQueuePreparer | None = None,
 ) -> applications.ApplicationWorker:
     monkeypatch.setattr(applications, "create_database", lambda _settings: FakeDatabase())
     monkeypatch.setattr(
@@ -84,13 +89,14 @@ def prepare_worker(
     )
     return applications.ApplicationWorker(
         Settings(environment="test", data_dir=tmp_path),
-        letter_preparer=lambda _account_id: 0,
+        letter_preparer=letter_preparer or (lambda _account_id: 0),
         job_handler=job_handler,
     )
 
 
 def setup_function() -> None:
     FakeApplicationService.job = None
+    FakeApplicationService.enabled = True
     FakeApplicationService.sent_today = 0
     FakeApplicationService.daily_limit = 25
     FakeApplicationService.recorded = []
@@ -142,6 +148,48 @@ def test_worker_does_not_claim_after_daily_limit(
 
     assert not worker.run_once(datetime(2026, 7, 27, 10, 0, tzinfo=UTC))
     assert FakeApplicationService.recorded == []
+
+
+def test_worker_does_not_prepare_letters_when_applications_are_paused(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    FakeApplicationService.enabled = False
+    prepared_for: list[int] = []
+
+    def prepare_letter(account_id: int) -> int:
+        prepared_for.append(account_id)
+        return 1
+
+    worker = prepare_worker(
+        monkeypatch,
+        tmp_path,
+        letter_preparer=prepare_letter,
+    )
+
+    assert not worker.run_once(datetime(2026, 7, 27, 10, 0, tzinfo=UTC))
+    assert prepared_for == []
+
+
+def test_worker_does_not_prepare_letters_after_daily_limit(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    FakeApplicationService.sent_today = FakeApplicationService.daily_limit
+    prepared_for: list[int] = []
+
+    def prepare_letter(account_id: int) -> int:
+        prepared_for.append(account_id)
+        return 1
+
+    worker = prepare_worker(
+        monkeypatch,
+        tmp_path,
+        letter_preparer=prepare_letter,
+    )
+
+    assert not worker.run_once(datetime(2026, 7, 27, 10, 0, tzinfo=UTC))
+    assert prepared_for == []
 
 
 def test_worker_marks_exception_after_claim_as_unknown(
@@ -200,7 +248,11 @@ def test_worker_runs_authenticated_browser_job(monkeypatch: pytest.MonkeyPatch) 
             *,
             expected_resume_title: str,
             cover_letter: str,
+            submit: bool,
+            submit_guard: object,
         ) -> HhApplyResult:
+            assert submit
+            assert callable(submit_guard)
             calls.append((source_url, expected_resume_title, cover_letter))
             return HhApplyResult(HhApplyStatus.APPLIED, source_url)
 
@@ -285,6 +337,9 @@ def test_worker_prepares_one_letter_for_active_direction(
         def scalars(self, _statement: object) -> tuple[str, ...]:
             return ("Python backend", "Другое ИТ")
 
+        def expire_all(self) -> None:
+            pass
+
     class LetterSessions:
         def begin(self) -> object:
             return nullcontext(LetterSession())
@@ -308,22 +363,30 @@ def test_worker_prepares_one_letter_for_active_direction(
             }
             return SimpleNamespace(generated=1, reused=0)
 
-        monkeypatch.setattr(applications, "create_database", lambda _settings: LetterDatabase())
-        monkeypatch.setattr(
-            applications,
-            "AiPromptSettingsService",
-            lambda _session: SimpleNamespace(
-                get_model=lambda: "selected-model",
-                get_reasoning_effort=lambda: "high",
-            ),
-        )
-        monkeypatch.setattr(
-            applications,
-            "configured_yandex_ai_client",
-            lambda _settings, *, model, reasoning_effort: {("selected-model", "high"): object()}[
-                (model, reasoning_effort)
-            ],
-        )
+    class FakeAutomation:
+        def __init__(self, _session: object) -> None:
+            pass
+
+        def applications_enabled(self) -> bool:
+            return True
+
+    monkeypatch.setattr(applications, "create_database", lambda _settings: LetterDatabase())
+    monkeypatch.setattr(applications, "ApplicationAutomationService", FakeAutomation)
+    monkeypatch.setattr(
+        applications,
+        "AiPromptSettingsService",
+        lambda _session: SimpleNamespace(
+            get_model=lambda: "selected-model",
+            get_reasoning_effort=lambda: "high",
+        ),
+    )
+    monkeypatch.setattr(
+        applications,
+        "configured_yandex_ai_client",
+        lambda _settings, *, model, reasoning_effort, operation: {
+            ("selected-model", "high", "cover_letter"): object()
+        }[(model, reasoning_effort, operation)],
+    )
 
     monkeypatch.setattr(applications, "CoverLetterService", FakeLetterService)
     worker = applications.ApplicationWorker(
@@ -332,3 +395,29 @@ def test_worker_prepares_one_letter_for_active_direction(
     )
 
     assert worker._prepare_letters(1) == 1
+
+
+def test_worker_checks_current_application_state_before_submit(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    worker = prepare_worker(monkeypatch, tmp_path)
+
+    assert worker._applications_enabled()
+    FakeApplicationService.enabled = False
+    assert not worker._applications_enabled()
+
+
+def test_worker_does_not_create_model_client_while_paused(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    FakeApplicationService.enabled = False
+    worker = prepare_worker(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        applications,
+        "configured_yandex_ai_client",
+        lambda *_args, **_kwargs: pytest.fail("модель не должна вызываться"),
+    )
+
+    assert worker._prepare_letters(1) == 0

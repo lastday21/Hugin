@@ -18,10 +18,11 @@ from hugin.adapters.yandex_credentials import (
 from hugin.core.settings import Settings
 from hugin.database import create_database, upgrade_database
 from hugin.database.models import CoverLetterModel
-from hugin.domain.content import CoverLetterState
+from hugin.domain.content import CoverLetterState, cover_letter_instruction_version
 from hugin.domain.vacancies import VacancyData
 from hugin.repositories import AccountRepository, ApplicationRepository, ResumeRepository
 from hugin.repositories.vacancies import VacancyRepository
+from hugin.services.ai_prompts import DEFAULT_COVER_LETTER_PROMPT
 from hugin.services.cover_letter import (
     CoverLetterPreparationItem,
     CoverLetterPreparationResult,
@@ -139,9 +140,9 @@ def test_prepare_creates_letters_without_browser_or_hh_submission(
     monkeypatch.setattr(
         cover_letter_cli,
         "_client",
-        lambda _settings, _store, *, model, reasoning_effort: {
-            ("selected-model", "high"): object()
-        }[(model, reasoning_effort)],
+        lambda _settings, _store, *, model, reasoning_effort, operation: {
+            ("selected-model", "high", "cover_letter"): object()
+        }[(model, reasoning_effort, operation)],
     )
     monkeypatch.setattr(cover_letter_cli, "ApplicationAutomationService", FakeAutomation)
     monkeypatch.setattr(cover_letter_cli, "CoverLetterService", FakeLetters)
@@ -203,7 +204,11 @@ def test_connection_check_uses_configured_client(
     )
     monkeypatch.setattr(cover_letter_cli, "WindowsYandexAICredentialStore", FakeStore)
     monkeypatch.setattr(cover_letter_cli, "get_settings", lambda: Settings())
-    monkeypatch.setattr(cover_letter_cli, "_client", lambda _settings, _store: client)
+    monkeypatch.setattr(
+        cover_letter_cli,
+        "_client",
+        lambda _settings, _store, *, operation: {"connection_check": client}[operation],
+    )
 
     assert cover_letter_cli.run(["test"]) == 0
     assert "yandexgpt-test: готово" in capsys.readouterr().out
@@ -234,7 +239,9 @@ def test_show_reads_saved_letter(
                     vacancy_id=vacancy.id,
                     resume_id=resume.id,
                     text="Сохраненное индивидуальное письмо",
-                    instruction_version="cover_letter_v1",
+                    instruction_version=cover_letter_instruction_version(
+                        DEFAULT_COVER_LETTER_PROMPT
+                    ),
                     model_name="yandexgpt-test",
                     context_hash="hash",
                     state=CoverLetterState.READY,
