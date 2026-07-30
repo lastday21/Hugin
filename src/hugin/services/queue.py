@@ -41,9 +41,10 @@ class QueueService:
         require_ready_cover_letter: bool = False,
         cover_letter_instruction_version: str | None = None,
         vacancy_rules_version: str | None = None,
+        vacancy_rule_categories: frozenset[str] | None = None,
     ) -> TaskRecord | None:
         selected_at = now or datetime.now(UTC)
-        system = self._system.get()
+        system = self._system.lock()
         if system.state is not SystemState.RUNNING:
             return None
         if self._tasks.has_unknown_result():
@@ -57,6 +58,7 @@ class QueueService:
             require_ready_cover_letter=require_ready_cover_letter,
             cover_letter_instruction_version=cover_letter_instruction_version,
             vacancy_rules_version=vacancy_rules_version,
+            vacancy_rule_categories=vacancy_rule_categories,
         )
 
     def policy(self, timezone_name: str | None = None) -> ApplicationPolicyRecord:
@@ -93,6 +95,10 @@ class QueueService:
             return current
         if current.state is not SystemState.PAUSED:
             raise ValueError("Сначала нужно устранить защитное состояние hh.ru")
+        if self._system.supervised_lease_active():
+            raise ValueError(
+                "Нельзя включить очередь, пока выполняется управляемый поштучный отклик"
+            )
         if self._tasks.has_unknown_result():
             raise ValueError("Сначала нужно сверить отклик, результат которого неизвестен")
         return self._system.transition(SystemState.RUNNING)

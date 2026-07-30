@@ -556,6 +556,8 @@ class SystemStateModel(Base):
         nullable=False,
     )
     next_apply_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    supervised_lease_token: Mapped[str | None] = mapped_column(String(64), index=True)
+    supervised_lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
     )

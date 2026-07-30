@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import unicodedata
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
@@ -39,6 +40,7 @@ from hugin.domain.hh import (
     HhProfileData,
     HhResumeData,
     HhResumeDetails,
+    HhResumeExperienceBlock,
     HhScreeningField,
     HhScreeningForm,
     screening_form_hash,
@@ -184,20 +186,271 @@ return ({
 """
 
 RESUME_DETAILS_SCRIPT = """
-() => ({
-    title: (
-        document.querySelector('[data-qa="resume-block-title-position"]')?.textContent || ''
-    ).trim(),
-    experience: (
-        document.querySelector('[data-qa="resume-list-card-experience"]')?.innerText || ''
-    ).trim(),
-    skills: (
-        document.querySelector('[data-qa="skills-card"]')?.innerText || ''
-    ).trim(),
-    education: (
-        document.querySelector('[data-qa="resume-list-card-education"]')?.innerText || ''
-    ).trim(),
-})
+async () => {
+const actionLine = /^(?:развернуть|свернуть|добавить|редактировать|указать уровни?)$/i;
+const clean = (value) => (value || '')
+    .replace(/\\u00a0/g, ' ')
+    .split('\\n')
+    .map((line) => line.trim().replace(/[ \\t]+/g, ' '))
+    .filter((line) => !actionLine.test(line))
+    .join('\\n')
+    .trim()
+    .replace(/\\n{3,}/g, '\\n\\n');
+const states = Array.from(
+    document.querySelectorAll('template.ResumeProfileFront-InitialState')
+).flatMap((template) => {
+    try {
+        return [JSON.parse(template.content.textContent || '{}')];
+    } catch {
+        return [];
+    }
+});
+const resumeState = states.find((state) => state?.scheme?.resume)?.scheme?.resume || {};
+const stateValues = (key) => {
+    const values = resumeState[key];
+    if (!Array.isArray(values)) return [];
+    return values
+        .map((item) => item?.string)
+        .filter((value) => typeof value === 'string' || typeof value === 'number');
+};
+const stateText = (key) => clean(stateValues(key)[0] || '');
+const labels = (values, known) => Array.from(new Set(
+    values.map((value) => known[String(value)] || clean(String(value))).filter(Boolean)
+)).join(', ');
+const firstText = (...selectors) => {
+    for (const selector of selectors) {
+        const node = document.querySelector(selector);
+        const value = clean(node?.innerText || node?.textContent || '');
+        if (value) return value;
+    }
+    return '';
+};
+const allText = (...selectors) => {
+    const nodes = Array.from(document.querySelectorAll(selectors.join(',')));
+    const leaves = nodes.filter((node, index, all) =>
+        !all.some((other, otherIndex) =>
+            index !== otherIndex && node !== other && node.contains(other)
+        )
+    );
+    return Array.from(new Set(
+        leaves.map((node) => clean(node.innerText || node.textContent || '')).filter(Boolean)
+    )).join(', ');
+};
+const mainText = clean(document.querySelector('main')?.innerText || document.body?.innerText || '');
+const fragment = (pattern) => {
+    for (const part of mainText.split(/\\n|,/).map(clean)) {
+        if (pattern.test(part)) return part;
+    }
+    return '';
+};
+const blockAfterHeading = (headingPattern) => {
+    const headings = Array.from(document.querySelectorAll(
+        'h1, h2, h3, h4, [role="heading"], [data-qa*="title"]'
+    ));
+    const heading = headings.find((node) => headingPattern.test(clean(node.textContent || '')));
+    if (!heading) return '';
+    const container = heading.closest('section, article, [data-qa*="about"], [data-qa*="skills"]');
+    if (!container) return '';
+    const value = clean(container.innerText || '');
+    const title = clean(heading.textContent || '');
+    return clean(value.startsWith(title) ? value.slice(title.length) : value);
+};
+const areaId = stateValues('area')[0];
+const stateAreaName = (() => {
+    if (areaId === undefined) return '';
+    const queue = states.map((value) => ({value, path: ''}));
+    for (let index = 0; index < queue.length; index += 1) {
+        const current = queue[index];
+        if (!current.value || typeof current.value !== 'object') continue;
+        const pathIsArea = /(?:area|region|city)/i.test(current.path);
+        if (pathIsArea && !Array.isArray(current.value)) {
+            const identifier = current.value.id ?? current.value.value ?? current.value.code;
+            if (String(identifier) === String(areaId)) {
+                for (const key of ['name', 'text', 'label', 'title']) {
+                    const candidate = clean(current.value[key]);
+                    if (candidate && candidate !== String(areaId)) return candidate;
+                }
+            }
+        }
+        for (const [key, value] of Object.entries(current.value)) {
+            if (value && typeof value === 'object') {
+                queue.push({value, path: current.path ? `${current.path}.${key}` : key});
+            } else if (
+                pathIsArea &&
+                key === String(areaId) &&
+                typeof value === 'string' &&
+                clean(value)
+            ) {
+                return clean(value);
+            }
+        }
+    }
+    return '';
+})();
+const apiAreaName = await (async () => {
+    if (stateAreaName || areaId === undefined || !/^\\d+$/.test(String(areaId))) return '';
+    try {
+        const response = await fetch(`https://api.hh.ru/areas/${areaId}`);
+        if (!response.ok) return '';
+        const area = await response.json();
+        return clean(area?.name);
+    } catch {
+        return '';
+    }
+})();
+const monthNames = [
+    'январь', 'февраль', 'март', 'апрель', 'май', 'июнь',
+    'июль', 'август', 'сентябрь', 'октябрь', 'ноябрь', 'декабрь'
+];
+const monthYear = (value) => {
+    const match = /^(\\d{4})-(\\d{2})/.exec(value || '');
+    if (!match) return clean(value);
+    const month = monthNames[Number(match[2]) - 1] || match[2];
+    return `${month} ${match[1]}`;
+};
+const stateExperienceBlocks = (
+    Array.isArray(resumeState.experience) ? resumeState.experience : []
+).map((item) => {
+    const company = clean(item?.companyName);
+    const position = clean(item?.position);
+    const start = monthYear(item?.startDate);
+    const end = item?.endDate ? monthYear(item.endDate) : 'настоящее время';
+    const period = start ? `${start} — ${end}` : '';
+    const description = clean(item?.description);
+    return {
+        company,
+        position,
+        period,
+        description,
+        text: clean([company, position, period, description].filter(Boolean).join('\\n'))
+    };
+}).filter((block) => block.text);
+const candidateNodes = Array.from(document.querySelectorAll([
+    '[data-qa="profile-experience-company-card"]',
+    '[data-qa="resume-list-card-experience"]',
+    '[data-qa="resume-block-experience"]',
+    '[data-qa^="resume-block-experience-"]',
+    '[data-qa^="resume-experience-item-"]'
+].join(',')));
+const experienceNodes = candidateNodes.filter((node, index, all) =>
+    !all.some((other, otherIndex) =>
+        otherIndex !== index && node.contains(other) && other !== node
+    )
+);
+const childText = (node, selectors) => {
+    for (const selector of selectors) {
+        const child = node.querySelector(selector);
+        const value = clean(child?.innerText || child?.textContent || '');
+        if (value) return value;
+    }
+    return '';
+};
+const experienceBlocks = experienceNodes.map((node) => {
+    const text = clean(node.innerText || node.textContent || '');
+    return {
+        company: childText(node, [
+            '[data-qa*="experience-company"]',
+            '[data-qa*="experience-organisation"]',
+            '[data-qa*="experience-employer"]'
+        ]),
+        position: childText(node, [
+            '[data-qa*="experience-position"]',
+            '[data-qa*="experience-title"]'
+        ]),
+        period: childText(node, [
+            '[data-qa*="experience-period"]',
+            '[data-qa*="experience-date"]',
+            '[data-qa*="time-interval"]'
+        ]),
+        description: childText(node, [
+            '[data-qa*="experience-description"]',
+            '[data-qa*="experience-responsibility"]'
+        ]),
+        text
+    };
+}).filter((block) => block.text);
+const structuredExperienceBlocks = stateExperienceBlocks.length
+    ? stateExperienceBlocks
+    : experienceBlocks;
+const experience = structuredExperienceBlocks.map((block) => block.text).join('\\n\\n') ||
+    firstText('[data-qa="resume-list-card-experience"]');
+const employment = labels(stateValues('employment'), {
+    full: 'Полная занятость',
+    part: 'Частичная занятость',
+    project: 'Проектная работа',
+    volunteer: 'Волонтёрство',
+    probation: 'Стажировка'
+}) || labels(stateValues('employmentForms'), {
+    FULL: 'Постоянная работа',
+    PART_TIME: 'Подработка',
+    PROJECT: 'Проектная работа',
+    INTERNSHIP: 'Стажировка'
+}) || allText(
+    '[data-qa="resume-position-field-employmentForms"]',
+    '[data-qa="resume-block-employment"]',
+    '[data-qa*="resume-employment"]'
+);
+const workFormat = labels(stateValues('workFormats'), {
+    ON_SITE: 'На месте работодателя',
+    REMOTE: 'Удалённо',
+    HYBRID: 'Гибрид'
+}) || allText(
+    '[data-qa="resume-position-field-workFormats"]',
+    '[data-qa="resume-block-work-schedule"]',
+    '[data-qa="resume-block-work-format"]',
+    '[data-qa*="resume-work-format"]'
+);
+const relocation = labels(stateValues('relocation'), {
+    no_relocation: 'Не готов к переезду',
+    relocation_possible: 'Готов к переезду',
+    relocation_desirable: 'Хочу переехать'
+}) || fragment(/переезд/i);
+const businessTrips = labels(stateValues('businessTripReadiness'), {
+    never: 'Не готов к командировкам',
+    sometimes: 'Готов к редким командировкам',
+    ready: 'Готов к командировкам'
+}) || fragment(/командиров/i);
+const stateSkills = stateValues('keySkills').map((value) => clean(String(value))).filter(Boolean);
+return {
+    title: firstText(
+        '[data-qa="resume-block-title-position"]',
+        '[data-qa*="resume-title"]'
+    ) || stateText('title'),
+    city: firstText(
+        '[data-qa="resume-personal-address"]',
+        '[data-qa="resume-personal-location"]',
+        '[data-qa="resume-block-location"]',
+        '[data-qa*="resume-address"]',
+        '[data-qa*="resume-location"]'
+    ) || stateAreaName || apiAreaName || fragment(/^(?:Проживает|Город)\\s*:/i).replace(
+        /^(?:Проживает|Город)\\s*:\\s*/i, ''
+    ),
+    salary: firstText(
+        '[data-qa="resume-block-salary"]',
+        '[data-qa="resume-block-title-salary"]',
+        '[data-qa*="resume-salary"]'
+    ) || fragment(/(?:зарплат|доход)/i),
+    employment,
+    workFormat,
+    relocation,
+    businessTrips,
+    experience,
+    experienceBlocks: structuredExperienceBlocks,
+    skills: stateSkills.join(', ') ||
+        allText('[data-qa^="skill-tag-"]') ||
+        firstText('[data-qa="skills-card"]', '[data-qa*="resume-skills"]') ||
+        blockAfterHeading(/^Навыки$/i),
+    education: firstText(
+        '[data-qa="resume-list-card-education"]',
+        '[data-qa*="resume-education"]'
+    ) || blockAfterHeading(/^Образование$/i),
+    about: stateText('skills') || firstText(
+        '[data-qa="resume-block-about"]',
+        '[data-qa="resume-about-card"]',
+        '[data-qa*="resume-about"]'
+    ) || blockAfterHeading(/^Обо мне$/i)
+};
+}
 """
 
 APPLICATION_FORM_SCRIPT = """
@@ -348,7 +601,23 @@ NEGOTIATIONS_SCRIPT = """
     const vacancy = item.querySelector('[data-qa="negotiations-item-vacancy"]');
     const anchor = vacancy?.closest('a') || vacancy?.querySelector('a[href*="/vacancy/"]');
     const tag = item.querySelector('[data-qa^="negotiations-tag"]');
+    const fiberKey = Object.getOwnPropertyNames(item).find(
+        (key) => key.startsWith('__reactFiber$')
+    );
+    let fiber = fiberKey ? item[fiberKey] : null;
+    let vacancyId = '';
+    for (let level = 0; fiber && level < 12 && !vacancyId; level += 1) {
+        const value = (
+            fiber.memoizedProps?.topic?.vacancyId ||
+            fiber.pendingProps?.topic?.vacancyId
+        );
+        if (typeof value === 'number' || typeof value === 'string') {
+            vacancyId = String(value);
+        }
+        fiber = fiber.return;
+    }
     return {
+        vacancyId,
         vacancyHref: anchor?.getAttribute('href') || '',
         statusQa: tag?.getAttribute('data-qa') || '',
         statusLabel: (tag?.textContent || '').trim().replace(/\\s+/g, ' '),
@@ -429,6 +698,17 @@ class _ApplicationSnapshot:
     @property
     def warnings(self) -> tuple[str, ...]:
         return self.screening_form.warnings
+
+
+@dataclass(slots=True)
+class _SubmissionAttempt:
+    started: bool = False
+
+
+class _ResumeSelectionError(RuntimeError):
+    def __init__(self, message: str, *, retryable: bool) -> None:
+        super().__init__(message)
+        self.retryable = retryable
 
 
 class VisibleHhBrowser:
@@ -699,12 +979,35 @@ class VisibleHhBrowser:
         payload = page.evaluate(RESUME_DETAILS_SCRIPT)
         if not isinstance(payload, dict):
             raise RuntimeError("hh.ru вернул некорректные данные резюме")
+        raw_blocks = payload.get("experienceBlocks")
+        if not isinstance(raw_blocks, list) or not all(
+            isinstance(block, dict) for block in raw_blocks
+        ):
+            raise RuntimeError("hh.ru вернул некорректные блоки опыта")
+        experience_blocks = tuple(
+            HhResumeExperienceBlock(
+                company=self._resume_text(block, "company"),
+                position=self._resume_text(block, "position"),
+                period=self._resume_text(block, "period"),
+                description=self._resume_text(block, "description"),
+                text=self._required_resume_text(block, "text", "блока опыта"),
+            )
+            for block in raw_blocks
+        )
         return HhResumeDetails(
             hh_id=resume_id,
-            title=self._required_string(payload, "title", "названия резюме"),
-            experience=self._optional_string(payload, "experience"),
-            skills=self._optional_string(payload, "skills"),
-            education=self._optional_string(payload, "education"),
+            title=self._required_resume_text(payload, "title", "названия резюме"),
+            experience=self._resume_text(payload, "experience"),
+            skills=self._resume_text(payload, "skills"),
+            education=self._resume_text(payload, "education"),
+            city=self._resume_text(payload, "city"),
+            salary=self._resume_text(payload, "salary"),
+            employment=self._resume_text(payload, "employment"),
+            work_format=self._resume_text(payload, "workFormat"),
+            relocation=self._resume_text(payload, "relocation"),
+            business_trips=self._resume_text(payload, "businessTrips"),
+            about=self._resume_text(payload, "about"),
+            experience_blocks=experience_blocks,
         )
 
     def read_application_statuses(self) -> tuple[HhNegotiationData, ...]:
@@ -713,10 +1016,19 @@ class VisibleHhBrowser:
         if not isinstance(payload, list) or not all(isinstance(item, dict) for item in payload):
             raise RuntimeError("hh.ru вернул некорректный список откликов")
         statuses: list[HhNegotiationData] = []
-        for item in payload:
-            vacancy_id = self._vacancy_id_from_href(self._optional_string(item, "vacancyHref"))
+        for position, item in enumerate(payload):
+            vacancy_id = self._optional_string(item, "vacancyId")
+            if vacancy_id and not vacancy_id.isdigit():
+                raise RuntimeError("hh.ru вернул некорректный номер вакансии в истории")
+            vacancy_href = self._optional_string(item, "vacancyHref")
+            vacancy_id = vacancy_id or self._vacancy_id_from_href(vacancy_href)
             if not vacancy_id:
-                continue
+                if vacancy_href:
+                    continue
+                vacancy_id = self._vacancy_id_from_negotiation_card(
+                    position=position,
+                    expected_count=len(payload),
+                )
             status_qa = self._optional_string(item, "statusQa").casefold()
             status_label = self._optional_string(item, "statusLabel")
             statuses.append(
@@ -786,15 +1098,52 @@ class VisibleHhBrowser:
         self,
         source_url: str,
         *,
+        expected_resume_hh_id: str,
         expected_resume_title: str,
         cover_letter: str,
         submit: bool = False,
         submit_guard: Callable[[], bool] | None = None,
     ) -> HhApplyResult:
-        response_url = self._application_response_url(source_url)
+        page = self._require_page()
+        attempt = _SubmissionAttempt()
+        try:
+            return self._apply_to_vacancy(
+                source_url,
+                expected_resume_hh_id=expected_resume_hh_id,
+                expected_resume_title=expected_resume_title,
+                cover_letter=cover_letter,
+                submit=submit,
+                submit_guard=submit_guard,
+                attempt=attempt,
+            )
+        except Exception as error:
+            if attempt.started:
+                return HhApplyResult(
+                    HhApplyStatus.UNKNOWN_RESULT,
+                    page.url,
+                    (f"Ошибка после начала отправки: {type(error).__name__}"),
+                )
+            return HhApplyResult(
+                HhApplyStatus.RETRYABLE_ERROR,
+                page.url,
+                (f"Ошибка до нажатия кнопки отправки: {type(error).__name__}"),
+            )
+
+    def _apply_to_vacancy(
+        self,
+        source_url: str,
+        *,
+        expected_resume_hh_id: str,
+        expected_resume_title: str,
+        cover_letter: str,
+        submit: bool,
+        submit_guard: Callable[[], bool] | None,
+        attempt: _SubmissionAttempt,
+    ) -> HhApplyResult:
+        vacancy_url = self._canonical_vacancy_url(source_url)
         page = self._require_page()
         try:
-            initial_response = page.goto(response_url, wait_until="domcontentloaded")
+            initial_response = page.goto(vacancy_url, wait_until="domcontentloaded")
             page.wait_for_timeout(1_500)
         except PlaywrightTimeoutError:
             return HhApplyResult(HhApplyStatus.RETRYABLE_ERROR, page.url)
@@ -804,6 +1153,22 @@ class VisibleHhBrowser:
                 page.url,
                 retry_after_seconds=self._retry_after_seconds(initial_response),
             )
+        if not self.is_authenticated():
+            return HhApplyResult(HhApplyStatus.AUTH_REQUIRED, page.url)
+        if self._any_visible(page, '[data-qa*="captcha"], iframe[src*="captcha"]'):
+            return HhApplyResult(HhApplyStatus.CAPTCHA_REQUIRED, page.url)
+        response_links = page.locator('[data-qa="vacancy-response-link-top"]:visible')
+        if response_links.count() == 0:
+            return HhApplyResult(HhApplyStatus.RETRYABLE_ERROR, page.url)
+        try:
+            response_links.first.click(no_wait_after=True, timeout=min(self._timeout_ms, 10_000))
+            page.locator('[data-qa="resume-title"]').first.wait_for(
+                state="visible",
+                timeout=self._timeout_ms,
+            )
+            page.wait_for_timeout(500)
+        except PlaywrightError:
+            return HhApplyResult(HhApplyStatus.RETRYABLE_ERROR, page.url)
 
         initial = self._application_snapshot(page)
         body_text = initial.body_text
@@ -829,6 +1194,41 @@ class VisibleHhBrowser:
             "повторно",
         ):
             return HhApplyResult(HhApplyStatus.ALREADY_APPLIED, page.url, body_text[:1000])
+
+        try:
+            initial = self._select_exact_resume(
+                page,
+                expected_resume_hh_id=expected_resume_hh_id,
+                expected_resume_title=expected_resume_title,
+            )
+        except _ResumeSelectionError as error:
+            return HhApplyResult(
+                (
+                    HhApplyStatus.RETRYABLE_ERROR
+                    if error.retryable
+                    else HhApplyStatus.RESUME_MISMATCH
+                ),
+                page.url,
+                confirmation=str(error),
+                warnings=initial.warnings,
+            )
+        body_text = initial.body_text
+        if not self.is_authenticated():
+            return HhApplyResult(HhApplyStatus.AUTH_REQUIRED, page.url)
+        if self._any_visible(page, '[data-qa*="captcha"], iframe[src*="captcha"]'):
+            return HhApplyResult(HhApplyStatus.CAPTCHA_REQUIRED, page.url)
+        if self._contains_any(
+            body_text,
+            "подозрительная активность",
+            "аккаунт заблокирован",
+            "достигнут лимит откликов",
+            "слишком много откликов",
+        ):
+            return HhApplyResult(HhApplyStatus.ACCOUNT_WARNING, page.url)
+        if self._contains_any(body_text, "вакансия в архиве", "вакансия закрыта"):
+            return HhApplyResult(HhApplyStatus.VACANCY_CLOSED, page.url)
+        if self._contains_any(body_text, "вы уже откликались", "отклик уже отправлен"):
+            return HhApplyResult(HhApplyStatus.ALREADY_APPLIED, page.url, body_text[:1000])
         if initial.questions:
             return HhApplyResult(
                 HhApplyStatus.QUESTIONS_REQUIRED,
@@ -837,29 +1237,23 @@ class VisibleHhBrowser:
                 warnings=initial.warnings,
                 screening_form=initial.screening_form,
             )
-        if initial.resume_title != expected_resume_title.strip():
-            return HhApplyResult(
-                HhApplyStatus.RESUME_MISMATCH,
-                page.url,
-                confirmation=(
-                    f"Ожидалось резюме «{expected_resume_title}», выбрано «{initial.resume_title}»"
-                ),
-                warnings=initial.warnings,
-            )
 
         if cover_letter.strip():
             letter = page.locator('[data-qa="vacancy-response-popup-form-letter-input"]')
             if letter.count() == 0:
                 toggle = page.locator('[data-qa="vacancy-response-letter-toggle"]')
+                if toggle.count() == 0:
+                    toggle = page.locator('[data-qa="add-cover-letter"]')
                 if toggle.count() != 1:
                     return HhApplyResult(HhApplyStatus.RETRYABLE_ERROR, page.url)
                 toggle.click()
             letter.first.wait_for(state="visible", timeout=self._timeout_ms)
             letter.first.fill(cover_letter.strip())
 
+        submit_button = page.locator('[data-qa="vacancy-response-submit-popup"]')
         if submit_button.count() != 1 or not submit_button.first.is_enabled():
             return HhApplyResult(HhApplyStatus.RETRYABLE_ERROR, page.url)
-        if not submit or submit_guard is None or not submit_guard():
+        if not submit or submit_guard is None:
             return HhApplyResult(
                 HhApplyStatus.MANUAL_REVIEW_REQUIRED,
                 page.url,
@@ -867,14 +1261,72 @@ class VisibleHhBrowser:
                 warnings=initial.warnings,
             )
 
-        vacancy_id, normalized_url = self._vacancy_id_and_url(source_url)
-        parsed = urlparse(normalized_url)
+        final = self._application_snapshot(page)
+        if self._normalized_ui_text(final.resume_title) != self._normalized_ui_text(
+            expected_resume_title
+        ):
+            return HhApplyResult(
+                HhApplyStatus.RESUME_MISMATCH,
+                page.url,
+                (
+                    f"Перед отправкой ожидалось резюме «{expected_resume_title}», "
+                    f"выбрано «{final.resume_title}»"
+                ),
+                warnings=final.warnings,
+            )
+        if final.questions:
+            return HhApplyResult(
+                HhApplyStatus.QUESTIONS_REQUIRED,
+                page.url,
+                questions=final.questions,
+                warnings=final.warnings,
+                screening_form=final.screening_form,
+            )
+        if not self.is_authenticated():
+            return HhApplyResult(HhApplyStatus.AUTH_REQUIRED, page.url)
+        if self._any_visible(page, '[data-qa*="captcha"], iframe[src*="captcha"]'):
+            return HhApplyResult(HhApplyStatus.CAPTCHA_REQUIRED, page.url)
+        if self._contains_any(
+            final.body_text,
+            "подозрительная активность",
+            "аккаунт заблокирован",
+            "достигнут лимит откликов",
+            "слишком много откликов",
+        ):
+            return HhApplyResult(HhApplyStatus.ACCOUNT_WARNING, page.url)
+        submit_button = page.locator('[data-qa="vacancy-response-submit-popup"]')
+        if submit_button.count() != 1 or not submit_button.first.is_enabled():
+            return HhApplyResult(HhApplyStatus.RETRYABLE_ERROR, page.url)
+        try:
+            submission_allowed = submit_guard()
+        except Exception as error:
+            return HhApplyResult(
+                HhApplyStatus.RETRYABLE_ERROR,
+                page.url,
+                (f"Не удалось повторно проверить данные перед отправкой: {type(error).__name__}"),
+                warnings=final.warnings,
+            )
+        if not submission_allowed:
+            return HhApplyResult(
+                HhApplyStatus.MANUAL_REVIEW_REQUIRED,
+                page.url,
+                "Перед отправкой изменились проверенные данные; кнопка не нажата",
+                warnings=final.warnings,
+            )
+
+        vacancy_id, _normalized_url = self._vacancy_id_and_url(source_url)
+        parsed = urlparse(self._resumes_url)
         response: Response | None = None
+        submit_button.first.click(
+            trial=True,
+            timeout=min(self._timeout_ms, 10_000),
+        )
         try:
             with page.expect_response(
                 self._is_application_submission_response,
                 timeout=self._timeout_ms,
             ) as response_info:
+                attempt.started = True
                 submit_button.first.click(no_wait_after=True)
             response = response_info.value
             page.wait_for_timeout(1_500)
@@ -919,15 +1371,17 @@ class VisibleHhBrowser:
         self,
         source_url: str,
         *,
+        expected_resume_hh_id: str,
         expected_resume_title: str,
         expected_version_hash: str,
         answers: dict[str, str],
         cover_letter: str = "",
     ) -> HhFormReviewResult:
         page = self._require_page()
+        vacancy_url = self._canonical_vacancy_url(source_url)
         try:
             response = page.goto(
-                self._application_response_url(source_url),
+                vacancy_url,
                 wait_until="domcontentloaded",
             )
             page.wait_for_timeout(1_500)
@@ -938,6 +1392,30 @@ class VisibleHhBrowser:
                 HhFormReviewStatus.UNAVAILABLE,
                 page.url,
                 message="hh.ru временно ограничил обращения",
+            )
+        if not self.is_authenticated():
+            return HhFormReviewResult(HhFormReviewStatus.AUTH_REQUIRED, page.url)
+        if self._any_visible(page, '[data-qa*="captcha"], iframe[src*="captcha"]'):
+            return HhFormReviewResult(HhFormReviewStatus.CAPTCHA_REQUIRED, page.url)
+        response_links = page.locator('[data-qa="vacancy-response-link-top"]:visible')
+        if response_links.count() == 0:
+            return HhFormReviewResult(
+                HhFormReviewStatus.UNAVAILABLE,
+                page.url,
+                message="hh.ru не показал кнопку отклика",
+            )
+        try:
+            response_links.first.click(no_wait_after=True, timeout=min(self._timeout_ms, 10_000))
+            page.locator('[data-qa="resume-title"]').first.wait_for(
+                state="visible",
+                timeout=self._timeout_ms,
+            )
+            page.wait_for_timeout(500)
+        except PlaywrightError:
+            return HhFormReviewResult(
+                HhFormReviewStatus.UNAVAILABLE,
+                page.url,
+                message="Форма отклика hh.ru не открылась",
             )
 
         snapshot = self._application_snapshot(page)
@@ -950,15 +1428,33 @@ class VisibleHhBrowser:
             return HhFormReviewResult(HhFormReviewStatus.VACANCY_CLOSED, page.url)
         if self._contains_any(body_text, "вы уже откликались", "отклик уже отправлен"):
             return HhFormReviewResult(HhFormReviewStatus.ALREADY_APPLIED, page.url)
-        if snapshot.resume_title != expected_resume_title.strip():
+
+        try:
+            snapshot = self._select_exact_resume(
+                page,
+                expected_resume_hh_id=expected_resume_hh_id,
+                expected_resume_title=expected_resume_title,
+            )
+        except _ResumeSelectionError as error:
             return HhFormReviewResult(
-                HhFormReviewStatus.RESUME_MISMATCH,
+                (
+                    HhFormReviewStatus.UNAVAILABLE
+                    if error.retryable
+                    else HhFormReviewStatus.RESUME_MISMATCH
+                ),
                 page.url,
                 current_form=snapshot.screening_form,
-                message=(
-                    f"Ожидалось резюме «{expected_resume_title}», выбрано «{snapshot.resume_title}»"
-                ),
+                message=str(error),
             )
+        body_text = snapshot.body_text
+        if not self.is_authenticated():
+            return HhFormReviewResult(HhFormReviewStatus.AUTH_REQUIRED, page.url)
+        if self._any_visible(page, '[data-qa*="captcha"], iframe[src*="captcha"]'):
+            return HhFormReviewResult(HhFormReviewStatus.CAPTCHA_REQUIRED, page.url)
+        if self._contains_any(body_text, "вакансия в архиве", "вакансия закрыта"):
+            return HhFormReviewResult(HhFormReviewStatus.VACANCY_CLOSED, page.url)
+        if self._contains_any(body_text, "вы уже откликались", "отклик уже отправлен"):
+            return HhFormReviewResult(HhFormReviewStatus.ALREADY_APPLIED, page.url)
         if not snapshot.screening_form.fields:
             return HhFormReviewResult(
                 HhFormReviewStatus.UNAVAILABLE,
@@ -978,6 +1474,8 @@ class VisibleHhBrowser:
             letter = page.locator('[data-qa="vacancy-response-popup-form-letter-input"]')
             if letter.count() == 0:
                 toggle = page.locator('[data-qa="vacancy-response-letter-toggle"]')
+                if toggle.count() == 0:
+                    toggle = page.locator('[data-qa="add-cover-letter"]')
                 if toggle.count() == 1:
                     toggle.click()
                     letter = page.locator('[data-qa="vacancy-response-popup-form-letter-input"]')
@@ -1094,13 +1592,27 @@ class VisibleHhBrowser:
         negotiations_url = urlunparse((scheme, netloc, "/applicant/negotiations", "", "", ""))
         try:
             page.goto(negotiations_url, wait_until="domcontentloaded")
-            page.wait_for_timeout(1_500)
-            links = page.locator('a[href*="/vacancy/"]')
-            return any(
-                self._vacancy_id_from_href(link.get_attribute("href")) == vacancy_id
-                for link in links.all()
-            )
-        except PlaywrightError:
+            page.wait_for_timeout(3_000)
+            payload = page.evaluate(NEGOTIATIONS_SCRIPT)
+            if not isinstance(payload, list) or not all(isinstance(item, dict) for item in payload):
+                return False
+            for position, item in enumerate(payload):
+                react_id = self._optional_string(item, "vacancyId")
+                if react_id and not react_id.isdigit():
+                    return False
+                direct_id = self._vacancy_id_from_href(self._optional_string(item, "vacancyHref"))
+                current_id = (
+                    react_id
+                    or direct_id
+                    or self._vacancy_id_from_negotiation_card(
+                        position=position,
+                        expected_count=len(payload),
+                    )
+                )
+                if current_id == vacancy_id:
+                    return True
+            return False
+        except (PlaywrightError, RuntimeError):
             return False
 
     def _open_negotiations(self) -> Page:
@@ -1109,7 +1621,7 @@ class VisibleHhBrowser:
         url = urlunparse((parsed.scheme, parsed.netloc, "/applicant/negotiations", "", "", ""))
         try:
             page.goto(url, wait_until="domcontentloaded")
-            page.wait_for_timeout(1_500)
+            page.wait_for_timeout(3_000)
         except PlaywrightError as error:
             raise RuntimeError("Страница откликов hh.ru не загрузилась") from error
         if not self.is_authenticated():
@@ -1128,6 +1640,34 @@ class VisibleHhBrowser:
                 "hh.ru показал предупреждение аккаунта",
             )
         return page
+
+    def _vacancy_id_from_negotiation_card(
+        self,
+        *,
+        position: int,
+        expected_count: int,
+    ) -> str:
+        page = self._open_negotiations()
+        cards = page.locator('[data-qa="negotiations-item"]')
+        if cards.count() != expected_count:
+            raise RuntimeError(
+                "Список откликов hh.ru изменился во время чтения; сверка остановлена"
+            )
+        items = cards.all()
+        if position < 0 or position >= len(items):
+            raise RuntimeError("hh.ru вернул некорректную позицию отклика")
+        try:
+            items[position].click(
+                no_wait_after=True,
+                timeout=min(self._timeout_ms, 10_000),
+            )
+            page.wait_for_timeout(1_500)
+        except PlaywrightError as error:
+            raise RuntimeError("Не удалось открыть отклик из истории hh.ru") from error
+        vacancy_id = self._vacancy_id_from_href(page.url)
+        if not vacancy_id:
+            raise RuntimeError("hh.ru не показал номер вакансии после открытия отклика")
+        return vacancy_id
 
     def _wait_for_chat_frame(self, page: Page) -> Frame | None:
         attempts = max(min(self._timeout_ms // 500, 20), 1)
@@ -1331,6 +1871,141 @@ class VisibleHhBrowser:
             raise RuntimeError("Браузер не запущен")
         return self._page
 
+    def _select_exact_resume(
+        self,
+        page: Page,
+        *,
+        expected_resume_hh_id: str,
+        expected_resume_title: str,
+    ) -> _ApplicationSnapshot:
+        resume_hh_id = expected_resume_hh_id.strip()
+        resume_title = expected_resume_title.strip()
+        if not resume_hh_id or not resume_title:
+            raise _ResumeSelectionError(
+                "У назначенного резюме отсутствует номер или название",
+                retryable=False,
+            )
+
+        selected_card = page.locator('[data-qa="resume-title"]')
+        if selected_card.count() != 1:
+            raise _ResumeSelectionError(
+                "hh.ru не показал единственную карточку выбранного резюме",
+                retryable=True,
+            )
+        try:
+            selected_card.first.click(no_wait_after=True, timeout=min(self._timeout_ms, 10_000))
+        except PlaywrightError as error:
+            raise _ResumeSelectionError(
+                "hh.ru не открыл список резюме для отклика",
+                retryable=True,
+            ) from error
+
+        bottom_sheet_selector = '[data-qa="bottom-sheet-content"]:visible input[name="resumeId"]'
+        dropdown_selector = '[data-qa="drop-base"]:visible [role="option"]'
+        options: list[Locator] = []
+        uses_bottom_sheet = False
+        for _attempt in range(10):
+            page.wait_for_timeout(500)
+            options = page.locator(bottom_sheet_selector).all()
+            uses_bottom_sheet = bool(options)
+            if not options:
+                options = page.locator(dropdown_selector).all()
+            if options:
+                break
+        option_values = [option.get_attribute("value") or "" for option in options]
+        if not uses_bottom_sheet and options:
+            option_values = []
+            prefix = "magritte-select-option-"
+            for option in options:
+                data_qa = option.get_attribute("data-qa") or ""
+                option_values.append(
+                    data_qa.removeprefix(prefix) if data_qa.startswith(prefix) else ""
+                )
+        if not option_values:
+            raise _ResumeSelectionError(
+                "Список резюме hh.ru не успел загрузиться; отклик остановлен",
+                retryable=True,
+            )
+        if any(not value for value in option_values) or len(set(option_values)) != len(
+            option_values
+        ):
+            raise _ResumeSelectionError(
+                "hh.ru показал неоднозначный список резюме; отклик остановлен",
+                retryable=False,
+            )
+        matching = [
+            option
+            for option, value in zip(options, option_values, strict=True)
+            if value == resume_hh_id
+        ]
+        if len(matching) != 1:
+            raise _ResumeSelectionError(
+                f"Резюме «{resume_title}» с точным номером не найдено в форме hh.ru",
+                retryable=False,
+            )
+        try:
+            matching[0].click(
+                force=uses_bottom_sheet,
+                no_wait_after=True,
+                timeout=min(self._timeout_ms, 10_000),
+            )
+            for _attempt in range(10):
+                page.wait_for_timeout(500)
+                if (
+                    page.locator(bottom_sheet_selector).count() == 0
+                    and page.locator(dropdown_selector).count() == 0
+                ):
+                    break
+            else:
+                page.keyboard.press("Escape")
+                for _attempt in range(4):
+                    page.wait_for_timeout(500)
+                    if (
+                        page.locator(bottom_sheet_selector).count() == 0
+                        and page.locator(dropdown_selector).count() == 0
+                    ):
+                        break
+                else:
+                    selected_card.first.click(
+                        no_wait_after=True,
+                        timeout=min(self._timeout_ms, 10_000),
+                    )
+                    for _attempt in range(4):
+                        page.wait_for_timeout(500)
+                        if (
+                            page.locator(bottom_sheet_selector).count() == 0
+                            and page.locator(dropdown_selector).count() == 0
+                        ):
+                            break
+                    else:
+                        raise _ResumeSelectionError(
+                            "Список резюме не закрылся после выбора; отклик остановлен",
+                            retryable=True,
+                        )
+        except PlaywrightError as error:
+            raise _ResumeSelectionError(
+                "hh.ru не подтвердил выбор назначенного резюме",
+                retryable=True,
+            ) from error
+
+        snapshot = self._application_snapshot(page)
+        if self._normalized_ui_text(snapshot.resume_title) != self._normalized_ui_text(
+            resume_title
+        ):
+            raise _ResumeSelectionError(
+                (
+                    f"Ожидалось резюме «{resume_title}», "
+                    f"после выбора показано «{snapshot.resume_title}»"
+                ),
+                retryable=False,
+            )
+        return snapshot
+
+    @staticmethod
+    def _normalized_ui_text(value: str) -> str:
+        normalized = unicodedata.normalize("NFKC", value).replace("\N{NO-BREAK SPACE}", " ")
+        return " ".join(normalized.split()).casefold()
+
     def _application_snapshot(self, page: Page) -> _ApplicationSnapshot:
         payload = page.evaluate(APPLICATION_FORM_SCRIPT)
         if not isinstance(payload, dict):
@@ -1416,6 +2091,20 @@ class VisibleHhBrowser:
             )
         )
 
+    def _canonical_vacancy_url(self, source_url: str) -> str:
+        vacancy_id, _normalized_url = self._vacancy_id_and_url(source_url)
+        base = urlparse(self._resumes_url)
+        return urlunparse(
+            (
+                base.scheme,
+                base.netloc,
+                f"/vacancy/{vacancy_id}",
+                "",
+                "",
+                "",
+            )
+        )
+
     @staticmethod
     def _required_string(payload: dict[object, object], key: str, label: str) -> str:
         value = payload.get(key)
@@ -1427,6 +2116,42 @@ class VisibleHhBrowser:
     def _optional_string(payload: dict[object, object], key: str) -> str:
         value = payload.get(key)
         return value.strip() if isinstance(value, str) else ""
+
+    @classmethod
+    def _required_resume_text(
+        cls,
+        payload: dict[object, object],
+        key: str,
+        label: str,
+    ) -> str:
+        value = cls._resume_text(payload, key)
+        if not value:
+            raise RuntimeError(f"Данные {label} отсутствуют на странице hh.ru")
+        return value
+
+    @staticmethod
+    def _resume_text(payload: dict[object, object], key: str) -> str:
+        value = payload.get(key)
+        if not isinstance(value, str):
+            return ""
+        action_lines = {
+            "развернуть",
+            "свернуть",
+            "добавить",
+            "редактировать",
+            "указать уровень",
+            "указать уровни",
+        }
+        result: list[str] = []
+        for raw_line in value.replace("\u00a0", " ").splitlines():
+            line = re.sub(r"[ \t]+", " ", raw_line).strip()
+            if line.casefold() in action_lines:
+                continue
+            if line:
+                result.append(line)
+            elif result and result[-1]:
+                result.append("")
+        return "\n".join(result).strip()
 
     @staticmethod
     def _date_time(value: str) -> datetime | None:

@@ -28,6 +28,7 @@ from hugin.repositories import (
 from hugin.repositories.vacancies import VacancyRepository
 from hugin.services.application_automation import ApplicationAutomationService
 from hugin.services.cover_letter import (
+    MANUAL_REVIEW_MODEL,
     MAX_LETTER_LENGTH,
     CoverLetterService,
     CoverLetterValidationError,
@@ -35,6 +36,7 @@ from hugin.services.cover_letter import (
     _relevant_excerpt,
     _SelectedFact,
     _without_future_plans,
+    _without_irrelevant_context_lines,
     _work_experience_excerpt,
     build_cover_letter_prompt,
     normalize_cover_letter,
@@ -227,6 +229,21 @@ def test_yandex_letter_uses_only_confirmed_facts_and_is_saved(settings: Settings
             )
             assert job is not None
             assert job.cover_letter == _letter()
+            selected_instruction_version = letter.instruction_version
+            letter.instruction_version = "changed-after-submit"
+            replacement = CoverLetterModel(
+                application_id=job.application.id,
+                vacancy_id=job.application.vacancy_id,
+                direction_id=job.application.direction_id,
+                resume_id=job.application.resume_id,
+                text=_letter(),
+                instruction_version=selected_instruction_version,
+                model_name="replacement-model",
+                context_hash=letter.context_hash,
+                state=CoverLetterState.READY,
+            )
+            session.add(replacement)
+            session.flush()
             ApplicationAutomationService(session).record_result(
                 job,
                 HhApplyResult(HhApplyStatus.APPLIED, job.vacancy.source_url, "успешно"),
@@ -235,6 +252,78 @@ def test_yandex_letter_uses_only_confirmed_facts_and_is_saved(settings: Settings
             assert sent_letter is not None
             assert sent_letter.state == CoverLetterState.SENT
             assert sent_letter.sent_at is not None
+            assert replacement.state == CoverLetterState.READY
+            assert replacement.sent_at is None
+    finally:
+        database.close()
+
+
+def test_manually_reviewed_letter_is_revalidated_and_saved(settings: Settings) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    try:
+        with database.sessions.begin() as session:
+            account_id, _, _, _ = _prepare_data(session)
+            CoverLetterService(session, FakeModel([_letter()])).prepare(
+                account_id=account_id,
+                direction_name="Python backend",
+            )
+            letter = session.scalar(select(CoverLetterModel))
+            assert letter is not None
+            reviewed_text = _letter().replace("Буду рад", "Готов")
+
+            saved = CoverLetterService(session).save_reviewed(
+                account_id=account_id,
+                letter_id=letter.id,
+                text=reviewed_text,
+            )
+
+            assert saved.state is CoverLetterState.READY
+            assert saved.text == reviewed_text
+            assert saved.model_name == MANUAL_REVIEW_MODEL
+            assert saved.context_hash
+
+            replacement_model = FakeModel([_letter()])
+            repeated = CoverLetterService(session, replacement_model).prepare(
+                account_id=account_id,
+                direction_name="Python backend",
+            )
+
+            assert repeated.already_ready == 1
+            assert replacement_model.prompts == []
+            assert saved.text == reviewed_text
+    finally:
+        database.close()
+
+
+def test_ready_model_letter_without_current_prompt_version_is_regenerated(
+    settings: Settings,
+) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    model = FakeModel([_letter(), _letter().replace("Буду рад", "Готов")])
+    try:
+        with database.sessions.begin() as session:
+            account_id, _, _, _ = _prepare_data(session)
+            CoverLetterService(session, model).prepare(
+                account_id=account_id,
+                direction_name="Python backend",
+            )
+            letter = session.scalar(select(CoverLetterModel))
+            assert letter is not None
+            letter.prompt_version_id = None
+            session.flush()
+
+            repeated = CoverLetterService(session, model).prepare(
+                account_id=account_id,
+                direction_name="Python backend",
+            )
+
+            assert repeated.generated == 1
+            assert repeated.already_ready == 0
+            assert len(model.prompts) == 2
+            assert letter.prompt_version_id is not None
+            assert letter.text == _letter().replace("Буду рад", "Готов")
     finally:
         database.close()
 
@@ -374,7 +463,7 @@ def _fact() -> tuple[_SelectedFact, ...]:
         _SelectedFact(
             id=1,
             category="work_experience",
-            content="Разрабатывал серверные приложения на Python и FastAPI.",
+            content="Разрабатывал серверные приложения на Python и FastAPI. Работал с PostgreSQL.",
         ),
     )
 
@@ -428,6 +517,17 @@ def test_relevance_guard_accepts_two_specific_task_terms() -> None:
     )
 
     _ensure_relevant_evidence(vacancy, facts)
+
+
+def test_relevance_guard_uses_description_when_structured_fields_are_empty() -> None:
+    vacancy = _vacancy()
+    vacancy.title = "Стажёр в отдел разработки"
+    vacancy.key_skills = []
+    vacancy.required_qualifications = None
+    vacancy.responsibilities = None
+    vacancy.description = "Базовое владение Python и понимание SQL."
+
+    _ensure_relevant_evidence(vacancy, _fact())
 
 
 def test_relevance_guard_rejects_unrelated_confirmed_facts() -> None:
@@ -539,6 +639,30 @@ def test_unchanged_manual_failure_does_not_block_next_vacancy(
             "рассказать о проектах и обсудить задачи команды.",
             "OTHER_EMPLOYER",
         ),
+        (
+            "Здравствуйте!\n\nРазрабатывал серверные приложения на Python и FastAPI, работал "
+            "с PostgreSQL и настраивал автоматические проверки. Опыт работы с чужим кодом и "
+            "доведение его до стабильной работы в проде — часть моей текущей практики. Также "
+            "реализовывал прикладную логику и интеграции. Готов подробно обсудить выполненные "
+            "проекты и подход к проверке результата.",
+            "UNCONFIRMED_CLAIM",
+        ),
+        (
+            "Здравствуйте!\n\nРазрабатывал серверные приложения на Python и FastAPI, работал "
+            "с PostgreSQL и настраивал автоматические проверки. Ранее работал с микросервисной "
+            "архитектурой, обеспечивал надежность взаимодействий и устойчивость к сбоям. "
+            "Также реализовывал прикладную логику и интеграции. Готов подробно обсудить "
+            "выполненные проекты и подход к проверке результата.",
+            "UNCONFIRMED_CLAIM",
+        ),
+        (
+            "Здравствуйте!\n\nРазрабатывал серверные приложения на Python и FastAPI, работал "
+            "с PostgreSQL и настраивал автоматические проверки. Получил практический опыт "
+            "работы с транзакциями и согласованностью данных. Также реализовывал прикладную "
+            "логику и интеграции. Готов подробно обсудить выполненные проекты и подход к "
+            "проверке результата.",
+            "UNCONFIRMED_CLAIM",
+        ),
     ],
 )
 def test_objective_letter_validation(text: str, code: str) -> None:
@@ -581,6 +705,7 @@ def test_prompt_normalization_and_context_selection() -> None:
     assert "1–2 наиболее подходящих проекта" in prompt
     assert "не смешивай сведения разных должностей и проектов" in prompt
     assert "нет требуемой технологии" in prompt
+    assert "список навыков подтверждает знание технологии" in prompt
     assert "Здравствуйте!" in prompt
 
 
@@ -605,6 +730,65 @@ def test_work_experience_context_keeps_project_boundaries() -> None:
     assert "генерировал аудио из текста через SpeechKit" in excerpt
     assert '<experience_item type="PROJECT" label="Аналитик">' in excerpt
     assert "собирал новости и формировал отчет через LLM" in excerpt
+
+
+def test_work_experience_context_drops_much_weaker_role() -> None:
+    content = """Январь 2026 — настоящее время
+Компания
+Python backend-разработчик
+- Разрабатываю REST API на Python и FastAPI.
+- Работаю с PostgreSQL через SQLAlchemy.
+Август 2025 — декабрь 2025
+Компания
+Специалист по автоматизации
+- Создавал прототипы с LLM."""
+
+    excerpt = _work_experience_excerpt(
+        content,
+        {"python", "fastapi", "postgresql", "sqlalchemy", "rest", "api"},
+        3000,
+    )
+
+    assert "Разрабатываю REST API" in excerpt
+    assert "прототипы с LLM" not in excerpt
+
+
+def test_work_experience_context_keeps_relevant_second_role() -> None:
+    content = """Январь 2026 — настоящее время
+Компания
+Python backend-разработчик
+- Разрабатываю REST API на Python и FastAPI.
+- Работаю с PostgreSQL через SQLAlchemy.
+Август 2025 — декабрь 2025
+Компания
+Специалист по автоматизации
+- Создавал backend-прототипы с LLM.
+- Интегрировал WebSocket и внешние API."""
+
+    excerpt = _work_experience_excerpt(
+        content,
+        {"python", "fastapi", "postgresql", "sqlalchemy", "llm", "websocket", "api"},
+        3000,
+    )
+
+    assert "Разрабатываю REST API" in excerpt
+    assert "backend-прототипы с LLM" in excerpt
+
+
+def test_irrelevant_context_is_removed_from_fact_before_generation() -> None:
+    content = """Разрабатываю REST API на Python и FastAPI.
+Создавал прототипы в Yandex Cloud и подключал AI Studio.
+Работаю с PostgreSQL через SQLAlchemy."""
+
+    cleaned = _without_irrelevant_context_lines(
+        content,
+        "Разработка REST API на Python, FastAPI и PostgreSQL.",
+    )
+
+    assert "REST API" in cleaned
+    assert "PostgreSQL" in cleaned
+    assert "Yandex Cloud" not in cleaned
+    assert "AI Studio" not in cleaned
 
 
 def test_future_technology_is_removed_from_letter_context() -> None:
@@ -680,3 +864,68 @@ def test_specialist_term_boundaries_do_not_match_storage() -> None:
     )
 
     validate_cover_letter(text, _vacancy(), _fact())
+
+
+@pytest.mark.parametrize(
+    ("technology", "claim"),
+    [
+        ("Django", "В другом проекте разрабатывал серверную часть на Django."),
+        ("Kafka", "В другом проекте интегрировал Kafka для обмена событиями."),
+    ],
+)
+def test_skill_list_does_not_confirm_technology_experience(
+    technology: str,
+    claim: str,
+) -> None:
+    text = (
+        "Здравствуйте!\n\nРазрабатывал серверные приложения на Python и FastAPI, работал "
+        f"с PostgreSQL. {claim} Настраивал автоматические проверки и обработку ошибок.\n\n"
+        "Буду рад подробнее обсудить задачи серверной части и реализованные решения."
+    )
+    facts = (
+        *_fact(),
+        _SelectedFact(2, "skills", technology),
+    )
+
+    with pytest.raises(CoverLetterValidationError) as error:
+        validate_cover_letter(text, _vacancy(), facts)
+
+    assert error.value.code == "UNCONFIRMED_TECHNOLOGY_EXPERIENCE"
+
+
+def test_confirmed_work_fact_supports_technology_experience() -> None:
+    text = (
+        "Здравствуйте!\n\nРазрабатывал серверные приложения на Python и Django, работал "
+        "с PostgreSQL и интегрировал Kafka для обмена событиями. Настраивал автоматические "
+        "проверки и обработку ошибок. При доработке таких служб отделял прикладную логику "
+        "от доступа к данным и проверял основные сценарии перед выпуском изменений.\n\n"
+        "Буду рад подробнее обсудить задачи серверной части и реализованные решения."
+    )
+    facts = (
+        _SelectedFact(
+            1,
+            "work_experience",
+            (
+                "Разрабатывал серверные приложения на Python и Django. Работал с PostgreSQL. "
+                "Интегрировал Kafka для обмена событиями."
+            ),
+        ),
+    )
+
+    validate_cover_letter(text, _vacancy(), facts)
+
+
+def test_skill_list_can_confirm_knowledge_without_claiming_experience() -> None:
+    text = (
+        "Здравствуйте!\n\nРазрабатывал серверные приложения на Python и FastAPI, работал "
+        "с PostgreSQL и настраивал автоматические проверки. Знаю основы Django. При доработке "
+        "служб отделял прикладную логику от доступа к данным, проверял обработку ошибок "
+        "и основные сценарии перед выпуском изменений.\n\nБуду рад подробнее обсудить задачи "
+        "серверной части и реализованные решения."
+    )
+    facts = (
+        *_fact(),
+        _SelectedFact(2, "skills", "Django"),
+    )
+
+    validate_cover_letter(text, _vacancy(), facts)

@@ -3,16 +3,20 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from hugin.core.settings import Settings
 from hugin.database import create_database, upgrade_database
 from hugin.database.models import (
+    ApplicationEventModel,
     ApplicationSettingsModel,
     ApplicationTaskModel,
     AutomationJobModel,
     IncidentModel,
+    NotificationModel,
 )
+from hugin.domain.applications import ApplicationEventType
 from hugin.domain.automation import AutomationJobKind, AutomationJobState
 from hugin.domain.content import (
     DeliveryState,
@@ -103,6 +107,14 @@ def test_notification_collection_delivery_and_retry_are_idempotent(
                     message="Фоновая проверка завершилась ошибкой",
                 )
             )
+            session.add(
+                ApplicationEventModel(
+                    application_id=application_id,
+                    event_type=ApplicationEventType.APPLIED,
+                    payload={"hh_status": "APPLIED", "source": "hh.ru"},
+                    created_at=now,
+                )
+            )
             application_settings = session.get(ApplicationSettingsModel, 1)
             assert application_settings is not None
             application_settings.timezone_name = "UTC+05:00"
@@ -118,6 +130,11 @@ def test_notification_collection_delivery_and_retry_are_idempotent(
             service = NotificationService(session)
             assert service.collect(account_id, now) == 10
             assert service.collect(account_id, now) == 0
+            summary = session.scalar(
+                select(NotificationModel).where(NotificationModel.event_type == "DAILY_SUMMARY")
+            )
+            assert summary is not None
+            assert "Отправлено: 0." in str(summary.payload["body"])
 
             repository = CommunicationRepository(session)
             first = repository.claim_due_notification(now)

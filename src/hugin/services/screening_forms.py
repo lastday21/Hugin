@@ -49,6 +49,7 @@ class ScreeningDraft:
     vacancy_title: str
     company: str
     source_url: str
+    resume_hh_id: str
     resume_title: str
     version_hash: str
     state: ScreeningFormState
@@ -309,6 +310,7 @@ class ScreeningDraftService:
             vacancy_title=vacancy.title,
             company=vacancy.employer_name or "Компания не указана",
             source_url=vacancy.source_url,
+            resume_hh_id=resume.hh_id,
             resume_title=resume.title,
             version_hash=form.version_hash,
             state=form.state,

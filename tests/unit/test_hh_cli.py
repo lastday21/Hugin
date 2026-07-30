@@ -5,7 +5,7 @@ import getpass
 import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace, TracebackType
@@ -13,7 +13,8 @@ from typing import ClassVar, cast
 
 import pytest
 
-from hugin import hh_cli
+import hugin.hh_cli as hh_cli
+from hugin.adapters.hh_browser import VisibleHhBrowser
 from hugin.core.settings import Settings
 from hugin.diagnostics import OperationJournal
 from hugin.domain.automation import AutomationJobState
@@ -149,12 +150,14 @@ class FakeBrowser:
         self,
         source_url: str,
         *,
+        expected_resume_hh_id: str,
         expected_resume_title: str,
         cover_letter: str,
         submit: bool = False,
         submit_guard: object = None,
     ) -> HhApplyResult:
         assert callable(submit_guard)
+        assert expected_resume_hh_id == "resume-1"
         self.applications.append((source_url, expected_resume_title, cover_letter))
         self.application_submit_modes.append(submit)
         if submit:
@@ -916,7 +919,7 @@ def test_apply_runs_queue_and_records_confirmed_result(
             source_url="https://hh.ru/vacancy/100",
             title="Python developer",
         ),
-        resume=SimpleNamespace(title="Python backend разработчик"),
+        resume=SimpleNamespace(hh_id="resume-1", title="Python backend разработчик"),
         direction_vacancy=SimpleNamespace(rules_details={"category": "MATCH"}),
         cover_letter="Письмо",
     )
@@ -978,6 +981,11 @@ def test_apply_runs_queue_and_records_confirmed_result(
             assert result.status is expected
             assert (kwargs["apply_delay"] is not None) is send
             return SimpleNamespace(sent=send, blocking=False, next_apply_at=None)
+
+        def release_after_preview(self, queued_job: object) -> SimpleNamespace:
+            assert not send
+            assert queued_job is job
+            return SimpleNamespace(sent=False, blocking=False, next_apply_at=None)
 
     monkeypatch.setattr(hh_cli, "upgrade_database", lambda settings: None)
     monkeypatch.setattr(hh_cli, "create_database", lambda settings: database)
@@ -1044,7 +1052,7 @@ def test_apply_keeps_queue_available_when_one_result_is_unknown(
             source_url="https://hh.ru/vacancy/100",
             title="Python developer",
         ),
-        resume=SimpleNamespace(title="Python backend разработчик"),
+        resume=SimpleNamespace(hh_id="resume-1", title="Python backend разработчик"),
         direction_vacancy=SimpleNamespace(rules_details={"category": "MATCH"}),
         cover_letter="Письмо",
     )
@@ -1116,6 +1124,634 @@ def test_apply_keeps_queue_available_when_one_result_is_unknown(
     monkeypatch.setattr(FakeBrowser, "apply_to_vacancy", fail_application)
 
     assert hh_cli.run(["apply", "--direction", "Python backend", "--limit", "1", "--send"]) == 0
+
+
+def test_supervised_apply_sends_exact_approved_letter_and_journals(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    settings = Settings(environment="test", data_dir=tmp_path)
+    database = FakeDatabase()
+    digest = "a" * 64
+    job = SimpleNamespace(
+        task=SimpleNamespace(id=41),
+        application=SimpleNamespace(id=51),
+        vacancy=SimpleNamespace(
+            hh_id="100",
+            source_url="https://hh.ru/vacancy/100",
+        ),
+        resume=SimpleNamespace(id=61, hh_id="resume-1", title="Python-разработчик"),
+        direction_vacancy=SimpleNamespace(rules_version="python_it_v5"),
+        cover_letter="Проверенное письмо",
+        cover_letter_id=71,
+        cover_letter_sha256=digest,
+    )
+    released: list[str] = []
+
+    class FakeAutomationService:
+        def __init__(self, session: object) -> None:
+            assert session is not None
+
+        def acquire_supervised_lease(self, token: str, **kwargs: object) -> datetime:
+            assert kwargs["ttl"] is not None
+            return datetime.now(UTC)
+
+        def release_supervised_lease(self, token: str) -> None:
+            released.append(token)
+
+        def claim_supervised(self, **kwargs: object) -> SimpleNamespace:
+            assert kwargs["task_id"] == 41
+            assert kwargs["vacancy_hh_id"] is None
+            assert kwargs["letter_id"] == 71
+            assert kwargs["letter_sha256"] == digest
+            assert kwargs["session_limit"] == 20
+            return job
+
+        def last_confirmed_application_at(
+            self,
+            account_id: int,
+            **kwargs: object,
+        ) -> datetime:
+            assert account_id == 1
+            return datetime(2026, 7, 30, 8, 0, tzinfo=UTC)
+
+        def policy(self, timezone_name: str | None = None) -> SimpleNamespace:
+            return SimpleNamespace(delay_min_seconds=30)
+
+        def record_result(
+            self,
+            queued_job: object,
+            result: HhApplyResult,
+            **kwargs: object,
+        ) -> SimpleNamespace:
+            assert queued_job is job
+            assert result.status is HhApplyStatus.APPLIED
+            apply_delay = cast(timedelta, kwargs["apply_delay"])
+            assert apply_delay.total_seconds() == 60
+            return SimpleNamespace(
+                sent=True,
+                blocking=False,
+                next_apply_at=datetime.now(UTC),
+            )
+
+        def supervised_lease_is_valid(self, token: str) -> bool:
+            return True
+
+    monkeypatch.setattr(hh_cli, "upgrade_database", lambda selected: None)
+    monkeypatch.setattr(hh_cli, "create_database", lambda selected: database)
+    monkeypatch.setattr(
+        hh_cli,
+        "HhProfileSyncService",
+        lambda session: SimpleNamespace(
+            synchronize=lambda profile: SimpleNamespace(account=SimpleNamespace(id=1))
+        ),
+    )
+    monkeypatch.setattr(hh_cli, "ApplicationAutomationService", FakeAutomationService)
+    browser = FakeBrowser(
+        tmp_path / "profile",
+        "https://hh.ru/login",
+        "https://hh.ru/resumes",
+        "https://hh.ru/search",
+        60_000,
+    )
+    arguments = argparse.Namespace(
+        account_id=1,
+        task_id=41,
+        vacancy_id=None,
+        letter_id=71,
+        letter_sha256=digest,
+        session_limit=20,
+    )
+
+    assert (
+        hh_cli._run_supervised_application(
+            arguments,
+            settings,
+            cast(VisibleHhBrowser, browser),
+            browser.read_profile(),
+        )
+        == 0
+    )
+    assert released
+    assert browser.application_submit_modes == [True]
+    entries = [
+        entry
+        for entry in OperationJournal(tmp_path).entries(component="applications")
+        if entry["event"] == "supervised.send"
+    ]
+    assert [entry["status"] for entry in entries] == ["started", "completed"]
+    completed = entries[-1]["details"]
+    assert completed["task_id"] == 41
+    assert completed["application_id"] == 51
+    assert completed["letter_id"] == 71
+    assert completed["letter_sha256"] == digest
+    assert completed["enforced_delay_seconds"] == 60
+    assert completed["actual_interval_seconds"] > 0
+    assert completed["confirmation"] == "успешно"
+
+
+def test_supervised_apply_stops_on_unknown_result(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    settings = Settings(environment="test", data_dir=tmp_path)
+    database = FakeDatabase()
+    digest = "b" * 64
+    job = SimpleNamespace(
+        task=SimpleNamespace(id=42),
+        application=SimpleNamespace(id=52),
+        vacancy=SimpleNamespace(hh_id="101", source_url="https://hh.ru/vacancy/101"),
+        resume=SimpleNamespace(id=62, hh_id="resume-1", title="Python-разработчик"),
+        direction_vacancy=SimpleNamespace(rules_version="python_it_v5"),
+        cover_letter="Проверенное письмо",
+        cover_letter_id=72,
+        cover_letter_sha256=digest,
+    )
+
+    class FakeAutomationService:
+        def __init__(self, session: object) -> None:
+            assert session is not None
+
+        def acquire_supervised_lease(self, token: str, **kwargs: object) -> datetime:
+            return datetime.now(UTC)
+
+        def release_supervised_lease(self, token: str) -> None:
+            return None
+
+        def last_confirmed_application_at(
+            self,
+            account_id: int,
+            **kwargs: object,
+        ) -> None:
+            return None
+
+        def claim_supervised(self, **kwargs: object) -> SimpleNamespace:
+            return job
+
+        def policy(self, timezone_name: str | None = None) -> SimpleNamespace:
+            return SimpleNamespace(delay_min_seconds=60)
+
+        def record_result(
+            self,
+            queued_job: object,
+            result: HhApplyResult,
+            **kwargs: object,
+        ) -> SimpleNamespace:
+            assert result.status is HhApplyStatus.UNKNOWN_RESULT
+            return SimpleNamespace(sent=False, blocking=True, next_apply_at=None)
+
+        def supervised_lease_is_valid(self, token: str) -> bool:
+            return True
+
+    monkeypatch.setattr(hh_cli, "upgrade_database", lambda selected: None)
+    monkeypatch.setattr(hh_cli, "create_database", lambda selected: database)
+    monkeypatch.setattr(
+        hh_cli,
+        "HhProfileSyncService",
+        lambda session: SimpleNamespace(
+            synchronize=lambda profile: SimpleNamespace(account=SimpleNamespace(id=1))
+        ),
+    )
+    monkeypatch.setattr(hh_cli, "ApplicationAutomationService", FakeAutomationService)
+    browser = FakeBrowser(
+        tmp_path / "profile",
+        "https://hh.ru/login",
+        "https://hh.ru/resumes",
+        "https://hh.ru/search",
+        60_000,
+    )
+    monkeypatch.setattr(
+        browser,
+        "apply_to_vacancy",
+        lambda *args, **kwargs: HhApplyResult(
+            HhApplyStatus.UNKNOWN_RESULT,
+            "https://hh.ru/vacancy/101",
+            "Результат не подтверждён",
+        ),
+    )
+    arguments = argparse.Namespace(
+        account_id=1,
+        task_id=42,
+        vacancy_id=None,
+        letter_id=72,
+        letter_sha256=digest,
+        session_limit=20,
+    )
+
+    assert (
+        hh_cli._run_supervised_application(
+            arguments,
+            settings,
+            cast(VisibleHhBrowser, browser),
+            browser.read_profile(),
+        )
+        == 3
+    )
+    entries = [
+        entry
+        for entry in OperationJournal(tmp_path).entries(component="applications")
+        if entry["event"] == "supervised.send"
+    ]
+    assert [entry["status"] for entry in entries] == ["started", "blocked"]
+    assert entries[-1]["details"]["result_status"] == "UNKNOWN_RESULT"
+
+
+def test_supervised_apply_records_rejected_claim_and_releases_lease(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    settings = Settings(environment="test", data_dir=tmp_path)
+    database = FakeDatabase()
+    digest = "c" * 64
+    released: list[str] = []
+
+    class FakeAutomationService:
+        def __init__(self, session: object) -> None:
+            assert session is not None
+
+        def acquire_supervised_lease(self, token: str, **kwargs: object) -> datetime:
+            return datetime.now(UTC)
+
+        def release_supervised_lease(self, token: str) -> None:
+            released.append(token)
+
+        def last_confirmed_application_at(
+            self,
+            account_id: int,
+            **kwargs: object,
+        ) -> None:
+            return None
+
+        def claim_supervised(self, **kwargs: object) -> SimpleNamespace:
+            raise LookupError("Письмо или задание уже изменилось")
+
+    monkeypatch.setattr(hh_cli, "upgrade_database", lambda selected: None)
+    monkeypatch.setattr(hh_cli, "create_database", lambda selected: database)
+    monkeypatch.setattr(
+        hh_cli,
+        "HhProfileSyncService",
+        lambda session: SimpleNamespace(
+            synchronize=lambda profile: SimpleNamespace(account=SimpleNamespace(id=1))
+        ),
+    )
+    monkeypatch.setattr(hh_cli, "ApplicationAutomationService", FakeAutomationService)
+    browser = FakeBrowser(
+        tmp_path / "profile",
+        "https://hh.ru/login",
+        "https://hh.ru/resumes",
+        "https://hh.ru/search",
+        60_000,
+    )
+    arguments = argparse.Namespace(
+        account_id=1,
+        task_id=43,
+        vacancy_id=None,
+        letter_id=73,
+        letter_sha256=digest,
+        session_limit=20,
+    )
+
+    assert (
+        hh_cli._run_supervised_application(
+            arguments,
+            settings,
+            cast(VisibleHhBrowser, browser),
+            browser.read_profile(),
+        )
+        == 2
+    )
+    assert released
+    entries = [
+        entry
+        for entry in OperationJournal(tmp_path).entries(component="applications")
+        if entry["event"] == "supervised.send"
+    ]
+    assert [entry["status"] for entry in entries] == ["started", "blocked"]
+    assert entries[-1]["details"]["task_id"] == 43
+    assert entries[-1]["details"]["reason"] == "Письмо или задание уже изменилось"
+
+
+def test_supervised_apply_records_unexpected_failure_and_releases_lease(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    settings = Settings(environment="test", data_dir=tmp_path)
+    database = FakeDatabase()
+    digest = "e" * 64
+    released: list[str] = []
+
+    class FakeAutomationService:
+        def __init__(self, session: object) -> None:
+            assert session is not None
+
+        def acquire_supervised_lease(self, token: str, **kwargs: object) -> datetime:
+            return datetime.now(UTC)
+
+        def release_supervised_lease(self, token: str) -> None:
+            released.append(token)
+
+        def last_confirmed_application_at(
+            self,
+            account_id: int,
+            **kwargs: object,
+        ) -> None:
+            raise OSError("База временно недоступна")
+
+    monkeypatch.setattr(hh_cli, "upgrade_database", lambda selected: None)
+    monkeypatch.setattr(hh_cli, "create_database", lambda selected: database)
+    monkeypatch.setattr(
+        hh_cli,
+        "HhProfileSyncService",
+        lambda session: SimpleNamespace(
+            synchronize=lambda profile: SimpleNamespace(account=SimpleNamespace(id=1))
+        ),
+    )
+    monkeypatch.setattr(hh_cli, "ApplicationAutomationService", FakeAutomationService)
+    browser = FakeBrowser(
+        tmp_path / "profile",
+        "https://hh.ru/login",
+        "https://hh.ru/resumes",
+        "https://hh.ru/search",
+        60_000,
+    )
+    arguments = argparse.Namespace(
+        account_id=1,
+        task_id=44,
+        vacancy_id=None,
+        letter_id=74,
+        letter_sha256=digest,
+        session_limit=20,
+    )
+
+    with pytest.raises(OSError, match="База временно недоступна"):
+        hh_cli._run_supervised_application(
+            arguments,
+            settings,
+            cast(VisibleHhBrowser, browser),
+            browser.read_profile(),
+        )
+
+    assert released
+    entries = [
+        entry
+        for entry in OperationJournal(tmp_path).entries(component="applications")
+        if entry["event"] == "supervised.send"
+    ]
+    assert [entry["status"] for entry in entries] == ["started", "failed"]
+    assert entries[-1]["details"]["task_id"] == 44
+    assert entries[-1]["details"]["letter_id"] == 74
+
+
+def test_supervised_apply_rejects_another_hh_account(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    settings = Settings(environment="test", data_dir=tmp_path)
+    database = FakeDatabase()
+    browser = FakeBrowser(
+        tmp_path / "profile",
+        "https://hh.ru/login",
+        "https://hh.ru/resumes",
+        "https://hh.ru/search",
+        60_000,
+    )
+    monkeypatch.setattr(hh_cli, "upgrade_database", lambda selected: None)
+    monkeypatch.setattr(hh_cli, "create_database", lambda selected: database)
+    monkeypatch.setattr(
+        hh_cli,
+        "HhProfileSyncService",
+        lambda session: SimpleNamespace(
+            synchronize=lambda profile: SimpleNamespace(account=SimpleNamespace(id=2))
+        ),
+    )
+    arguments = argparse.Namespace(
+        account_id=1,
+        task_id=45,
+        vacancy_id=None,
+        letter_id=75,
+        letter_sha256="f" * 64,
+        session_limit=20,
+    )
+
+    assert (
+        hh_cli._run_supervised_application(
+            arguments,
+            settings,
+            cast(VisibleHhBrowser, browser),
+            browser.read_profile(),
+        )
+        == 2
+    )
+    entries = [
+        entry
+        for entry in OperationJournal(tmp_path).entries(component="applications")
+        if entry["event"] == "supervised.send"
+    ]
+    assert [entry["status"] for entry in entries] == ["started", "blocked"]
+    assert "другой аккаунт" in entries[-1]["details"]["reason"]
+
+
+def test_supervised_resume_must_match_id_title_and_be_unambiguous() -> None:
+    matching = HhProfileData(
+        external_id="12345",
+        label="Иван Иванов",
+        resumes=(HhResumeData("resume-1", "Python-разработчик"),),
+    )
+    hh_cli._validate_supervised_resume(matching, "resume-1", "Python-разработчик")
+
+    with pytest.raises(ValueError, match="не совпадает"):
+        hh_cli._validate_supervised_resume(matching, "resume-2", "Python-разработчик")
+
+    duplicates = HhProfileData(
+        external_id="12345",
+        label="Иван Иванов",
+        resumes=(
+            HhResumeData("resume-1", "Python-разработчик"),
+            HhResumeData("resume-2", "Python-разработчик"),
+        ),
+    )
+    with pytest.raises(ValueError, match="несколько резюме"):
+        hh_cli._validate_supervised_resume(duplicates, "resume-1", "Python-разработчик")
+
+
+def test_supervised_resume_mismatch_returns_claim_to_queue(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    settings = Settings(environment="test", data_dir=tmp_path)
+    database = FakeDatabase()
+    digest = "a" * 64
+    returned: list[tuple[str, int, str]] = []
+    released: list[str] = []
+    job = SimpleNamespace(
+        task=SimpleNamespace(id=46),
+        application=SimpleNamespace(id=56),
+        vacancy=SimpleNamespace(hh_id="106", source_url="https://hh.ru/vacancy/106"),
+        resume=SimpleNamespace(
+            id=66,
+            hh_id="deleted-resume",
+            title="Удалённое резюме",
+        ),
+        direction_vacancy=SimpleNamespace(rules_version="python_it_v5"),
+        cover_letter="Проверенное письмо",
+        cover_letter_id=76,
+        cover_letter_sha256=digest,
+    )
+
+    class FakeAutomationService:
+        def __init__(self, session: object) -> None:
+            assert session is not None
+
+        def acquire_supervised_lease(self, token: str, **kwargs: object) -> datetime:
+            return datetime.now(UTC)
+
+        def release_supervised_lease(self, token: str) -> None:
+            released.append(token)
+
+        def last_confirmed_application_at(
+            self,
+            account_id: int,
+            **kwargs: object,
+        ) -> None:
+            return None
+
+        def claim_supervised(self, **kwargs: object) -> SimpleNamespace:
+            return job
+
+        def policy(self, timezone_name: str | None = None) -> SimpleNamespace:
+            return SimpleNamespace(delay_min_seconds=60)
+
+        def release_supervised_claim(
+            self,
+            token: str,
+            task_id: int,
+            *,
+            error_code: str,
+        ) -> None:
+            returned.append((token, task_id, error_code))
+
+    monkeypatch.setattr(hh_cli, "upgrade_database", lambda selected: None)
+    monkeypatch.setattr(hh_cli, "create_database", lambda selected: database)
+    monkeypatch.setattr(
+        hh_cli,
+        "HhProfileSyncService",
+        lambda session: SimpleNamespace(
+            synchronize=lambda profile: SimpleNamespace(account=SimpleNamespace(id=1))
+        ),
+    )
+    monkeypatch.setattr(hh_cli, "ApplicationAutomationService", FakeAutomationService)
+    browser = FakeBrowser(
+        tmp_path / "profile",
+        "https://hh.ru/login",
+        "https://hh.ru/resumes",
+        "https://hh.ru/search",
+        60_000,
+    )
+    arguments = argparse.Namespace(
+        account_id=1,
+        task_id=46,
+        vacancy_id=None,
+        letter_id=76,
+        letter_sha256=digest,
+        session_limit=20,
+    )
+
+    assert (
+        hh_cli._run_supervised_application(
+            arguments,
+            settings,
+            cast(VisibleHhBrowser, browser),
+            browser.read_profile(),
+        )
+        == 2
+    )
+    assert len(returned) == 1
+    assert returned[0][1:] == (46, "RESUME_PROFILE_MISMATCH")
+    assert released == [returned[0][0]]
+    assert browser.applications == []
+
+
+def test_supervised_submission_guard_checks_exact_running_task(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    settings = Settings(environment="test", data_dir=tmp_path)
+    database = FakeDatabase()
+    checked: list[tuple[str, int, int, str, str, str]] = []
+
+    class FakeAutomationService:
+        def __init__(self, session: object) -> None:
+            assert session is not None
+
+        def supervised_submission_is_allowed(
+            self,
+            token: str,
+            task_id: int,
+            **kwargs: object,
+        ) -> bool:
+            checked.append(
+                (
+                    token,
+                    task_id,
+                    cast(int, kwargs["letter_id"]),
+                    cast(str, kwargs["letter_sha256"]),
+                    cast(str, kwargs["resume_hh_id"]),
+                    cast(str, kwargs["resume_title"]),
+                )
+            )
+            return True
+
+    monkeypatch.setattr(hh_cli, "create_database", lambda selected: database)
+    monkeypatch.setattr(hh_cli, "ApplicationAutomationService", FakeAutomationService)
+
+    assert hh_cli._supervised_submission_allowed(
+        settings,
+        "lease-token",
+        46,
+        73,
+        "a" * 64,
+        "resume-1",
+        "Python-разработчик",
+    )
+    assert checked == [("lease-token", 46, 73, "a" * 64, "resume-1", "Python-разработчик")]
+    assert database.closed
+
+
+def test_supervised_apply_validates_limit_and_letter_hash(tmp_path: Path) -> None:
+    settings = Settings(environment="test", data_dir=tmp_path)
+    browser = FakeBrowser(
+        tmp_path / "profile",
+        "https://hh.ru/login",
+        "https://hh.ru/resumes",
+        "https://hh.ru/search",
+        60_000,
+    )
+    arguments = argparse.Namespace(
+        account_id=1,
+        task_id=44,
+        vacancy_id=None,
+        letter_id=74,
+        letter_sha256="d" * 64,
+        session_limit=21,
+    )
+
+    with pytest.raises(ValueError, match="не более 20"):
+        hh_cli._run_supervised_application(
+            arguments,
+            settings,
+            cast(VisibleHhBrowser, browser),
+            browser.read_profile(),
+        )
+
+    arguments.session_limit = 20
+    arguments.letter_sha256 = "не хэш"
+    with pytest.raises(ValueError, match="SHA256"):
+        hh_cli._run_supervised_application(
+            arguments,
+            settings,
+            cast(VisibleHhBrowser, browser),
+            browser.read_profile(),
+        )
 
 
 def test_main_uses_process_exit(monkeypatch: pytest.MonkeyPatch) -> None:

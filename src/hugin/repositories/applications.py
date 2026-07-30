@@ -136,6 +136,11 @@ class ApplicationRepository:
                     ApplicationEventModel.created_at >= since,
                     ApplicationEventModel.payload["hh_status"].as_string()
                     == ApplicationState.APPLIED.value,
+                    func.coalesce(
+                        ApplicationEventModel.payload["source"].as_string(),
+                        "",
+                    )
+                    != "hh.ru",
                 )
             )
             or 0

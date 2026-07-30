@@ -109,7 +109,7 @@ def test_communications_migration_preserves_existing_rows(settings: Settings) ->
         database.close()
 
     upgrade_database(settings)
-    assert current_revision(settings) == "0016_safe_application_defaults"
+    assert current_revision(settings) == "0017_supervised_lease"
     check_database_schema(settings)
 
     migrated = create_database(settings)

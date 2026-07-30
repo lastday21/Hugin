@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import hashlib
 import sys
 from collections.abc import Sequence
+from pathlib import Path
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 
 from hugin.adapters.yandex_ai import YandexAIClient, YandexAIError
 from hugin.adapters.yandex_credentials import (
@@ -16,11 +18,12 @@ from hugin.core.settings import Settings, get_settings
 from hugin.database import create_database, upgrade_database
 from hugin.database.models import (
     ApplicationModel,
+    CoverLetterFactModel,
     CoverLetterModel,
     VacancyModel,
 )
 from hugin.diagnostics import OperationJournal
-from hugin.domain.content import cover_letter_instruction_version
+from hugin.domain.content import CoverLetterState, cover_letter_instruction_version
 from hugin.services.ai_prompts import AiPromptSettingsService
 from hugin.services.application_automation import ApplicationAutomationService
 from hugin.services.cover_letter import SYSTEM_PROMPT, CoverLetterService
@@ -61,6 +64,22 @@ def build_parser() -> argparse.ArgumentParser:
     show = subparsers.add_parser("show", help="показать сохраненное письмо по номеру вакансии")
     show.add_argument("--account-id", type=positive_int, default=1)
     show.add_argument("--vacancy-id", required=True, help="номер вакансии hh.ru")
+
+    reject = subparsers.add_parser(
+        "reject",
+        help="отклонить проверенное письмо и разрешить создать новое",
+    )
+    reject.add_argument("--account-id", type=positive_int, default=1)
+    reject.add_argument("--letter-id", type=positive_int, required=True)
+    reject.add_argument("--reason", required=True, help="краткая причина отклонения")
+
+    replace = subparsers.add_parser(
+        "replace",
+        help="проверить и сохранить исправленный вручную текст письма",
+    )
+    replace.add_argument("--account-id", type=positive_int, default=1)
+    replace.add_argument("--letter-id", type=positive_int, required=True)
+    replace.add_argument("--file", type=Path, required=True, help="текстовый файл UTF-8")
     return parser
 
 
@@ -125,11 +144,73 @@ def run(argv: Sequence[str] | None = None) -> int:
                         raise LookupError("Письмо для этой вакансии не найдено")
                     letter, vacancy = row
                     print(f"Вакансия: {vacancy.title} (№ {vacancy.hh_id})")
+                    print(f"Идентификатор письма: {letter.id}")
                     print(f"Состояние: {letter.state.value}")
                     if letter.text:
+                        digest = hashlib.sha256(letter.text.encode("utf-8")).hexdigest()
+                        print(f"SHA256 письма: {digest}")
                         print(letter.text)
                     elif letter.failure_reason:
                         print(f"Причина: {letter.failure_reason}")
+                return 0
+            if arguments.command == "reject":
+                reason = " ".join(arguments.reason.split())
+                if not reason:
+                    raise ValueError("Причина отклонения не может быть пустой")
+                with database.sessions.begin() as session:
+                    letter = session.scalar(
+                        select(CoverLetterModel)
+                        .join(
+                            ApplicationModel,
+                            ApplicationModel.id == CoverLetterModel.application_id,
+                        )
+                        .where(
+                            CoverLetterModel.id == arguments.letter_id,
+                            ApplicationModel.account_id == arguments.account_id,
+                        )
+                    )
+                    if letter is None:
+                        raise LookupError("Письмо не найдено")
+                    if letter.state is CoverLetterState.SENT:
+                        raise ValueError("Уже отправленное письмо отклонить нельзя")
+                    session.execute(
+                        delete(CoverLetterFactModel).where(
+                            CoverLetterFactModel.cover_letter_id == letter.id
+                        )
+                    )
+                    letter.text = None
+                    letter.state = CoverLetterState.FAILED
+                    letter.failure_reason = f"MANUAL_REVIEW: {reason}"[:512]
+                    letter.reused_from_id = None
+                print(
+                    f"Письмо № {arguments.letter_id} отклонено. "
+                    "Для вакансии можно создать новый вариант."
+                )
+                return 0
+            if arguments.command == "replace":
+                path = arguments.file.resolve()
+                if not path.is_file():
+                    raise ValueError("Файл с письмом не найден")
+                text = path.read_text(encoding="utf-8")
+                with database.sessions.begin() as session:
+                    letter = CoverLetterService(session).save_reviewed(
+                        account_id=arguments.account_id,
+                        letter_id=arguments.letter_id,
+                        text=text,
+                    )
+                digest = hashlib.sha256((letter.text or "").encode("utf-8")).hexdigest()
+                OperationJournal(settings.data_dir).record(
+                    "applications",
+                    "cover_letter.manual_review",
+                    status="completed",
+                    account_id=arguments.account_id,
+                    letter_id=letter.id,
+                    letter_sha256=digest,
+                )
+                print(
+                    f"Исправленное письмо № {letter.id} прошло проверки и сохранено. "
+                    f"SHA256: {digest}"
+                )
                 return 0
 
             with database.sessions.begin() as session:

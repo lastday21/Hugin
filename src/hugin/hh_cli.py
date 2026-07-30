@@ -5,6 +5,7 @@ import getpass
 import random
 import sys
 import time
+import uuid
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 
@@ -212,6 +213,23 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="действительно нажимать кнопку отправки; без флага форма только заполняется",
     )
+
+    supervised = subparsers.add_parser(
+        "supervised-apply",
+        help="отправить один точно выбранный и заранее проверенный отклик",
+    )
+    supervised.add_argument("--account-id", type=positive_int, default=1)
+    selector = supervised.add_mutually_exclusive_group(required=True)
+    selector.add_argument("--task-id", type=positive_int, help="номер задания в очереди")
+    selector.add_argument("--vacancy-id", help="номер вакансии hh.ru")
+    supervised.add_argument("--letter-id", type=positive_int, required=True)
+    supervised.add_argument("--letter-sha256", required=True)
+    supervised.add_argument(
+        "--session-limit",
+        type=positive_int,
+        default=20,
+        help="предельное число откликов в управляемом сеансе, не более 20",
+    )
     return parser
 
 
@@ -368,6 +386,8 @@ def run(argv: Sequence[str] | None = None) -> int:
                     failures.append((vacancy.title, str(error)))
         if arguments.command == "apply":
             return _run_applications(arguments, settings, browser, profile)
+        if arguments.command == "supervised-apply":
+            return _run_supervised_application(arguments, settings, browser, profile)
 
     upgrade_database(settings)
     if arguments.command == "search":
@@ -884,6 +904,7 @@ def _run_applications(
             try:
                 result = browser.apply_to_vacancy(
                     job.vacancy.source_url,
+                    expected_resume_hh_id=job.resume.hh_id,
                     expected_resume_title=job.resume.title,
                     cover_letter=job.cover_letter,
                     submit=arguments.send,
@@ -906,10 +927,14 @@ def _run_applications(
                             current_policy.delay_max_seconds,
                         )
                     )
-                recorded = runtime_service.record_result(
-                    job,
-                    result,
-                    apply_delay=apply_delay,
+                recorded = (
+                    runtime_service.release_after_preview(job)
+                    if not arguments.send and result.status is HhApplyStatus.MANUAL_REVIEW_REQUIRED
+                    else runtime_service.record_result(
+                        job,
+                        result,
+                        apply_delay=apply_delay,
+                    )
                 )
             OperationJournal(settings.data_dir).record(
                 "applications",
@@ -954,6 +979,221 @@ def _applications_enabled(settings: Settings) -> bool:
     try:
         with database.sessions.begin() as session:
             return ApplicationAutomationService(session).applications_enabled()
+    finally:
+        database.close()
+
+
+def _run_supervised_application(
+    arguments: argparse.Namespace,
+    settings: Settings,
+    browser: VisibleHhBrowser,
+    profile: HhProfileData,
+) -> int:
+    if arguments.session_limit > 20:
+        raise ValueError("В одном управляемом сеансе разрешено не более 20 откликов")
+    digest = arguments.letter_sha256.strip().casefold()
+    if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+        raise ValueError("SHA256 письма должен состоять из 64 шестнадцатеричных символов")
+
+    upgrade_database(settings)
+    token = uuid.uuid4().hex
+    journal_run = OperationJournal(settings.data_dir).start(
+        "applications",
+        "supervised.send",
+        account_id=arguments.account_id,
+        task_id=arguments.task_id,
+        vacancy_id=arguments.vacancy_id,
+        letter_id=arguments.letter_id,
+        letter_sha256=digest,
+        session_limit=arguments.session_limit,
+    )
+    database = create_database(settings)
+    lease_acquired = False
+    job = None
+    result: HhApplyResult | None = None
+    try:
+        with database.sessions.begin() as session:
+            synchronized_profile = HhProfileSyncService(session).synchronize(profile)
+            if synchronized_profile.account.id != arguments.account_id:
+                raise ValueError(
+                    "В профиле браузера открыт другой аккаунт hh.ru; "
+                    "управляемая отправка остановлена"
+                )
+            service = ApplicationAutomationService(session)
+            service.acquire_supervised_lease(token, ttl=timedelta(minutes=15))
+            lease_acquired = True
+        claim_at = datetime.now(UTC)
+        with database.sessions.begin() as session:
+            service = ApplicationAutomationService(session)
+            previous_confirmed_at = service.last_confirmed_application_at(
+                arguments.account_id,
+                before=claim_at,
+            )
+            job = service.claim_supervised(
+                lease_token=token,
+                task_id=arguments.task_id,
+                vacancy_hh_id=arguments.vacancy_id,
+                letter_id=arguments.letter_id,
+                letter_sha256=digest,
+                account_id=arguments.account_id,
+                day_start=local_day_start_utc(claim_at.astimezone()),
+                session_limit=arguments.session_limit,
+                now=claim_at,
+            )
+            policy = service.policy(local_timezone_name())
+            enforced_delay_seconds = max(60, policy.delay_min_seconds)
+
+        try:
+            _validate_supervised_resume(profile, job.resume.hh_id, job.resume.title)
+        except ValueError:
+            with database.sessions.begin() as session:
+                ApplicationAutomationService(session).release_supervised_claim(
+                    token,
+                    job.task.id,
+                    error_code="RESUME_PROFILE_MISMATCH",
+                )
+            raise
+        try:
+            result = browser.apply_to_vacancy(
+                job.vacancy.source_url,
+                expected_resume_hh_id=job.resume.hh_id,
+                expected_resume_title=job.resume.title,
+                cover_letter=job.cover_letter or "",
+                submit=True,
+                submit_guard=lambda: _supervised_submission_allowed(
+                    settings,
+                    token,
+                    job.task.id,
+                    job.cover_letter_id,
+                    job.cover_letter_sha256,
+                    job.resume.hh_id,
+                    job.resume.title,
+                ),
+            )
+        except Exception as error:
+            result = HhApplyResult(
+                HhApplyStatus.UNKNOWN_RESULT,
+                job.vacancy.source_url,
+                f"Ошибка выполнения после начала отклика: {type(error).__name__}",
+            )
+
+        with database.sessions.begin() as session:
+            service = ApplicationAutomationService(session)
+            finished_at = datetime.now(UTC)
+            recorded = service.record_result(
+                job,
+                result,
+                apply_delay=(
+                    timedelta(seconds=enforced_delay_seconds)
+                    if result.status is HhApplyStatus.APPLIED
+                    else None
+                ),
+                now=finished_at,
+            )
+        actual_interval_seconds = (
+            max((finished_at - previous_confirmed_at).total_seconds(), 0)
+            if previous_confirmed_at is not None
+            else None
+        )
+        details = {
+            "task_id": job.task.id,
+            "application_id": job.application.id,
+            "vacancy_id": job.vacancy.hh_id,
+            "letter_id": job.cover_letter_id,
+            "letter_sha256": job.cover_letter_sha256,
+            "resume_id": job.resume.id,
+            "rules_version": job.direction_vacancy.rules_version,
+            "result_status": result.status.value,
+            "final_url": result.final_url,
+            "confirmation": result.confirmation,
+            "enforced_delay_seconds": enforced_delay_seconds if recorded.sent else 0,
+            "actual_interval_seconds": actual_interval_seconds,
+            "next_apply_at": (
+                recorded.next_apply_at.isoformat() if recorded.next_apply_at is not None else None
+            ),
+        }
+        if recorded.sent:
+            journal_run.succeed(**details)
+            print(
+                f"Отклик на вакансию №{job.vacancy.hh_id} подтверждён. "
+                f"Следующая отправка не раньше чем через {enforced_delay_seconds} секунд."
+            )
+            return 0
+        journal_run.block(**details)
+        print(f"Отклик не отправлен: {_apply_status_text(result.status)}.")
+        return 3 if result.status is HhApplyStatus.UNKNOWN_RESULT else 2
+    except (LookupError, RuntimeError, ValueError) as error:
+        journal_run.block(
+            task_id=getattr(getattr(job, "task", None), "id", arguments.task_id),
+            application_id=getattr(getattr(job, "application", None), "id", None),
+            letter_id=arguments.letter_id,
+            letter_sha256=digest,
+            final_url=getattr(result, "final_url", None),
+            confirmation=getattr(result, "confirmation", None),
+            reason=str(error),
+        )
+        print(f"Управляемая отправка остановлена: {error}", file=sys.stderr)
+        return 2
+    except Exception as error:
+        journal_run.fail(
+            error,
+            task_id=getattr(getattr(job, "task", None), "id", arguments.task_id),
+            application_id=getattr(getattr(job, "application", None), "id", None),
+            letter_id=arguments.letter_id,
+            letter_sha256=digest,
+            final_url=getattr(result, "final_url", None),
+            confirmation=getattr(result, "confirmation", None),
+        )
+        raise
+    finally:
+        if lease_acquired:
+            try:
+                with database.sessions.begin() as session:
+                    ApplicationAutomationService(session).release_supervised_lease(token)
+            except Exception:
+                pass
+        database.close()
+
+
+def _validate_supervised_resume(
+    profile: HhProfileData,
+    expected_hh_id: str,
+    expected_title: str,
+) -> None:
+    normalized_title = expected_title.strip()
+    selected = [resume for resume in profile.resumes if resume.hh_id == expected_hh_id]
+    if len(selected) != 1 or selected[0].title.strip() != normalized_title:
+        raise ValueError("Активное резюме задания не совпадает с резюме в текущем профиле hh.ru")
+    same_title = [resume for resume in profile.resumes if resume.title.strip() == normalized_title]
+    if len(same_title) != 1:
+        raise ValueError(
+            "В профиле hh.ru найдено несколько резюме с одинаковым названием; "
+            "нельзя однозначно проверить выбранное резюме"
+        )
+
+
+def _supervised_submission_allowed(
+    settings: Settings,
+    token: str,
+    task_id: int,
+    letter_id: int | None,
+    letter_sha256: str | None,
+    resume_hh_id: str,
+    resume_title: str,
+) -> bool:
+    if letter_id is None or letter_sha256 is None:
+        return False
+    database = create_database(settings)
+    try:
+        with database.sessions.begin() as session:
+            return ApplicationAutomationService(session).supervised_submission_is_allowed(
+                token,
+                task_id,
+                letter_id=letter_id,
+                letter_sha256=letter_sha256,
+                resume_hh_id=resume_hh_id,
+                resume_title=resume_title,
+            )
     finally:
         database.close()
 

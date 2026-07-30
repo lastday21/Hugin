@@ -80,6 +80,40 @@ def test_queue_respects_system_state_and_priority(settings: Settings) -> None:
         database.close()
 
 
+def test_background_claim_refreshes_pause_and_supervised_lease(
+    settings: Settings,
+) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    now = datetime.now(UTC)
+
+    try:
+        with database.sessions.begin() as session:
+            application_id = create_application(session, "lease-race", "resume-lease-race")
+            task = QueueTaskRepository(session).enqueue(application_id, 50, now)
+            SystemStateRepository(session).transition(SystemState.RUNNING)
+
+        stale_session = database.sessions()
+        try:
+            stale_session.begin()
+            stale_service = ApplicationAutomationService(stale_session)
+            assert stale_service.applications_enabled()
+
+            with database.sessions.begin() as control_session:
+                QueueService(control_session).pause()
+                ApplicationAutomationService(control_session).acquire_supervised_lease(
+                    "lease-race-token"
+                )
+
+            assert QueueService(stale_session).claim_next(now) is None
+            assert QueueTaskRepository(stale_session).get(task.id).state is TaskState.PENDING
+            stale_session.commit()
+        finally:
+            stale_session.close()
+    finally:
+        database.close()
+
+
 def test_unknown_result_requires_reconciliation_before_retry(settings: Settings) -> None:
     upgrade_database(settings)
     database = create_database(settings)
@@ -252,6 +286,100 @@ def test_running_task_is_recovered_without_automatic_retry(settings: Settings) -
             event = ApplicationRepository(session).list_events(application_id)[-1]
             assert event.event_type is ApplicationEventType.UNKNOWN_RESULT
             assert event.payload["recovery"] == "startup"
+    finally:
+        database.close()
+
+
+def test_queue_does_not_claim_task_for_application_already_found_on_hh(
+    settings: Settings,
+) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    now = datetime(2026, 7, 22, 12, 0, tzinfo=UTC)
+
+    try:
+        with database.sessions.begin() as session:
+            application_id = create_application(session, "already-on-hh", "resume-1")
+            repository = QueueTaskRepository(session)
+            task = repository.enqueue(application_id, 50, now)
+            ApplicationRepository(session).transition_state(
+                application_id,
+                ApplicationState.APPLIED,
+                {"hh_status": "APPLIED", "source": "hh.ru"},
+            )
+
+            assert repository.claim_next(now) is None
+            assert repository.claim_exact(task.id, now) is None
+            assert repository.get(task.id).state is TaskState.PENDING
+    finally:
+        database.close()
+
+
+def test_supervised_running_task_is_recovered_only_after_lease_expires(
+    settings: Settings,
+) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    now = datetime.now(UTC)
+
+    try:
+        with database.sessions.begin() as session:
+            application_id = create_application(
+                session,
+                "supervised-expired",
+                "resume-supervised-expired",
+            )
+            tasks = QueueTaskRepository(session)
+            task = tasks.enqueue(application_id, 50, now)
+            system = SystemStateRepository(session)
+            system.acquire_supervised_lease(
+                "supervised-expired-lease",
+                now=now,
+                ttl=timedelta(minutes=1),
+            )
+            assert tasks.claim_exact(task.id, now) is not None
+
+            service = ApplicationAutomationService(session)
+            assert service.recover_interrupted() == 0
+            assert tasks.get(task.id).state is TaskState.RUNNING
+            assert service.supervised_lease_is_valid("supervised-expired-lease")
+            assert not service.supervised_lease_is_valid("wrong-lease")
+
+            assert service.recover_expired_supervised(now + timedelta(minutes=1, seconds=1)) == 1
+            recovered = tasks.get(task.id)
+            assert recovered.state is TaskState.UNKNOWN_RESULT
+            assert not service.supervised_lease_is_valid("supervised-expired-lease")
+            event = ApplicationRepository(session).list_events(application_id)[-1]
+            assert event.payload["recovery"] == "supervised_lease_expired"
+    finally:
+        database.close()
+
+
+@pytest.mark.parametrize(
+    "target",
+    (
+        SystemState.AUTH_REQUIRED,
+        SystemState.CAPTCHA_REQUIRED,
+        SystemState.ACCOUNT_WARNING,
+    ),
+)
+def test_supervised_protective_state_blocks_background_queue(
+    settings: Settings,
+    target: SystemState,
+) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+
+    try:
+        with database.sessions.begin() as session:
+            service = ApplicationAutomationService(session)
+            service.acquire_supervised_lease("supervised-protective")
+            service._transition_system(target)
+
+            assert SystemStateRepository(session).get().state is target
+            assert not service.applications_enabled()
+            with pytest.raises(RuntimeError, match="Очередь должна быть на паузе"):
+                service.acquire_supervised_lease("supervised-next")
     finally:
         database.close()
 

@@ -38,6 +38,7 @@ from hugin.domain import (
     VacancyState,
     WorkFormat,
 )
+from hugin.domain.content import cover_letter_instruction_version
 from hugin.repositories import (
     AccountRepository,
     ApplicationRepository,
@@ -47,6 +48,7 @@ from hugin.repositories import (
     SystemStateRepository,
     VacancyRepository,
 )
+from hugin.services.ai_prompts import DEFAULT_AI_PROMPTS
 from hugin.services.screening_forms import ScreeningDraftService
 
 pytestmark = pytest.mark.integration
@@ -159,7 +161,9 @@ def seed_workspace(settings: Settings) -> tuple[int, str, str]:
                     direction_id=direction.id,
                     resume_id=resume.id,
                     text="Здравствуйте! Готов обсудить задачи команды.",
-                    instruction_version="cover_letter_v11_ui-test",
+                    instruction_version=cover_letter_instruction_version(
+                        DEFAULT_AI_PROMPTS.cover_letter
+                    ),
                     model_name="test",
                     state=CoverLetterState.READY,
                 )
@@ -235,6 +239,36 @@ def seed_workspace(settings: Settings) -> tuple[int, str, str]:
                 applied_application.id,
                 ApplicationState.APPLIED,
                 {"hh_status": ApplicationState.APPLIED.value},
+            )
+
+            externally_discovered = VacancyRepository(session).upsert(
+                VacancyData(
+                    hh_id="ui-external",
+                    title="Ранее отправленный отклик",
+                    source_url="https://hh.ru/vacancy/ui-external",
+                )
+            )
+            external_application = applications.create_apply_intent(
+                account.id,
+                externally_discovered.id,
+                resume.id,
+                direction.id,
+            )
+            applications.transition_state(
+                external_application.id,
+                ApplicationState.APPLIED,
+                {
+                    "hh_status": ApplicationState.APPLIED.value,
+                    "source": "hh.ru",
+                },
+            )
+            applications.transition_state(
+                external_application.id,
+                ApplicationState.REJECTED,
+                {
+                    "hh_status": ApplicationState.REJECTED.value,
+                    "source": "hh.ru",
+                },
             )
             return account.id, vacancy.hh_id, rejected.hh_id
     finally:

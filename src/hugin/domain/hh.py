@@ -35,12 +35,29 @@ class HhProfileData:
 
 
 @dataclass(frozen=True, slots=True)
+class HhResumeExperienceBlock:
+    company: str = ""
+    position: str = ""
+    period: str = ""
+    description: str = ""
+    text: str = ""
+
+
+@dataclass(frozen=True, slots=True)
 class HhResumeDetails:
     hh_id: str
     title: str
     experience: str
     skills: str
     education: str
+    city: str = ""
+    salary: str = ""
+    employment: str = ""
+    work_format: str = ""
+    relocation: str = ""
+    business_trips: str = ""
+    about: str = ""
+    experience_blocks: tuple[HhResumeExperienceBlock, ...] = ()
 
 
 class HhApplyStatus(StrEnum):

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.orm import Session
@@ -15,7 +15,7 @@ from hugin.database.models import (
     SystemStateModel,
     VacancyModel,
 )
-from hugin.domain.applications import ApplicationEventType, EventPayload
+from hugin.domain.applications import ApplicationEventType, ApplicationState, EventPayload
 from hugin.domain.content import CURRENT_COVER_LETTER_INSTRUCTION, CoverLetterState
 from hugin.domain.directions import VacancyState
 from hugin.domain.state_machines import ensure_system_transition, ensure_task_transition
@@ -120,6 +120,7 @@ class QueueTaskRepository:
         require_ready_cover_letter: bool = False,
         cover_letter_instruction_version: str | None = None,
         vacancy_rules_version: str | None = None,
+        vacancy_rule_categories: frozenset[str] | None = None,
     ) -> TaskRecord | None:
         selected_at = as_utc(now or datetime.now(UTC))
         statement = (
@@ -129,6 +130,7 @@ class QueueTaskRepository:
             .where(
                 ApplicationTaskModel.state.in_(READY_STATES),
                 ApplicationTaskModel.scheduled_at <= selected_at,
+                ApplicationModel.state == ApplicationState.APPLYING,
             )
             .order_by(
                 VacancyModel.published_at.desc().nulls_last(),
@@ -142,16 +144,24 @@ class QueueTaskRepository:
             statement = statement.where(ApplicationModel.account_id == account_id)
         if direction_id is not None:
             statement = statement.where(ApplicationModel.direction_id == direction_id)
-        if vacancy_rules_version is not None:
+        if vacancy_rules_version is not None or vacancy_rule_categories is not None:
             statement = statement.join(
                 DirectionVacancyModel,
                 and_(
                     DirectionVacancyModel.direction_id == ApplicationModel.direction_id,
                     DirectionVacancyModel.vacancy_id == ApplicationModel.vacancy_id,
                 ),
-            ).where(
-                DirectionVacancyModel.state == VacancyState.QUEUED,
-                DirectionVacancyModel.rules_version == vacancy_rules_version,
+            )
+            statement = statement.where(DirectionVacancyModel.state == VacancyState.QUEUED)
+        if vacancy_rules_version is not None:
+            statement = statement.where(
+                DirectionVacancyModel.rules_version == vacancy_rules_version
+            )
+        if vacancy_rule_categories is not None:
+            statement = statement.where(
+                DirectionVacancyModel.rules_details["category"]
+                .as_string()
+                .in_(tuple(vacancy_rule_categories))
             )
         if require_ready_cover_letter:
             instruction_filter = (
@@ -181,6 +191,30 @@ class QueueTaskRepository:
             .where(
                 ApplicationTaskModel.id == task_id,
                 ApplicationTaskModel.state.in_(READY_STATES),
+                ApplicationTaskModel.application.has(
+                    ApplicationModel.state == ApplicationState.APPLYING
+                ),
+            )
+            .values(
+                state=TaskState.RUNNING,
+                attempts=ApplicationTaskModel.attempts + 1,
+                updated_at=selected_at,
+            )
+            .returning(ApplicationTaskModel)
+        )
+        return _task_record(task) if task is not None else None
+
+    def claim_exact(self, task_id: int, now: datetime | None = None) -> TaskRecord | None:
+        selected_at = as_utc(now or datetime.now(UTC))
+        task = self._session.scalar(
+            update(ApplicationTaskModel)
+            .where(
+                ApplicationTaskModel.id == task_id,
+                ApplicationTaskModel.state.in_(READY_STATES),
+                ApplicationTaskModel.scheduled_at <= selected_at,
+                ApplicationTaskModel.application.has(
+                    ApplicationModel.state == ApplicationState.APPLYING
+                ),
             )
             .values(
                 state=TaskState.RUNNING,
@@ -216,7 +250,18 @@ class QueueTaskRepository:
         direction_id: int,
         *,
         rules_version: str,
+        allowed_categories: frozenset[str] | None = None,
     ) -> int:
+        ineligible = [
+            DirectionVacancyModel.state != VacancyState.QUEUED,
+            DirectionVacancyModel.rules_version != rules_version,
+        ]
+        if allowed_categories is not None:
+            ineligible.append(
+                DirectionVacancyModel.rules_details["category"]
+                .as_string()
+                .not_in(tuple(allowed_categories))
+            )
         task_ids = tuple(
             self._session.scalars(
                 select(ApplicationTaskModel.id)
@@ -234,10 +279,7 @@ class QueueTaskRepository:
                 .where(
                     ApplicationModel.direction_id == direction_id,
                     ApplicationTaskModel.state.in_(READY_STATES),
-                    or_(
-                        DirectionVacancyModel.state != VacancyState.QUEUED,
-                        DirectionVacancyModel.rules_version != rules_version,
-                    ),
+                    or_(*ineligible),
                 )
             )
         )
@@ -249,7 +291,7 @@ class QueueTaskRepository:
             )
         return len(task_ids)
 
-    def recover_running(self) -> list[TaskRecord]:
+    def recover_running(self, *, recovery: str = "startup") -> list[TaskRecord]:
         task_ids = self._session.scalars(
             select(ApplicationTaskModel.id)
             .where(ApplicationTaskModel.state == TaskState.RUNNING)
@@ -260,7 +302,7 @@ class QueueTaskRepository:
                 task_id,
                 TaskState.UNKNOWN_RESULT,
                 error_code="INTERRUPTED_DURING_APPLY",
-                event_payload={"recovery": "startup"},
+                event_payload={"recovery": recovery},
             )
             for task_id in task_ids
         ]
@@ -326,11 +368,36 @@ class SystemStateRepository:
             raise SystemStateNotFoundError
         return _system_record(model)
 
+    def lock(self) -> SystemStateRecord:
+        model = self._session.scalar(
+            select(SystemStateModel)
+            .where(SystemStateModel.id == 1)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if model is None:
+            raise SystemStateNotFoundError
+        return _system_record(model)
+
     def transition(self, target: SystemState) -> SystemStateRecord:
-        model = self._session.get(SystemStateModel, 1)
+        model = self._session.scalar(
+            select(SystemStateModel)
+            .where(SystemStateModel.id == 1)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
         if model is None:
             raise SystemStateNotFoundError
         ensure_system_transition(model.state, target)
+        if (
+            target is SystemState.RUNNING
+            and model.supervised_lease_token is not None
+            and model.supervised_lease_expires_at is not None
+            and as_utc(model.supervised_lease_expires_at) > datetime.now(UTC)
+        ):
+            raise ValueError(
+                "Нельзя включить очередь, пока выполняется управляемый поштучный отклик"
+            )
         model.state = target
         self._session.flush()
         return _system_record(model)
@@ -342,6 +409,112 @@ class SystemStateRepository:
         model.next_apply_at = as_utc(value) if value is not None else None
         self._session.flush()
         return _system_record(model)
+
+    def acquire_supervised_lease(
+        self,
+        token: str,
+        *,
+        now: datetime | None = None,
+        ttl: timedelta = timedelta(minutes=15),
+    ) -> datetime:
+        if not token or len(token) > 64:
+            raise ValueError("Некорректный идентификатор управляемого сеанса")
+        selected_at = as_utc(now or datetime.now(UTC))
+        if ttl <= timedelta(0):
+            raise ValueError("Срок аренды должен быть положительным")
+        expires_at = selected_at + ttl
+        updated_id = self._session.scalar(
+            update(SystemStateModel)
+            .where(
+                SystemStateModel.id == 1,
+                SystemStateModel.state == SystemState.PAUSED,
+                or_(
+                    SystemStateModel.supervised_lease_token.is_(None),
+                    SystemStateModel.supervised_lease_expires_at.is_(None),
+                    SystemStateModel.supervised_lease_expires_at <= selected_at,
+                    SystemStateModel.supervised_lease_token == token,
+                ),
+            )
+            .values(
+                supervised_lease_token=token,
+                supervised_lease_expires_at=expires_at,
+                updated_at=selected_at,
+            )
+            .returning(SystemStateModel.id)
+        )
+        if updated_id != 1:
+            raise RuntimeError(
+                "Очередь должна быть на паузе, а другой управляемый сеанс — завершён"  # noqa: RUF001
+            )
+        self._session.flush()
+        return expires_at
+
+    def supervised_lease_is_valid(
+        self,
+        token: str,
+        *,
+        now: datetime | None = None,
+    ) -> bool:
+        selected_at = as_utc(now or datetime.now(UTC))
+        return bool(
+            self._session.scalar(
+                select(SystemStateModel.id).where(
+                    SystemStateModel.id == 1,
+                    SystemStateModel.state == SystemState.PAUSED,
+                    SystemStateModel.supervised_lease_token == token,
+                    SystemStateModel.supervised_lease_expires_at > selected_at,
+                )
+            )
+        )
+
+    def supervised_lease_active(self, now: datetime | None = None) -> bool:
+        selected_at = as_utc(now or datetime.now(UTC))
+        return bool(
+            self._session.scalar(
+                select(SystemStateModel.id).where(
+                    SystemStateModel.id == 1,
+                    SystemStateModel.supervised_lease_token.is_not(None),
+                    SystemStateModel.supervised_lease_expires_at > selected_at,
+                )
+            )
+        )
+
+    def clear_expired_supervised_lease(self, now: datetime | None = None) -> bool:
+        selected_at = as_utc(now or datetime.now(UTC))
+        cleared_id = self._session.scalar(
+            update(SystemStateModel)
+            .where(
+                SystemStateModel.id == 1,
+                SystemStateModel.supervised_lease_token.is_not(None),
+                or_(
+                    SystemStateModel.supervised_lease_expires_at.is_(None),
+                    SystemStateModel.supervised_lease_expires_at <= selected_at,
+                ),
+            )
+            .values(
+                supervised_lease_token=None,
+                supervised_lease_expires_at=None,
+                updated_at=selected_at,
+            )
+            .returning(SystemStateModel.id)
+        )
+        self._session.flush()
+        return cleared_id == 1
+
+    def release_supervised_lease(self, token: str) -> None:
+        self._session.execute(
+            update(SystemStateModel)
+            .where(
+                SystemStateModel.id == 1,
+                SystemStateModel.supervised_lease_token == token,
+            )
+            .values(
+                supervised_lease_token=None,
+                supervised_lease_expires_at=None,
+                updated_at=datetime.now(UTC),
+            )
+        )
+        self._session.flush()
 
 
 class ApplicationSettingsRepository:

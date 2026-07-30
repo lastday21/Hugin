@@ -26,6 +26,7 @@ def make_draft(*, answers: bool = True) -> ScreeningDraft:
         vacancy_title="Python разработчик",
         company="Компания",
         source_url="https://hh.ru/vacancy/123",
+        resume_hh_id="resume-1",
         resume_title="Python",
         version_hash="version-1",
         state=ScreeningFormState.INPUT_REQUIRED,
@@ -201,6 +202,7 @@ def test_open_refills_answers_and_waits_for_manual_submit(
     assert result == 0
     assert FakeBrowser.open_arguments == {
         "source_url": "https://hh.ru/vacancy/123",
+        "expected_resume_hh_id": "resume-1",
         "expected_resume_title": "Python",
         "expected_version_hash": "version-1",
         "answers": {"0:name:telegram": "@ivan"},

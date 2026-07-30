@@ -1,12 +1,23 @@
 from __future__ import annotations
 
+import hashlib
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from sqlalchemy import delete
 
 from hugin.core.settings import Settings
 from hugin.database import create_database, upgrade_database
+from hugin.database.models import (
+    ApplicationEventModel,
+    CandidateProfileModel,
+    CoverLetterModel,
+    DirectionVacancyModel,
+    ResumeModel,
+    VerifiedFactModel,
+)
 from hugin.domain import (
+    ApplicationEventType,
     ApplicationReconciliationResult,
     ApplicationState,
     HhApplyResult,
@@ -16,7 +27,13 @@ from hugin.domain import (
     TaskState,
     VacancyData,
 )
+from hugin.domain.content import (
+    ConfirmationState,
+    CoverLetterState,
+    cover_letter_instruction_version,
+)
 from hugin.domain.directions import VacancyState
+from hugin.domain.hh_sync import HhNegotiationData, HhNegotiationStatus
 from hugin.repositories import (
     AccountRepository,
     ApplicationRepository,
@@ -26,12 +43,27 @@ from hugin.repositories import (
     SystemStateRepository,
     VacancyRepository,
 )
+from hugin.services.ai_prompts import DEFAULT_AI_PROMPTS
 from hugin.services.application_automation import ApplicationAutomationService
 from hugin.services.application_reconciliation import ApplicationReconciliationService
+from hugin.services.cover_letter import MANUAL_REVIEW_MODEL, CoverLetterService
+from hugin.services.hh_sync import HhSynchronizationService
 from hugin.services.queue import QueueService
 from hugin.services.vacancy_analysis import RULES_VERSION
 
 pytestmark = pytest.mark.integration
+
+
+def _supervised_letter() -> str:
+    return (
+        "Здравствуйте!\n\n"
+        "Разрабатываю серверные приложения на Python, реализую прикладную логику и уделяю "
+        "внимание обработке ошибок. При работе разделяю прикладную часть и доступ к данным, "
+        "проверяю изменения автоматическими проверками и разбираю результат до понятной "
+        "причины. Такой подход помогает аккуратно дорабатывать серверную часть, сохранять "
+        "целостность данных и проверять поведение службы перед выпуском.\n\n"
+        "Готов подробнее рассказать про выполненные задачи и обсудить задачи команды."
+    )
 
 
 def test_automation_prepares_claims_and_records_results(settings: Settings) -> None:
@@ -111,9 +143,22 @@ def test_automation_prepares_claims_and_records_results(settings: Settings) -> N
             )
             assert QueueTaskRepository(session).get(first.task.id).state is TaskState.INPUT_REQUIRED
 
+            assert service.claim_next(direction.id, include_stretch=False) is None
             second = service.claim_next(direction.id)
             assert second is not None
             assert second.vacancy.hh_id == "200"
+            HhSynchronizationService(session).synchronize_statuses(
+                account_id=account.id,
+                statuses=(
+                    HhNegotiationData(
+                        second.vacancy.hh_id,
+                        HhNegotiationStatus.APPLIED,
+                        "Не просмотрен",  # noqa: RUF001
+                        True,
+                    ),
+                ),
+            )
+            assert QueueTaskRepository(session).get(second.task.id).state is TaskState.COMPLETED
             recorded = service.record_result(
                 second,
                 HhApplyResult(HhApplyStatus.APPLIED, second.vacancy.source_url, "успешно"),
@@ -417,8 +462,505 @@ def test_review_claim_is_allowed_only_while_queue_is_paused(settings: Settings) 
 
             assert service.claim_next(allow_paused_review=True) is None
 
+            service.acquire_supervised_lease("review-lease")
+            with pytest.raises(RuntimeError, match="во время управляемого отклика"):
+                service.claim_next(allow_paused_review=True)
+            service.release_supervised_lease("review-lease")
+
             SystemStateRepository(session).transition(SystemState.RUNNING)
             with pytest.raises(RuntimeError, match="только на паузе"):
                 service.claim_next(allow_paused_review=True)
+    finally:
+        database.close()
+
+
+def test_background_claim_and_submit_guard_require_the_same_current_letter(
+    settings: Settings,
+) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    try:
+        with database.sessions.begin() as session:
+            account = AccountRepository(session).create("Иван", "background-account")
+            resume = ResumeRepository(session).upsert(
+                account.id,
+                "background-resume",
+                "Python backend",
+            )
+            directions = DirectionRepository(session)
+            direction = directions.create(account.id, "Python backend")
+            directions.attach_resume(direction.id, resume.id)
+            vacancy = VacancyRepository(session).upsert(
+                VacancyData(
+                    "background-vacancy",
+                    "Python backend",
+                    "https://hh.ru/vacancy/background-vacancy",
+                )
+            )
+            directions.track_vacancy(direction.id, vacancy.id)
+            directions.apply_rules(
+                direction.id,
+                vacancy.id,
+                state=VacancyState.QUEUED,
+                score=90,
+                details={"category": "MATCH", "accepted": True},
+                rules_version=RULES_VERSION,
+            )
+            application = ApplicationRepository(session).create_apply_intent(
+                account.id,
+                vacancy.id,
+                resume.id,
+                direction.id,
+            )
+            task = QueueTaskRepository(session).enqueue(application.id, 90)
+            profile = CandidateProfileModel(
+                account_id=account.id,
+                active_resume_id=resume.id,
+                display_name="Иван",
+            )
+            session.add(profile)
+            session.flush()
+            session.add(
+                VerifiedFactModel(
+                    profile_id=profile.id,
+                    category="work_experience",
+                    content=(
+                        "Разрабатываю серверные приложения на Python, реализую прикладную "
+                        "логику, обрабатываю ошибки, разделяю прикладную часть и доступ к "
+                        "данным, использую автоматические проверки и слежу за целостностью "
+                        "данных."
+                    ),
+                    source_type="test",
+                    resume_id=resume.id,
+                    direction_id=direction.id,
+                    state=ConfirmationState.CONFIRMED,
+                    allow_in_letters=True,
+                )
+            )
+            session.flush()
+            text = _supervised_letter()
+            letter = CoverLetterModel(
+                application_id=application.id,
+                vacancy_id=vacancy.id,
+                direction_id=direction.id,
+                resume_id=resume.id,
+                text=text,
+                instruction_version=cover_letter_instruction_version(
+                    DEFAULT_AI_PROMPTS.cover_letter
+                ),
+                model_name="old-model",
+                state=CoverLetterState.READY,
+            )
+            session.add(letter)
+            session.flush()
+            letter.context_hash = CoverLetterService(session).current_context_hash(application.id)
+            session.flush()
+
+            service = ApplicationAutomationService(session)
+            SystemStateRepository(session).transition(SystemState.RUNNING)
+            assert service.claim_next(require_cover_letter=True) is None
+            stale_task = QueueTaskRepository(session).get(task.id)
+            assert stale_task.state is TaskState.RETRY_SCHEDULED
+            assert stale_task.last_error_code == "COVER_LETTER_STALE"
+
+            letter.model_name = MANUAL_REVIEW_MODEL
+            session.flush()
+            job = service.claim_next(require_cover_letter=True)
+            assert job is not None
+            assert job.cover_letter_id == letter.id
+            assert job.cover_letter_sha256 == hashlib.sha256(text.encode("utf-8")).hexdigest()
+            assert service.background_submission_is_allowed(
+                task.id,
+                letter_id=letter.id,
+                letter_sha256=job.cover_letter_sha256,
+                resume_hh_id=resume.hh_id,
+                resume_title=resume.title,
+            )
+
+            letter.context_hash = "0" * 64
+            session.flush()
+            assert not service.background_submission_is_allowed(
+                task.id,
+                letter_id=letter.id,
+                letter_sha256=job.cover_letter_sha256,
+                resume_hh_id=resume.hh_id,
+                resume_title=resume.title,
+            )
+
+            tracking = session.get(
+                DirectionVacancyModel,
+                (direction.id, vacancy.id),
+            )
+            assert tracking is not None
+            tracking.rules_details = {"category": "STRETCH", "accepted": True}
+            letter.context_hash = CoverLetterService(session).current_context_hash(application.id)
+            session.flush()
+            assert not service.background_submission_is_allowed(
+                task.id,
+                letter_id=letter.id,
+                letter_sha256=job.cover_letter_sha256,
+                resume_hh_id=resume.hh_id,
+                resume_title=resume.title,
+            )
+    finally:
+        database.close()
+
+
+def test_supervised_claim_requires_exact_letter_and_excludes_worker(
+    settings: Settings,
+) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    try:
+        with database.sessions.begin() as session:
+            account = AccountRepository(session).create("Иван", "supervised-account")
+            resume = ResumeRepository(session).upsert(
+                account.id,
+                "supervised-resume",
+                "Python backend",
+            )
+            directions = DirectionRepository(session)
+            direction = directions.create(account.id, "Python backend")
+            directions.attach_resume(direction.id, resume.id)
+            vacancy = VacancyRepository(session).upsert(
+                VacancyData(
+                    "supervised-vacancy",
+                    "Python backend",
+                    "https://hh.ru/vacancy/supervised-vacancy",
+                )
+            )
+            directions.track_vacancy(direction.id, vacancy.id)
+            directions.apply_rules(
+                direction.id,
+                vacancy.id,
+                state=VacancyState.QUEUED,
+                score=90,
+                details={"category": "MATCH", "accepted": True},
+                rules_version=RULES_VERSION,
+            )
+            application = ApplicationRepository(session).create_apply_intent(
+                account.id,
+                vacancy.id,
+                resume.id,
+                direction.id,
+            )
+            task = QueueTaskRepository(session).enqueue(application.id, 90)
+            profile = CandidateProfileModel(
+                account_id=account.id,
+                active_resume_id=resume.id,
+                display_name="Иван",
+            )
+            session.add(profile)
+            session.flush()
+            session.add(
+                VerifiedFactModel(
+                    profile_id=profile.id,
+                    category="work_experience",
+                    content=(
+                        "Разрабатываю серверные приложения на Python, реализую прикладную "
+                        "логику, обрабатываю ошибки, разделяю прикладную часть и доступ к "
+                        "данным, использую автоматические проверки и слежу за целостностью "
+                        "данных."
+                    ),
+                    source_type="test",
+                    resume_id=resume.id,
+                    direction_id=direction.id,
+                    state=ConfirmationState.CONFIRMED,
+                    allow_in_letters=True,
+                )
+            )
+            session.flush()
+            text = _supervised_letter()
+            letter = CoverLetterModel(
+                application_id=application.id,
+                vacancy_id=vacancy.id,
+                direction_id=direction.id,
+                resume_id=resume.id,
+                text=text,
+                instruction_version=cover_letter_instruction_version(
+                    DEFAULT_AI_PROMPTS.cover_letter
+                ),
+                model_name=MANUAL_REVIEW_MODEL,
+                state=CoverLetterState.READY,
+            )
+            session.add(letter)
+            session.flush()
+            letter.context_hash = CoverLetterService(session).current_context_hash(application.id)
+            session.flush()
+
+            service = ApplicationAutomationService(session)
+            service.acquire_supervised_lease("lease-one")
+            with pytest.raises(RuntimeError, match="другой управляемый сеанс"):
+                service.acquire_supervised_lease("lease-two")
+
+            digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+            session.add(
+                ApplicationEventModel(
+                    application_id=application.id,
+                    event_type=ApplicationEventType.APPLIED,
+                    payload={"hh_status": "APPLIED", "source": "hh.ru"},
+                )
+            )
+            session.flush()
+            assert service.last_confirmed_application_at(account.id) is None
+            session.execute(
+                delete(ApplicationEventModel).where(
+                    ApplicationEventModel.application_id == application.id
+                )
+            )
+            session.flush()
+            session.add_all(
+                ApplicationEventModel(
+                    application_id=application.id,
+                    event_type=ApplicationEventType.APPLIED,
+                    payload={"hh_status": "APPLIED"},
+                )
+                for _ in range(20)
+            )
+            session.flush()
+            assert service.last_confirmed_application_at(account.id) is not None
+            assert (
+                service.last_confirmed_application_at(
+                    account.id,
+                    before=datetime(2000, 1, 1, tzinfo=UTC),
+                )
+                is None
+            )
+            with pytest.raises(RuntimeError, match="Предел управляемого сеанса"):
+                service.claim_supervised(
+                    lease_token="lease-one",
+                    task_id=task.id,
+                    letter_id=letter.id,
+                    letter_sha256=digest,
+                    account_id=account.id,
+                    day_start=datetime(2020, 1, 1, tzinfo=UTC),
+                    session_limit=20,
+                )
+            session.execute(
+                delete(ApplicationEventModel).where(
+                    ApplicationEventModel.application_id == application.id
+                )
+            )
+            session.flush()
+            interval_now = datetime.now(UTC)
+            session.add(
+                ApplicationEventModel(
+                    application_id=application.id,
+                    event_type=ApplicationEventType.APPLIED,
+                    payload={"hh_status": "APPLIED"},
+                    created_at=interval_now - timedelta(seconds=30),
+                )
+            )
+            session.flush()
+            with pytest.raises(RuntimeError, match="Следующая отправка разрешена"):
+                service.claim_supervised(
+                    lease_token="lease-one",
+                    task_id=task.id,
+                    letter_id=letter.id,
+                    letter_sha256=digest,
+                    now=interval_now,
+                )
+            session.execute(
+                delete(ApplicationEventModel).where(
+                    ApplicationEventModel.application_id == application.id
+                )
+            )
+            session.flush()
+            with pytest.raises(ValueError, match="изменился после утверждения"):
+                service.claim_supervised(
+                    lease_token="lease-one",
+                    vacancy_hh_id=vacancy.hh_id,
+                    letter_id=letter.id,
+                    letter_sha256="0" * 64,
+                )
+            assert QueueTaskRepository(session).get(task.id).state is TaskState.PENDING
+
+            letter.model_name = "old-model"
+            session.flush()
+            with pytest.raises(ValueError, match="устаревшей версией"):
+                service.claim_supervised(
+                    lease_token="lease-one",
+                    task_id=task.id,
+                    letter_id=letter.id,
+                    letter_sha256=digest,
+                )
+            assert QueueTaskRepository(session).get(task.id).state is TaskState.PENDING
+            letter.model_name = MANUAL_REVIEW_MODEL
+            invalid_text = text.replace(
+                "Разрабатываю серверные приложения на Python",
+                "Разрабатываю серверные приложения на Python уже 5 лет",
+            )
+            letter.text = invalid_text
+            session.flush()
+            with pytest.raises(ValueError, match="появилась цифра"):
+                service.claim_supervised(
+                    lease_token="lease-one",
+                    task_id=task.id,
+                    letter_id=letter.id,
+                    letter_sha256=hashlib.sha256(invalid_text.encode("utf-8")).hexdigest(),
+                )
+            assert QueueTaskRepository(session).get(task.id).state is TaskState.PENDING
+            letter.text = text
+            session.flush()
+
+            job = service.claim_supervised(
+                lease_token="lease-one",
+                task_id=task.id,
+                letter_id=letter.id,
+                letter_sha256=digest,
+            )
+            assert job.task.id == task.id
+            assert job.cover_letter_id == letter.id
+            assert job.cover_letter_sha256 == digest
+            assert QueueTaskRepository(session).get(task.id).state is TaskState.RUNNING
+            assert service.supervised_submission_is_allowed(
+                "lease-one",
+                task.id,
+                letter_id=letter.id,
+                letter_sha256=digest,
+                resume_hh_id=resume.hh_id,
+                resume_title=resume.title,
+            )
+            letter.model_name = "old-model"
+            session.flush()
+            assert not service.supervised_submission_is_allowed(
+                "lease-one",
+                task.id,
+                letter_id=letter.id,
+                letter_sha256=digest,
+                resume_hh_id=resume.hh_id,
+                resume_title=resume.title,
+            )
+            letter.model_name = MANUAL_REVIEW_MODEL
+            session.flush()
+            guard_now = datetime.now(UTC)
+            session.add(
+                ApplicationEventModel(
+                    application_id=application.id,
+                    event_type=ApplicationEventType.APPLIED,
+                    payload={"hh_status": "APPLIED"},
+                    created_at=guard_now - timedelta(seconds=30),
+                )
+            )
+            session.flush()
+            assert not service.supervised_submission_is_allowed(
+                "lease-one",
+                task.id,
+                letter_id=letter.id,
+                letter_sha256=digest,
+                resume_hh_id=resume.hh_id,
+                resume_title=resume.title,
+                now=guard_now,
+            )
+            session.execute(
+                delete(ApplicationEventModel).where(
+                    ApplicationEventModel.application_id == application.id
+                )
+            )
+            session.flush()
+            assert not service.supervised_submission_is_allowed(
+                "lease-one",
+                task.id,
+                letter_id=letter.id,
+                letter_sha256="0" * 64,
+                resume_hh_id=resume.hh_id,
+                resume_title=resume.title,
+            )
+            original_text = letter.text
+            letter.text = " "
+            session.flush()
+            assert not service.supervised_submission_is_allowed(
+                "lease-one",
+                task.id,
+                letter_id=letter.id,
+                letter_sha256=digest,
+                resume_hh_id=resume.hh_id,
+                resume_title=resume.title,
+            )
+            letter.text = original_text
+            session.flush()
+            original_context_hash = letter.context_hash
+            letter.context_hash = "0" * 64
+            session.flush()
+            assert not service.supervised_submission_is_allowed(
+                "lease-one",
+                task.id,
+                letter_id=letter.id,
+                letter_sha256=digest,
+                resume_hh_id=resume.hh_id,
+                resume_title=resume.title,
+            )
+            letter.context_hash = original_context_hash
+            session.flush()
+            tracked_model = session.get(
+                DirectionVacancyModel,
+                (direction.id, vacancy.id),
+            )
+            assert tracked_model is not None
+            tracked_model.rules_version = "outdated-rules"
+            session.flush()
+            assert not service.supervised_submission_is_allowed(
+                "lease-one",
+                task.id,
+                letter_id=letter.id,
+                letter_sha256=digest,
+                resume_hh_id=resume.hh_id,
+                resume_title=resume.title,
+            )
+            tracked_model.rules_version = RULES_VERSION
+            resume_model = session.get(ResumeModel, resume.id)
+            assert resume_model is not None
+            resume_model.updated_at = datetime.now(UTC) + timedelta(seconds=1)
+            session.flush()
+            assert not service.supervised_submission_is_allowed(
+                "lease-one",
+                task.id,
+                letter_id=letter.id,
+                letter_sha256=digest,
+                resume_hh_id=resume.hh_id,
+                resume_title=resume.title,
+            )
+            with pytest.raises(RuntimeError, match="уже начатого фонового действия"):
+                service.acquire_supervised_lease("lease-three")
+            service.release_supervised_claim(
+                "lease-one",
+                task.id,
+                error_code="RESUME_PROFILE_MISMATCH",
+            )
+            returned = QueueTaskRepository(session).get(task.id)
+            assert returned.state is TaskState.RETRY_SCHEDULED
+            assert returned.last_error_code == "RESUME_PROFILE_MISMATCH"
+
+            service.release_supervised_lease("lease-one")
+            SystemStateRepository(session).transition(SystemState.RUNNING)
+            assert service.applications_enabled()
+            SystemStateRepository(session).transition(SystemState.PAUSED)
+            assert QueueTaskRepository(session).claim_exact(task.id) is not None
+            QueueTaskRepository(session).transition(
+                task.id,
+                TaskState.UNKNOWN_RESULT,
+                error_code="UNKNOWN_RESULT",
+            )
+            with pytest.raises(RuntimeError, match="результат которого неизвестен"):
+                service.acquire_supervised_lease("lease-after-unknown")
+    finally:
+        database.close()
+
+
+def test_worker_is_disabled_while_supervised_lease_is_active(settings: Settings) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    try:
+        with database.sessions.begin() as session:
+            service = ApplicationAutomationService(session)
+            service.acquire_supervised_lease("lease-one")
+            with pytest.raises(ValueError, match="управляемый"):
+                SystemStateRepository(session).transition(SystemState.RUNNING)
+            with pytest.raises(ValueError, match="управляемый"):
+                QueueService(session).resume()
+            assert not service.applications_enabled()
+            service.release_supervised_lease("lease-one")
+            QueueService(session).resume()
+            assert service.applications_enabled()
     finally:
         database.close()

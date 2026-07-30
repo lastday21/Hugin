@@ -15,10 +15,12 @@ from hugin.domain.hh_sync import (
     HhNegotiationData,
     HhNegotiationStatus,
 )
+from hugin.domain.tasks import TaskState
 from hugin.domain.vacancies import VacancyData
 from hugin.repositories import (
     AccountRepository,
     ApplicationRepository,
+    QueueTaskRepository,
     ResumeRepository,
     VacancyRepository,
 )
@@ -68,6 +70,9 @@ def test_hh_statuses_and_messages_are_synchronized_idempotently(
                 second_vacancy.id,
                 resume.id,
             )
+            tasks = QueueTaskRepository(session)
+            first_task = tasks.enqueue(first.id, 80)
+            second_task = tasks.enqueue(second.id, 70)
 
         with database.sessions.begin() as session:
             service = HhSynchronizationService(session)
@@ -103,6 +108,8 @@ def test_hh_statuses_and_messages_are_synchronized_idempotently(
             }
             assert ApplicationRepository(session).get(first.id).state is ApplicationState.VIEWED
             assert ApplicationRepository(session).get(second.id).state is ApplicationState.REJECTED
+            assert QueueTaskRepository(session).get(first_task.id).state is TaskState.SKIPPED
+            assert QueueTaskRepository(session).get(second_task.id).state is TaskState.SKIPPED
 
             invited = service.synchronize_statuses(
                 account_id=account.id,

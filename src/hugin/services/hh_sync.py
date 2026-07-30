@@ -7,7 +7,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from hugin.database.models import ApplicationModel, VacancyModel
-from hugin.domain.applications import ApplicationState
+from hugin.domain.applications import ApplicationState, EventPayload
 from hugin.domain.automation import AutomationJobResult
 from hugin.domain.content import MessageDirection
 from hugin.domain.hh_sync import (
@@ -16,8 +16,10 @@ from hugin.domain.hh_sync import (
     HhNegotiationStatus,
 )
 from hugin.domain.state_machines import APPLICATION_TRANSITIONS
+from hugin.domain.tasks import TaskState
 from hugin.repositories.applications import ApplicationRepository
 from hugin.repositories.communications import CommunicationRepository
+from hugin.repositories.tasks import QueueTaskRepository
 
 _ATTENTION_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (
@@ -41,6 +43,7 @@ class HhSynchronizationService:
         self._session = session
         self._applications = ApplicationRepository(session)
         self._communications = CommunicationRepository(session)
+        self._tasks = QueueTaskRepository(session)
 
     def tracked_vacancy_ids(self, account_id: int) -> tuple[str, ...]:
         return tuple(self._application_map(account_id))
@@ -77,7 +80,7 @@ class HhSynchronizationService:
                 )
                 updated += 1
             if target is not current.state and target in APPLICATION_TRANSITIONS[current.state]:
-                self._applications.transition_state(
+                current = self._applications.transition_state(
                     current.id,
                     target,
                     {
@@ -87,6 +90,7 @@ class HhSynchronizationService:
                     },
                 )
                 updated += 1
+            self._close_obsolete_task(current.id, item)
             if item.status is HhNegotiationStatus.INVITED:
                 self._communications.save_invitation(
                     application_id=current.id,
@@ -106,6 +110,38 @@ class HhSynchronizationService:
             "updated": updated,
             "invitations": invitations,
         }
+
+    def _close_obsolete_task(
+        self,
+        application_id: int,
+        status: HhNegotiationData,
+    ) -> None:
+        task = self._tasks.get_by_application_id(application_id)
+        if task is None:
+            return
+        payload: EventPayload = {
+            "source": "hh.ru",
+            "hh_status": status.status.value,
+            "status_label": status.status_label[:255],
+        }
+        if task.state in {
+            TaskState.PENDING,
+            TaskState.RETRY_SCHEDULED,
+            TaskState.REVIEW_REQUIRED,
+            TaskState.INPUT_REQUIRED,
+        }:
+            self._tasks.transition(
+                task.id,
+                TaskState.SKIPPED,
+                error_code="ALREADY_APPLIED_ON_HH",
+                event_payload=payload,
+            )
+        elif task.state in {TaskState.RUNNING, TaskState.UNKNOWN_RESULT}:
+            self._tasks.transition(
+                task.id,
+                TaskState.COMPLETED,
+                event_payload=payload,
+            )
 
     def synchronize_messages(
         self,

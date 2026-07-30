@@ -121,7 +121,7 @@ class BackgroundSearchCycle:
                 prepared = ApplicationAutomationService(session).prepare(
                     account_external_id=profile.external_id,
                     direction_name=direction_name,
-                    include_stretch=True,
+                    include_stretch=False,
                 )
         finally:
             database.close()

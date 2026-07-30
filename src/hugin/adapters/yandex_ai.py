@@ -143,7 +143,6 @@ class YandexAIClient:
             run.succeed(
                 operation=self._operation,
                 model=self._model,
-                model_calls=1,
                 output_characters=len(result),
                 **usage_details,
                 **usage,

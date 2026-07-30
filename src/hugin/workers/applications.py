@@ -202,6 +202,7 @@ class ApplicationWorker:
         try:
             with database.sessions.begin() as session:
                 service = ApplicationAutomationService(session)
+                service.recover_expired_supervised(now)
                 if not service.applications_enabled():
                     return None, False
                 local_now = now.astimezone()
@@ -216,6 +217,7 @@ class ApplicationWorker:
                     service.claim_next(
                         account_id=self._account_id,
                         require_cover_letter=True,
+                        include_stretch=False,
                     ),
                     True,
                 )
@@ -255,6 +257,7 @@ class ApplicationWorker:
                         account_id=account_id,
                         direction_name=direction_name,
                         limit=1,
+                        include_stretch=False,
                     )
                     prepared += result.generated + result.reused
                     if prepared:
@@ -296,11 +299,28 @@ class ApplicationWorker:
                 raise RuntimeError("Готовое сопроводительное письмо отсутствует")
             return browser.apply_to_vacancy(
                 job.vacancy.source_url,
+                expected_resume_hh_id=job.resume.hh_id,
                 expected_resume_title=job.resume.title,
                 cover_letter=job.cover_letter,
                 submit=True,
-                submit_guard=self._applications_enabled,
+                submit_guard=lambda: self._background_submission_is_allowed(job),
             )
+
+    def _background_submission_is_allowed(self, job: ApplyJob) -> bool:
+        if job.cover_letter_id is None or job.cover_letter_sha256 is None:
+            return False
+        database = create_database(self._settings)
+        try:
+            with database.sessions.begin() as session:
+                return ApplicationAutomationService(session).background_submission_is_allowed(
+                    job.task.id,
+                    letter_id=job.cover_letter_id,
+                    letter_sha256=job.cover_letter_sha256,
+                    resume_hh_id=job.resume.hh_id,
+                    resume_title=job.resume.title,
+                )
+        finally:
+            database.close()
 
     def _applications_enabled(self) -> bool:
         database = create_database(self._settings)

@@ -99,6 +99,7 @@ class AutomationSchedulerService:
                 .where(
                     CareerDirectionModel.account_id == account_id,
                     CareerDirectionModel.is_active.is_(True),
+                    DirectionSearchQueryModel.area == "",
                     DirectionSearchQueryModel.is_active.is_(True),
                 )
                 .order_by(DirectionSearchQueryModel.id)

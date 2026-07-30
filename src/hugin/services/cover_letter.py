@@ -34,11 +34,12 @@ from hugin.domain.directions import VacancyState
 from hugin.domain.tasks import TaskState
 from hugin.services.ai_prompts import AiPromptSettingsService, with_user_prompt
 from hugin.services.resume_improvement import ResumeBlockExtractor
-from hugin.services.vacancy_analysis import RULES_VERSION
+from hugin.services.vacancy_analysis import RULES_VERSION, RuleCategory
 
 PROMPT_PURPOSE = "cover_letter"
-PROMPT_VERSION = 11
+PROMPT_VERSION = 15
 INSTRUCTION_VERSION = CURRENT_COVER_LETTER_INSTRUCTION
+MANUAL_REVIEW_MODEL = "manual-review"
 MIN_LETTER_LENGTH = 350
 MAX_LETTER_LENGTH = 2000
 MAX_FACT_CONTEXT_LENGTH = 7_000
@@ -56,6 +57,11 @@ SYSTEM_PROMPT = """Ты пишешь индивидуальные сопрово
 не переноси задачи, технологии и результаты между такими элементами. Если обязательного навыка
 нет в подтвержденных фактах, не заявляй и не подразумевай опыт с ним. Описание назначения проекта
 не является действием кандидата: выполненными считай только действия, прямо названные в источнике.
+Факт с category="skills" подтверждает только знание перечисленного навыка: не превращай его
+в выполненную работу или опыт применения без отдельного действия в описании опыта или проекта.
+Не превращай формулировки требований вакансии — например, работу с чужим кодом, транзакциями,
+микросервисную архитектуру, отказоустойчивость или доведение решений до промышленной среды —
+в опыт кандидата, если этого нет в подтвержденных фактах.
 Сохраняй статус и время действия из источника: «разрабатываю», «интегрирую» и «добавляю»
 нельзя превращать в «разработал», «интегрировал» и «добавил». Планы, будущие и необязательные
 возможности не являются опытом и не должны попадать в письмо.
@@ -100,27 +106,83 @@ _TEMPLATE_PHRASES = (
     "как мой опыт",
     "такая работа требует",
 )
-_SPECIALIST_TERM_PATTERNS = (
-    re.compile(r"\bai[- ]?агент\w*", re.IGNORECASE),
-    re.compile(r"\bai[- ]agents?\b", re.IGNORECASE),
-    re.compile(r"\bагентск\w*", re.IGNORECASE),
-    re.compile(r"(?<![A-Za-z])rag(?![A-Za-z])", re.IGNORECASE),
-    re.compile(r"\blanggraph\b", re.IGNORECASE),
-    re.compile(r"\blangchain\b", re.IGNORECASE),
-    re.compile(r"(?<![A-Za-z])nlp(?![A-Za-z])", re.IGNORECASE),
+_TECHNOLOGY_PATTERNS = (
+    ("AI-агенты", re.compile(r"\bai[- ]?агент\w*|\bai[- ]agents?\b", re.IGNORECASE)),
+    ("агентские системы", re.compile(r"\bагентск\w*", re.IGNORECASE)),
+    ("RAG", re.compile(r"(?<![A-Za-z])rag(?![A-Za-z])", re.IGNORECASE)),
+    ("LangGraph", re.compile(r"\blanggraph\b", re.IGNORECASE)),
+    ("LangChain", re.compile(r"\blangchain\b", re.IGNORECASE)),
+    ("NLP", re.compile(r"(?<![A-Za-z])nlp(?![A-Za-z])", re.IGNORECASE)),
+    ("Yandex Cloud", re.compile(r"\byandex cloud\b|яндекс клауд", re.IGNORECASE)),
+    ("OpenAI", re.compile(r"\bopenai\b", re.IGNORECASE)),
+    ("AI Studio", re.compile(r"\bai studio\b", re.IGNORECASE)),
+    ("SpeechKit", re.compile(r"\bspeechkit\b", re.IGNORECASE)),
+    ("LLM", re.compile(r"(?<![A-Za-z])llm(?![A-Za-z])", re.IGNORECASE)),
+    ("gRPC", re.compile(r"(?<![A-Za-z])grpc(?![A-Za-z])", re.IGNORECASE)),
+    ("OpenTelemetry", re.compile(r"\bopentelemetry\b", re.IGNORECASE)),
+    ("Jaeger", re.compile(r"\bjaeger\b", re.IGNORECASE)),
+    ("Prometheus", re.compile(r"\bprometheus\b", re.IGNORECASE)),
+    ("Kafka", re.compile(r"\bkafka\b", re.IGNORECASE)),
+    ("Python", re.compile(r"\bpython\b", re.IGNORECASE)),
+    ("FastAPI", re.compile(r"\bfastapi\b", re.IGNORECASE)),
+    ("Django", re.compile(r"\bdjango\b", re.IGNORECASE)),
+    ("Flask", re.compile(r"\bflask\b", re.IGNORECASE)),
+    ("PostgreSQL", re.compile(r"\bpostgres(?:ql)?\b", re.IGNORECASE)),
+    ("Redis", re.compile(r"\bredis\b", re.IGNORECASE)),
+    ("SQLAlchemy", re.compile(r"\bsqlalchemy\b", re.IGNORECASE)),
+    ("Pydantic", re.compile(r"\bpydantic\b", re.IGNORECASE)),
+    ("Alembic", re.compile(r"\balembic\b", re.IGNORECASE)),
+    ("asyncio", re.compile(r"\basyncio\b", re.IGNORECASE)),
+    ("pytest", re.compile(r"\bpytest\b", re.IGNORECASE)),
+    ("Celery", re.compile(r"\bcelery\b", re.IGNORECASE)),
+    ("WebSocket", re.compile(r"\bwebsockets?\b", re.IGNORECASE)),
+    ("REST", re.compile(r"(?<![A-Za-z])rest(?![A-Za-z])", re.IGNORECASE)),
+    ("OpenAPI", re.compile(r"\bopenapi\b", re.IGNORECASE)),
+    ("GraphQL", re.compile(r"\bgraphql\b", re.IGNORECASE)),
+    ("Docker", re.compile(r"\bdocker\b", re.IGNORECASE)),
+    ("RabbitMQ", re.compile(r"\brabbitmq\b", re.IGNORECASE)),
+    ("Kubernetes", re.compile(r"\bkubernetes\b|(?<![A-Za-z])k8s(?![A-Za-z])", re.IGNORECASE)),
+    ("Temporal", re.compile(r"\btemporal\b", re.IGNORECASE)),
+    ("MongoDB", re.compile(r"\bmongodb\b", re.IGNORECASE)),
+    ("MySQL", re.compile(r"\bmysql\b", re.IGNORECASE)),
+    ("SQLite", re.compile(r"\bsqlite\b", re.IGNORECASE)),
+    ("ClickHouse", re.compile(r"\bclickhouse\b", re.IGNORECASE)),
+    ("Elasticsearch", re.compile(r"\belasticsearch\b", re.IGNORECASE)),
+    ("Nginx", re.compile(r"\bnginx\b", re.IGNORECASE)),
+    ("Linux", re.compile(r"\blinux\b", re.IGNORECASE)),
+    ("Playwright", re.compile(r"\bplaywright\b", re.IGNORECASE)),
+    ("Selenium", re.compile(r"\bselenium\b", re.IGNORECASE)),
+    ("aiohttp", re.compile(r"\baiohttp\b", re.IGNORECASE)),
+    ("httpx", re.compile(r"\bhttpx\b", re.IGNORECASE)),
+    ("Uvicorn", re.compile(r"\buvicorn\b", re.IGNORECASE)),
+    ("Gunicorn", re.compile(r"\bgunicorn\b", re.IGNORECASE)),
+    ("Git", re.compile(r"\bgit\b", re.IGNORECASE)),
+    ("CI/CD", re.compile(r"(?<![A-Za-z])ci\s*/\s*cd(?![A-Za-z])", re.IGNORECASE)),
+    ("React", re.compile(r"\breact\b", re.IGNORECASE)),
+    ("TypeScript", re.compile(r"\btypescript\b", re.IGNORECASE)),
+    ("JavaScript", re.compile(r"\bjavascript\b", re.IGNORECASE)),
+    ("Node.js", re.compile(r"\bnode(?:\.js|js)?\b", re.IGNORECASE)),
+    ("AWS", re.compile(r"(?<![A-Za-z])aws(?![A-Za-z])", re.IGNORECASE)),
+    ("Azure", re.compile(r"\bazure\b", re.IGNORECASE)),
+    ("S3", re.compile(r"(?<![A-Za-z0-9])s3(?![A-Za-z0-9])", re.IGNORECASE)),
 )
-_CONFIRMED_TECHNOLOGY_PATTERNS = (
-    *_SPECIALIST_TERM_PATTERNS,
-    re.compile(r"\byandex cloud\b|яндекс клауд", re.IGNORECASE),
-    re.compile(r"\bopenai\b", re.IGNORECASE),
-    re.compile(r"\bai studio\b", re.IGNORECASE),
-    re.compile(r"\bspeechkit\b", re.IGNORECASE),
-    re.compile(r"(?<![A-Za-z])llm(?![A-Za-z])", re.IGNORECASE),
-    re.compile(r"(?<![A-Za-z])grpc(?![A-Za-z])", re.IGNORECASE),
-    re.compile(r"\bopentelemetry\b", re.IGNORECASE),
-    re.compile(r"\bjaeger\b", re.IGNORECASE),
-    re.compile(r"\bprometheus\b", re.IGNORECASE),
-    re.compile(r"\bkafka\b", re.IGNORECASE),
+_CONFIRMED_TECHNOLOGY_PATTERNS = tuple(pattern for _name, pattern in _TECHNOLOGY_PATTERNS)
+_EXPERIENCE_FACT_CATEGORIES = frozenset({"work_experience", "about"})
+_TECHNOLOGY_EXPERIENCE_CLAIM = re.compile(
+    r"(?:"
+    r"\b(?:работал(?:а|и)?|работаю|работаем|работать|"
+    r"разрабатыв\w*|реализ\w*|созда\w*|интегр\w*|"
+    r"использ\w*|примен\w*|настраив\w*|настро\w*|"
+    r"подключ\w*|внедр\w*|разворач\w*|проектир\w*|"
+    r"поддержива\w*|писал(?:а|и)?|пишу)\b|"
+    r"\bопыт\w*(?:\s+работы)?\s+(?:с|в|на)\b"
+    r")",
+    re.IGNORECASE,
+)
+_TECHNOLOGY_EXPERIENCE_EVIDENCE = re.compile(
+    rf"(?:{_TECHNOLOGY_EXPERIENCE_CLAIM.pattern}|"
+    r"\b(?:разработк|реализац|интеграц|настройк|внедрен)\w*\b)",
+    re.IGNORECASE,
 )
 _PLACEHOLDERS = re.compile(
     r"(?:\[[^\]\n]{1,80}\]|\{[^}\n]{1,80}\}|<[^>\n]{1,80}>|"
@@ -230,6 +292,59 @@ _CONTEXTUAL_DETAILS = (
         re.compile(r"(?<![A-Za-z])grpc(?![A-Za-z])", re.IGNORECASE),
         ("grpc", "микросервис", "межсервис", "rpc"),
         "gRPC не относится к задачам вакансии",
+    ),
+)
+_GROUNDED_CLAIMS = (
+    (
+        re.compile(
+            r"\b(?:опыт\w*|работ\w*|реализ\w*|обеспеч\w*)"
+            r"[^.!?\n]{0,80}\bтранзакц\w*\b",
+            re.IGNORECASE,
+        ),
+        re.compile(r"\bтранзакц\w*\b", re.IGNORECASE),
+        "работа с транзакциями не подтверждена фактами кандидата",
+    ),
+    (
+        re.compile(
+            r"\b(?:микросервис\w*(?:\s+архитектур\w*)?|microservices?)\b",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"\b(?:микросервис\w*(?:\s+архитектур\w*)?|microservices?)\b",
+            re.IGNORECASE,
+        ),
+        "микросервисная архитектура не подтверждена фактами кандидата",
+    ),
+    (
+        re.compile(
+            r"\b(?:отказоустойчив\w*|устойчив\w*\s+к\s+сбо\w*|"
+            r"над[её]жност\w*\s+взаимодейств\w*)\b",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"\b(?:отказоустойчив\w*|устойчив\w*\s+к\s+сбо\w*|"
+            r"над[её]жност\w*\s+взаимодейств\w*)\b",
+            re.IGNORECASE,
+        ),
+        "отказоустойчивость не подтверждена фактами кандидата",
+    ),
+    (
+        re.compile(
+            r"\b(?:чуж(?:ой|им|ого)|незнаком(?:ой|ым|ого))\s+"
+            r"(?:код\w*|кодовой\s+баз\w*)\b",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"\b(?:чуж(?:ой|им|ого)|незнаком(?:ой|ым|ого))\s+"
+            r"(?:код\w*|кодовой\s+баз\w*)\b",
+            re.IGNORECASE,
+        ),
+        "работа с чужой кодовой базой не подтверждена фактами кандидата",
+    ),
+    (
+        re.compile(r"\b(?:в\s+проде|продакшн\w*|production)\b", re.IGNORECASE),
+        re.compile(r"\b(?:в\s+проде|продакшн\w*|production)\b", re.IGNORECASE),
+        "работа в промышленной среде не подтверждена фактами кандидата",
     ),
 )
 _MANDATORY_LETTER_INPUT = re.compile(
@@ -354,6 +469,7 @@ class CoverLetterService:
         direction_name: str,
         limit: int = 20,
         vacancy_hh_id: str | None = None,
+        include_stretch: bool = True,
     ) -> CoverLetterPreparationResult:
         if limit < 1:
             raise ValueError("Количество писем должно быть положительным")
@@ -366,7 +482,12 @@ class CoverLetterService:
         items: list[CoverLetterPreparationItem] = []
         already_ready = 0
         attempted = 0
-        candidates = self._candidates(account_id, direction.id, vacancy_hh_id)
+        candidates = self._candidates(
+            account_id,
+            direction.id,
+            vacancy_hh_id,
+            include_stretch=include_stretch,
+        )
         if vacancy_hh_id is not None and not candidates:
             raise LookupError(f"Вакансия № {vacancy_hh_id} не найдена в готовой очереди")
         for candidate in candidates:
@@ -442,6 +563,163 @@ class CoverLetterService:
             missing=missing,
         )
 
+    def save_reviewed(
+        self,
+        *,
+        account_id: int,
+        letter_id: int,
+        text: str,
+    ) -> CoverLetterModel:
+        normalized = normalize_cover_letter(text)
+        instruction_version = self._instruction_version(
+            AiPromptSettingsService(self._session).get().cover_letter
+        )
+        row = self._session.execute(
+            select(CoverLetterModel, ApplicationModel, VacancyModel)
+            .join(
+                ApplicationModel,
+                ApplicationModel.id == CoverLetterModel.application_id,
+            )
+            .join(VacancyModel, VacancyModel.id == CoverLetterModel.vacancy_id)
+            .where(
+                CoverLetterModel.id == letter_id,
+                CoverLetterModel.instruction_version == instruction_version,
+                ApplicationModel.account_id == account_id,
+            )
+        ).first()
+        if row is None:
+            raise LookupError("Актуальное письмо не найдено")
+        letter: CoverLetterModel
+        application: ApplicationModel
+        vacancy: VacancyModel
+        letter, application, vacancy = row
+        if letter.state is CoverLetterState.SENT:
+            raise ValueError("Уже отправленное письмо изменить нельзя")
+        if application.direction_id is None:
+            raise RuntimeError("У отклика не указано направление")
+        candidate = next(
+            (
+                item
+                for item in self._candidates(
+                    account_id,
+                    application.direction_id,
+                    vacancy.hh_id,
+                )
+                if item.application.id == application.id
+            ),
+            None,
+        )
+        if candidate is None:
+            raise LookupError("Вакансия больше не находится в готовой очереди")
+        facts = self._select_facts(candidate, application.direction_id)
+        validate_cover_letter(normalized, vacancy, facts)
+        if self._same_text_exists(vacancy, normalized):
+            raise CoverLetterValidationError(
+                "DUPLICATE_TEXT",
+                "Такой текст уже используется для другой, не связанной вакансии",
+            )
+        letter.context_hash = self.current_context_hash(application.id)
+        letter.model_name = MANUAL_REVIEW_MODEL
+        letter.prompt_version_id = None
+        self._save_ready(letter, normalized, tuple(fact.id for fact in facts))
+        return letter
+
+    def validate_for_submission(
+        self,
+        *,
+        application_id: int,
+        letter_id: int,
+    ) -> None:
+        row = self._session.execute(
+            select(
+                CoverLetterModel,
+                ApplicationModel,
+                VacancyModel,
+                ResumeModel,
+                DirectionVacancyModel,
+            )
+            .join(
+                ApplicationModel,
+                ApplicationModel.id == CoverLetterModel.application_id,
+            )
+            .join(VacancyModel, VacancyModel.id == ApplicationModel.vacancy_id)
+            .join(ResumeModel, ResumeModel.id == ApplicationModel.resume_id)
+            .join(
+                DirectionVacancyModel,
+                (DirectionVacancyModel.direction_id == ApplicationModel.direction_id)
+                & (DirectionVacancyModel.vacancy_id == ApplicationModel.vacancy_id),
+            )
+            .where(
+                CoverLetterModel.id == letter_id,
+                ApplicationModel.id == application_id,
+            )
+        ).first()
+        if row is None:
+            raise LookupError("Сопроводительное письмо для отклика не найдено")
+        letter, application, vacancy, resume, tracked = row
+        instruction_version = self._instruction_version(
+            AiPromptSettingsService(self._session).get().cover_letter
+        )
+        if (
+            application.direction_id is None
+            or letter.state is not CoverLetterState.READY
+            or not letter.text
+            or letter.instruction_version != instruction_version
+            or letter.resume_id != resume.id
+            or letter.vacancy_id != vacancy.id
+        ):
+            raise ValueError("Сопроводительное письмо больше не актуально для этого отклика")
+        if not self._has_current_origin(letter):
+            raise ValueError(
+                "Письмо создано устаревшей версией инструкции и требует повторной подготовки"
+            )
+        facts = self._select_facts(
+            _Candidate(application, vacancy, resume, tracked),
+            application.direction_id,
+        )
+        validate_cover_letter(letter.text, vacancy, facts)
+        if letter.context_hash != self.current_context_hash(application.id):
+            raise ValueError("Данные вакансии, правила или подтверждённые факты изменились")
+
+    def current_context_hash(self, application_id: int) -> str:
+        row = self._session.execute(
+            select(
+                ApplicationModel,
+                VacancyModel,
+                ResumeModel,
+                DirectionVacancyModel,
+                CareerDirectionModel,
+            )
+            .join(VacancyModel, VacancyModel.id == ApplicationModel.vacancy_id)
+            .join(ResumeModel, ResumeModel.id == ApplicationModel.resume_id)
+            .join(
+                DirectionVacancyModel,
+                (DirectionVacancyModel.direction_id == ApplicationModel.direction_id)
+                & (DirectionVacancyModel.vacancy_id == ApplicationModel.vacancy_id),
+            )
+            .join(
+                CareerDirectionModel,
+                CareerDirectionModel.id == ApplicationModel.direction_id,
+            )
+            .where(ApplicationModel.id == application_id)
+        ).first()
+        if row is None:
+            raise LookupError("Отклик для проверки письма не найден")
+        application, vacancy, resume, tracked, direction = row
+        candidate = _Candidate(application, vacancy, resume, tracked)
+        facts = self._select_facts(candidate, direction.id)
+        instruction = AiPromptSettingsService(self._session).get().cover_letter
+        user_prompt = with_user_prompt(
+            build_cover_letter_prompt(
+                vacancy,
+                direction.name,
+                tracked.rules_details.get("reasons", []),
+                facts,
+            ),
+            instruction,
+        )
+        return hashlib.sha256(user_prompt.encode("utf-8")).hexdigest()
+
     def _prepare_one(
         self,
         candidate: _Candidate,
@@ -466,17 +744,46 @@ class CoverLetterService:
         if (
             letter is not None
             and letter.state is CoverLetterState.READY
+            and letter.model_name == MANUAL_REVIEW_MODEL
+        ):
+            if not letter.text or letter.context_hash != context_hash:
+                return self._item(
+                    candidate,
+                    CoverLetterState.READY,
+                    "blocked",
+                    "Утверждённое вручную письмо устарело и требует повторной проверки",
+                )
+            try:
+                validate_cover_letter(letter.text, candidate.vacancy, facts)
+            except CoverLetterValidationError as error:
+                return self._item(
+                    candidate,
+                    CoverLetterState.READY,
+                    "blocked",
+                    f"Утверждённое вручную письмо требует исправления: {error}",
+                )
+            return self._item(candidate, CoverLetterState.READY, "existing")
+        if (
+            letter is not None
+            and letter.state is CoverLetterState.READY
             and letter.text
             and letter.context_hash == context_hash
             and letter.model_name == model.model_name
+            and letter.prompt_version_id == prompt_version.id
         ):
-            return self._item(candidate, CoverLetterState.READY, "existing")
+            try:
+                validate_cover_letter(letter.text, candidate.vacancy, facts)
+            except CoverLetterValidationError:
+                pass
+            else:
+                return self._item(candidate, CoverLetterState.READY, "existing")
         if (
             letter is not None
             and letter.state is CoverLetterState.FAILED
             and letter.failure_reason in _PERMANENT_PREPARATION_FAILURES
             and letter.context_hash == context_hash
             and letter.model_name == model.model_name
+            and letter.prompt_version_id == prompt_version.id
         ):
             return self._item(
                 candidate,
@@ -502,7 +809,7 @@ class CoverLetterService:
                 "failed",
                 str(error),
             )
-        source = self._duplicate_source(candidate, instruction_version)
+        source = self._duplicate_source(candidate, instruction_version, prompt_version.id)
         if source is not None and source.text:
             source_fact_ids = tuple(
                 self._session.scalars(
@@ -586,6 +893,8 @@ class CoverLetterService:
         account_id: int,
         direction_id: int,
         vacancy_hh_id: str | None = None,
+        *,
+        include_stretch: bool = True,
     ) -> tuple[_Candidate, ...]:
         statement = (
             select(
@@ -613,6 +922,11 @@ class CoverLetterService:
         )
         if vacancy_hh_id is not None:
             statement = statement.where(VacancyModel.hh_id == vacancy_hh_id)
+        if not include_stretch:
+            statement = statement.where(
+                DirectionVacancyModel.rules_details["category"].as_string()
+                == RuleCategory.MATCH.value
+            )
         rows = self._session.execute(
             statement.order_by(
                 case((VacancyModel.duplicate_of_id.is_(None), 0), else_=1),
@@ -676,7 +990,9 @@ class CoverLetterService:
             ),
         )
         selected: list[_SelectedFact] = []
+        seen_contents: set[tuple[str, str]] = set()
         remaining = MAX_FACT_CONTEXT_LENGTH
+        vacancy_text = _vacancy_text(candidate.vacancy)
         for fact in ranked[:4]:
             if remaining < 200:
                 break
@@ -685,6 +1001,17 @@ class CoverLetterService:
                 remaining,
             )
             safe_content = _without_contact_lines(fact.content)
+            safe_content = _without_irrelevant_context_lines(
+                safe_content,
+                vacancy_text,
+            )
+            content_key = (
+                fact.category,
+                " ".join(safe_content.casefold().split()),
+            )
+            if not content_key[1] or content_key in seen_contents:
+                continue
+            seen_contents.add(content_key)
             if fact.category == "work_experience":
                 content = _work_experience_excerpt(
                     safe_content,
@@ -749,6 +1076,7 @@ class CoverLetterService:
         self,
         candidate: _Candidate,
         instruction_version: str,
+        prompt_version_id: int,
     ) -> CoverLetterModel | None:
         model = self._require_model()
         canonical_id = candidate.vacancy.duplicate_of_id
@@ -762,11 +1090,25 @@ class CoverLetterService:
                 ApplicationModel.vacancy_id == canonical_id,
                 ApplicationModel.resume_id == candidate.resume.id,
                 CoverLetterModel.instruction_version == instruction_version,
+                CoverLetterModel.prompt_version_id == prompt_version_id,
                 CoverLetterModel.model_name == model.model_name,
                 CoverLetterModel.state.in_((CoverLetterState.READY, CoverLetterState.SENT)),
                 CoverLetterModel.text.is_not(None),
             )
             .order_by(CoverLetterModel.id.desc())
+        )
+
+    def _has_current_origin(self, letter: CoverLetterModel) -> bool:
+        if letter.model_name == MANUAL_REVIEW_MODEL:
+            return letter.prompt_version_id is None
+        if letter.prompt_version_id is None:
+            return False
+        prompt_version = self._session.get(PromptVersionModel, letter.prompt_version_id)
+        return bool(
+            prompt_version is not None
+            and prompt_version.purpose == PROMPT_PURPOSE
+            and prompt_version.version == PROMPT_VERSION
+            and prompt_version.instruction_text == SYSTEM_PROMPT
         )
 
     def _same_text_exists(self, vacancy: VacancyModel, text: str) -> bool:
@@ -886,6 +1228,9 @@ def build_cover_letter_prompt(
 - выбери 1–2 наиболее подходящих проекта или примера работы, а не весь опыт кандидата;
 - каждый пример опиши конкретно: какая была задача, что кандидат сделал, какие подходящие
   технологии применил и какой результат получил, если результат подтвержден;
+- список навыков подтверждает знание технологии, но сам по себе не подтверждает выполненную
+  работу: для фраз «разрабатывал», «реализовал» или «работал с» найди отдельное действие
+  в описании опыта или проекта;
 - не смешивай сведения разных должностей и проектов: при упоминании названного проекта используй
   только действия, технологии и результат, которые прямо относятся к нему в подтвержденном тексте;
 - не превращай назначение продукта в выполненную работу: например, фраза «помогает с поиском»
@@ -949,6 +1294,32 @@ def normalize_cover_letter(response: str) -> str:
     return "\n".join(normalized).strip()
 
 
+def _confirmed_experience_facts(
+    facts: tuple[_SelectedFact, ...],
+) -> tuple[_SelectedFact, ...]:
+    return tuple(
+        fact
+        for fact in facts
+        if fact.category in _EXPERIENCE_FACT_CATEGORIES
+        and _TECHNOLOGY_EXPERIENCE_EVIDENCE.search(fact.content) is not None
+    )
+
+
+def _claimed_technology_experience(
+    text: str,
+) -> tuple[tuple[str, re.Pattern[str]], ...]:
+    claimed: list[tuple[str, re.Pattern[str]]] = []
+    seen: set[str] = set()
+    for segment in re.split(r"[.!?\n]+", text):
+        if _TECHNOLOGY_EXPERIENCE_CLAIM.search(segment) is None:
+            continue
+        for name, pattern in _TECHNOLOGY_PATTERNS:
+            if name not in seen and pattern.search(segment) is not None:
+                claimed.append((name, pattern))
+                seen.add(name)
+    return tuple(claimed)
+
+
 def validate_cover_letter(
     text: str,
     vacancy: VacancyModel,
@@ -980,7 +1351,12 @@ def validate_cover_letter(
         )
 
     fact_text = "\n".join(fact.content for fact in facts)
+    experience_facts = _confirmed_experience_facts(facts)
+    experience_fact_text = "\n".join(fact.content for fact in experience_facts)
     vacancy_text = _vacancy_text(vacancy).casefold()
+    for claim, evidence, reason in _GROUNDED_CLAIMS:
+        if claim.search(text) is not None and evidence.search(experience_fact_text) is None:
+            raise CoverLetterValidationError("UNCONFIRMED_CLAIM", reason)
     for pattern, vacancy_markers, reason in _CONTEXTUAL_DETAILS:
         if pattern.search(text) is not None and not any(
             marker in vacancy_text for marker in vacancy_markers
@@ -991,6 +1367,15 @@ def validate_cover_letter(
             raise CoverLetterValidationError(
                 "UNCONFIRMED_SPECIALIST_TERM",
                 "В письме появилась технология, которой нет в подтвержденных фактах",
+            )
+    for technology, pattern in _claimed_technology_experience(text):
+        if not any(pattern.search(fact.content) is not None for fact in experience_facts):
+            raise CoverLetterValidationError(
+                "UNCONFIRMED_TECHNOLOGY_EXPERIENCE",
+                (
+                    f"В письме заявлен опыт с {technology}, "
+                    "но он не подтверждён описанием выполненной работы"
+                ),
             )
     allowed_numbers = set(_NUMBER.findall(fact_text))
     allowed_numbers.update(_NUMBER.findall(vacancy.title))
@@ -1132,8 +1517,11 @@ def _work_experience_excerpt(
     ranked = sorted(candidates, key=lambda item: (-item[0], item[1]))
     selected: list[str] = []
     used = 0
+    strongest_overlap = ranked[0][0] if ranked else 0
     for overlap, _index, rendered in ranked:
         if selected and overlap == 0:
+            continue
+        if selected and overlap * 3 < strongest_overlap:
             continue
         if used + len(rendered) + 2 > limit:
             continue
@@ -1147,6 +1535,20 @@ def _work_experience_excerpt(
                 selected.append(rendered)
                 break
     return "\n\n".join(selected)
+
+
+def _without_irrelevant_context_lines(content: str, vacancy_text: str) -> str:
+    normalized_vacancy = vacancy_text.casefold()
+    kept: list[str] = []
+    for line in content.splitlines():
+        if any(
+            pattern.search(line) is not None
+            and not any(marker in normalized_vacancy for marker in vacancy_markers)
+            for pattern, vacancy_markers, _reason in _CONTEXTUAL_DETAILS
+        ):
+            continue
+        kept.append(line)
+    return "\n".join(kept).strip()
 
 
 def _without_future_plans(content: str) -> str:
@@ -1185,15 +1587,19 @@ def _ensure_relevant_evidence(
         )
     fact_tokens = _tokens("\n".join(fact.content for fact in facts))
     title_tokens = _tokens(vacancy.title)
+    structured_focus = (
+        " ".join(vacancy.key_skills),
+        vacancy.required_qualifications,
+        vacancy.responsibilities,
+    )
     focus_tokens = _tokens(
         " ".join(
             filter(
                 None,
                 (
                     vacancy.title,
-                    " ".join(vacancy.key_skills),
-                    vacancy.required_qualifications,
-                    vacancy.responsibilities,
+                    *structured_focus,
+                    vacancy.description if not any(structured_focus) else None,
                 ),
             )
         )

@@ -372,3 +372,50 @@ def test_resource_saving_staggers_new_search_jobs_and_preserves_saved_schedule(
             )
     finally:
         database.close()
+
+
+def test_scheduler_creates_jobs_only_for_configured_search_queries(
+    settings: Settings,
+) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    scheduled_at = datetime(2026, 7, 26, 15, 0, tzinfo=UTC)
+
+    try:
+        with database.sessions.begin() as session:
+            account = AccountRepository(session).create("Фоновая проверка")
+            direction = DirectionRepository(session).create(account.id, "Python backend")
+            configured = DirectionRepository(session).add_query(
+                direction.id,
+                "Python backend",
+                schedule_minutes=120,
+            )
+            legacy_variant = DirectionRepository(session).add_query(
+                direction.id,
+                "Python backend",
+                area="1",
+                schedule_minutes=120,
+            )
+            scheduler = AutomationSchedulerService(session)
+            scheduler.ensure_search_job(
+                account_id=account.id,
+                search_query_id=legacy_variant.id,
+                interval_minutes=120,
+                now=scheduled_at,
+            )
+
+        with database.sessions.begin() as session:
+            scheduler = AutomationSchedulerService(session)
+            scheduler.ensure_configured_jobs(account.id, scheduled_at)
+            searches = [
+                job
+                for job in scheduler.list_for_account(account.id)
+                if job.kind is AutomationJobKind.SEARCH
+            ]
+
+            assert {job.search_query_id: job.state for job in searches} == {
+                configured.id: AutomationJobState.WAITING,
+                legacy_variant.id: AutomationJobState.DISABLED,
+            }
+    finally:
+        database.close()

@@ -87,6 +87,7 @@ def run(argv: Sequence[str] | None = None) -> int:
 
         result = browser.open_screening_form(
             draft.source_url,
+            expected_resume_hh_id=draft.resume_hh_id,
             expected_resume_title=draft.resume_title,
             expected_version_hash=draft.version_hash,
             answers=draft.answers,

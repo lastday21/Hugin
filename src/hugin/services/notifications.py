@@ -8,7 +8,6 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from hugin.database.models import (
-    ApplicationEventModel,
     ApplicationModel,
     ApplicationSettingsModel,
     ApplicationTaskModel,
@@ -20,7 +19,7 @@ from hugin.database.models import (
     ScreeningFormModel,
     VacancyModel,
 )
-from hugin.domain.applications import ApplicationEventType, ApplicationState
+from hugin.domain.applications import ApplicationState
 from hugin.domain.content import (
     IncidentSeverity,
     IncidentState,
@@ -29,6 +28,7 @@ from hugin.domain.content import (
 )
 from hugin.domain.tasks import TaskState
 from hugin.domain.time import timezone_by_name
+from hugin.repositories.applications import ApplicationRepository
 from hugin.repositories.communications import CommunicationRepository
 from hugin.services.ui_communications import WINDOWS_NOTIFICATION_EVENTS
 
@@ -36,6 +36,7 @@ from hugin.services.ui_communications import WINDOWS_NOTIFICATION_EVENTS
 class NotificationService:
     def __init__(self, session: Session) -> None:
         self._session = session
+        self._applications = ApplicationRepository(session)
         self._communications = CommunicationRepository(session)
 
     def collect(self, account_id: int, now: datetime | None = None) -> int:
@@ -245,16 +246,7 @@ class NotificationService:
                 ApplicationModel.created_at >= day_start,
             )
         )
-        sent = self._session.scalar(
-            select(func.count())
-            .select_from(ApplicationEventModel)
-            .join(ApplicationModel)
-            .where(
-                ApplicationModel.account_id == account_id,
-                ApplicationEventModel.event_type == ApplicationEventType.APPLIED,
-                ApplicationEventModel.created_at >= day_start,
-            )
-        )
+        sent = self._applications.count_applied_since(account_id, day_start)
         viewed = self._session.scalar(
             select(func.count())
             .select_from(ApplicationModel)

@@ -259,6 +259,75 @@ def test_show_reads_saved_letter(
     assert "Сохраненное индивидуальное письмо" in output
 
 
+def test_reject_clears_reviewed_letter_and_allows_regeneration(
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    try:
+        with database.sessions.begin() as session:
+            account = AccountRepository(session).create("Кандидат", "reject-account")
+            resume = ResumeRepository(session).upsert(account.id, "reject-resume", "Python")
+            vacancy = VacancyRepository(session).upsert(
+                VacancyData(
+                    "reject-123",
+                    "Python-разработчик",
+                    "https://hh.ru/vacancy/reject-123",
+                )
+            )
+            application = ApplicationRepository(session).create_apply_intent(
+                account.id,
+                vacancy.id,
+                resume.id,
+            )
+            letter = CoverLetterModel(
+                application_id=application.id,
+                vacancy_id=vacancy.id,
+                resume_id=resume.id,
+                text="Неподтвержденное утверждение",
+                instruction_version=cover_letter_instruction_version(DEFAULT_COVER_LETTER_PROMPT),
+                model_name="yandexgpt-test",
+                context_hash="hash",
+                state=CoverLetterState.READY,
+            )
+            session.add(letter)
+            session.flush()
+            letter_id = letter.id
+    finally:
+        database.close()
+
+    monkeypatch.setattr(cover_letter_cli, "get_settings", lambda: settings)
+    monkeypatch.setattr(cover_letter_cli, "WindowsYandexAICredentialStore", FakeStore)
+
+    assert (
+        cover_letter_cli.run(
+            [
+                "reject",
+                "--account-id",
+                "1",
+                "--letter-id",
+                str(letter_id),
+                "--reason",
+                "нет подтверждения",
+            ]
+        )
+        == 0
+    )
+    database = create_database(settings)
+    try:
+        with database.sessions() as session:
+            rejected = session.get(CoverLetterModel, letter_id)
+            assert rejected is not None
+            assert rejected.state is CoverLetterState.FAILED
+            assert rejected.text is None
+            assert rejected.failure_reason == "MANUAL_REVIEW: нет подтверждения"
+    finally:
+        database.close()
+    assert "можно создать новый вариант" in capsys.readouterr().out
+
+
 def test_client_loads_environment_and_protected_store(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

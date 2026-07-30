@@ -55,7 +55,12 @@ SYSTEM_TRANSITIONS: dict[SystemState, frozenset[SystemState]] = {
         }
     ),
     SystemState.PAUSED: frozenset(
-        {SystemState.RUNNING, SystemState.AUTH_REQUIRED, SystemState.CAPTCHA_REQUIRED}
+        {
+            SystemState.RUNNING,
+            SystemState.AUTH_REQUIRED,
+            SystemState.CAPTCHA_REQUIRED,
+            SystemState.ACCOUNT_WARNING,
+        }
     ),
     SystemState.AUTH_REQUIRED: frozenset({SystemState.RUNNING, SystemState.PAUSED}),
     SystemState.CAPTCHA_REQUIRED: frozenset({SystemState.RUNNING, SystemState.PAUSED}),

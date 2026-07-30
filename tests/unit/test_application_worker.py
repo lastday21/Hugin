@@ -36,6 +36,9 @@ class FakeApplicationService:
     daily_limit: ClassVar[int] = 25
     recorded: ClassVar[list[tuple[ApplyJob, HhApplyResult, timedelta | None, datetime]]] = []
     recovered: ClassVar[int] = 0
+    expired_recovered: ClassVar[int] = 0
+    expired_recovery_checks: ClassVar[list[datetime]] = []
+    submission_checks: ClassVar[list[dict[str, object]]] = []
 
     def __init__(self, _session: object) -> None:
         pass
@@ -43,6 +46,10 @@ class FakeApplicationService:
     def recover_interrupted(self) -> int:
         type(self).recovered += 1
         return 0
+
+    def recover_expired_supervised(self, now: datetime) -> int:
+        type(self).expired_recovery_checks.append(now)
+        return type(self).expired_recovered
 
     def policy(self, _timezone_name: str | None = None) -> SimpleNamespace:
         return SimpleNamespace(
@@ -57,8 +64,20 @@ class FakeApplicationService:
     def applied_since(self, _account_id: int, _since: datetime) -> int:
         return self.sent_today
 
+    def background_submission_is_allowed(
+        self,
+        task_id: int,
+        **values: object,
+    ) -> bool:
+        type(self).submission_checks.append({"task_id": task_id, **values})
+        return self.enabled
+
     def claim_next(self, **kwargs: object) -> object | None:
-        assert kwargs == {"account_id": 1, "require_cover_letter": True}
+        assert kwargs == {
+            "account_id": 1,
+            "require_cover_letter": True,
+            "include_stretch": False,
+        }
         selected = type(self).job
         type(self).job = None
         return selected
@@ -101,6 +120,9 @@ def setup_function() -> None:
     FakeApplicationService.daily_limit = 25
     FakeApplicationService.recorded = []
     FakeApplicationService.recovered = 0
+    FakeApplicationService.expired_recovered = 0
+    FakeApplicationService.expired_recovery_checks = []
+    FakeApplicationService.submission_checks = []
 
 
 def test_worker_processes_ready_application_and_records_delay(
@@ -171,6 +193,19 @@ def test_worker_does_not_prepare_letters_when_applications_are_paused(
     assert prepared_for == []
 
 
+def test_worker_checks_expired_supervised_task_while_queue_is_paused(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    FakeApplicationService.enabled = False
+    FakeApplicationService.expired_recovered = 1
+    worker = prepare_worker(monkeypatch, tmp_path)
+    now = datetime(2026, 7, 27, 10, 0, tzinfo=UTC)
+
+    assert not worker.run_once(now)
+    assert FakeApplicationService.expired_recovery_checks == [now]
+
+
 def test_worker_does_not_prepare_letters_after_daily_limit(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -229,8 +264,11 @@ def test_worker_recovers_interrupted_jobs_before_start(
     assert FakeApplicationService.recovered == 1
 
 
-def test_worker_runs_authenticated_browser_job(monkeypatch: pytest.MonkeyPatch) -> None:
-    calls: list[tuple[str, str, str]] = []
+def test_worker_runs_authenticated_browser_job(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[str, str, str, str]] = []
 
     class FakeBrowser:
         def __init__(self, *_args: object, **_kwargs: object) -> None:
@@ -246,6 +284,7 @@ def test_worker_runs_authenticated_browser_job(monkeypatch: pytest.MonkeyPatch) 
             self,
             source_url: str,
             *,
+            expected_resume_hh_id: str,
             expected_resume_title: str,
             cover_letter: str,
             submit: bool,
@@ -253,7 +292,8 @@ def test_worker_runs_authenticated_browser_job(monkeypatch: pytest.MonkeyPatch) 
         ) -> HhApplyResult:
             assert submit
             assert callable(submit_guard)
-            calls.append((source_url, expected_resume_title, cover_letter))
+            assert submit_guard()
+            calls.append((source_url, expected_resume_hh_id, expected_resume_title, cover_letter))
             return HhApplyResult(HhApplyStatus.APPLIED, source_url)
 
     class FakeLoginService:
@@ -265,16 +305,16 @@ def test_worker_runs_authenticated_browser_job(monkeypatch: pytest.MonkeyPatch) 
 
     monkeypatch.setattr(applications, "VisibleHhBrowser", FakeBrowser)
     monkeypatch.setattr(applications, "HhLoginService", FakeLoginService)
-    worker = applications.ApplicationWorker(
-        Settings(environment="test"),
-        letter_preparer=lambda _account_id: 0,
-    )
+    worker = prepare_worker(monkeypatch, tmp_path)
     job = cast(
         ApplyJob,
         SimpleNamespace(
+            task=SimpleNamespace(id=10),
             vacancy=SimpleNamespace(source_url="https://hh.ru/vacancy/101"),
-            resume=SimpleNamespace(title="Python backend"),
+            resume=SimpleNamespace(hh_id="resume-1", title="Python backend"),
             cover_letter="Здравствуйте!",
+            cover_letter_id=20,
+            cover_letter_sha256="letter-sha",
         ),
     )
 
@@ -284,9 +324,19 @@ def test_worker_runs_authenticated_browser_job(monkeypatch: pytest.MonkeyPatch) 
     assert calls == [
         (
             "https://hh.ru/vacancy/101",
+            "resume-1",
             "Python backend",
             "Здравствуйте!",
         )
+    ]
+    assert FakeApplicationService.submission_checks == [
+        {
+            "task_id": 10,
+            "letter_id": 20,
+            "letter_sha256": "letter-sha",
+            "resume_hh_id": "resume-1",
+            "resume_title": "Python backend",
+        }
     ]
 
 
@@ -360,6 +410,7 @@ def test_worker_prepares_one_letter_for_active_direction(
                 "account_id": 1,
                 "direction_name": "Python backend",
                 "limit": 1,
+                "include_stretch": False,
             }
             return SimpleNamespace(generated=1, reused=0)
 

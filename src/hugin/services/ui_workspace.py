@@ -31,17 +31,18 @@ from hugin.database.models import (
 from hugin.domain.applications import ApplicationEventType
 from hugin.domain.automation import AutomationJobKind, AutomationJobState
 from hugin.domain.content import (
-    CURRENT_COVER_LETTER_INSTRUCTION,
     CoverLetterState,
     IncidentState,
     InvitationState,
     MessageDirection,
     ScreeningFormState,
+    cover_letter_instruction_version,
 )
 from hugin.domain.directions import DirectionScope, VacancyState
 from hugin.domain.tasks import TaskState
 from hugin.domain.time import local_day_start_utc
 from hugin.repositories.applications import ApplicationRepository
+from hugin.services.ai_prompts import AiPromptSettingsService
 from hugin.services.queue import QueueService
 
 ACTIVE_QUEUE_STATES = (
@@ -229,6 +230,9 @@ class UiWorkspaceService:
 
     def dashboard(self, account_id: int) -> UiDashboard:
         account = self._account(account_id)
+        instruction_version = cover_letter_instruction_version(
+            AiPromptSettingsService(self._session).get().cover_letter
+        )
         settings = self._session.get(ApplicationSettingsModel, 1)
         if settings is None:
             raise LookupError("Настройки приложения не найдены")
@@ -269,10 +273,7 @@ class UiWorkspaceService:
                 .where(
                     ApplicationModel.account_id == account_id,
                     CoverLetterModel.state == CoverLetterState.READY,
-                    CoverLetterModel.instruction_version.startswith(
-                        f"{CURRENT_COVER_LETTER_INSTRUCTION}_",
-                        autoescape=True,
-                    ),
+                    CoverLetterModel.instruction_version == instruction_version,
                 )
             )
             or 0
@@ -415,14 +416,14 @@ class UiWorkspaceService:
 
     def queue(self, account_id: int, limit: int = 100) -> tuple[UiQueueItem, ...]:
         self._account(account_id)
+        instruction_version = cover_letter_instruction_version(
+            AiPromptSettingsService(self._session).get().cover_letter
+        )
         letter_state = (
             select(CoverLetterModel.state)
             .where(
                 CoverLetterModel.application_id == ApplicationModel.id,
-                CoverLetterModel.instruction_version.startswith(
-                    f"{CURRENT_COVER_LETTER_INSTRUCTION}_",
-                    autoescape=True,
-                ),
+                CoverLetterModel.instruction_version == instruction_version,
             )
             .order_by(CoverLetterModel.id.desc())
             .limit(1)
@@ -535,6 +536,11 @@ class UiWorkspaceService:
             .where(
                 ApplicationEventModel.application_id == ApplicationModel.id,
                 ApplicationEventModel.event_type == ApplicationEventType.APPLIED,
+                func.coalesce(
+                    ApplicationEventModel.payload["source"].as_string(),
+                    "",
+                )
+                != "hh.ru",
             )
             .correlate(ApplicationModel)
             .scalar_subquery()
@@ -559,6 +565,11 @@ class UiWorkspaceService:
                 .where(
                     ApplicationEventModel.application_id == ApplicationModel.id,
                     ApplicationEventModel.event_type == ApplicationEventType.APPLIED,
+                    func.coalesce(
+                        ApplicationEventModel.payload["source"].as_string(),
+                        "",
+                    )
+                    != "hh.ru",
                 )
                 .exists(),
             )
@@ -586,6 +597,9 @@ class UiWorkspaceService:
 
     def vacancy(self, account_id: int, hh_id: str) -> UiVacancyCard:
         self._account(account_id)
+        instruction_version = cover_letter_instruction_version(
+            AiPromptSettingsService(self._session).get().cover_letter
+        )
         row = self._session.execute(
             select(VacancyModel, DirectionVacancyModel, CareerDirectionModel)
             .join(
@@ -613,10 +627,7 @@ class UiWorkspaceService:
                 ApplicationModel.account_id == account_id,
                 ApplicationModel.vacancy_id == vacancy.id,
                 CoverLetterModel.text.is_not(None),
-                CoverLetterModel.instruction_version.startswith(
-                    f"{CURRENT_COVER_LETTER_INSTRUCTION}_",
-                    autoescape=True,
-                ),
+                CoverLetterModel.instruction_version == instruction_version,
             )
             .order_by(CoverLetterModel.id.desc())
             .limit(1)

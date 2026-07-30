@@ -34,6 +34,7 @@ class FakeDraft:
     application_id: int = 11
     form_id: int = 12
     source_url: str = "https://hh.ru/vacancy/101"
+    resume_hh_id: str = "resume-python"
     resume_title: str = "Python"
     version_hash: str = "version-1"
     answers: dict[str, str] | None = None

@@ -98,6 +98,8 @@ def test_yandex_client_journals_call_and_reported_tokens(
     assert client.complete("system", "user") == "Готово"
 
     entries = list(journal.entries())
+    assert {entry["run_id"] for entry in entries} == {entries[0]["run_id"]}
+    assert sum(entry.get("details", {}).get("model_calls", 0) for entry in entries) == 1
     completed = next(entry for entry in entries if entry["status"] == "completed")
     assert completed["component"] == "yandex_ai"
     assert completed["event"] == "model.complete"
