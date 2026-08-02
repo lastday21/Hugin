@@ -12,10 +12,13 @@ from hugin.domain.automation import (
     AutomationJobRecord,
     AutomationJobResult,
     AutomationJobState,
+    AutomationJobStateError,
 )
 from hugin.services.automation import AutomationSchedulerService
 
 type AutomationJobHandler = Callable[[AutomationJobRecord], AutomationJobResult]
+
+DEFAULT_HEARTBEAT_SECONDS = 30.0
 
 
 class AutomationJobBlocked(RuntimeError):
@@ -32,16 +35,20 @@ class AutomationWorker:
         account_id: int = 1,
         handlers: Mapping[AutomationJobKind, AutomationJobHandler] | None = None,
         poll_seconds: float = 2.0,
+        heartbeat_seconds: float = DEFAULT_HEARTBEAT_SECONDS,
         journal: OperationJournal | None = None,
     ) -> None:
         if account_id < 1:
             raise ValueError("Идентификатор аккаунта должен быть положительным")
         if poll_seconds <= 0:
             raise ValueError("Интервал проверки расписания должен быть положительным")
+        if heartbeat_seconds <= 0:
+            raise ValueError("Интервал пульса фонового задания должен быть положительным")
         self._settings = settings
         self._account_id = account_id
         self._handlers = dict(handlers or {})
         self._poll_seconds = poll_seconds
+        self._heartbeat_seconds = heartbeat_seconds
         self._journal = journal or OperationJournal(settings.data_dir)
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -129,7 +136,7 @@ class AutomationWorker:
                 return True
 
             try:
-                result = handler(job)
+                result = self._run_handler(job, handler)
             except AutomationJobBlocked as error:
                 with database.sessions.begin() as session:
                     AutomationSchedulerService(session).block(
@@ -155,6 +162,57 @@ class AutomationWorker:
             return True
         finally:
             database.close()
+
+    def _run_handler(
+        self,
+        job: AutomationJobRecord,
+        handler: AutomationJobHandler,
+    ) -> AutomationJobResult:
+        heartbeat_stop = threading.Event()
+        heartbeat_thread = threading.Thread(
+            target=lambda: self._heartbeat_job(job.key, heartbeat_stop),
+            name=f"hugin-heartbeat-{job.key}",
+            daemon=True,
+        )
+        heartbeat_thread.start()
+        try:
+            return handler(job)
+        finally:
+            heartbeat_stop.set()
+            heartbeat_thread.join()
+
+    def _heartbeat_job(self, job_key: str, stop: threading.Event) -> None:
+        if stop.wait(self._heartbeat_seconds):
+            return
+        try:
+            database = create_database(self._settings)
+        except Exception as error:
+            self._record_heartbeat_error(job_key, error)
+            return
+        try:
+            while not stop.is_set():
+                try:
+                    with database.sessions.begin() as session:
+                        AutomationSchedulerService(session).heartbeat(job_key)
+                except AutomationJobStateError:
+                    return
+                except Exception as error:
+                    self._record_heartbeat_error(job_key, error)
+                if stop.wait(self._heartbeat_seconds):
+                    return
+        finally:
+            database.close()
+
+    def _record_heartbeat_error(self, job_key: str, error: Exception) -> None:
+        self._journal.record(
+            "automation",
+            "job.heartbeat",
+            status="failed",
+            level="WARNING",
+            account_id=self._account_id,
+            job_key=job_key,
+            **error_details(error),
+        )
 
     def _run(self) -> None:
         while not self._stop.is_set():

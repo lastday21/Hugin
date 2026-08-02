@@ -21,6 +21,12 @@ from hugin.repositories.communications import CommunicationRepository
 from hugin.services.notifications import NotificationService
 
 
+class NotificationChannelNotConfigured(RuntimeError):
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
 class NotificationWorker:
     def __init__(
         self,
@@ -106,6 +112,13 @@ class NotificationWorker:
         )
         try:
             self._send(notification)
+        except NotificationChannelNotConfigured as error:
+            self._record_failure(
+                notification.id,
+                error.code,
+                selected_at,
+            )
+            run.block(reason=str(error), error_code=error.code)
         except Exception as error:
             self._record_failure(
                 notification.id,
@@ -133,7 +146,10 @@ class NotificationWorker:
         if notification.channel is NotificationChannel.TELEGRAM:
             telegram = credentials.load_telegram_gateway()
             if telegram is None:
-                raise RuntimeError("Telegram не настроен")
+                raise NotificationChannelNotConfigured(
+                    "TELEGRAM_NOT_CONFIGURED",
+                    "Telegram не настроен",
+                )
             TelegramGatewayNotificationSender(
                 self._settings.telegram_gateway_url,
                 telegram,
@@ -142,7 +158,10 @@ class NotificationWorker:
             return
         email = credentials.load_email()
         if email is None:
-            raise RuntimeError("Электронная почта не настроена")
+            raise NotificationChannelNotConfigured(
+                "EMAIL_NOT_CONFIGURED",
+                "Электронная почта не настроена",
+            )
         EmailNotificationSender(email).send(content)
 
     def _record_success(self, notification_id: int, sent_at: datetime) -> None:

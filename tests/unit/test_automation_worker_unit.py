@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import replace
@@ -15,6 +16,7 @@ from hugin.domain import (
     AutomationJobRecord,
     AutomationJobResult,
     AutomationJobState,
+    AutomationJobStateError,
 )
 from hugin.workers.automation import AutomationJobBlocked, AutomationWorker
 
@@ -65,6 +67,8 @@ class FakeScheduler:
         self.configured: list[tuple[int, datetime | None]] = []
         self.recovered: list[datetime | None] = []
         self.unblocked: list[tuple[str, datetime | None]] = []
+        self.heartbeats: list[tuple[str, datetime | None]] = []
+        self.heartbeat_seen = threading.Event()
         self.blocked: list[tuple[str, str, str, datetime | None]] = []
         self.failed: list[tuple[str, str, str, datetime | None]] = []
         self.completed: list[tuple[str, AutomationJobResult, datetime | None]] = []
@@ -88,6 +92,10 @@ class FakeScheduler:
         job = self.job
         self.job = None
         return job
+
+    def heartbeat(self, job_key: str, now: datetime | None = None) -> None:
+        self.heartbeats.append((job_key, now))
+        self.heartbeat_seen.set()
 
     def block(
         self,
@@ -233,13 +241,21 @@ def test_connected_handler_unblocks_previous_missing_source(
     assert scheduler.unblocked == [("messages:1", now)]
 
 
-@pytest.mark.parametrize(("account_id", "poll_seconds"), [(0, 2.0), (1, 0.0)])
-def test_worker_rejects_invalid_settings(account_id: int, poll_seconds: float) -> None:
+@pytest.mark.parametrize(
+    ("account_id", "poll_seconds", "heartbeat_seconds"),
+    [(0, 2.0, 30.0), (1, 0.0, 30.0), (1, 2.0, 0.0)],
+)
+def test_worker_rejects_invalid_settings(
+    account_id: int,
+    poll_seconds: float,
+    heartbeat_seconds: float,
+) -> None:
     with pytest.raises(ValueError):
         AutomationWorker(
             Settings(environment="test"),
             account_id=account_id,
             poll_seconds=poll_seconds,
+            heartbeat_seconds=heartbeat_seconds,
         )
 
 
@@ -333,6 +349,96 @@ def test_worker_completes_successful_handler(
     assert scheduler.completed == [(job.key, {"checked": 3}, now)]
     assert not scheduler.blocked
     assert not scheduler.failed
+
+
+def test_worker_updates_heartbeat_from_a_separate_database(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 7, 26, 8, 0, tzinfo=UTC)
+    job = make_job(AutomationJobKind.SEARCH)
+    scheduler = FakeScheduler(job)
+    databases: list[FakeDatabase] = []
+
+    def create_database(_settings: Settings) -> FakeDatabase:
+        database = FakeDatabase()
+        databases.append(database)
+        return database
+
+    def create_scheduler(_session: object) -> FakeScheduler:
+        return scheduler
+
+    monkeypatch.setattr(worker_module, "create_database", create_database)
+    monkeypatch.setattr(worker_module, "AutomationSchedulerService", create_scheduler)
+
+    def complete(_job: AutomationJobRecord) -> AutomationJobResult:
+        assert scheduler.heartbeat_seen.wait(1.0)
+        return {"checked": 3}
+
+    worker = AutomationWorker(
+        Settings(environment="test", data_dir=tmp_path),
+        handlers={AutomationJobKind.SEARCH: complete},
+        heartbeat_seconds=0.01,
+    )
+
+    assert worker.run_once(now)
+    assert scheduler.heartbeats
+    assert all(heartbeat == (job.key, None) for heartbeat in scheduler.heartbeats)
+    assert scheduler.completed == [(job.key, {"checked": 3}, now)]
+    assert len(databases) == 2
+    assert all(database.closed for database in databases)
+
+
+def test_heartbeat_records_database_creation_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    def fail_database(_settings: Settings) -> FakeDatabase:
+        raise RuntimeError("База временно недоступна")
+
+    monkeypatch.setattr(worker_module, "create_database", fail_database)
+    worker = AutomationWorker(
+        Settings(environment="test", data_dir=tmp_path),
+        heartbeat_seconds=0.001,
+    )
+
+    worker._heartbeat_job("search:7", threading.Event())
+
+    entries = tuple(worker._journal.entries(component="automation", status="failed"))
+    assert entries[-1]["event"] == "job.heartbeat"
+    assert entries[-1]["details"]["job_key"] == "search:7"
+
+
+def test_heartbeat_stops_when_job_is_no_longer_running(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    database = FakeDatabase()
+
+    class StoppedScheduler(FakeScheduler):
+        def heartbeat(self, job_key: str, now: datetime | None = None) -> None:
+            del now
+            raise AutomationJobStateError(
+                job_key,
+                AutomationJobState.WAITING,
+                AutomationJobState.RUNNING,
+            )
+
+    scheduler = StoppedScheduler(None)
+    monkeypatch.setattr(worker_module, "create_database", lambda _settings: database)
+    monkeypatch.setattr(
+        worker_module,
+        "AutomationSchedulerService",
+        lambda _session: scheduler,
+    )
+    worker = AutomationWorker(
+        Settings(environment="test", data_dir=tmp_path),
+        heartbeat_seconds=0.001,
+    )
+
+    worker._heartbeat_job("search:7", threading.Event())
+
+    assert database.closed
 
 
 def test_worker_blocks_job_without_connected_handler(

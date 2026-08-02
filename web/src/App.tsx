@@ -3165,6 +3165,7 @@ function NotificationSettingsForm({
   const [telegramConnected, setTelegramConnected] = useState(false);
   const [telegramBotUsername, setTelegramBotUsername] = useState("hugin_workbot");
   const [telegramStatusLoading, setTelegramStatusLoading] = useState(true);
+  const [emailConfigured, setEmailConfigured] = useState(false);
   const [smtpHost, setSmtpHost] = useState("");
   const [smtpPort, setSmtpPort] = useState("587");
   const [smtpUsername, setSmtpUsername] = useState("");
@@ -3208,6 +3209,7 @@ function NotificationSettingsForm({
         setTelegramBotConfigured(result.telegram_bot_configured === true);
         setTelegramConnected(result.telegram_configured === true);
         setTelegramBotUsername(result.telegram_bot_username ?? "hugin_workbot");
+        setEmailConfigured(result.email_configured === true);
       } catch (reason) {
         if (active) setError(readableError(reason));
       } finally {
@@ -3328,6 +3330,7 @@ function NotificationSettingsForm({
       );
       if (result.status !== "READY") throw new Error(result.message);
       setSmtpPassword("");
+      setEmailConfigured(true);
       setEmailEnabled(true);
       onToast({ kind: "success", message: result.message });
     } catch (reason) {
@@ -3359,10 +3362,12 @@ function NotificationSettingsForm({
           },
           {
             title: "Электронная почта",
-            description: "Отправлять на сохранённый адрес.",
+            description: emailConfigured
+              ? "Отправлять на сохранённый адрес."
+              : "Сначала сохраните настройки почты ниже.",
             enabled: emailEnabled,
             setEnabled: setEmailEnabled,
-            disabled: false,
+            disabled: !emailConfigured,
           },
         ].map((channel) => (
           <label className="notification-master" key={channel.title}>

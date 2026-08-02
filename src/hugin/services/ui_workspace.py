@@ -40,7 +40,7 @@ from hugin.domain.content import (
 )
 from hugin.domain.directions import DirectionScope, VacancyState
 from hugin.domain.tasks import TaskState
-from hugin.domain.time import local_day_start_utc
+from hugin.domain.time import day_start_utc
 from hugin.repositories.applications import ApplicationRepository
 from hugin.services.ai_prompts import AiPromptSettingsService
 from hugin.services.queue import QueueService
@@ -52,6 +52,7 @@ ACTIVE_QUEUE_STATES = (
     TaskState.REVIEW_REQUIRED,
     TaskState.UNKNOWN_RESULT,
 )
+BACKGROUND_HEARTBEAT_STALE_AFTER = timedelta(minutes=2)
 
 
 def _direction_scope(direction: CareerDirectionModel) -> DirectionScope:
@@ -239,7 +240,7 @@ class UiWorkspaceService:
         queue = QueueService(self._session).status()
         applied_today = ApplicationRepository(self._session).count_applied_since(
             account_id,
-            local_day_start_utc(),
+            day_start_utc(queue.policy.timezone_name),
         )
         directions = tuple(
             self._direction_summary(direction)
@@ -375,6 +376,12 @@ class UiWorkspaceService:
             if job.state in {AutomationJobState.BLOCKED, AutomationJobState.FAILED}
         )
         now = datetime.now(UTC)
+        running = tuple(job for job in enabled if job.state is AutomationJobState.RUNNING)
+        fresh_running = any(
+            (job.heartbeat_at or job.last_started_at or job.updated_at)
+            >= now - BACKGROUND_HEARTBEAT_STALE_AFTER
+            for job in running
+        )
         overdue = any(
             job.next_run_at is not None
             and job.next_run_at < now - timedelta(minutes=2)
@@ -383,7 +390,7 @@ class UiWorkspaceService:
         )
         if failures:
             state = "NEEDS_ATTENTION"
-        elif overdue:
+        elif (running and not fresh_running) or (overdue and not fresh_running):
             state = "STOPPED"
         else:
             state = "RUNNING"
