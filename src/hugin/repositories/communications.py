@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import cast
 
-from sqlalchemy import select
+from sqlalchemy import or_, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
@@ -33,6 +33,13 @@ from hugin.domain.content import (
 )
 from hugin.domain.directions import ConfigPayload
 from hugin.domain.time import as_utc
+
+_NON_RETRYABLE_NOTIFICATION_ERRORS = frozenset(
+    {
+        "EMAIL_NOT_CONFIGURED",
+        "TELEGRAM_NOT_CONFIGURED",
+    }
+)
 
 
 def _optional_utc(value: datetime | None) -> datetime | None:
@@ -404,6 +411,45 @@ class CommunicationRepository:
         self._session.refresh(model)
         return _invitation_record(model)
 
+    def has_open_message_invitation(
+        self,
+        application_id: int,
+        title: str,
+    ) -> bool:
+        self._require_application(application_id)
+        invitation_id = self._session.scalar(
+            select(InvitationModel.id)
+            .where(
+                InvitationModel.application_id == application_id,
+                InvitationModel.hh_id.like("message:%"),
+                InvitationModel.title == title,
+                InvitationModel.state != InvitationState.CLOSED,
+            )
+            .limit(1)
+        )
+        return invitation_id is not None
+
+    def close_status_invitations(
+        self,
+        application_id: int,
+        updated_at: datetime,
+    ) -> int:
+        self._require_application(application_id)
+        closed_ids = self._session.scalars(
+            update(InvitationModel)
+            .where(
+                InvitationModel.application_id == application_id,
+                InvitationModel.hh_id.like("status:%"),
+                InvitationModel.state != InvitationState.CLOSED,
+            )
+            .values(
+                state=InvitationState.CLOSED,
+                updated_at=as_utc(updated_at),
+            )
+            .returning(InvitationModel.id)
+        )
+        return len(tuple(closed_ids))
+
     def mark_invitation_seen(
         self,
         account_id: int,
@@ -470,6 +516,10 @@ class CommunicationRepository:
                     }
                 ),
                 NotificationModel.scheduled_at <= as_utc(now),
+                or_(
+                    NotificationModel.error_code.is_(None),
+                    NotificationModel.error_code.not_in(_NON_RETRYABLE_NOTIFICATION_ERRORS),
+                ),
             )
             .order_by(NotificationModel.scheduled_at, NotificationModel.id)
             .with_for_update(skip_locked=True)

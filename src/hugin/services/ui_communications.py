@@ -181,7 +181,10 @@ class UiCommunicationService:
             select(InvitationModel, ApplicationModel, VacancyModel)
             .join(ApplicationModel, ApplicationModel.id == InvitationModel.application_id)
             .join(VacancyModel, VacancyModel.id == ApplicationModel.vacancy_id)
-            .where(ApplicationModel.account_id == account_id)
+            .where(
+                ApplicationModel.account_id == account_id,
+                InvitationModel.state != InvitationState.CLOSED,
+            )
             .order_by(
                 InvitationModel.created_at.desc(),
                 InvitationModel.id.desc(),

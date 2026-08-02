@@ -152,3 +152,34 @@ def test_notification_collection_delivery_and_retry_are_idempotent(
             assert sent.sent_at == now
     finally:
         database.close()
+
+
+def test_unconfigured_notification_channel_is_not_retried(
+    settings: Settings,
+) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    now = datetime(2026, 7, 27, 8, 0, tzinfo=UTC)
+    try:
+        with database.sessions.begin() as session:
+            repository = CommunicationRepository(session)
+            notification = repository.enqueue_notification(
+                deduplication_key="email-without-credentials",
+                event_type="NEW_MESSAGE",
+                channel=NotificationChannel.EMAIL,
+                payload={"title": "Hugin", "body": "Новое сообщение"},
+                scheduled_at=now,
+            )
+            repository.mark_notification_failed(
+                notification.id,
+                error_code="EMAIL_NOT_CONFIGURED",
+                retry_at=now,
+            )
+
+        with database.sessions.begin() as session:
+            assert (
+                CommunicationRepository(session).claim_due_notification(now + timedelta(days=1))
+                is None
+            )
+    finally:
+        database.close()

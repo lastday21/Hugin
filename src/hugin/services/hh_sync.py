@@ -21,14 +21,36 @@ from hugin.repositories.applications import ApplicationRepository
 from hugin.repositories.communications import CommunicationRepository
 from hugin.repositories.tasks import QueueTaskRepository
 
-_ATTENTION_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
-    (
-        re.compile(r"\b(?:приглаша\w*|собеседован\w*|интервью|встреч\w*|созвон\w*)\b", re.I),
-        "Приглашение на собеседование",
+_INTERVIEW_TITLE = "Приглашение на собеседование"
+_NEGATED_ATTENTION_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(
+        r"\bне\s+"  # noqa: RUF001
+        r"(?:(?:готов|мож|смож|буд|планир|хот)\w*\s+){0,2}"
+        r"(?:(?:пока|сейчас|далее|больше)\s+)?"
+        r"(?:приглас|приглаш)\w*",
+        re.I,
     ),
+    re.compile(
+        r"\bне\s+"  # noqa: RUF001
+        r"(?:(?:готов|буд|планир)\w*\s+){0,2}"
+        r"(?:провод\w+\s+)?"
+        r"(?:собеседован|интервью|встреч|созвон)\w*",
+        re.I,
+    ),
+    re.compile(
+        r"\b(?:собеседован|интервью|встреч|созвон)\w*"
+        r"\s+не\s+(?:буд|состо)\w*",
+        re.I,
+    ),
+)
+_ATTENTION_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (
         re.compile(r"\b(?:тестов\w*|тестовое|задани\w*|опрос\w*)\b", re.I),
         "Задание от работодателя",
+    ),
+    (
+        re.compile(r"\b(?:приглаша\w*|собеседован\w*|интервью|встреч\w*|созвон\w*)\b", re.I),
+        _INTERVIEW_TITLE,
     ),
     (
         re.compile(r"\b(?:вопрос\w*|уточнит\w*|ответьте|сообщите|напишите)\b", re.I),
@@ -92,16 +114,22 @@ class HhSynchronizationService:
                 updated += 1
             self._close_obsolete_task(current.id, item)
             if item.status is HhNegotiationStatus.INVITED:
-                self._communications.save_invitation(
-                    application_id=current.id,
-                    hh_id=f"status:{item.vacancy_id}:invited",
-                    title="Приглашение на собеседование",
-                    details=item.status_label or None,
-                    interview_at=None,
-                    booking_url=None,
-                    updated_at=selected_at,
-                )
-                invitations += 1
+                if self._communications.has_open_message_invitation(
+                    current.id,
+                    _INTERVIEW_TITLE,
+                ):
+                    self._communications.close_status_invitations(current.id, selected_at)
+                else:
+                    self._communications.save_invitation(
+                        application_id=current.id,
+                        hh_id=f"status:{item.vacancy_id}:invited",
+                        title=_INTERVIEW_TITLE,
+                        details=item.status_label or None,
+                        interview_at=None,
+                        booking_url=None,
+                        updated_at=selected_at,
+                    )
+                    invitations += 1
 
         return {
             "tracked": len(applications),
@@ -170,13 +198,14 @@ class HhSynchronizationService:
                 body=item.body,
                 occurred_at=selected_at,
             )
-            if not is_new:
-                continue
-            created += 1
+            if is_new:
+                created += 1
             if item.direction is MessageDirection.OUTGOING:
-                outgoing += 1
+                if is_new:
+                    outgoing += 1
                 continue
-            incoming += 1
+            if is_new:
+                incoming += 1
             attention_title = self._attention_title(item.body)
             if attention_title is None:
                 continue
@@ -189,7 +218,10 @@ class HhSynchronizationService:
                 booking_url=self._booking_url(item.body),
                 updated_at=selected_at,
             )
-            attention += 1
+            if attention_title == _INTERVIEW_TITLE:
+                self._communications.close_status_invitations(application.id, selected_at)
+            if is_new:
+                attention += 1
 
         return {
             "tracked": len(applications),
@@ -217,10 +249,14 @@ class HhSynchronizationService:
 
     @staticmethod
     def _attention_title(body: str) -> str | None:
-        return next(
-            (title for pattern, title in _ATTENTION_PATTERNS if pattern.search(body)),
-            None,
-        )
+        negated_interview = any(pattern.search(body) for pattern in _NEGATED_ATTENTION_PATTERNS)
+        for pattern, title in _ATTENTION_PATTERNS:
+            if not pattern.search(body):
+                continue
+            if title == _INTERVIEW_TITLE and negated_interview:
+                continue
+            return title
+        return None
 
     @staticmethod
     def _booking_url(body: str) -> str | None:

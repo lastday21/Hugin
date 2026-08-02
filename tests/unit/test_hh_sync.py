@@ -9,7 +9,7 @@ import pytest
 from hugin.core.settings import Settings
 from hugin.database import create_database, upgrade_database
 from hugin.domain.applications import ApplicationState
-from hugin.domain.content import MessageDirection, RecruiterMessageState
+from hugin.domain.content import InvitationState, MessageDirection, RecruiterMessageState
 from hugin.domain.hh_sync import (
     HhChatMessageData,
     HhNegotiationData,
@@ -28,6 +28,58 @@ from hugin.repositories.communications import CommunicationRepository
 from hugin.services.hh_sync import HhSynchronizationService
 
 pytestmark = pytest.mark.integration
+
+
+def test_test_assignment_takes_priority_over_interview_wording() -> None:
+    body = "Приглашаем продолжить отбор. Для этого обязательно выполните тестовое задание."
+
+    assert HhSynchronizationService._attention_title(body) == "Задание от работодателя"
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    (
+        (
+            "К сожалению, мы не приглашаем вас на следующий этап.",
+            None,
+        ),
+        (
+            "Мы не готовы пригласить вас на собеседование.",
+            None,
+        ),
+        (
+            "Не забудьте: приглашаем на собеседование.",
+            "Приглашение на собеседование",
+        ),
+    ),
+)
+def test_interview_classification_respects_negative_context(
+    body: str,
+    expected: str | None,
+) -> None:
+    assert HhSynchronizationService._attention_title(body) == expected
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    (
+        (
+            "Мы не готовы пригласить вас на собеседование, "
+            "но предлагаем выполнить тестовое задание.",
+            "Задание от работодателя",
+        ),
+        (
+            "Мы не готовы пригласить вас на собеседование, "
+            "но сообщите, пожалуйста, когда сможете приступить.",
+            "Вопрос работодателя",
+        ),
+    ),
+)
+def test_negative_interview_context_preserves_other_attention(
+    body: str,
+    expected: str,
+) -> None:
+    assert HhSynchronizationService._attention_title(body) == expected
 
 
 def test_hh_statuses_and_messages_are_synchronized_idempotently(
@@ -183,5 +235,88 @@ def test_hh_statuses_and_messages_are_synchronized_idempotently(
             invitations = communication.list_invitations_for_account(account.id)
             assert len(invitations) == 2
             assert invitations[0].booking_url == "https://calendar.example.com/interview"
+            assert invitations[1].state is InvitationState.CLOSED
+
+            status_after_message = service.synchronize_statuses(
+                account_id=account.id,
+                statuses=(
+                    HhNegotiationData(
+                        "sync-101",
+                        HhNegotiationStatus.INVITED,
+                        "Собеседование",
+                        True,
+                    ),
+                ),
+                checked_at=checked_at,
+            )
+            assert status_after_message["invitations"] == 0
+            assert len(communication.list_invitations_for_account(account.id)) == 2
+    finally:
+        database.close()
+
+
+def test_incoming_question_does_not_close_status_invitation(
+    settings: Settings,
+) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    checked_at = datetime(2026, 7, 27, 9, 0, tzinfo=UTC)
+    try:
+        with database.sessions.begin() as session:
+            account = AccountRepository(session).create("Вопрос после приглашения")
+            resume = ResumeRepository(session).upsert(
+                account.id,
+                "question-after-invitation-resume",
+                "Python backend",
+            )
+            vacancy = VacancyRepository(session).upsert(
+                VacancyData(
+                    hh_id="question-after-invitation",
+                    title="Python-разработчик",
+                    source_url="https://hh.ru/vacancy/question-after-invitation",
+                )
+            )
+            ApplicationRepository(session).create_apply_intent(
+                account.id,
+                vacancy.id,
+                resume.id,
+            )
+
+        with database.sessions.begin() as session:
+            service = HhSynchronizationService(session)
+            status_result = service.synchronize_statuses(
+                account_id=account.id,
+                statuses=(
+                    HhNegotiationData(
+                        vacancy.hh_id,
+                        HhNegotiationStatus.INVITED,
+                        "Приглашение на собеседование",
+                        True,
+                    ),
+                ),
+                checked_at=checked_at,
+            )
+            message_result = service.synchronize_messages(
+                account_id=account.id,
+                messages=(
+                    HhChatMessageData(
+                        vacancy_id=vacancy.hh_id,
+                        hh_id="question-message",
+                        direction=MessageDirection.INCOMING,
+                        body="Ответьте, пожалуйста, когда сможете приступить к работе.",
+                    ),
+                ),
+                checked_at=checked_at,
+            )
+
+            assert status_result["invitations"] == 1
+            assert message_result["attention"] == 1
+            invitations = CommunicationRepository(session).list_invitations_for_account(account.id)
+            assert len(invitations) == 2
+            assert {invitation.title for invitation in invitations} == {
+                "Приглашение на собеседование",
+                "Вопрос работодателя",
+            }
+            assert all(invitation.state is InvitationState.RECEIVED for invitation in invitations)
     finally:
         database.close()

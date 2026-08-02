@@ -23,6 +23,7 @@ from hugin.domain.applications import ApplicationState
 from hugin.domain.content import (
     IncidentSeverity,
     IncidentState,
+    InvitationState,
     MessageDirection,
     NotificationChannel,
 )
@@ -67,7 +68,10 @@ class NotificationService:
             select(InvitationModel.id, ApplicationModel.id, VacancyModel.title)
             .join(ApplicationModel, ApplicationModel.id == InvitationModel.application_id)
             .join(VacancyModel, VacancyModel.id == ApplicationModel.vacancy_id)
-            .where(ApplicationModel.account_id == account_id)
+            .where(
+                ApplicationModel.account_id == account_id,
+                InvitationModel.state != InvitationState.CLOSED,
+            )
         )
         for invitation_id, application_id, vacancy_title in invitations:
             created += self.enqueue_event(
