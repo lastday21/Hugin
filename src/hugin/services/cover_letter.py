@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import re
+from collections import Counter
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from html import escape
 from typing import Protocol
 
@@ -32,12 +34,14 @@ from hugin.domain.content import (
 )
 from hugin.domain.directions import VacancyState
 from hugin.domain.tasks import TaskState
+from hugin.domain.vacancies import VacancyAvailability
+from hugin.repositories.tasks import QueueTaskRepository
 from hugin.services.ai_prompts import AiPromptSettingsService, with_user_prompt
 from hugin.services.resume_improvement import ResumeBlockExtractor
 from hugin.services.vacancy_analysis import RULES_VERSION, RuleCategory
 
 PROMPT_PURPOSE = "cover_letter"
-PROMPT_VERSION = 15
+PROMPT_VERSION = 17
 INSTRUCTION_VERSION = CURRENT_COVER_LETTER_INSTRUCTION
 MANUAL_REVIEW_MODEL = "manual-review"
 MIN_LETTER_LENGTH = 350
@@ -76,15 +80,6 @@ _ALLOWED_FACT_CATEGORIES = {
     "courses",
     "education",
     "languages",
-}
-_CATEGORY_PRIORITY = {
-    "work_experience": 100,
-    "skills": 90,
-    "about": 70,
-    "desired_position": 60,
-    "courses": 35,
-    "education": 25,
-    "languages": 20,
 }
 _READY_TASK_STATES = (TaskState.PENDING, TaskState.RETRY_SCHEDULED)
 _SERVICE_PREFIXES = (
@@ -197,6 +192,9 @@ _CONTACT_LINE = re.compile(
 )
 _PHONE = re.compile(r"(?<!\d)(?:\+7|8)[\s()-]*\d{3}[\s()-]*\d{3}[\s()-]*\d{2}")
 _NUMBER = re.compile(r"\d+(?:[.,]\d+)?")
+_ALPHANUMERIC_NUMBER_TOKEN = re.compile(
+    r"(?<![\w.+#-])(?=[\w.+#-]*\d)(?=[\w.+#-]*[^\W\d_])[\w.+#-]+(?![\w.+#-])"
+)
 _WORD_NUMBER_YEARS = re.compile(
     r"\b(?:один|два|три|четыре|пять|шесть|семь|восемь|девять|десять)\s+"
     r"(?:год|года|лет)\b",
@@ -236,6 +234,12 @@ _RELEVANCE_STOP_WORDS = {
     "знание",
     "навыки",
 }
+_GENERIC_RELEVANCE_TERMS = _RELEVANCE_STOP_WORDS | {
+    "api",
+    "backend",
+    "python",
+    "rest",
+}
 _STRONG_RELEVANCE_TERMS = {
     "python",
     "fastapi",
@@ -254,6 +258,46 @@ _STRONG_RELEVANCE_TERMS = {
     "llm",
     "speechkit",
 }
+_DISTINCTIVE_RELEVANCE_TERMS = (_STRONG_RELEVANCE_TERMS - {"python"}) | {
+    "clickhouse",
+    "git",
+    "kubernetes",
+    "linux",
+    "mysql",
+    "rabbitmq",
+    "sql",
+    "sqlite",
+    "typescript",
+}
+_FACT_CATEGORY_BONUS = {
+    "work_experience": 12,
+    "education": 7,
+    "courses": 6,
+    "skills": 3,
+    "about": 1,
+    "languages": 1,
+    "desired_position": 0,
+}
+_SIMILARITY_STOP_WORDS = _GENERIC_RELEVANCE_TERMS | {
+    "буду",
+    "вашей",
+    "готов",
+    "готовы",
+    "задач",
+    "здравствуйте",
+    "команде",
+    "обсудить",
+    "подробнее",
+    "проект",
+    "проекта",
+    "решений",
+    "сейчас",
+    "также",
+}
+_MAX_SELECTED_FACTS = 2
+_MAX_SIMILAR_LETTERS = 100
+_NEAR_DUPLICATE_SIMILARITY = 0.75
+_HIGH_DUPLICATE_SIMILARITY = 0.92
 _CONTEXTUAL_DETAILS = (
     (
         re.compile(
@@ -346,19 +390,54 @@ _GROUNDED_CLAIMS = (
         re.compile(r"\b(?:в\s+проде|продакшн\w*|production)\b", re.IGNORECASE),
         "работа в промышленной среде не подтверждена фактами кандидата",
     ),
+    (
+        re.compile(r"\b(?:высок\w*\s+нагруз\w*|highload)\b", re.IGNORECASE),
+        re.compile(r"\b(?:высок\w*\s+нагруз\w*|highload)\b", re.IGNORECASE),
+        "работа под высокой нагрузкой не подтверждена фактами кандидата",
+    ),
+    (
+        re.compile(
+            r"\b(?:асинхрон\w*|async)\b[^.!?\n]{0,80}"
+            r"\b(?:баз\w*\s+данн\w*|бд|sqlalchemy|postgres\w*)\b",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"\b(?:асинхрон\w*|async)\b[^.!?\n]{0,80}"
+            r"\b(?:баз\w*\s+данн\w*|бд|sqlalchemy|postgres\w*)\b",
+            re.IGNORECASE,
+        ),
+        "асинхронная работа с базой данных не подтверждена фактами кандидата",
+    ),
 )
 _MANDATORY_LETTER_INPUT = re.compile(
     r"(?:"
+    r"как\s+откликнуться\s*:|"
+    r"(?:в|к)\s+(?:сопроводительном(?:\s+письме)?|отклике)"
+    r"\s*(?:коротко\s*)?[:—-]\s*(?:\d+[.)]|[•●▪-])|"
+    r"отклик\w*[^.!?\n]{0,80}(?:опиш\w*|укаж\w*|пришл\w*|добав\w*)"
+    r"[^.!?\n]{0,100}(?:именно|обязател\w*)|"
     r"в\s+(?:сопроводительном(?:\s+письме)?|отклике)"
     r"[\s\S]{0,60}?"
     r"(?:обязательн\w*|укажите|ответьте|напишите|расскажите)|"
     r"(?:сопроводительное\s+письмо|отклик)"
     r"[\s\S]{0,60}?"
     r"(?:долж\w+\s+содержать|без\s+(?:этих|обязательных)\s+пункт)|"
+    r"сопроводительн\w*\s+письм\w*[^.!?\n]{0,100}"
+    r"(?:ссылк\w*|портфолио|github|информац\w*\s+о\s+себе)|"
     r"(?:обязательно\s+)?(?:укажите|ответьте|напишите|расскажите)"
     r"[\s\S]{0,50}?"
     r"в\s+(?:сопроводительном(?:\s+письме)?|отклике)|"
+    r"при\s+отклик\w*[^.!?\n]{0,60}"
+    r"(?:укаж\w*|ответ\w*|напиш\w*|пришл\w*|добав\w*)|"
     r"без\s+ответ\w*[\s\S]{0,40}?отклик[\s\S]{0,30}?не\s+рассматри"
+    r")",
+    re.IGNORECASE,
+)
+_EXTERNAL_APPLICATION_FORM = re.compile(
+    r"(?:"
+    r"forms\.gle|docs\.google\.com/forms|"
+    r"(?:заполн\w*|пройд\w*)[^.!?\n]{0,80}"
+    r"(?:внешн\w*\s+)?(?:форм\w*|анкет\w*)"
     r")",
     re.IGNORECASE,
 )
@@ -368,6 +447,8 @@ _PERMANENT_PREPARATION_FAILURES = frozenset(
         "NO_RELEVANT_EVIDENCE",
     }
 )
+_AUTO_RETRY_FAILURE_PREFIX = "COVER_LETTER_RETRY_FAILED:"
+_AUTO_RETRY_ERROR_CODE = "COVER_LETTER_RETRY_FAILED"
 _ACTION_LINE = re.compile(
     r"\b(?:разработ|реализ|настро|интегр|автоматиз|созда|поддерж|проектир|тестир|"
     r"оптимиз|анализир|внедр)",
@@ -408,6 +489,31 @@ class CoverLetterValidationError(ValueError):
     def __init__(self, code: str, message: str) -> None:
         super().__init__(message)
         self.code = code
+
+
+def _is_permanent_preparation_failure(reason: str | None) -> bool:
+    return reason is not None and (
+        reason in _PERMANENT_PREPARATION_FAILURES or reason.startswith(_AUTO_RETRY_FAILURE_PREFIX)
+    )
+
+
+def _template_phrase_correction_prompt(
+    original_prompt: str,
+    error: CoverLetterValidationError,
+) -> str:
+    if error.code != "TEMPLATE_PHRASE":
+        raise ValueError("Исправляющий запрос допустим только для шаблонной фразы")
+    return (
+        f"{original_prompt.rstrip()}\n\n"
+        "<local_validation_correction>\n"
+        "Предыдущий вариант не прошёл локальную проверку и не был сохранён.\n"
+        f"Код проверки: {error.code}.\n"
+        f"Конкретная причина: {error}.\n"
+        "Напиши письмо заново. Не используй указанную фразу и другие шаблонные вводные. "
+        "Сохрани все требования точности, подтверждённости и связи с вакансией "
+        "из исходного запроса.\n"
+        "</local_validation_correction>"
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -469,10 +575,13 @@ class CoverLetterService:
         direction_name: str,
         limit: int = 20,
         vacancy_hh_id: str | None = None,
+        application_id: int | None = None,
         include_stretch: bool = True,
     ) -> CoverLetterPreparationResult:
         if limit < 1:
             raise ValueError("Количество писем должно быть положительным")
+        if application_id is not None and application_id < 1:
+            raise ValueError("Идентификатор отклика должен быть положительным")
         if self._model is None:
             raise RuntimeError("Для создания писем нужно настроить YandexGPT")
         direction = self._direction(account_id, direction_name)
@@ -486,10 +595,16 @@ class CoverLetterService:
             account_id,
             direction.id,
             vacancy_hh_id,
+            application_id,
             include_stretch=include_stretch,
         )
-        if vacancy_hh_id is not None and not candidates:
-            raise LookupError(f"Вакансия № {vacancy_hh_id} не найдена в готовой очереди")
+        if (vacancy_hh_id is not None or application_id is not None) and not candidates:
+            target = (
+                f"отклик № {application_id}"
+                if application_id is not None
+                else f"вакансия № {vacancy_hh_id}"
+            )
+            raise LookupError(f"{target.capitalize()} не найден в готовой очереди")
         for candidate in candidates:
             item = self._prepare_one(
                 candidate,
@@ -604,6 +719,11 @@ class CoverLetterService:
                     account_id,
                     application.direction_id,
                     vacancy.hh_id,
+                    task_states=(
+                        TaskState.PENDING,
+                        TaskState.RETRY_SCHEDULED,
+                        TaskState.REVIEW_REQUIRED,
+                    ),
                 )
                 if item.application.id == application.id
             ),
@@ -612,16 +732,32 @@ class CoverLetterService:
         if candidate is None:
             raise LookupError("Вакансия больше не находится в готовой очереди")
         facts = self._select_facts(candidate, application.direction_id)
-        validate_cover_letter(normalized, vacancy, facts)
-        if self._same_text_exists(vacancy, normalized):
+        used_facts = validate_cover_letter(
+            normalized,
+            vacancy,
+            facts,
+            allow_manual_input=True,
+        )
+        if self._conflicting_similar_text(
+            candidate,
+            normalized,
+            tuple(fact.id for fact in used_facts),
+        ):
             raise CoverLetterValidationError(
-                "DUPLICATE_TEXT",
-                "Такой текст уже используется для другой, не связанной вакансии",
+                "NEAR_DUPLICATE_TEXT",
+                "Письмо слишком похоже на текст для другой, не связанной вакансии",
             )
         letter.context_hash = self.current_context_hash(application.id)
         letter.model_name = MANUAL_REVIEW_MODEL
         letter.prompt_version_id = None
-        self._save_ready(letter, normalized, tuple(fact.id for fact in facts))
+        self._save_ready(letter, normalized, tuple(fact.id for fact in used_facts))
+        task = QueueTaskRepository(self._session).get_by_application_id(application.id)
+        if task is not None and task.state is TaskState.REVIEW_REQUIRED:
+            QueueTaskRepository(self._session).transition(
+                task.id,
+                TaskState.RETRY_SCHEDULED,
+                scheduled_at=datetime.now(UTC),
+            )
         return letter
 
     def validate_for_submission(
@@ -673,13 +809,49 @@ class CoverLetterService:
             raise ValueError(
                 "Письмо создано устаревшей версией инструкции и требует повторной подготовки"
             )
-        facts = self._select_facts(
+        selected_facts = self._select_facts(
             _Candidate(application, vacancy, resume, tracked),
             application.direction_id,
         )
-        validate_cover_letter(letter.text, vacancy, facts)
+        facts = self._linked_selected_facts(letter, selected_facts)
+        used_facts = validate_cover_letter(
+            letter.text,
+            vacancy,
+            facts,
+            allow_manual_input=letter.model_name == MANUAL_REVIEW_MODEL,
+        )
+        stored_fact_ids = set(self._stored_fact_ids(letter.id))
+        used_fact_ids = {fact.id for fact in used_facts}
+        if not stored_fact_ids and letter.model_name == MANUAL_REVIEW_MODEL:
+            self._replace_fact_links(letter.id, tuple(used_fact_ids))
+        elif used_fact_ids != stored_fact_ids:
+            raise ValueError("Журнал источников сопроводительного письма устарел")
         if letter.context_hash != self.current_context_hash(application.id):
             raise ValueError("Данные вакансии, правила или подтверждённые факты изменились")
+
+    def handle_stale_ready_letter(
+        self,
+        *,
+        application_id: int,
+        letter_id: int,
+    ) -> bool:
+        letter = self._session.scalar(
+            select(CoverLetterModel)
+            .where(
+                CoverLetterModel.id == letter_id,
+                CoverLetterModel.application_id == application_id,
+            )
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if letter is None:
+            raise LookupError("Устаревшее сопроводительное письмо не найдено")
+        if letter.state is not CoverLetterState.READY:
+            raise RuntimeError("Сопроводительное письмо уже изменило состояние")
+        if letter.model_name == MANUAL_REVIEW_MODEL:
+            return True
+        self._save_failed(letter, "COVER_LETTER_STALE")
+        return False
 
     def current_context_hash(self, application_id: int) -> str:
         row = self._session.execute(
@@ -754,7 +926,12 @@ class CoverLetterService:
                     "Утверждённое вручную письмо устарело и требует повторной проверки",
                 )
             try:
-                validate_cover_letter(letter.text, candidate.vacancy, facts)
+                validate_cover_letter(
+                    letter.text,
+                    candidate.vacancy,
+                    facts,
+                    allow_manual_input=True,
+                )
             except CoverLetterValidationError as error:
                 return self._item(
                     candidate,
@@ -780,11 +957,16 @@ class CoverLetterService:
         if (
             letter is not None
             and letter.state is CoverLetterState.FAILED
-            and letter.failure_reason in _PERMANENT_PREPARATION_FAILURES
+            and _is_permanent_preparation_failure(letter.failure_reason)
             and letter.context_hash == context_hash
             and letter.model_name == model.model_name
             and letter.prompt_version_id == prompt_version.id
         ):
+            assert letter.failure_reason is not None
+            self._mark_preparation_blocked(
+                candidate.application.id,
+                letter.failure_reason,
+            )
             return self._item(
                 candidate,
                 CoverLetterState.FAILED,
@@ -803,6 +985,7 @@ class CoverLetterService:
             _ensure_relevant_evidence(candidate.vacancy, facts)
         except CoverLetterValidationError as error:
             self._save_failed(letter, error.code)
+            self._mark_preparation_blocked(candidate.application.id, error.code)
             return self._item(
                 candidate,
                 CoverLetterState.FAILED,
@@ -826,22 +1009,61 @@ class CoverLetterService:
             )
             return self._item(candidate, CoverLetterState.READY, "reused")
 
+        correction_reason: str | None = None
         try:
-            text = normalize_cover_letter(model.complete(SYSTEM_PROMPT, user_prompt))
-            validate_cover_letter(text, candidate.vacancy, facts)
-            if self._same_text_exists(candidate.vacancy, text):
-                raise CoverLetterValidationError(
-                    "DUPLICATE_TEXT",
-                    "Такой текст уже создан для другой, не связанной вакансии",
-                )
-        except CoverLetterValidationError as error:
-            self._save_failed(letter, error.code)
-            return self._item(
+            text, used_facts = self._generate_validated_letter(
+                model,
+                user_prompt,
                 candidate,
-                CoverLetterState.FAILED,
-                "failed",
-                str(error),
+                facts,
             )
+        except CoverLetterValidationError as error:
+            if error.code != "TEMPLATE_PHRASE":
+                self._save_failed(letter, error.code)
+                return self._item(
+                    candidate,
+                    CoverLetterState.FAILED,
+                    "failed",
+                    str(error),
+                )
+            correction_reason = str(error)
+            correction_prompt = _template_phrase_correction_prompt(user_prompt, error)
+            try:
+                text, used_facts = self._generate_validated_letter(
+                    model,
+                    correction_prompt,
+                    candidate,
+                    facts,
+                )
+            except CoverLetterValidationError as retry_error:
+                failure_reason = f"{_AUTO_RETRY_FAILURE_PREFIX}{error.code}->{retry_error.code}"
+                self._save_failed(letter, failure_reason)
+                self._mark_preparation_blocked(
+                    candidate.application.id,
+                    failure_reason,
+                )
+                return self._item(
+                    candidate,
+                    CoverLetterState.FAILED,
+                    "failed",
+                    (
+                        f"Исправляющий повтор после причины «{error}» "
+                        f"не прошёл проверку: {retry_error}"
+                    ),
+                )
+            except YandexAIError:
+                failure_reason = f"{_AUTO_RETRY_FAILURE_PREFIX}{error.code}->YANDEXGPT_ERROR"
+                self._save_failed(letter, failure_reason)
+                self._mark_preparation_blocked(
+                    candidate.application.id,
+                    failure_reason,
+                )
+                return self._item(
+                    candidate,
+                    CoverLetterState.FAILED,
+                    "failed",
+                    "Исправляющий повтор не вернул допустимый текст",
+                )
         except YandexAIError:
             self._save_failed(letter, "YANDEXGPT_ERROR")
             return self._item(
@@ -851,8 +1073,33 @@ class CoverLetterService:
                 "YandexGPT не вернул допустимый текст",
             )
 
-        self._save_ready(letter, text, tuple(fact.id for fact in facts))
-        return self._item(candidate, CoverLetterState.READY, "generated")
+        self._save_ready(letter, text, tuple(fact.id for fact in used_facts))
+        reason = (
+            f"Исправлено после локальной проверки: {correction_reason}"
+            if correction_reason is not None
+            else None
+        )
+        return self._item(candidate, CoverLetterState.READY, "generated", reason)
+
+    def _generate_validated_letter(
+        self,
+        model: CoverLetterTextModel,
+        user_prompt: str,
+        candidate: _Candidate,
+        facts: tuple[_SelectedFact, ...],
+    ) -> tuple[str, tuple[_SelectedFact, ...]]:
+        text = normalize_cover_letter(model.complete(SYSTEM_PROMPT, user_prompt))
+        used_facts = validate_cover_letter(text, candidate.vacancy, facts)
+        if self._conflicting_similar_text(
+            candidate,
+            text,
+            tuple(fact.id for fact in used_facts),
+        ):
+            raise CoverLetterValidationError(
+                "NEAR_DUPLICATE_TEXT",
+                "Письмо слишком похоже на текст для другой, не связанной вакансии",
+            )
+        return text, used_facts
 
     def _direction(self, account_id: int, name: str) -> CareerDirectionModel:
         direction = self._session.scalar(
@@ -893,8 +1140,10 @@ class CoverLetterService:
         account_id: int,
         direction_id: int,
         vacancy_hh_id: str | None = None,
+        application_id: int | None = None,
         *,
         include_stretch: bool = True,
+        task_states: tuple[TaskState, ...] = _READY_TASK_STATES,
     ) -> tuple[_Candidate, ...]:
         statement = (
             select(
@@ -915,18 +1164,24 @@ class CoverLetterService:
                 ApplicationModel.account_id == account_id,
                 ApplicationModel.direction_id == direction_id,
                 ApplicationModel.state == ApplicationState.APPLYING,
-                ApplicationTaskModel.state.in_(_READY_TASK_STATES),
+                ApplicationTaskModel.state.in_(task_states),
+                VacancyModel.availability == VacancyAvailability.ACTIVE,
                 DirectionVacancyModel.state == VacancyState.QUEUED,
                 DirectionVacancyModel.rules_version == RULES_VERSION,
             )
         )
         if vacancy_hh_id is not None:
             statement = statement.where(VacancyModel.hh_id == vacancy_hh_id)
-        if not include_stretch:
-            statement = statement.where(
-                DirectionVacancyModel.rules_details["category"].as_string()
-                == RuleCategory.MATCH.value
-            )
+        if application_id is not None:
+            statement = statement.where(ApplicationModel.id == application_id)
+        allowed_categories = (
+            (RuleCategory.MATCH.value, RuleCategory.STRETCH.value)
+            if include_stretch
+            else (RuleCategory.MATCH.value,)
+        )
+        statement = statement.where(
+            DirectionVacancyModel.rules_details["category"].as_string().in_(allowed_categories)
+        )
         rows = self._session.execute(
             statement.order_by(
                 case((VacancyModel.duplicate_of_id.is_(None), 0), else_=1),
@@ -978,28 +1233,12 @@ class CoverLetterService:
                 "Подтвердите хотя бы блок опыта, проектов, курсов или образования",
             )
 
-        vacancy_tokens = _tokens(_vacancy_text(candidate.vacancy))
-        ranked = sorted(
-            facts,
-            key=lambda fact: (
-                -(
-                    _CATEGORY_PRIORITY.get(fact.category, 0)
-                    + 8 * len(vacancy_tokens & _tokens(fact.content))
-                ),
-                fact.id,
-            ),
-        )
-        selected: list[_SelectedFact] = []
-        seen_contents: set[tuple[str, str]] = set()
-        remaining = MAX_FACT_CONTEXT_LENGTH
         vacancy_text = _vacancy_text(candidate.vacancy)
-        for fact in ranked[:4]:
-            if remaining < 200:
-                break
-            per_fact_limit = min(
-                4500 if fact.category == "work_experience" else 2500,
-                remaining,
-            )
+        vacancy_tokens = _tokens(vacancy_text)
+        prepared: list[tuple[int, set[str], _SelectedFact]] = []
+        seen_contents: set[tuple[str, str]] = set()
+        for fact in facts:
+            per_fact_limit = 4500 if fact.category == "work_experience" else 2500
             safe_content = _without_contact_lines(fact.content)
             safe_content = _without_irrelevant_context_lines(
                 safe_content,
@@ -1017,13 +1256,57 @@ class CoverLetterService:
                     safe_content,
                     vacancy_tokens,
                     per_fact_limit,
+                    priority_tokens=_tokens(candidate.vacancy.title),
                 )
             else:
-                content = _relevant_excerpt(safe_content, vacancy_tokens, per_fact_limit)
+                content = _relevant_excerpt(
+                    safe_content,
+                    vacancy_tokens,
+                    per_fact_limit,
+                    minimal=True,
+                )
             if not content:
                 continue
-            selected.append(_SelectedFact(fact.id, fact.category, content))
-            remaining -= len(content)
+            overlap = _meaningful_overlap(vacancy_tokens, _tokens(content))
+            strong_overlap = overlap & _DISTINCTIVE_RELEVANCE_TERMS
+            score = (
+                12 * len(strong_overlap)
+                + 4 * len(overlap)
+                + _FACT_CATEGORY_BONUS.get(fact.category, 0)
+            )
+            prepared.append(
+                (
+                    score,
+                    overlap,
+                    _SelectedFact(fact.id, fact.category, content),
+                )
+            )
+
+        ranked = sorted(
+            prepared,
+            key=lambda item: (
+                -item[0],
+                -len(item[1]),
+                -_FACT_CATEGORY_BONUS.get(item[2].category, 0),
+                item[2].id,
+            ),
+        )
+        selected: list[_SelectedFact] = []
+        covered: set[str] = set()
+        remaining = MAX_FACT_CONTEXT_LENGTH
+        for _score, overlap, selected_fact in ranked:
+            if len(selected) >= _MAX_SELECTED_FACTS or remaining < 200:
+                break
+            novel = overlap - covered
+            if selected and not novel:
+                continue
+            if selected and not (novel & _DISTINCTIVE_RELEVANCE_TERMS) and len(novel) < 2:
+                continue
+            if len(selected_fact.content) > remaining:
+                continue
+            selected.append(selected_fact)
+            covered.update(overlap)
+            remaining -= len(selected_fact.content)
         if not selected:
             raise CoverLetterValidationError(
                 "NO_CONFIRMED_FACTS",
@@ -1111,20 +1394,89 @@ class CoverLetterService:
             and prompt_version.instruction_text == SYSTEM_PROMPT
         )
 
-    def _same_text_exists(self, vacancy: VacancyModel, text: str) -> bool:
-        rows = self._session.execute(
-            select(VacancyModel.id, VacancyModel.duplicate_of_id)
-            .join(ApplicationModel, ApplicationModel.vacancy_id == VacancyModel.id)
-            .join(CoverLetterModel, CoverLetterModel.application_id == ApplicationModel.id)
-            .where(
-                CoverLetterModel.text == text,
-                CoverLetterModel.state.in_((CoverLetterState.READY, CoverLetterState.SENT)),
+    def _stored_fact_ids(self, letter_id: int) -> tuple[int, ...]:
+        return tuple(
+            self._session.scalars(
+                select(CoverLetterFactModel.fact_id)
+                .where(CoverLetterFactModel.cover_letter_id == letter_id)
+                .order_by(CoverLetterFactModel.fact_id)
             )
         )
-        current_root = vacancy.duplicate_of_id or vacancy.id
-        return any(
-            (duplicate_of_id or vacancy_id) != current_root for vacancy_id, duplicate_of_id in rows
+
+    def _linked_selected_facts(
+        self,
+        letter: CoverLetterModel,
+        selected_facts: tuple[_SelectedFact, ...],
+    ) -> tuple[_SelectedFact, ...]:
+        stored_ids = set(self._stored_fact_ids(letter.id))
+        if not stored_ids and letter.model_name == MANUAL_REVIEW_MODEL:
+            return selected_facts
+        linked = tuple(fact for fact in selected_facts if fact.id in stored_ids)
+        if not stored_ids or {fact.id for fact in linked} != stored_ids:
+            raise ValueError("Подтверждённые источники сопроводительного письма устарели")
+        return linked
+
+    def _conflicting_similar_text(
+        self,
+        candidate: _Candidate,
+        text: str,
+        fact_ids: tuple[int, ...],
+    ) -> bool:
+        rows = tuple(
+            self._session.execute(
+                select(CoverLetterModel.id, CoverLetterModel.text, VacancyModel)
+                .join(
+                    ApplicationModel,
+                    ApplicationModel.id == CoverLetterModel.application_id,
+                )
+                .join(VacancyModel, VacancyModel.id == ApplicationModel.vacancy_id)
+                .where(
+                    ApplicationModel.account_id == candidate.application.account_id,
+                    ApplicationModel.resume_id == candidate.application.resume_id,
+                    ApplicationModel.id != candidate.application.id,
+                    CoverLetterModel.state.in_((CoverLetterState.READY, CoverLetterState.SENT)),
+                    CoverLetterModel.text.is_not(None),
+                )
+                .order_by(CoverLetterModel.id.desc())
+                .limit(_MAX_SIMILAR_LETTERS)
+            )
         )
+        if not rows:
+            return False
+        letter_ids = tuple(row[0] for row in rows)
+        linked_facts: dict[int, set[int]] = {}
+        for letter_id, fact_id in self._session.execute(
+            select(
+                CoverLetterFactModel.cover_letter_id,
+                CoverLetterFactModel.fact_id,
+            ).where(CoverLetterFactModel.cover_letter_id.in_(letter_ids))
+        ):
+            linked_facts.setdefault(letter_id, set()).add(fact_id)
+
+        current_root = candidate.vacancy.duplicate_of_id or candidate.vacancy.id
+        current_focus = _vacancy_focus_tokens(candidate.vacancy) - _GENERIC_RELEVANCE_TERMS
+        current_fact_ids = set(fact_ids)
+        text_tokens = _tokens(text)
+        for letter_id, previous_text, previous_vacancy in rows:
+            if not previous_text:
+                continue
+            previous_root = previous_vacancy.duplicate_of_id or previous_vacancy.id
+            if previous_root == current_root:
+                continue
+            similarity = _letter_similarity(text, previous_text)
+            if similarity >= _HIGH_DUPLICATE_SIMILARITY:
+                return True
+            if similarity < _NEAR_DUPLICATE_SIMILARITY:
+                continue
+            if not (current_fact_ids & linked_facts.get(letter_id, set())):
+                continue
+            previous_focus = _vacancy_focus_tokens(previous_vacancy) - _GENERIC_RELEVANCE_TERMS
+            focus_similarity = _set_similarity(current_focus, previous_focus)
+            unique_current = current_focus - previous_focus
+            unique_in_text = _matching_tokens(unique_current, text_tokens)
+            if focus_similarity < 0.55 and len(unique_in_text) < 2:
+                return True
+        return False
 
     def _save_ready(
         self,
@@ -1134,15 +1486,23 @@ class CoverLetterService:
         *,
         reused_from_id: int | None = None,
     ) -> None:
-        self._session.execute(
-            delete(CoverLetterFactModel).where(CoverLetterFactModel.cover_letter_id == letter.id)
-        )
-        for fact_id in dict.fromkeys(fact_ids):
-            self._session.add(CoverLetterFactModel(cover_letter_id=letter.id, fact_id=fact_id))
+        self._replace_fact_links(letter.id, fact_ids)
         letter.text = text
         letter.state = CoverLetterState.READY
         letter.failure_reason = None
         letter.reused_from_id = reused_from_id
+        self._session.flush()
+
+    def _replace_fact_links(
+        self,
+        letter_id: int,
+        fact_ids: tuple[int, ...],
+    ) -> None:
+        self._session.execute(
+            delete(CoverLetterFactModel).where(CoverLetterFactModel.cover_letter_id == letter_id)
+        )
+        for fact_id in dict.fromkeys(fact_ids):
+            self._session.add(CoverLetterFactModel(cover_letter_id=letter_id, fact_id=fact_id))
         self._session.flush()
 
     def _save_failed(self, letter: CoverLetterModel, reason: str) -> None:
@@ -1154,6 +1514,24 @@ class CoverLetterService:
         letter.failure_reason = reason[:512]
         letter.reused_from_id = None
         self._session.flush()
+
+    def _mark_preparation_blocked(self, application_id: int, reason: str) -> None:
+        if not _is_permanent_preparation_failure(reason):
+            return
+        tasks = QueueTaskRepository(self._session)
+        task = tasks.get_by_application_id(application_id)
+        if task is None or task.state not in _READY_TASK_STATES:
+            return
+        requires_review = reason == "MANUAL_INPUT_REQUIRED" or reason.startswith(
+            _AUTO_RETRY_FAILURE_PREFIX
+        )
+        tasks.transition(
+            task.id,
+            TaskState.REVIEW_REQUIRED if requires_review else TaskState.SKIPPED,
+            error_code=_AUTO_RETRY_ERROR_CODE
+            if reason.startswith(_AUTO_RETRY_FAILURE_PREFIX)
+            else reason,
+        )
 
     def _require_model(self) -> CoverLetterTextModel:
         if self._model is None:
@@ -1324,7 +1702,14 @@ def validate_cover_letter(
     text: str,
     vacancy: VacancyModel,
     facts: tuple[_SelectedFact, ...],
-) -> None:
+    *,
+    allow_manual_input: bool = False,
+) -> tuple[_SelectedFact, ...]:
+    _ensure_relevant_evidence(
+        vacancy,
+        facts,
+        allow_manual_input=allow_manual_input,
+    )
     if not text:
         raise CoverLetterValidationError("EMPTY", "YandexGPT вернул пустое письмо")
     if len(text) < 40:
@@ -1344,10 +1729,11 @@ def validate_cover_letter(
             "MISSING_GREETING",
             "Письмо не начинается с приветствия «Здравствуйте!»",
         )
-    if any(phrase in lowered for phrase in _TEMPLATE_PHRASES):
+    template_phrase = next((phrase for phrase in _TEMPLATE_PHRASES if phrase in lowered), None)
+    if template_phrase is not None:
         raise CoverLetterValidationError(
             "TEMPLATE_PHRASE",
-            "В письме осталась шаблонная вводная фраза",
+            f"В письме найдена запрещённая шаблонная фраза «{template_phrase}»",
         )
 
     fact_text = "\n".join(fact.content for fact in facts)
@@ -1380,7 +1766,29 @@ def validate_cover_letter(
     allowed_numbers = set(_NUMBER.findall(fact_text))
     allowed_numbers.update(_NUMBER.findall(vacancy.title))
     allowed_numbers.update(_NUMBER.findall(vacancy.employer_name or ""))
-    unexpected_numbers = set(_NUMBER.findall(text)) - allowed_numbers
+    vacancy_number_tokens = {
+        match.group(0).strip(".+#-").casefold()
+        for match in _ALPHANUMERIC_NUMBER_TOKEN.finditer(_vacancy_text(vacancy))
+    }
+    text_number_tokens = tuple(_ALPHANUMERIC_NUMBER_TOKEN.finditer(text))
+    unexpected_numbers: set[str] = set()
+    for number in _NUMBER.finditer(text):
+        if number.group(0) in allowed_numbers:
+            continue
+        containing_token = next(
+            (
+                token
+                for token in text_number_tokens
+                if token.start() <= number.start() and number.end() <= token.end()
+            ),
+            None,
+        )
+        if (
+            containing_token is not None
+            and containing_token.group(0).strip(".+#-").casefold() in vacancy_number_tokens
+        ):
+            continue
+        unexpected_numbers.add(number.group(0))
     if unexpected_numbers:
         raise CoverLetterValidationError(
             "UNCONFIRMED_NUMBER",
@@ -1408,6 +1816,26 @@ def validate_cover_letter(
             )
     if len(text) < MIN_LETTER_LENGTH:
         raise CoverLetterValidationError("TOO_SHORT", "Письмо получилось слишком коротким")
+    used_facts = _used_facts_for_text(text, facts)
+    if not used_facts:
+        raise CoverLetterValidationError(
+            "UNATTRIBUTED_CONTENT",
+            "В письме не найдено конкретного подтверждённого источника",
+        )
+    _ensure_relevant_evidence(
+        vacancy,
+        used_facts,
+        allow_manual_input=allow_manual_input,
+    )
+    has_checkable_focus = bool(_vacancy_focus_tokens(vacancy) - _GENERIC_RELEVANCE_TERMS)
+    if not _has_distinctive_vacancy_accent(text, vacancy, used_facts) and (
+        not allow_manual_input or has_checkable_focus
+    ):
+        raise CoverLetterValidationError(
+            "NO_VACANCY_FOCUS",
+            "Письмо не содержит отличительного подтверждённого акцента вакансии",
+        )
+    return used_facts
 
 
 def _vacancy_text(vacancy: VacancyModel) -> str:
@@ -1443,6 +1871,108 @@ def _shares_token(expected: set[str], actual: set[str]) -> bool:
             if len(left) >= 6 and len(right) >= 6 and left[:5] == right[:5]:
                 return True
     return False
+
+
+def _matching_tokens(expected: set[str], actual: set[str]) -> set[str]:
+    return {token for token in expected if _shares_token({token}, actual)}
+
+
+def _meaningful_overlap(vacancy_tokens: set[str], evidence_tokens: set[str]) -> set[str]:
+    return _matching_tokens(vacancy_tokens, evidence_tokens) - _GENERIC_RELEVANCE_TERMS
+
+
+def _vacancy_focus_tokens(vacancy: VacancyModel) -> set[str]:
+    structured_details = " ".join(
+        filter(
+            None,
+            (
+                vacancy.responsibilities,
+                vacancy.required_qualifications,
+                vacancy.preferred_qualifications,
+                " ".join(vacancy.key_skills),
+            ),
+        )
+    )
+    if structured_details:
+        return _tokens(f"{vacancy.title} {structured_details}")
+    return _tokens(f"{vacancy.title} {vacancy.description or ''}")
+
+
+def _used_facts_for_text(
+    text: str,
+    facts: tuple[_SelectedFact, ...],
+) -> tuple[_SelectedFact, ...]:
+    text_tokens = _tokens(text)
+    text_numbers = set(_NUMBER.findall(text))
+    covered_tokens: set[str] = set()
+    covered_technologies: set[str] = set()
+    covered_numbers: set[str] = set()
+    used: list[_SelectedFact] = []
+    for fact in facts:
+        fact_tokens = _tokens(fact.content)
+        shared_tokens = _matching_tokens(fact_tokens, text_tokens) - _GENERIC_RELEVANCE_TERMS
+        shared_technologies = {
+            name
+            for name, pattern in _TECHNOLOGY_PATTERNS
+            if name != "Python"
+            and pattern.search(fact.content) is not None
+            and pattern.search(text) is not None
+        }
+        shared_numbers = set(_NUMBER.findall(fact.content)) & text_numbers
+        novel_tokens = shared_tokens - covered_tokens
+        novel_technologies = shared_technologies - covered_technologies
+        novel_numbers = shared_numbers - covered_numbers
+        if not novel_technologies and not novel_numbers and len(novel_tokens) < 2:
+            continue
+        used.append(fact)
+        covered_tokens.update(shared_tokens)
+        covered_technologies.update(shared_technologies)
+        covered_numbers.update(shared_numbers)
+    return tuple(used)
+
+
+def _similarity_words(text: str) -> tuple[str, ...]:
+    words: list[str] = []
+    for token in _TOKEN.findall(text.replace("-", " ")):
+        normalized = token.casefold().strip(".")
+        if not normalized or normalized in _STOP_WORDS or normalized in _SIMILARITY_STOP_WORDS:
+            continue
+        if len(normalized) >= 8 and normalized.isalpha():
+            normalized = normalized[:6]
+        words.append(normalized)
+    return tuple(words)
+
+
+def _letter_similarity(left: str, right: str) -> float:
+    left_counts = Counter(_similarity_words(left))
+    right_counts = Counter(_similarity_words(right))
+    if not left_counts or not right_counts:
+        return 0.0
+    numerator = sum(
+        left_counts[token] * right_counts[token]
+        for token in left_counts.keys() & right_counts.keys()
+    )
+    left_length = sum(value * value for value in left_counts.values()) ** 0.5
+    right_length = sum(value * value for value in right_counts.values()) ** 0.5
+    return float(numerator / (left_length * right_length))
+
+
+def _set_similarity(left: set[str], right: set[str]) -> float:
+    if not left or not right:
+        return 0.0
+    return len(left & right) / len(left | right)
+
+
+def _has_distinctive_vacancy_accent(
+    text: str,
+    vacancy: VacancyModel,
+    facts: tuple[_SelectedFact, ...],
+) -> bool:
+    focus_tokens = _vacancy_focus_tokens(vacancy)
+    fact_tokens = _tokens("\n".join(fact.content for fact in facts))
+    confirmed_focus = _meaningful_overlap(focus_tokens, fact_tokens)
+    letter_focus = _matching_tokens(confirmed_focus, _tokens(text))
+    return bool(letter_focus & _DISTINCTIVE_RELEVANCE_TERMS) or len(letter_focus) >= 2
 
 
 def _relevant_excerpt(
@@ -1495,6 +2025,8 @@ def _work_experience_excerpt(
     content: str,
     vacancy_tokens: set[str],
     limit: int,
+    *,
+    priority_tokens: set[str] | None = None,
 ) -> str:
     content = _without_future_plans(content)
     try:
@@ -1502,9 +2034,12 @@ def _work_experience_excerpt(
     except ValueError:
         return _relevant_excerpt(content, vacancy_tokens, limit)
 
-    candidates: list[tuple[int, int, str]] = []
+    preferred = (priority_tokens or set()) - _RELEVANCE_STOP_WORDS
+    candidates: list[tuple[set[str], int, str]] = []
     for block in structure.blocks:
-        overlap = len(vacancy_tokens & _tokens(f"{block.label}\n{block.source_text}"))
+        overlap_tokens = (
+            vacancy_tokens & _tokens(f"{block.label}\n{block.source_text}")
+        ) - _RELEVANCE_STOP_WORDS
         label = block.label.rsplit(" — ", 1)[-1]
         rendered = (
             f'<experience_item type="{escape(block.kind.value)}" '
@@ -1512,25 +2047,42 @@ def _work_experience_excerpt(
             f"{block.source_text}\n"
             "</experience_item>"
         )
-        candidates.append((overlap, block.index, rendered))
+        candidates.append((overlap_tokens, block.index, rendered))
 
-    ranked = sorted(candidates, key=lambda item: (-item[0], item[1]))
     selected: list[str] = []
     used = 0
-    strongest_overlap = ranked[0][0] if ranked else 0
-    for overlap, _index, rendered in ranked:
-        if selected and overlap == 0:
+    covered: set[str] = set()
+    remaining = list(candidates)
+    while remaining and len(selected) < 2:
+        ranked = sorted(
+            remaining,
+            key=lambda item: (
+                -len((item[0] - covered) & preferred),
+                -len((item[0] - covered) & _STRONG_RELEVANCE_TERMS),
+                -len(item[0] - covered),
+                -len(item[0]),
+                item[1],
+            ),
+        )
+        overlap_tokens, _index, rendered = ranked[0]
+        remaining.remove(ranked[0])
+        novel = overlap_tokens - covered
+        if selected and not novel:
             continue
-        if selected and overlap * 3 < strongest_overlap:
+        if (
+            selected
+            and not (novel & preferred)
+            and not (novel & _STRONG_RELEVANCE_TERMS)
+            and len(novel) * 3 < len(covered)
+        ):
             continue
         if used + len(rendered) + 2 > limit:
             continue
         selected.append(rendered)
+        covered.update(overlap_tokens)
         used += len(rendered) + 2
-        if len(selected) >= 2:
-            break
     if not selected:
-        for _overlap, _index, rendered in ranked:
+        for _overlap_tokens, _index, rendered in candidates:
             if len(rendered) <= limit:
                 selected.append(rendered)
                 break
@@ -1578,37 +2130,34 @@ def _without_future_plans(content: str) -> str:
 def _ensure_relevant_evidence(
     vacancy: VacancyModel,
     facts: tuple[_SelectedFact, ...],
+    *,
+    allow_manual_input: bool = False,
 ) -> None:
-    if _MANDATORY_LETTER_INPUT.search(_vacancy_text(vacancy)) is not None:
+    vacancy_text = _vacancy_text(vacancy)
+    if _EXTERNAL_APPLICATION_FORM.search(vacancy_text) is not None or (
+        not allow_manual_input and _MANDATORY_LETTER_INPUT.search(vacancy_text) is not None
+    ):
         raise CoverLetterValidationError(
             "MANUAL_INPUT_REQUIRED",
             "Работодатель требует отдельные ответы в отклике; нужна ручная проверка, "
             "модель не вызывалась",
         )
-    fact_tokens = _tokens("\n".join(fact.content for fact in facts))
-    title_tokens = _tokens(vacancy.title)
-    structured_focus = (
-        " ".join(vacancy.key_skills),
-        vacancy.required_qualifications,
-        vacancy.responsibilities,
+    narrative_facts = tuple(
+        fact
+        for fact in facts
+        if fact.category in {"work_experience", "about", "courses", "education"}
     )
-    focus_tokens = _tokens(
-        " ".join(
-            filter(
-                None,
-                (
-                    vacancy.title,
-                    *structured_focus,
-                    vacancy.description if not any(structured_focus) else None,
-                ),
-            )
+    if not narrative_facts:
+        raise CoverLetterValidationError(
+            "NO_RELEVANT_EVIDENCE",
+            "Для письма нет подтверждённого действия, проекта или образования",
         )
-    )
-    overlap = (focus_tokens & fact_tokens) - _RELEVANCE_STOP_WORDS
-    strong_overlap = overlap & _STRONG_RELEVANCE_TERMS
-    if "python" in title_tokens and "python" in fact_tokens:
+    focus_tokens = _vacancy_focus_tokens(vacancy)
+    if allow_manual_input and not (focus_tokens - _GENERIC_RELEVANCE_TERMS):
         return
-    if strong_overlap or len(overlap) >= 2:
+    narrative_tokens = _tokens("\n".join(fact.content for fact in narrative_facts))
+    overlap = _meaningful_overlap(focus_tokens, narrative_tokens)
+    if overlap & _DISTINCTIVE_RELEVANCE_TERMS or len(overlap) >= 2:
         return
     raise CoverLetterValidationError(
         "NO_RELEVANT_EVIDENCE",
