@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 
 from hugin.core.settings import Settings
 from hugin.database import create_database, upgrade_database
-from hugin.database.models import SystemStateModel
+from hugin.database.models import ApplicationModel, SystemStateModel, VacancyModel
 from hugin.domain import (
     ApplicationEventType,
     ApplicationNotFoundError,
@@ -18,6 +18,7 @@ from hugin.domain import (
     SystemStateNotFoundError,
     TaskNotFoundError,
     TaskState,
+    VacancyAvailability,
     VacancyData,
 )
 from hugin.repositories import (
@@ -27,6 +28,10 @@ from hugin.repositories import (
     ResumeRepository,
     SystemStateRepository,
     VacancyRepository,
+)
+from hugin.repositories.tasks import (
+    FORM_PREFLIGHT_INTERRUPTED,
+    FORM_PREFLIGHT_RUNNING,
 )
 from hugin.services import ApplicationAutomationService, QueueService
 
@@ -286,6 +291,91 @@ def test_running_task_is_recovered_without_automatic_retry(settings: Settings) -
             event = ApplicationRepository(session).list_events(application_id)[-1]
             assert event.event_type is ApplicationEventType.UNKNOWN_RESULT
             assert event.payload["recovery"] == "startup"
+    finally:
+        database.close()
+
+
+def test_interrupted_form_preflight_is_retried_without_unknown_result(
+    settings: Settings,
+) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    now = datetime(2026, 7, 22, 12, 0, tzinfo=UTC)
+
+    try:
+        with database.sessions.begin() as session:
+            application_id = create_application(session, "preflight", "resume-preflight")
+            repository = QueueTaskRepository(session)
+            task = repository.enqueue(application_id, 50, now)
+            SystemStateRepository(session).transition(SystemState.RUNNING)
+            claimed = repository.claim_next(
+                now,
+                running_error_code=FORM_PREFLIGHT_RUNNING,
+            )
+            assert claimed is not None
+            assert claimed.last_error_code == FORM_PREFLIGHT_RUNNING
+
+            assert ApplicationAutomationService(session).recover_interrupted() == 1
+            recovered = repository.get(task.id)
+
+            assert recovered.state is TaskState.RETRY_SCHEDULED
+            assert recovered.last_error_code == FORM_PREFLIGHT_INTERRUPTED
+            assert recovered.scheduled_at >= now
+            assert SystemStateRepository(session).get().state is SystemState.RUNNING
+            assert not any(
+                event.event_type is ApplicationEventType.UNKNOWN_RESULT
+                for event in ApplicationRepository(session).list_events(application_id)
+            )
+            actual_claim = repository.claim_next(recovered.scheduled_at)
+            assert actual_claim is not None
+            assert actual_claim.last_error_code is None
+    finally:
+        database.close()
+
+
+def test_interrupted_form_preflight_closes_when_vacancy_is_already_closed(
+    settings: Settings,
+) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    now = datetime(2026, 7, 22, 12, 0, tzinfo=UTC)
+
+    try:
+        with database.sessions.begin() as session:
+            application_id = create_application(
+                session,
+                "preflight-closed",
+                "resume-preflight-closed",
+            )
+            repository = QueueTaskRepository(session)
+            task = repository.enqueue(application_id, 50, now)
+            SystemStateRepository(session).transition(SystemState.RUNNING)
+            assert (
+                repository.claim_next(
+                    now,
+                    running_error_code=FORM_PREFLIGHT_RUNNING,
+                )
+                is not None
+            )
+            application = session.get(ApplicationModel, application_id)
+            assert application is not None
+            vacancy = session.get(VacancyModel, application.vacancy_id)
+            assert vacancy is not None
+            vacancy.availability = VacancyAvailability.CLOSED
+            session.flush()
+
+            assert ApplicationAutomationService(session).recover_interrupted() == 1
+
+            assert repository.get(task.id).state is TaskState.SKIPPED
+            assert repository.get(task.id).last_error_code == "VACANCY_CLOSED"
+            assert (
+                ApplicationRepository(session).get(application_id).state is ApplicationState.CLOSED
+            )
+            assert SystemStateRepository(session).get().state is SystemState.RUNNING
+            assert not any(
+                event.event_type is ApplicationEventType.UNKNOWN_RESULT
+                for event in ApplicationRepository(session).list_events(application_id)
+            )
     finally:
         database.close()
 

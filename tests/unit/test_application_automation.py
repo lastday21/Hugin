@@ -4,13 +4,14 @@ import hashlib
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from sqlalchemy import delete
+from sqlalchemy import delete, select
 
 from hugin.core.settings import Settings
 from hugin.database import create_database, upgrade_database
 from hugin.database.models import (
     ApplicationEventModel,
     CandidateProfileModel,
+    CoverLetterFactModel,
     CoverLetterModel,
     DirectionVacancyModel,
     ResumeModel,
@@ -25,6 +26,7 @@ from hugin.domain import (
     ReconciliationStatus,
     SystemState,
     TaskState,
+    VacancyAvailability,
     VacancyData,
 )
 from hugin.domain.content import (
@@ -43,13 +45,21 @@ from hugin.repositories import (
     SystemStateRepository,
     VacancyRepository,
 )
+from hugin.repositories.tasks import (
+    FORM_PREFLIGHT_PASSED,
+    FORM_PREFLIGHT_RUNNING,
+)
 from hugin.services.ai_prompts import DEFAULT_AI_PROMPTS
 from hugin.services.application_automation import ApplicationAutomationService
 from hugin.services.application_reconciliation import ApplicationReconciliationService
 from hugin.services.cover_letter import MANUAL_REVIEW_MODEL, CoverLetterService
 from hugin.services.hh_sync import HhSynchronizationService
 from hugin.services.queue import QueueService
-from hugin.services.vacancy_analysis import RULES_VERSION
+from hugin.services.vacancy_analysis import (
+    RULES_VERSION,
+    RuleCategory,
+    VacancyAnalysisService,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -64,6 +74,204 @@ def _supervised_letter() -> str:
         "целостность данных и проверять поведение службы перед выпуском.\n\n"
         "Готов подробнее рассказать про выполненные задачи и обсудить задачи команды."
     )
+
+
+def test_form_preflight_claims_only_task_without_current_letter(
+    settings: Settings,
+) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    now = datetime.now(UTC)
+
+    try:
+        with database.sessions.begin() as session:
+            account = AccountRepository(session).create("Иван", "preflight-account")
+            resume = ResumeRepository(session).upsert(
+                account.id,
+                "preflight-resume",
+                "Python backend",
+            )
+            directions = DirectionRepository(session)
+            direction = directions.create(account.id, "Python backend")
+            directions.attach_resume(direction.id, resume.id)
+            vacancy = VacancyRepository(session).upsert(
+                VacancyData(
+                    "preflight-vacancy",
+                    "Python backend",
+                    "https://hh.ru/vacancy/preflight-vacancy",
+                )
+            )
+            directions.track_vacancy(direction.id, vacancy.id)
+            directions.apply_rules(
+                direction.id,
+                vacancy.id,
+                state=VacancyState.QUEUED,
+                score=90,
+                details={"category": "MATCH", "accepted": True},
+                rules_version=RULES_VERSION,
+            )
+            application = ApplicationRepository(session).create_apply_intent(
+                account.id,
+                vacancy.id,
+                resume.id,
+                direction.id,
+            )
+            task = QueueTaskRepository(session).enqueue(application.id, 90, now)
+            SystemStateRepository(session).transition(SystemState.RUNNING)
+            service = ApplicationAutomationService(session)
+
+            job = service.claim_next_form_preflight(account_id=account.id, now=now)
+
+            assert job is not None
+            assert job.task.id == task.id
+            assert job.cover_letter is None
+            assert job.task.last_error_code == FORM_PREFLIGHT_RUNNING
+            service.release_form_preflight(job, now=now)
+            released = QueueTaskRepository(session).get(task.id)
+            assert released.state is TaskState.RETRY_SCHEDULED
+            assert released.last_error_code == FORM_PREFLIGHT_PASSED
+
+            session.add(
+                CoverLetterModel(
+                    application_id=application.id,
+                    vacancy_id=vacancy.id,
+                    direction_id=direction.id,
+                    resume_id=resume.id,
+                    text="Здравствуйте!\n\nПроверенное письмо.",  # noqa: RUF001
+                    instruction_version=cover_letter_instruction_version(
+                        DEFAULT_AI_PROMPTS.cover_letter
+                    ),
+                    model_name=MANUAL_REVIEW_MODEL,
+                    state=CoverLetterState.READY,
+                )
+            )
+            session.flush()
+
+            assert service.claim_next_form_preflight(account_id=account.id, now=now) is None
+            assert QueueTaskRepository(session).get(task.id).state is TaskState.RETRY_SCHEDULED
+
+            closed_vacancy = VacancyRepository(session).upsert(
+                VacancyData(
+                    "preflight-closed",
+                    "Python backend",
+                    "https://hh.ru/vacancy/preflight-closed",
+                )
+            )
+            directions.track_vacancy(direction.id, closed_vacancy.id)
+            directions.apply_rules(
+                direction.id,
+                closed_vacancy.id,
+                state=VacancyState.QUEUED,
+                score=89,
+                details={"category": "MATCH", "accepted": True},
+                rules_version=RULES_VERSION,
+            )
+            closed_application = ApplicationRepository(session).create_apply_intent(
+                account.id,
+                closed_vacancy.id,
+                resume.id,
+                direction.id,
+            )
+            closed_task = QueueTaskRepository(session).enqueue(
+                closed_application.id,
+                89,
+                now,
+            )
+            closed_job = service.claim_next_form_preflight(
+                account_id=account.id,
+                now=now,
+            )
+            assert closed_job is not None
+
+            recorded = service.record_result(
+                closed_job,
+                HhApplyResult(
+                    HhApplyStatus.VACANCY_CLOSED,
+                    closed_job.vacancy.source_url,
+                ),
+                now=now,
+            )
+
+            assert not recorded.sent
+            assert (
+                ApplicationRepository(session).get(closed_application.id).state
+                is ApplicationState.CLOSED
+            )
+            assert QueueTaskRepository(session).get(closed_task.id).state is TaskState.SKIPPED
+    finally:
+        database.close()
+
+
+def test_supervised_form_preflight_claims_exact_task_while_paused(
+    settings: Settings,
+) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    now = datetime.now(UTC)
+
+    try:
+        with database.sessions.begin() as session:
+            account = AccountRepository(session).create(
+                "Иван",
+                "supervised-preflight-account",
+            )
+            resume = ResumeRepository(session).upsert(
+                account.id,
+                "supervised-preflight-resume",
+                "Python backend",
+            )
+            directions = DirectionRepository(session)
+            direction = directions.create(account.id, "Python backend")
+            directions.attach_resume(direction.id, resume.id)
+            vacancy = VacancyRepository(session).upsert(
+                VacancyData(
+                    "supervised-preflight-vacancy",
+                    "Python backend",
+                    "https://hh.ru/vacancy/supervised-preflight-vacancy",
+                )
+            )
+            directions.track_vacancy(direction.id, vacancy.id)
+            directions.apply_rules(
+                direction.id,
+                vacancy.id,
+                state=VacancyState.QUEUED,
+                score=91,
+                details={"category": "MATCH", "accepted": True},
+                rules_version=RULES_VERSION,
+            )
+            application = ApplicationRepository(session).create_apply_intent(
+                account.id,
+                vacancy.id,
+                resume.id,
+                direction.id,
+            )
+            task = QueueTaskRepository(session).enqueue(application.id, 91, now)
+            service = ApplicationAutomationService(session)
+
+            job = service.claim_supervised_form_preflight(
+                account_id=account.id,
+                task_id=task.id,
+                now=now,
+            )
+
+            assert job.task.id == task.id
+            assert job.vacancy.hh_id == "supervised-preflight-vacancy"
+            assert job.cover_letter is None
+            assert job.task.last_error_code == FORM_PREFLIGHT_RUNNING
+            service.release_form_preflight(job, now=now)
+            released = QueueTaskRepository(session).get(task.id)
+            assert released.state is TaskState.RETRY_SCHEDULED
+            assert released.last_error_code == FORM_PREFLIGHT_PASSED
+
+            SystemStateRepository(session).transition(SystemState.RUNNING)
+            with pytest.raises(RuntimeError, match="поставьте отправку откликов на паузу"):
+                service.claim_supervised_form_preflight(
+                    account_id=account.id,
+                    task_id=task.id,
+                    now=now,
+                )
+    finally:
+        database.close()
 
 
 def test_automation_prepares_claims_and_records_results(settings: Settings) -> None:
@@ -289,6 +497,16 @@ def test_automation_prepares_claims_and_records_results(settings: Settings) -> N
                 is ApplicationState.CLOSED
             )
             assert QueueTaskRepository(session).get(closed_job.task.id).state is TaskState.SKIPPED
+            assert (
+                VacancyRepository(session).get(closed_vacancy.id).availability
+                is VacancyAvailability.CLOSED
+            )
+            assert (
+                DirectionRepository(session)
+                .get_tracked_vacancy(direction.id, closed_vacancy.id)
+                .state
+                is VacancyState.CLOSED
+            )
 
             auth_vacancy = vacancies.upsert(
                 VacancyData("500", "Protected Python role", "https://hh.ru/vacancy/500")
@@ -453,6 +671,84 @@ def test_rule_change_skips_and_can_restore_pending_task(settings: Settings) -> N
         database.close()
 
 
+def test_reanalysis_skips_pending_task_for_vacancy_older_than_thirty_days(
+    settings: Settings,
+) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    now = datetime.now(UTC)
+
+    try:
+        with database.sessions.begin() as session:
+            account = AccountRepository(session).create("Иван", "old-vacancy-account")
+            resume = ResumeRepository(session).upsert(
+                account.id,
+                "old-vacancy-resume",
+                "Python backend",
+            )
+            directions = DirectionRepository(session)
+            direction = directions.create(account.id, "Python backend")
+            directions.attach_resume(direction.id, resume.id)
+            vacancy = VacancyRepository(session).upsert(
+                VacancyData(
+                    "old-vacancy",
+                    "Python backend разработчик",
+                    "https://hh.ru/vacancy/old-vacancy",
+                    published_at=now - timedelta(days=31),
+                    description="Разработка backend-службы на Python и FastAPI",
+                    key_skills=("Python", "FastAPI", "PostgreSQL"),
+                    details_fetched_at=now,
+                )
+            )
+            directions.track_vacancy(direction.id, vacancy.id)
+            directions.apply_rules(
+                direction.id,
+                vacancy.id,
+                state=VacancyState.ANALYZED,
+                score=80,
+                details={"category": "MATCH", "accepted": True},
+                rules_version=RULES_VERSION,
+            )
+            applications = ApplicationAutomationService(session)
+            assert (
+                applications.prepare_for_account_id(
+                    account_id=account.id,
+                    direction_name=direction.name,
+                    include_stretch=False,
+                ).created
+                == 1
+            )
+            application = ApplicationRepository(session).get_by_key(
+                account.id,
+                vacancy.id,
+                resume.id,
+            )
+            assert application is not None
+            task = QueueTaskRepository(session).get_by_application_id(application.id)
+            assert task is not None
+            assert task.state is TaskState.PENDING
+
+            analyzed = VacancyAnalysisService(session).reanalyze(
+                account_external_id=account.external_id or "",
+                direction_name=direction.name,
+            )
+            applications.prepare_for_account_id(
+                account_id=account.id,
+                direction_name=direction.name,
+                include_stretch=False,
+            )
+
+            assert len(analyzed) == 1
+            assert analyzed[0].evaluation.category is RuleCategory.REJECTED
+            assert analyzed[0].state is VacancyState.FILTERED_OUT
+            assert analyzed[0].vacancy.availability is VacancyAvailability.ACTIVE
+            skipped = QueueTaskRepository(session).get(task.id)
+            assert skipped.state is TaskState.SKIPPED
+            assert skipped.last_error_code == "VACANCY_RULES_CHANGED"
+    finally:
+        database.close()
+
+
 def test_review_claim_is_allowed_only_while_queue_is_paused(settings: Settings) -> None:
     upgrade_database(settings)
     database = create_database(settings)
@@ -495,6 +791,11 @@ def test_background_claim_and_submit_guard_require_the_same_current_letter(
                     "background-vacancy",
                     "Python backend",
                     "https://hh.ru/vacancy/background-vacancy",
+                    description=(
+                        "Разработка серверных приложений на Python, прикладной логики, "
+                        "обработки ошибок и контроля целостности данных."
+                    ),
+                    key_skills=("Python",),
                 )
             )
             directions.track_vacancy(direction.id, vacancy.id)
@@ -553,6 +854,10 @@ def test_background_claim_and_submit_guard_require_the_same_current_letter(
             )
             session.add(letter)
             session.flush()
+            fact_id = session.scalar(select(VerifiedFactModel.id).limit(1))
+            assert fact_id is not None
+            session.add(CoverLetterFactModel(cover_letter_id=letter.id, fact_id=fact_id))
+            letter.reused_from_id = letter.id
             letter.context_hash = CoverLetterService(session).current_context_hash(application.id)
             session.flush()
 
@@ -562,8 +867,29 @@ def test_background_claim_and_submit_guard_require_the_same_current_letter(
             stale_task = QueueTaskRepository(session).get(task.id)
             assert stale_task.state is TaskState.RETRY_SCHEDULED
             assert stale_task.last_error_code == "COVER_LETTER_STALE"
+            assert letter.state is CoverLetterState.FAILED
+            assert letter.text is None
+            assert letter.failure_reason == "COVER_LETTER_STALE"
+            assert letter.reused_from_id is None
+            assert (
+                session.scalar(
+                    select(CoverLetterFactModel.fact_id).where(
+                        CoverLetterFactModel.cover_letter_id == letter.id
+                    )
+                )
+                is None
+            )
+            assert ApplicationAutomationService(session).recover_interrupted() == 0
+            preflight = service.claim_next_form_preflight(account_id=account.id)
+            assert preflight is not None
+            assert preflight.application.id == application.id
+            service.release_form_preflight(preflight)
 
             letter.model_name = MANUAL_REVIEW_MODEL
+            letter.state = CoverLetterState.READY
+            letter.text = text
+            letter.failure_reason = None
+            letter.context_hash = CoverLetterService(session).current_context_hash(application.id)
             session.flush()
             job = service.claim_next(require_cover_letter=True)
             assert job is not None
@@ -602,6 +928,28 @@ def test_background_claim_and_submit_guard_require_the_same_current_letter(
                 resume_hh_id=resume.hh_id,
                 resume_title=resume.title,
             )
+
+            tracking.rules_details = {"category": "REJECTED", "accepted": False}
+            letter.context_hash = CoverLetterService(session).current_context_hash(application.id)
+            session.flush()
+            assert not service.background_submission_is_allowed(
+                task.id,
+                letter_id=letter.id,
+                letter_sha256=job.cover_letter_sha256,
+                resume_hh_id=resume.hh_id,
+                resume_title=resume.title,
+            )
+
+            tracking.rules_details = {"category": "MATCH", "accepted": True}
+            service.release_after_preview(job)
+            letter.context_hash = "0" * 64
+            session.flush()
+            assert service.claim_next(require_cover_letter=True) is None
+            manual_task = QueueTaskRepository(session).get(task.id)
+            assert manual_task.state is TaskState.REVIEW_REQUIRED
+            assert manual_task.last_error_code == "COVER_LETTER_STALE"
+            assert letter.state is CoverLetterState.READY
+            assert letter.text == text
     finally:
         database.close()
 
@@ -627,6 +975,11 @@ def test_supervised_claim_requires_exact_letter_and_excludes_worker(
                     "supervised-vacancy",
                     "Python backend",
                     "https://hh.ru/vacancy/supervised-vacancy",
+                    description=(
+                        "Разработка серверных приложений на Python, прикладной логики, "
+                        "обработки ошибок и контроля целостности данных."
+                    ),
+                    key_skills=("Python",),
                 )
             )
             directions.track_vacancy(direction.id, vacancy.id)

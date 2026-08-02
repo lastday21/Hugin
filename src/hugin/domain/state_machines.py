@@ -24,7 +24,7 @@ APPLICATION_TRANSITIONS: dict[ApplicationState, frozenset[ApplicationState]] = {
 }
 
 TASK_TRANSITIONS: dict[TaskState, frozenset[TaskState]] = {
-    TaskState.PENDING: frozenset({TaskState.RUNNING, TaskState.SKIPPED}),
+    TaskState.PENDING: frozenset({TaskState.RUNNING, TaskState.REVIEW_REQUIRED, TaskState.SKIPPED}),
     TaskState.RUNNING: frozenset(
         {
             TaskState.COMPLETED,
@@ -35,7 +35,9 @@ TASK_TRANSITIONS: dict[TaskState, frozenset[TaskState]] = {
             TaskState.UNKNOWN_RESULT,
         }
     ),
-    TaskState.RETRY_SCHEDULED: frozenset({TaskState.RUNNING, TaskState.SKIPPED}),
+    TaskState.RETRY_SCHEDULED: frozenset(
+        {TaskState.RUNNING, TaskState.REVIEW_REQUIRED, TaskState.SKIPPED}
+    ),
     TaskState.REVIEW_REQUIRED: frozenset({TaskState.RETRY_SCHEDULED, TaskState.SKIPPED}),
     TaskState.INPUT_REQUIRED: frozenset({TaskState.REVIEW_REQUIRED, TaskState.SKIPPED}),
     TaskState.UNKNOWN_RESULT: frozenset(

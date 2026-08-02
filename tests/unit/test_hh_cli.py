@@ -1126,6 +1126,141 @@ def test_apply_keeps_queue_available_when_one_result_is_unknown(
     assert hh_cli.run(["apply", "--direction", "Python backend", "--limit", "1", "--send"]) == 0
 
 
+def test_supervised_preflight_checks_exact_task_without_letter_or_submission(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    settings = Settings(environment="test", data_dir=tmp_path)
+    database = FakeDatabase()
+    job = SimpleNamespace(
+        task=SimpleNamespace(id=40),
+        application=SimpleNamespace(id=50),
+        vacancy=SimpleNamespace(
+            hh_id="100",
+            title="Python-разработчик",
+            source_url="https://hh.ru/vacancy/100",
+        ),
+        resume=SimpleNamespace(
+            id=60,
+            hh_id="resume-1",
+            title="Python-разработчик",
+        ),
+        direction_vacancy=SimpleNamespace(rules_version="python_it_v26"),
+    )
+    released: list[object] = []
+
+    class FakeAutomationService:
+        def __init__(self, session: object) -> None:
+            pass
+
+        def claim_supervised_form_preflight(self, **kwargs: object) -> SimpleNamespace:
+            assert kwargs == {
+                "account_id": 1,
+                "task_id": 40,
+                "include_stretch": False,
+            }
+            return job
+
+        def release_form_preflight(self, selected_job: object) -> None:
+            assert selected_job is job
+            released.append(selected_job)
+
+    monkeypatch.setattr(hh_cli, "upgrade_database", lambda selected: None)
+    monkeypatch.setattr(hh_cli, "create_database", lambda selected: database)
+    monkeypatch.setattr(
+        hh_cli,
+        "HhProfileSyncService",
+        lambda session: SimpleNamespace(
+            synchronize=lambda profile: SimpleNamespace(account=SimpleNamespace(id=1))
+        ),
+    )
+    monkeypatch.setattr(hh_cli, "ApplicationAutomationService", FakeAutomationService)
+    browser = FakeBrowser(
+        tmp_path / "profile",
+        "https://hh.ru/login",
+        "https://hh.ru/resumes",
+        "https://hh.ru/search",
+        60_000,
+    )
+    arguments = argparse.Namespace(
+        account_id=1,
+        task_id=40,
+        include_stretch=False,
+    )
+
+    assert (
+        hh_cli._run_supervised_form_preflight(
+            arguments,
+            settings,
+            cast(VisibleHhBrowser, browser),
+            browser.read_profile(),
+        )
+        == 0
+    )
+    assert released == [job]
+    assert browser.application_submit_modes == [False]
+    assert browser.applications == [
+        (
+            "https://hh.ru/vacancy/100",
+            "Python-разработчик",
+            "",
+        )
+    ]
+    entries = [
+        entry
+        for entry in OperationJournal(tmp_path).entries(component="applications")
+        if entry["event"] == "supervised.form_preflight"
+    ]
+    assert [entry["status"] for entry in entries] == ["started", "completed"]
+    assert entries[-1]["details"]["sent"] is False
+
+
+def test_supervised_preflight_rejects_another_hh_account(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    settings = Settings(environment="test", data_dir=tmp_path)
+    database = FakeDatabase()
+    monkeypatch.setattr(hh_cli, "upgrade_database", lambda selected: None)
+    monkeypatch.setattr(hh_cli, "create_database", lambda selected: database)
+    monkeypatch.setattr(
+        hh_cli,
+        "HhProfileSyncService",
+        lambda session: SimpleNamespace(
+            synchronize=lambda profile: SimpleNamespace(account=SimpleNamespace(id=2))
+        ),
+    )
+    browser = FakeBrowser(
+        tmp_path / "profile",
+        "https://hh.ru/login",
+        "https://hh.ru/resumes",
+        "https://hh.ru/search",
+        60_000,
+    )
+    arguments = argparse.Namespace(
+        account_id=1,
+        task_id=40,
+        include_stretch=False,
+    )
+
+    assert (
+        hh_cli._run_supervised_form_preflight(
+            arguments,
+            settings,
+            cast(VisibleHhBrowser, browser),
+            browser.read_profile(),
+        )
+        == 2
+    )
+    entries = [
+        entry
+        for entry in OperationJournal(tmp_path).entries(component="applications")
+        if entry["event"] == "supervised.form_preflight"
+    ]
+    assert [entry["status"] for entry in entries] == ["started", "blocked"]
+    assert "другой аккаунт" in entries[-1]["details"]["reason"]
+
+
 def test_supervised_apply_sends_exact_approved_letter_and_journals(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

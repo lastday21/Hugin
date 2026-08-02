@@ -30,8 +30,12 @@ from hugin.domain.tasks import (
     TaskState,
 )
 from hugin.domain.time import as_utc
+from hugin.domain.vacancies import VacancyAvailability
 
 READY_STATES = (TaskState.PENDING, TaskState.RETRY_SCHEDULED)
+FORM_PREFLIGHT_RUNNING = "FORM_PREFLIGHT_RUNNING"
+FORM_PREFLIGHT_INTERRUPTED = "FORM_PREFLIGHT_INTERRUPTED"
+FORM_PREFLIGHT_PASSED = "FORM_PREFLIGHT_PASSED"
 
 
 def _task_record(model: ApplicationTaskModel) -> TaskRecord:
@@ -118,10 +122,16 @@ class QueueTaskRepository:
         account_id: int | None = None,
         direction_id: int | None = None,
         require_ready_cover_letter: bool = False,
+        exclude_ready_cover_letter: bool = False,
         cover_letter_instruction_version: str | None = None,
         vacancy_rules_version: str | None = None,
         vacancy_rule_categories: frozenset[str] | None = None,
+        running_error_code: str | None = None,
     ) -> TaskRecord | None:
+        if require_ready_cover_letter and exclude_ready_cover_letter:
+            raise ValueError(
+                "Нельзя одновременно требовать и исключать готовое сопроводительное письмо"
+            )
         selected_at = as_utc(now or datetime.now(UTC))
         statement = (
             select(ApplicationTaskModel.id)
@@ -131,6 +141,8 @@ class QueueTaskRepository:
                 ApplicationTaskModel.state.in_(READY_STATES),
                 ApplicationTaskModel.scheduled_at <= selected_at,
                 ApplicationModel.state == ApplicationState.APPLYING,
+                VacancyModel.availability == VacancyAvailability.ACTIVE,
+                VacancyModel.duplicate_of_id.is_(None),
             )
             .order_by(
                 VacancyModel.published_at.desc().nulls_last(),
@@ -163,7 +175,7 @@ class QueueTaskRepository:
                 .as_string()
                 .in_(tuple(vacancy_rule_categories))
             )
-        if require_ready_cover_letter:
+        if require_ready_cover_letter or exclude_ready_cover_letter:
             instruction_filter = (
                 CoverLetterModel.instruction_version == cover_letter_instruction_version
                 if cover_letter_instruction_version is not None
@@ -172,7 +184,7 @@ class QueueTaskRepository:
                     autoescape=True,
                 )
             )
-            statement = statement.where(
+            ready_letter = (
                 select(CoverLetterModel.id)
                 .where(
                     CoverLetterModel.application_id == ApplicationModel.id,
@@ -181,6 +193,9 @@ class QueueTaskRepository:
                     instruction_filter,
                 )
                 .exists()
+            )
+            statement = statement.where(
+                ready_letter if require_ready_cover_letter else ~ready_letter
             )
         task_id = self._session.scalar(statement)
         if task_id is None:
@@ -198,13 +213,20 @@ class QueueTaskRepository:
             .values(
                 state=TaskState.RUNNING,
                 attempts=ApplicationTaskModel.attempts + 1,
+                last_error_code=running_error_code,
                 updated_at=selected_at,
             )
             .returning(ApplicationTaskModel)
         )
         return _task_record(task) if task is not None else None
 
-    def claim_exact(self, task_id: int, now: datetime | None = None) -> TaskRecord | None:
+    def claim_exact(
+        self,
+        task_id: int,
+        now: datetime | None = None,
+        *,
+        running_error_code: str | None = None,
+    ) -> TaskRecord | None:
         selected_at = as_utc(now or datetime.now(UTC))
         task = self._session.scalar(
             update(ApplicationTaskModel)
@@ -219,6 +241,7 @@ class QueueTaskRepository:
             .values(
                 state=TaskState.RUNNING,
                 attempts=ApplicationTaskModel.attempts + 1,
+                last_error_code=running_error_code,
                 updated_at=selected_at,
             )
             .returning(ApplicationTaskModel)
@@ -252,22 +275,29 @@ class QueueTaskRepository:
         rules_version: str,
         allowed_categories: frozenset[str] | None = None,
     ) -> int:
-        ineligible = [
+        rules_ineligible = [
             DirectionVacancyModel.state != VacancyState.QUEUED,
             DirectionVacancyModel.rules_version != rules_version,
         ]
         if allowed_categories is not None:
-            ineligible.append(
+            rules_ineligible.append(
                 DirectionVacancyModel.rules_details["category"]
                 .as_string()
                 .not_in(tuple(allowed_categories))
             )
-        task_ids = tuple(
-            self._session.scalars(
-                select(ApplicationTaskModel.id)
+        tasks = tuple(
+            self._session.execute(
+                select(
+                    ApplicationTaskModel.id,
+                    VacancyModel.duplicate_of_id,
+                )
                 .join(
                     ApplicationModel,
                     ApplicationModel.id == ApplicationTaskModel.application_id,
+                )
+                .join(
+                    VacancyModel,
+                    VacancyModel.id == ApplicationModel.vacancy_id,
                 )
                 .join(
                     DirectionVacancyModel,
@@ -279,33 +309,89 @@ class QueueTaskRepository:
                 .where(
                     ApplicationModel.direction_id == direction_id,
                     ApplicationTaskModel.state.in_(READY_STATES),
-                    or_(*ineligible),
+                    or_(
+                        *rules_ineligible,
+                        VacancyModel.duplicate_of_id.is_not(None),
+                    ),
                 )
             )
         )
-        for task_id in task_ids:
+        for task_id, duplicate_of_id in tasks:
             self.transition(
                 task_id,
                 TaskState.SKIPPED,
-                error_code="VACANCY_RULES_CHANGED",
+                error_code=(
+                    "VACANCY_DUPLICATE" if duplicate_of_id is not None else "VACANCY_RULES_CHANGED"
+                ),
             )
-        return len(task_ids)
+        return len(tasks)
 
-    def recover_running(self, *, recovery: str = "startup") -> list[TaskRecord]:
-        task_ids = self._session.scalars(
-            select(ApplicationTaskModel.id)
+    def recover_running(
+        self,
+        *,
+        recovery: str = "startup",
+        now: datetime | None = None,
+    ) -> list[TaskRecord]:
+        selected_at = as_utc(now or datetime.now(UTC))
+        tasks = self._session.execute(
+            select(
+                ApplicationTaskModel.id,
+                ApplicationTaskModel.last_error_code,
+                ApplicationTaskModel.application_id,
+                VacancyModel.availability,
+            )
+            .join(
+                ApplicationModel,
+                ApplicationModel.id == ApplicationTaskModel.application_id,
+            )
+            .join(VacancyModel, VacancyModel.id == ApplicationModel.vacancy_id)
             .where(ApplicationTaskModel.state == TaskState.RUNNING)
             .order_by(ApplicationTaskModel.id)
         )
-        return [
-            self.transition(
-                task_id,
-                TaskState.UNKNOWN_RESULT,
-                error_code="INTERRUPTED_DURING_APPLY",
-                event_payload={"recovery": recovery},
+        recovered: list[TaskRecord] = []
+        for task_id, error_code, application_id, availability in tasks:
+            if error_code == FORM_PREFLIGHT_RUNNING:
+                if availability is not VacancyAvailability.ACTIVE:
+                    application = self._session.get(ApplicationModel, application_id)
+                    if application is not None and application.state is ApplicationState.APPLYING:
+                        application.state = ApplicationState.CLOSED
+                        self._session.add(
+                            ApplicationEventModel(
+                                application_id=application_id,
+                                event_type=ApplicationEventType.STATE_CHANGED,
+                                payload={
+                                    "previous_state": ApplicationState.APPLYING.value,
+                                    "state": ApplicationState.CLOSED.value,
+                                    "reason": f"VACANCY_{availability.value}",
+                                },
+                            )
+                        )
+                    recovered.append(
+                        self.transition(
+                            task_id,
+                            TaskState.SKIPPED,
+                            error_code=f"VACANCY_{availability.value}",
+                        )
+                    )
+                    continue
+                recovered.append(
+                    self.transition(
+                        task_id,
+                        TaskState.RETRY_SCHEDULED,
+                        scheduled_at=selected_at,
+                        error_code=FORM_PREFLIGHT_INTERRUPTED,
+                    )
+                )
+                continue
+            recovered.append(
+                self.transition(
+                    task_id,
+                    TaskState.UNKNOWN_RESULT,
+                    error_code="INTERRUPTED_DURING_APPLY",
+                    event_payload={"recovery": recovery},
+                )
             )
-            for task_id in task_ids
-        ]
+        return recovered
 
     def count_by_state(self) -> dict[TaskState, int]:
         rows = self._session.execute(

@@ -42,10 +42,15 @@ from hugin.repositories.directions import (
     DirectionRepository,
     ResumeRepository,
 )
-from hugin.repositories.tasks import QueueTaskRepository, SystemStateRepository
+from hugin.repositories.tasks import (
+    FORM_PREFLIGHT_PASSED,
+    FORM_PREFLIGHT_RUNNING,
+    QueueTaskRepository,
+    SystemStateRepository,
+)
 from hugin.repositories.vacancies import VacancyRepository
 from hugin.services.ai_prompts import AiPromptSettingsService
-from hugin.services.cover_letter import MANUAL_REVIEW_MODEL, CoverLetterService
+from hugin.services.cover_letter import CoverLetterService
 from hugin.services.queue import QueueService
 from hugin.services.screening_forms import ScreeningDraftService
 from hugin.services.vacancy_analysis import RULES_VERSION, RuleCategory
@@ -136,11 +141,13 @@ class ApplicationAutomationService:
         created = 0
         existing = 0
         for tracked in self._directions.list_tracked_vacancies(direction.id):
+            vacancy = self._vacancies.get(tracked.vacancy_id)
             category = tracked.rules_details.get("category")
             if (
                 tracked.rules_version != RULES_VERSION
                 or tracked.state not in {VacancyState.ANALYZED, VacancyState.QUEUED}
                 or category not in allowed
+                or vacancy.duplicate_of_id is not None
             ):
                 continue
             current = self._applications.get_by_key(account.id, tracked.vacancy_id, resume.id)
@@ -215,7 +222,7 @@ class ApplicationAutomationService:
         if self._system.supervised_lease_active():
             return 0
         recovered = self._tasks.recover_running()
-        if recovered:
+        if any(task.state is TaskState.UNKNOWN_RESULT for task in recovered):
             self._transition_system(SystemState.PAUSED)
         return len(recovered)
 
@@ -223,8 +230,12 @@ class ApplicationAutomationService:
         selected_at = now or datetime.now(UTC)
         if not self._system.clear_expired_supervised_lease(selected_at):
             return 0
-        recovered = self._tasks.recover_running(recovery="supervised_lease_expired")
-        self._transition_system(SystemState.PAUSED)
+        recovered = self._tasks.recover_running(
+            recovery="supervised_lease_expired",
+            now=selected_at,
+        )
+        if any(task.state is TaskState.UNKNOWN_RESULT for task in recovered):
+            self._transition_system(SystemState.PAUSED)
         return len(recovered)
 
     def policy(self, timezone_name: str | None = None) -> ApplicationPolicyRecord:
@@ -304,10 +315,12 @@ class ApplicationAutomationService:
                 ApplicationTaskModel.state == TaskState.RUNNING,
                 ApplicationModel.state == ApplicationState.APPLYING,
                 VacancyModel.availability == VacancyAvailability.ACTIVE,
+                VacancyModel.duplicate_of_id.is_(None),
                 DirectionVacancyModel.state == VacancyState.QUEUED,
                 DirectionVacancyModel.rules_version == RULES_VERSION,
-                DirectionVacancyModel.rules_details["category"].as_string()
-                == RuleCategory.MATCH.value,
+                DirectionVacancyModel.rules_details["category"]
+                .as_string()
+                .in_((RuleCategory.MATCH.value, RuleCategory.STRETCH.value)),
                 CoverLetterModel.id == letter_id,
                 CoverLetterModel.state == CoverLetterState.READY,
                 CoverLetterModel.text.is_not(None),
@@ -489,6 +502,7 @@ class ApplicationAutomationService:
                 ApplicationTaskModel.state.in_((TaskState.PENDING, TaskState.RETRY_SCHEDULED)),
                 ApplicationModel.state == ApplicationState.APPLYING,
                 VacancyModel.availability == VacancyAvailability.ACTIVE,
+                VacancyModel.duplicate_of_id.is_(None),
                 DirectionVacancyModel.state == VacancyState.QUEUED,
                 DirectionVacancyModel.rules_version == RULES_VERSION,
                 CoverLetterModel.id == letter_id,
@@ -646,7 +660,14 @@ class ApplicationAutomationService:
                 cover_letter_instruction_version=instruction_version,
                 vacancy_rules_version=RULES_VERSION,
                 vacancy_rule_categories=(
-                    None if include_stretch else frozenset({RuleCategory.MATCH.value})
+                    frozenset(
+                        {
+                            RuleCategory.MATCH.value,
+                            RuleCategory.STRETCH.value,
+                        }
+                    )
+                    if include_stretch
+                    else frozenset({RuleCategory.MATCH.value})
                 ),
             )
         else:
@@ -657,7 +678,14 @@ class ApplicationAutomationService:
                 cover_letter_instruction_version=instruction_version,
                 vacancy_rules_version=RULES_VERSION,
                 vacancy_rule_categories=(
-                    None if include_stretch else frozenset({RuleCategory.MATCH.value})
+                    frozenset(
+                        {
+                            RuleCategory.MATCH.value,
+                            RuleCategory.STRETCH.value,
+                        }
+                    )
+                    if include_stretch
+                    else frozenset({RuleCategory.MATCH.value})
                 ),
             )
         if task is None:
@@ -691,11 +719,11 @@ class ApplicationAutomationService:
                 ):
                     raise ValueError("Резюме изменилось после подготовки письма")
             except (LookupError, RuntimeError, ValueError):
-                target = (
-                    TaskState.REVIEW_REQUIRED
-                    if letter.model_name == MANUAL_REVIEW_MODEL
-                    else TaskState.RETRY_SCHEDULED
+                manual_review = CoverLetterService(self._session).handle_stale_ready_letter(
+                    application_id=application.id,
+                    letter_id=letter.id,
                 )
+                target = TaskState.REVIEW_REQUIRED if manual_review else TaskState.RETRY_SCHEDULED
                 self._tasks.transition(
                     task.id,
                     target,
@@ -721,6 +749,183 @@ class ApplicationAutomationService:
             cover_letter=cover_letter,
             cover_letter_id=letter.id if letter is not None else None,
             cover_letter_sha256=cover_letter_sha256,
+        )
+
+    def claim_next_form_preflight(
+        self,
+        *,
+        account_id: int,
+        include_stretch: bool = True,
+        now: datetime | None = None,
+    ) -> ApplyJob | None:
+        selected_at = as_utc(now or datetime.now(UTC))
+        system = self._system.lock()
+        if (
+            system.state is not SystemState.RUNNING
+            or self._tasks.has_unknown_result()
+            or self._system.supervised_lease_active(selected_at)
+            or (system.next_apply_at is not None and as_utc(system.next_apply_at) > selected_at)
+        ):
+            return None
+        instruction_version = cover_letter_instruction_version(
+            AiPromptSettingsService(self._session).get().cover_letter
+        )
+        task = self._tasks.claim_next(
+            selected_at,
+            account_id=account_id,
+            exclude_ready_cover_letter=True,
+            cover_letter_instruction_version=instruction_version,
+            vacancy_rules_version=RULES_VERSION,
+            vacancy_rule_categories=(
+                frozenset(
+                    {
+                        RuleCategory.MATCH.value,
+                        RuleCategory.STRETCH.value,
+                    }
+                )
+                if include_stretch
+                else frozenset({RuleCategory.MATCH.value})
+            ),
+            running_error_code=FORM_PREFLIGHT_RUNNING,
+        )
+        if task is None:
+            return None
+        application = self._applications.get(task.application_id)
+        if application.account_id != account_id:
+            raise RuntimeError("Задание проверки формы относится к другому аккаунту")
+        if application.direction_id is None:
+            raise RuntimeError("Направление отклика отсутствует")
+        return ApplyJob(
+            task=task,
+            application=application,
+            vacancy=self._vacancies.get(application.vacancy_id),
+            resume=self._resumes.get(application.resume_id),
+            direction_vacancy=self._directions.get_tracked_vacancy(
+                application.direction_id,
+                application.vacancy_id,
+            ),
+        )
+
+    def claim_supervised_form_preflight(
+        self,
+        *,
+        account_id: int,
+        task_id: int,
+        include_stretch: bool = False,
+        now: datetime | None = None,
+    ) -> ApplyJob:
+        selected_at = as_utc(now or datetime.now(UTC))
+        system = self._system.lock()
+        if system.state is not SystemState.PAUSED:
+            raise RuntimeError(
+                "Перед управляемой проверкой формы поставьте отправку откликов на паузу"
+            )
+        if self._tasks.has_unknown_result():
+            raise RuntimeError("Сначала нужно сверить отклик, результат которого неизвестен")
+        if self._system.supervised_lease_active(selected_at):
+            raise RuntimeError("Другой управляемый сеанс ещё не завершён")
+
+        instruction_version = cover_letter_instruction_version(
+            AiPromptSettingsService(self._session).get().cover_letter
+        )
+        allowed_categories = (
+            (RuleCategory.MATCH.value, RuleCategory.STRETCH.value)
+            if include_stretch
+            else (RuleCategory.MATCH.value,)
+        )
+        current_letter = (
+            select(CoverLetterModel.id)
+            .where(
+                CoverLetterModel.application_id == ApplicationModel.id,
+                CoverLetterModel.state == CoverLetterState.READY,
+                CoverLetterModel.text.is_not(None),
+                CoverLetterModel.instruction_version == instruction_version,
+            )
+            .exists()
+        )
+        row = self._session.execute(
+            select(
+                ApplicationTaskModel,
+                ApplicationModel,
+                VacancyModel,
+                ResumeModel,
+                DirectionVacancyModel,
+            )
+            .join(
+                ApplicationModel,
+                ApplicationModel.id == ApplicationTaskModel.application_id,
+            )
+            .join(VacancyModel, VacancyModel.id == ApplicationModel.vacancy_id)
+            .join(ResumeModel, ResumeModel.id == ApplicationModel.resume_id)
+            .join(
+                DirectionVacancyModel,
+                (DirectionVacancyModel.direction_id == ApplicationModel.direction_id)
+                & (DirectionVacancyModel.vacancy_id == ApplicationModel.vacancy_id),
+            )
+            .where(
+                ApplicationTaskModel.id == task_id,
+                ApplicationTaskModel.state.in_((TaskState.PENDING, TaskState.RETRY_SCHEDULED)),
+                ApplicationTaskModel.scheduled_at <= selected_at,
+                ApplicationModel.account_id == account_id,
+                ApplicationModel.state == ApplicationState.APPLYING,
+                VacancyModel.availability == VacancyAvailability.ACTIVE,
+                VacancyModel.duplicate_of_id.is_(None),
+                ResumeModel.is_active.is_(True),
+                DirectionVacancyModel.state == VacancyState.QUEUED,
+                DirectionVacancyModel.rules_version == RULES_VERSION,
+                DirectionVacancyModel.rules_details["category"].as_string().in_(allowed_categories),
+                ~current_letter,
+            )
+            .limit(1)
+        ).first()
+        if row is None:
+            raise LookupError(
+                "Задание не готово к проверке формы, уже имеет актуальное письмо "
+                "или больше не соответствует правилам"
+            )
+
+        task_model, application_model, vacancy_model, resume_model, _tracked = row
+        claimed = self._tasks.claim_exact(
+            task_model.id,
+            selected_at,
+            running_error_code=FORM_PREFLIGHT_RUNNING,
+        )
+        if claimed is None:
+            raise RuntimeError(
+                "Задание уже забрал другой процесс или время его обработки ещё не наступило"  # noqa: RUF001
+            )
+        application = self._applications.get(application_model.id)
+        if application.direction_id is None:
+            raise RuntimeError("Направление отклика отсутствует")
+        return ApplyJob(
+            task=claimed,
+            application=application,
+            vacancy=self._vacancies.get(vacancy_model.id),
+            resume=self._resumes.get(resume_model.id),
+            direction_vacancy=self._directions.get_tracked_vacancy(
+                application.direction_id,
+                vacancy_model.id,
+            ),
+        )
+
+    def release_form_preflight(
+        self,
+        job: ApplyJob,
+        *,
+        now: datetime | None = None,
+    ) -> None:
+        task = self._tasks.get(job.task.id)
+        if (
+            task.state is not TaskState.RUNNING
+            or task.last_error_code != FORM_PREFLIGHT_RUNNING
+            or task.application_id != job.application.id
+        ):
+            raise RuntimeError("Предварительная проверка формы уже завершена")
+        self._tasks.transition(
+            task.id,
+            TaskState.RETRY_SCHEDULED,
+            scheduled_at=as_utc(now or datetime.now(UTC)),
+            error_code=FORM_PREFLIGHT_PASSED,
         )
 
     def applied_since(self, account_id: int, since: datetime) -> int:
@@ -853,16 +1058,28 @@ class ApplicationAutomationService:
             return RecordedApplyResult(blocking=False, sent=False)
 
         if result.status is HhApplyStatus.VACANCY_CLOSED:
-            self._applications.transition_state(
-                job.application.id,
-                ApplicationState.CLOSED,
-                payload,
+            self._vacancies.mark_unavailable(
+                job.vacancy.id,
+                VacancyAvailability.CLOSED,
             )
-            self._tasks.transition(
-                job.task.id,
-                TaskState.SKIPPED,
-                error_code=result.status.value,
-            )
+            current_application = self._applications.get(job.application.id)
+            current_task = self._tasks.get(job.task.id)
+            if current_application.state is ApplicationState.APPLYING:
+                self._applications.transition_state(
+                    job.application.id,
+                    ApplicationState.CLOSED,
+                    payload,
+                )
+            elif current_application.state is not ApplicationState.CLOSED:
+                raise RuntimeError("Закрытая вакансия имеет несовместимое состояние отклика")
+            if current_task.state is TaskState.RUNNING:
+                self._tasks.transition(
+                    job.task.id,
+                    TaskState.SKIPPED,
+                    error_code=result.status.value,
+                )
+            elif current_task.state is not TaskState.SKIPPED:
+                raise RuntimeError("Закрытая вакансия имеет несовместимое состояние задания")
             return RecordedApplyResult(blocking=False, sent=False)
 
         if result.status is HhApplyStatus.UNKNOWN_RESULT:
@@ -894,7 +1111,10 @@ class ApplicationAutomationService:
             scheduled_at=retry_at,
             error_code=result.status.value,
         )
-        if result.status is HhApplyStatus.RETRYABLE_ERROR:
+        if (
+            result.status is HhApplyStatus.RETRYABLE_ERROR
+            and result.retry_after_seconds is not None
+        ):
             self._system.set_next_apply_at(retry_at)
         target_state = system_states.get(result.status)
         if target_state is not None:
@@ -902,7 +1122,12 @@ class ApplicationAutomationService:
         return RecordedApplyResult(
             blocking=target_state is not None,
             sent=False,
-            next_apply_at=(retry_at if result.status is HhApplyStatus.RETRYABLE_ERROR else None),
+            next_apply_at=(
+                retry_at
+                if result.status is HhApplyStatus.RETRYABLE_ERROR
+                and result.retry_after_seconds is not None
+                else None
+            ),
         )
 
     def release_after_preview(

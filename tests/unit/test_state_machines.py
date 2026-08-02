@@ -20,6 +20,8 @@ def test_valid_state_transitions() -> None:
     ensure_application_transition(ApplicationState.APPLYING, ApplicationState.APPLIED)
     ensure_task_transition(TaskState.RUNNING, TaskState.UNKNOWN_RESULT)
     ensure_task_transition(TaskState.RUNNING, TaskState.INPUT_REQUIRED)
+    ensure_task_transition(TaskState.PENDING, TaskState.REVIEW_REQUIRED)
+    ensure_task_transition(TaskState.RETRY_SCHEDULED, TaskState.REVIEW_REQUIRED)
     ensure_task_transition(TaskState.INPUT_REQUIRED, TaskState.REVIEW_REQUIRED)
     ensure_task_transition(TaskState.UNKNOWN_RESULT, TaskState.REVIEW_REQUIRED)
     ensure_task_transition(TaskState.REVIEW_REQUIRED, TaskState.RETRY_SCHEDULED)

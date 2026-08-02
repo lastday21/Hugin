@@ -19,6 +19,7 @@ from hugin.domain.directions import EmploymentForm, SearchRegion, WorkFormat
 from hugin.domain.hh import HhApplyResult, HhApplyStatus, HhProfileData
 from hugin.domain.resumes import ProfileQuestionCandidate
 from hugin.domain.time import local_day_start_utc, local_timezone_name
+from hugin.domain.vacancies import VacancyData, VacancyUnavailableError
 from hugin.services.application_automation import ApplicationAutomationService
 from hugin.services.automation import AutomationSchedulerService
 from hugin.services.career_directions import (
@@ -214,6 +215,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="действительно нажимать кнопку отправки; без флага форма только заполняется",
     )
 
+    supervised_preflight = subparsers.add_parser(
+        "supervised-preflight",
+        help="проверить форму одного выбранного задания без письма и без отправки",
+    )
+    supervised_preflight.add_argument("--account-id", type=positive_int, default=1)
+    supervised_preflight.add_argument(
+        "--task-id",
+        type=positive_int,
+        required=True,
+        help="номер задания в очереди",
+    )
+    supervised_preflight.add_argument(
+        "--include-stretch",
+        action="store_true",
+        help="разрешить пограничную вакансию; по умолчанию проверяются только точные совпадения",
+    )
+
     supervised = subparsers.add_parser(
         "supervised-apply",
         help="отправить один точно выбранный и заранее проверенный отклик",
@@ -382,10 +400,29 @@ def run(argv: Sequence[str] | None = None) -> int:
             for vacancy in pending:
                 try:
                     vacancy_details.append(browser.read_vacancy_details(vacancy.source_url))
+                except VacancyUnavailableError as error:
+                    vacancy_details.append(
+                        VacancyData(
+                            hh_id=vacancy.hh_id,
+                            title=vacancy.title,
+                            source_url=vacancy.source_url,
+                            employer_name=vacancy.employer_name,
+                            published_at=vacancy.published_at,
+                            region=vacancy.region,
+                            availability=error.availability,
+                        )
+                    )
                 except RuntimeError as error:
                     failures.append((vacancy.title, str(error)))
         if arguments.command == "apply":
             return _run_applications(arguments, settings, browser, profile)
+        if arguments.command == "supervised-preflight":
+            return _run_supervised_form_preflight(
+                arguments,
+                settings,
+                browser,
+                profile,
+            )
         if arguments.command == "supervised-apply":
             return _run_supervised_application(arguments, settings, browser, profile)
 
@@ -979,6 +1016,134 @@ def _applications_enabled(settings: Settings) -> bool:
     try:
         with database.sessions.begin() as session:
             return ApplicationAutomationService(session).applications_enabled()
+    finally:
+        database.close()
+
+
+def _run_supervised_form_preflight(
+    arguments: argparse.Namespace,
+    settings: Settings,
+    browser: VisibleHhBrowser,
+    profile: HhProfileData,
+) -> int:
+    upgrade_database(settings)
+    journal_run = OperationJournal(settings.data_dir).start(
+        "applications",
+        "supervised.form_preflight",
+        account_id=arguments.account_id,
+        task_id=arguments.task_id,
+    )
+    database = create_database(settings)
+    job = None
+    try:
+        with database.sessions.begin() as session:
+            synchronized_profile = HhProfileSyncService(session).synchronize(profile)
+            if synchronized_profile.account.id != arguments.account_id:
+                raise ValueError(
+                    "В профиле браузера открыт другой аккаунт hh.ru; проверка формы остановлена"
+                )
+            job = ApplicationAutomationService(session).claim_supervised_form_preflight(
+                account_id=arguments.account_id,
+                task_id=arguments.task_id,
+                include_stretch=arguments.include_stretch,
+            )
+        try:
+            _validate_supervised_resume(profile, job.resume.hh_id, job.resume.title)
+        except ValueError as error:
+            mismatch = HhApplyResult(
+                HhApplyStatus.RESUME_MISMATCH,
+                job.vacancy.source_url,
+                str(error),
+            )
+            with database.sessions.begin() as session:
+                ApplicationAutomationService(session).record_result(
+                    job,
+                    mismatch,
+                    apply_delay=None,
+                )
+            journal_run.block(
+                task_id=job.task.id,
+                application_id=job.application.id,
+                vacancy_id=job.vacancy.hh_id,
+                result_status=mismatch.status.value,
+                reason=str(error),
+                sent=False,
+            )
+            print(f"Проверка формы остановлена: {error}", file=sys.stderr)
+            return 2
+        try:
+            result = browser.apply_to_vacancy(
+                job.vacancy.source_url,
+                expected_resume_hh_id=job.resume.hh_id,
+                expected_resume_title=job.resume.title,
+                cover_letter="",
+                submit=False,
+                submit_guard=lambda: False,
+            )
+        except Exception as error:
+            result = HhApplyResult(
+                HhApplyStatus.RETRYABLE_ERROR,
+                job.vacancy.source_url,
+                f"Ошибка предварительной проверки формы: {type(error).__name__}",
+            )
+        if result.status is HhApplyStatus.UNKNOWN_RESULT:
+            result = HhApplyResult(
+                HhApplyStatus.RETRYABLE_ERROR,
+                result.final_url,
+                "Предварительная проверка не отправляет отклик; проверка будет повторена",
+                warnings=result.warnings,
+                retry_after_seconds=result.retry_after_seconds,
+            )
+
+        with database.sessions.begin() as session:
+            service = ApplicationAutomationService(session)
+            if result.status is HhApplyStatus.MANUAL_REVIEW_REQUIRED:
+                service.release_form_preflight(job)
+                recorded = None
+            else:
+                recorded = service.record_result(job, result, apply_delay=None)
+
+        details = {
+            "task_id": job.task.id,
+            "application_id": job.application.id,
+            "vacancy_id": job.vacancy.hh_id,
+            "resume_id": job.resume.id,
+            "rules_version": job.direction_vacancy.rules_version,
+            "result_status": result.status.value,
+            "final_url": result.final_url,
+            "questions": len(result.questions),
+            "warnings": len(result.warnings),
+            "sent": False,
+        }
+        if result.status is HhApplyStatus.MANUAL_REVIEW_REQUIRED:
+            journal_run.succeed(**details)
+            print(
+                f"Форма вакансии №{job.vacancy.hh_id} проверена. "
+                "Отклик не отправлен, модель не вызывалась."
+            )
+            return 0
+        journal_run.block(**details)
+        print(f"Письмо не готовилось: {_apply_status_text(result.status)}.")
+        if result.questions:
+            print(f"Нужны надёжные ответы на вопросы работодателя: {len(result.questions)}.")
+        return 3 if recorded is not None and recorded.blocking else 2
+    except (LookupError, RuntimeError, ValueError) as error:
+        journal_run.block(
+            task_id=getattr(getattr(job, "task", None), "id", arguments.task_id),
+            application_id=getattr(getattr(job, "application", None), "id", None),
+            vacancy_id=getattr(getattr(job, "vacancy", None), "hh_id", None),
+            reason=str(error),
+        )
+        print(f"Управляемая проверка формы остановлена: {error}", file=sys.stderr)
+        return 2
+    except Exception as error:
+        journal_run.fail(
+            error,
+            task_id=getattr(getattr(job, "task", None), "id", arguments.task_id),
+            application_id=getattr(getattr(job, "application", None), "id", None),
+            vacancy_id=getattr(getattr(job, "vacancy", None), "hh_id", None),
+        )
+        raise
     finally:
         database.close()
 
