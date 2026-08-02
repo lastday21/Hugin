@@ -157,12 +157,12 @@ def test_background_search_reads_and_queues_without_applying(settings: Settings)
     assert result["found"] == 2
     assert result["unique_vacancies"] == 2
     assert result["details_loaded"] == 1
-    assert result["queued"] == 2
+    assert result["queued"] == 0
     assert browser.searches == [
         ("Python backend разработчик", "1", 0),
         ("Python backend разработчик", "1", 1),
     ]
-    assert browser.details == ["https://hh.ru/vacancy/background-102"]
+    assert browser.details == ["https://hh.ru/vacancy/legacy-v4"]
 
     database = create_database(settings)
     try:
@@ -172,7 +172,7 @@ def test_background_search_reads_and_queues_without_applying(settings: Settings)
             assert first is not None
             assert second is not None
             assert first.details_fetched_at is None
-            assert second.details_fetched_at is not None
+            assert second.details_fetched_at is None
             legacy_vacancy = VacancyRepository(session).get_by_hh_id("legacy-v4")
             assert legacy_vacancy is not None
             legacy_link = DirectionRepository(session).get_tracked_vacancy(
@@ -180,7 +180,8 @@ def test_background_search_reads_and_queues_without_applying(settings: Settings)
                 legacy_vacancy.id,
             )
             assert legacy_link.rules_version == RULES_VERSION
-            assert legacy_link.state is VacancyState.QUEUED
+            assert legacy_link.state is VacancyState.ANALYZED
+            assert legacy_link.rules_details["category"] == "STRETCH"
     finally:
         database.close()
 

@@ -158,6 +158,45 @@ def test_rejected_list_validates_sort_and_restore_state(settings: Settings) -> N
         database.close()
 
 
+def test_exact_body_repost_with_changed_title_is_not_queued_twice(
+    settings: Settings,
+) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    try:
+        with database.sessions.begin() as session:
+            account = AccountRepository(session).create("Тест", "duplicate-title-account")
+            assert account.external_id is not None
+            resume = ResumeRepository(session).upsert(account.id, "resume-duplicate", "Python")
+            directions = DirectionRepository(session)
+            direction = directions.create(account.id, "Python backend")
+            directions.attach_resume(direction.id, resume.id)
+            service = VacancyAnalysisService(session)
+
+            results = service.synchronize(
+                account_external_id=account.external_id,
+                direction_name=direction.name,
+                vacancies=(
+                    detailed_vacancy("duplicate-title-1", "Junior Python (стажер)"),
+                    detailed_vacancy(
+                        "duplicate-title-2",
+                        "Junior Python-разработчик (стажер)",
+                    ),
+                ),
+            )
+
+            assert results[1].vacancy.duplicate_of_id == results[0].vacancy.id
+            prepared = ApplicationAutomationService(session).prepare(
+                account_external_id=account.external_id,
+                direction_name=direction.name,
+                include_stretch=False,
+            )
+            assert prepared.created == 1
+            assert session.scalar(select(func.count(ApplicationModel.id))) == 1
+    finally:
+        database.close()
+
+
 def test_fullstack_found_by_python_is_routed_to_it_without_duplicate_task(
     settings: Settings,
 ) -> None:

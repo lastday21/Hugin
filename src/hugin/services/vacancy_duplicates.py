@@ -35,9 +35,13 @@ class VacancyDuplicateDetector:
         left_body = left.responsibilities or left.description or ""
         right_body = right.responsibilities or right.description or ""
         body = self._text_similarity(left_body, right_body)
-        if title < 0.82 or body < 0.78 or not self._salary_compatible(left, right):
+        if not self._salary_compatible(left, right):
             return None
         salary = self._salary_similarity(left, right)
+        if body >= 0.97:
+            return body * 0.85 + salary * 0.15
+        if title < 0.82 or body < 0.78:
+            return None
         combined = title * 0.35 + body * 0.5 + salary * 0.15
         return combined if combined >= 0.82 else None
 

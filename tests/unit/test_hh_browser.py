@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 
 import pytest
-from playwright.sync_api import Error, Frame, Locator, Page, TimeoutError
+from playwright.sync_api import Error, Frame, Locator, Page, Response, TimeoutError
 
 from hugin.adapters import hh_browser as browser_module
 from hugin.adapters.hh_browser import VisibleHhBrowser
@@ -29,6 +30,7 @@ from hugin.domain.hh_sync import (
     HhNegotiationStatus,
     HhSyncBlockedError,
 )
+from hugin.domain.vacancies import VacancyAvailability, VacancyUnavailableError
 from hugin.services.hh_login import HhCredentials, LoginStatus
 
 TEST_RESUME_HH_ID = "resume-hash"
@@ -411,6 +413,7 @@ def test_vacancies_are_read_from_search_page(tmp_path: Path) -> None:
                 "title": "Python-разработчик",
                 "href": "https://ufa.hh.ru/vacancy/123?query=Python",
                 "employer": "Компания",
+                "publishedAt": "2026-07-28T17:29:53.587+03:00",
             },
             {
                 "title": "Backend-разработчик",
@@ -432,7 +435,18 @@ def test_vacancies_are_read_from_search_page(tmp_path: Path) -> None:
     assert [vacancy.hh_id for vacancy in result.vacancies] == ["123", "456"]
     assert result.vacancies[0].source_url == "https://ufa.hh.ru/vacancy/123"
     assert result.vacancies[0].employer_name == "Компания"
+    assert result.vacancies[0].published_at == datetime(
+        2026,
+        7,
+        28,
+        14,
+        29,
+        53,
+        587000,
+        tzinfo=UTC,
+    )
     assert result.vacancies[1].employer_name is None
+    assert result.vacancies[1].published_at is None
     search_url, wait_until = page.goto_calls[-1]
     assert wait_until == "domcontentloaded"
     assert "text=Python+backend" in search_url
@@ -440,6 +454,15 @@ def test_vacancies_are_read_from_search_page(tmp_path: Path) -> None:
     assert "page=2" in search_url
     assert "schedule=remote" in search_url
     assert "schedule=fullDay" in search_url
+
+
+def test_search_reads_publication_time_from_current_hh_card_data() -> None:
+    assert "key.startsWith('__reactFiber$')" in browser_module.VACANCY_SEARCH_SCRIPT
+    assert "String(candidate.vacancyId || '') !== vacancyId" in (
+        browser_module.VACANCY_SEARCH_SCRIPT
+    )
+    assert "publicationTime.$.trim()" in browser_module.VACANCY_SEARCH_SCRIPT
+    assert "candidate.creationTime" not in browser_module.VACANCY_SEARCH_SCRIPT
 
 
 def test_search_rejects_unknown_filter(tmp_path: Path) -> None:
@@ -464,7 +487,7 @@ def test_vacancy_details_are_read_from_page(tmp_path: Path) -> None:
         "address": "ул. Примерная, 1",
         "salary": "от 120 000 до 180 000 ₽ на руки",
         "schedule": "5/2",
-        "publishedAt": "2026-07-21T10:30:00+03:00",
+        "publishedAt": "Вакансия опубликована 21 июля 2026",
         "hasCoverLetter": True,
         "hasScreeningForm": True,
         "hasExternalLink": False,
@@ -491,8 +514,87 @@ def test_vacancy_details_are_read_from_page(tmp_path: Path) -> None:
     assert vacancy.has_cover_letter
     assert vacancy.has_screening_form
     assert vacancy.has_test_assignment
-    assert vacancy.published_at == datetime(2026, 7, 21, 7, 30, tzinfo=UTC)
+    assert vacancy.published_at is not None
+    assert (
+        vacancy.published_at.year,
+        vacancy.published_at.month,
+        vacancy.published_at.day,
+    ) == (2026, 7, 21)
     assert vacancy.details_fetched_at is not None
+
+
+@pytest.mark.parametrize(
+    ("status", "availability"),
+    [
+        (404, VacancyAvailability.UNAVAILABLE),
+        (410, VacancyAvailability.UNAVAILABLE),
+        (200, VacancyAvailability.ARCHIVED),
+        (200, VacancyAvailability.CLOSED),
+    ],
+)
+def test_unavailable_vacancy_details_are_reported_before_title_wait(
+    tmp_path: Path,
+    status: int,
+    availability: VacancyAvailability,
+) -> None:
+    page = FakePage()
+    response = FakeResponse()
+    response.status = status
+    page.goto_response = response
+    page.details_payload = {
+        "availability": (availability.value if status == 200 else VacancyAvailability.ACTIVE.value)
+    }
+
+    with pytest.raises(VacancyUnavailableError) as error:
+        make_browser(page, tmp_path).read_vacancy_details("https://hh.ru/vacancy/123")
+
+    assert error.value.availability is availability
+
+
+def test_visible_russian_publication_date_is_parsed() -> None:
+    parsed = VisibleHhBrowser._date_time("Вакансия опубликована 30 июля 2026")
+
+    assert parsed is not None
+    assert (parsed.year, parsed.month, parsed.day) == (2026, 7, 30)
+
+
+def test_structured_job_posting_date_is_parsed_with_timezone() -> None:
+    parsed = VisibleHhBrowser._date_time("2026-07-30T19:17:03.720+03:00")
+
+    assert parsed == datetime(2026, 7, 30, 16, 17, 3, 720000, tzinfo=UTC)
+    assert 'script[type="application/ld+json"]' in browser_module.VACANCY_DETAILS_SCRIPT
+    assert "candidate.datePosted || candidate.datePublished" in (
+        browser_module.VACANCY_DETAILS_SCRIPT
+    )
+
+
+def test_publication_date_without_year_is_not_in_the_future() -> None:
+    parsed = VisibleHhBrowser._date_time("Вакансия опубликована 31 декабря")
+
+    assert parsed is not None
+    assert (parsed.month, parsed.day) == (12, 31)
+    assert parsed <= datetime.now(UTC) + timedelta(days=1)
+
+
+@pytest.mark.parametrize("status", [404, 410])
+def test_apply_reports_closed_vacancy_before_looking_for_response_button(
+    tmp_path: Path,
+    status: int,
+) -> None:
+    page = FakePage("https://hh.ru/applicant/resumes")
+    response = FakeResponse()
+    response.status = status
+    page.goto_response = response
+    page.locators["body"] = FakeLocator(text="Вакансия недоступна")
+
+    result = make_browser(page, tmp_path).apply_to_vacancy(
+        "https://hh.ru/vacancy/123",
+        expected_resume_hh_id=TEST_RESUME_HH_ID,
+        expected_resume_title="Python backend разработчик",
+        cover_letter="Письмо",
+    )
+
+    assert result.status is HhApplyStatus.VACANCY_CLOSED
 
 
 @pytest.mark.parametrize(
@@ -794,6 +896,50 @@ def test_application_with_questions_is_not_submitted(tmp_path: Path) -> None:
     assert result.status is HhApplyStatus.QUESTIONS_REQUIRED
     assert result.questions == ("Укажите Telegram",)
     assert page.goto_calls[0][0] == "https://hh.ru/vacancy/123"
+
+
+def test_empty_letter_preflight_accepts_disabled_submit_but_real_submit_does_not(
+    tmp_path: Path,
+) -> None:
+    payload = {
+        "fields": [],
+        "warnings": [],
+        "resumeTitle": "Python backend разработчик",
+        "bodyText": "Форма отклика",
+    }
+    submit_selector = '[data-qa="vacancy-response-submit-popup"]'
+    preflight_page = FakePage("https://hh.ru/applicant/resumes")
+    preflight_page.application_payload = payload
+    preflight_submit = FakeLocator(enabled=False)
+    preflight_page.locators[submit_selector] = preflight_submit
+
+    preflight = make_browser(preflight_page, tmp_path).apply_to_vacancy(
+        "https://hh.ru/vacancy/123",
+        expected_resume_hh_id=TEST_RESUME_HH_ID,
+        expected_resume_title="Python backend разработчик",
+        cover_letter="",
+        submit=False,
+    )
+
+    assert preflight.status is HhApplyStatus.MANUAL_REVIEW_REQUIRED
+    assert preflight_submit.clicked == 0
+
+    submit_page = FakePage("https://hh.ru/applicant/resumes")
+    submit_page.application_payload = payload
+    real_submit = FakeLocator(enabled=False)
+    submit_page.locators[submit_selector] = real_submit
+
+    applied = make_browser(submit_page, tmp_path).apply_to_vacancy(
+        "https://hh.ru/vacancy/123",
+        expected_resume_hh_id=TEST_RESUME_HH_ID,
+        expected_resume_title="Python backend разработчик",
+        cover_letter="",
+        submit=True,
+        submit_guard=lambda: True,
+    )
+
+    assert applied.status is HhApplyStatus.RETRYABLE_ERROR
+    assert real_submit.clicked == 0
 
 
 def test_application_selects_exact_resume_before_reading_questions(tmp_path: Path) -> None:
@@ -1824,6 +1970,40 @@ class FakeStarter:
         return self.playwright
 
 
+def test_profile_lock_waits_until_another_browser_releases_it(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    lock_path = tmp_path / "profile.lock"
+    owner = browser_module._BrowserProfileLock(lock_path, timeout_seconds=1)
+    contender = browser_module._BrowserProfileLock(lock_path, timeout_seconds=1)
+    owner.acquire()
+    waits: list[float] = []
+
+    def release_owner(delay: float) -> None:
+        waits.append(delay)
+        owner.release()
+
+    monkeypatch.setattr(browser_module, "sleep", release_owner)
+    contender.acquire()
+    contender.release()
+
+    assert waits == [browser_module._PROFILE_LOCK_RETRY_SECONDS]
+
+
+def test_profile_lock_wait_is_bounded(tmp_path: Path) -> None:
+    lock_path = tmp_path / "profile.lock"
+    owner = browser_module._BrowserProfileLock(lock_path, timeout_seconds=0)
+    contender = browser_module._BrowserProfileLock(lock_path, timeout_seconds=0)
+    owner.acquire()
+
+    try:
+        with pytest.raises(RuntimeError, match="занят другой задачей"):
+            contender.acquire()
+    finally:
+        owner.release()
+
+
 def test_context_starts_visible_persistent_browser(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -1846,10 +2026,18 @@ def test_context_starts_visible_persistent_browser(
         assert chromium.calls[0]["headless"] is False
         assert chromium.calls[0]["no_viewport"] is True
         assert chromium.calls[0]["args"] == ["--start-maximized"]
+        contender = browser_module._BrowserProfileLock(
+            tmp_path / "profile" / browser_module._PROFILE_LOCK_FILENAME,
+            timeout_seconds=0,
+        )
+        with pytest.raises(RuntimeError, match="занят другой задачей"):
+            contender.acquire()
 
     assert (tmp_path / "profile").is_dir()
     assert context.closed
     assert playwright.stopped
+    contender.acquire()
+    contender.release()
 
 
 def test_background_context_starts_minimized_with_quiet_chromium(
@@ -1891,3 +2079,298 @@ def test_failed_browser_start_stops_playwright(
         ).__enter__()
 
     assert playwright.stopped
+    contender = browser_module._BrowserProfileLock(
+        tmp_path / browser_module._PROFILE_LOCK_FILENAME,
+        timeout_seconds=0,
+    )
+    contender.acquire()
+    contender.release()
+
+
+def test_profile_lock_rejects_second_acquire_and_allows_empty_release(tmp_path: Path) -> None:
+    lock = browser_module._BrowserProfileLock(tmp_path / "profile.lock", timeout_seconds=0)
+
+    lock.release()
+    lock.acquire()
+    try:
+        with pytest.raises(RuntimeError, match="уже занят"):
+            lock.acquire()
+    finally:
+        lock.release()
+
+
+def test_profile_lock_uses_posix_file_locking(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[int, int]] = []
+    fake_fcntl = SimpleNamespace(
+        LOCK_EX=1,
+        LOCK_NB=2,
+        LOCK_UN=4,
+        flock=lambda descriptor, operation: calls.append((descriptor, operation)),
+    )
+    monkeypatch.setattr(browser_module, "sys", SimpleNamespace(platform="linux"))
+    monkeypatch.setattr(browser_module, "fcntl", fake_fcntl, raising=False)
+
+    with (tmp_path / "profile.lock").open("a+b") as handle:
+        browser_module._BrowserProfileLock._try_lock(handle)
+        browser_module._BrowserProfileLock._unlock(handle)
+        descriptor = handle.fileno()
+
+    assert calls == [(descriptor, 3), (descriptor, 4)]
+
+
+def test_retry_after_accepts_http_date_without_timezone() -> None:
+    response = FakeResponse()
+    response.headers["retry-after"] = "Wed, 31 Dec 2099 23:59:59"
+
+    assert VisibleHhBrowser._retry_after_seconds(cast(Response, response)) == 86_400
+
+
+@pytest.mark.parametrize("value", [None, "not-a-date"])
+def test_retry_after_ignores_missing_or_invalid_value(value: str | None) -> None:
+    response = FakeResponse()
+    if value is not None:
+        response.headers["retry-after"] = value
+
+    assert VisibleHhBrowser._retry_after_seconds(cast(Response, response)) is None
+
+
+def test_retry_after_ignores_unavailable_headers() -> None:
+    class BrokenHeaderResponse(FakeResponse):
+        def header_value(self, name: str) -> str | None:
+            raise Error(f"header unavailable: {name}")
+
+    assert VisibleHhBrowser._retry_after_seconds(cast(Response, BrokenHeaderResponse())) is None
+
+
+def test_chat_frame_wait_stops_after_configured_attempts(tmp_path: Path) -> None:
+    page = FakePage()
+    browser = make_browser(page, tmp_path)
+    browser._timeout_ms = 500
+
+    assert browser._wait_for_chat_frame(cast(Page, page)) is None
+
+
+@pytest.mark.parametrize(
+    ("status_qa", "expected"),
+    [
+        ("invitation", HhNegotiationStatus.INVITED),
+        ("closed", HhNegotiationStatus.CLOSED),
+        ("not-viewed", HhNegotiationStatus.APPLIED),
+        ("viewed", HhNegotiationStatus.VIEWED),
+    ],
+)
+def test_negotiation_status_covers_visible_hh_states(
+    status_qa: str,
+    expected: HhNegotiationStatus,
+) -> None:
+    assert VisibleHhBrowser._negotiation_status(status_qa, "") is expected
+
+
+def test_submission_response_predicates_reject_incomplete_response() -> None:
+    response = cast(Response, object())
+
+    assert not VisibleHhBrowser._is_application_submission_response(response)
+    assert not VisibleHhBrowser._is_message_submission_response(response)
+
+
+def test_application_confirmation_accepts_success_response_payload(tmp_path: Path) -> None:
+    page = FakePage()
+    page.locators["body"] = FakeLocator(text="")
+    response = FakeResponse()
+    response.body = '{"status":"success"}'
+    browser = make_browser(page, tmp_path)
+
+    assert browser._application_confirmation(cast(Page, page), None) == ""
+    assert browser._application_confirmation(cast(Page, page), cast(Response, response)).startswith(
+        "hh.ru"
+    )
+
+
+def test_text_helpers_handle_unavailable_page_body(tmp_path: Path) -> None:
+    class BrokenTextLocator(FakeLocator):
+        def inner_text(self) -> str:
+            raise Error("body unavailable")
+
+    page = FakePage()
+    page.locators["body"] = BrokenTextLocator()
+
+    assert not VisibleHhBrowser._message_visible(cast(Page, page), "message")
+    assert VisibleHhBrowser._page_body_text(cast(Page, page)) == ""
+    assert make_browser(page, tmp_path)._application_confirmation(cast(Page, page), None) == ""
+
+
+def test_message_external_id_rejects_unusable_response_payloads() -> None:
+    malformed = FakeResponse()
+    malformed.body = "not-json"
+    wrong_shape = FakeResponse()
+    wrong_shape.body = "[]"
+
+    assert VisibleHhBrowser._message_external_id(None) is None
+    assert VisibleHhBrowser._message_external_id(cast(Response, malformed)) is None
+    assert VisibleHhBrowser._message_external_id(cast(Response, wrong_shape)) is None
+
+
+def test_open_applicant_form_is_noop_without_account_card(tmp_path: Path) -> None:
+    page = FakePage()
+
+    make_browser(page, tmp_path)._open_applicant_form(cast(Page, page))
+
+    assert '[data-qa="submit-button"]' not in page.locators
+
+
+def test_resume_selection_requires_expected_identity(tmp_path: Path) -> None:
+    browser = make_browser(FakePage(), tmp_path)
+
+    with pytest.raises(browser_module._ResumeSelectionError) as error:
+        browser._select_exact_resume(
+            browser._require_page(),
+            expected_resume_hh_id="",
+            expected_resume_title="Python backend",
+        )
+
+    assert not error.value.retryable
+
+
+def test_resume_selection_requires_unique_selected_card(tmp_path: Path) -> None:
+    page = FakePage()
+    page.locators['[data-qa="resume-title"]'] = FakeLocator(0)
+    browser = make_browser(page, tmp_path)
+
+    with pytest.raises(browser_module._ResumeSelectionError) as error:
+        browser._select_exact_resume(
+            cast(Page, page),
+            expected_resume_hh_id=TEST_RESUME_HH_ID,
+            expected_resume_title="Python backend",
+        )
+
+    assert error.value.retryable
+
+
+def test_resume_selection_reports_card_click_failure(tmp_path: Path) -> None:
+    page = FakePage()
+    page.locators['[data-qa="resume-title"]'] = FakeLocator(click_error=True)
+    browser = make_browser(page, tmp_path)
+
+    with pytest.raises(browser_module._ResumeSelectionError) as error:
+        browser._select_exact_resume(
+            cast(Page, page),
+            expected_resume_hh_id=TEST_RESUME_HH_ID,
+            expected_resume_title="Python backend",
+        )
+
+    assert error.value.retryable
+
+
+def test_resume_selection_stops_when_options_do_not_load(tmp_path: Path) -> None:
+    page = FakePage()
+    page.locators[RESUME_OPTIONS_SELECTOR] = FakeLocator(items=[])
+    page.locators[RESUME_DROPDOWN_OPTIONS_SELECTOR] = FakeLocator(items=[])
+    browser = make_browser(page, tmp_path)
+
+    with pytest.raises(browser_module._ResumeSelectionError) as error:
+        browser._select_exact_resume(
+            cast(Page, page),
+            expected_resume_hh_id=TEST_RESUME_HH_ID,
+            expected_resume_title="Python backend",
+        )
+
+    assert error.value.retryable
+
+
+def test_resume_selection_rejects_ambiguous_option_values(tmp_path: Path) -> None:
+    page = FakePage()
+    page.locators[RESUME_OPTIONS_SELECTOR] = FakeLocator(
+        items=[
+            FakeLocator(value=TEST_RESUME_HH_ID),
+            FakeLocator(value=TEST_RESUME_HH_ID),
+        ]
+    )
+    browser = make_browser(page, tmp_path)
+
+    with pytest.raises(browser_module._ResumeSelectionError) as error:
+        browser._select_exact_resume(
+            cast(Page, page),
+            expected_resume_hh_id=TEST_RESUME_HH_ID,
+            expected_resume_title="Python backend",
+        )
+
+    assert not error.value.retryable
+
+
+def test_required_payload_helpers_reject_missing_values() -> None:
+    with pytest.raises(RuntimeError):
+        VisibleHhBrowser._required_string({}, "title", "название")
+    with pytest.raises(RuntimeError):
+        VisibleHhBrowser._required_resume_text({}, "skills", "навыки")
+
+    assert VisibleHhBrowser._resume_text({"skills": 42}, "skills") == ""
+
+
+def test_relative_publication_dates_are_parsed() -> None:
+    today = VisibleHhBrowser._date_time("Вакансия опубликована сегодня")
+    yesterday = VisibleHhBrowser._date_time("Вакансия опубликована вчера")
+
+    assert today is not None
+    assert yesterday is not None
+    assert today.astimezone().date() == datetime.now().astimezone().date()
+    assert yesterday.astimezone().date() == (datetime.now().astimezone() - timedelta(days=1)).date()
+
+
+def test_vacancy_availability_validates_payload() -> None:
+    assert VisibleHhBrowser._vacancy_availability(None, []) is VacancyAvailability.ACTIVE
+    with pytest.raises(RuntimeError):
+        VisibleHhBrowser._vacancy_availability(None, {"availability": "UNKNOWN"})
+
+
+def test_salary_supports_range_currency_and_net_value() -> None:
+    assert VisibleHhBrowser._salary("100 000 — 150 000 € на руки") == (
+        Decimal("100000"),
+        Decimal("150000"),
+        "EUR",
+        False,
+    )
+
+
+def test_empty_description_has_no_sections() -> None:
+    assert VisibleHhBrowser._description_sections("") == (None, None, None)
+
+
+@pytest.mark.parametrize(
+    "href",
+    [
+        "https://example.com/resume/abc",
+        "https://hh.ru/not-resume/abc",
+    ],
+)
+def test_resume_id_rejects_external_or_malformed_link(href: str) -> None:
+    with pytest.raises(RuntimeError):
+        VisibleHhBrowser._resume_id(href)
+
+
+def test_search_filters_serialize_boolean_and_reject_object() -> None:
+    assert VisibleHhBrowser._search_filters({"only_with_salary": True}) == [
+        ("only_with_salary", "true")
+    ]
+    with pytest.raises(ValueError):
+        VisibleHhBrowser._search_filters({"salary": object()})
+
+
+def test_found_vacancies_distinguishes_empty_and_malformed_result() -> None:
+    assert VisibleHhBrowser._found_vacancies("", has_items=False) == 0
+    with pytest.raises(RuntimeError):
+        VisibleHhBrowser._found_vacancies("", has_items=True)
+
+
+@pytest.mark.parametrize(
+    "href",
+    [
+        "https://example.com/vacancy/123",
+        "https://hh.ru/not-vacancy/123",
+    ],
+)
+def test_vacancy_url_rejects_external_or_malformed_link(href: str) -> None:
+    with pytest.raises(RuntimeError):
+        VisibleHhBrowser._vacancy_id_and_url(href)

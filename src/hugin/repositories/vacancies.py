@@ -1,25 +1,33 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
 
-from sqlalchemy import func, select
+from sqlalchemy import case, exists, func, or_, select, update
 from sqlalchemy.orm import Session
 
 from hugin.database.models import (
+    ApplicationEventModel,
+    ApplicationModel,
+    ApplicationTaskModel,
     DirectionVacancyModel,
     VacancyChangeModel,
     VacancyDiscoveryModel,
     VacancyModel,
 )
+from hugin.domain.applications import ApplicationEventType, ApplicationState
+from hugin.domain.directions import VacancyState
+from hugin.domain.tasks import TaskState
 from hugin.domain.time import as_utc
 from hugin.domain.vacancies import (
+    VacancyAvailability,
     VacancyChangeRecord,
     VacancyData,
     VacancyDiscoveryRecord,
     VacancyRecord,
 )
+from hugin.repositories.tasks import FORM_PREFLIGHT_RUNNING
 
 
 def _to_record(model: VacancyModel) -> VacancyRecord:
@@ -120,7 +128,12 @@ class VacancyRepository:
             value = getattr(data, field)
             if value is not None or created:
                 self._set(model, field, value, changes)
-        self._set(model, "availability", data.availability, changes)
+        if (
+            created
+            or data.details_fetched_at is not None
+            or data.availability is not VacancyAvailability.ACTIVE
+        ):
+            self._set(model, "availability", data.availability, changes)
         if data.details_fetched_at is not None:
             for field in (
                 "description",
@@ -140,6 +153,8 @@ class VacancyRepository:
             self._set(model, "key_skills", list(data.key_skills), changes)
             model.details_fetched_at = data.details_fetched_at
         self._session.flush()
+        if model.availability is not VacancyAvailability.ACTIVE:
+            self._close_links_and_waiting_tasks(model.id, model.availability)
         if created or changes:
             self._session.add(
                 VacancyChangeModel(
@@ -176,6 +191,92 @@ class VacancyRepository:
         if model is None:
             raise LookupError("vacancy was not found")
         return _to_record(model)
+
+    def mark_unavailable(
+        self,
+        vacancy_id: int,
+        availability: VacancyAvailability,
+    ) -> VacancyRecord:
+        if availability is VacancyAvailability.ACTIVE:
+            raise ValueError("Для активной вакансии нужно использовать обычное обновление")
+        model = self._session.get(VacancyModel, vacancy_id)
+        if model is None:
+            raise LookupError("vacancy was not found")
+        changes: dict[str, object] = {}
+        self._set(model, "availability", availability, changes)
+        self._close_links_and_waiting_tasks(vacancy_id, availability)
+        if changes:
+            self._session.add(
+                VacancyChangeModel(
+                    vacancy_id=vacancy_id,
+                    event_type="AVAILABILITY_CHANGED",
+                    changes=changes,
+                )
+            )
+        self._session.flush()
+        return _to_record(model)
+
+    def _close_links_and_waiting_tasks(
+        self,
+        vacancy_id: int,
+        availability: VacancyAvailability,
+    ) -> None:
+        self._session.execute(
+            update(DirectionVacancyModel)
+            .where(DirectionVacancyModel.vacancy_id == vacancy_id)
+            .values(state=VacancyState.CLOSED)
+        )
+        waiting_states = (
+            TaskState.PENDING,
+            TaskState.RETRY_SCHEDULED,
+            TaskState.REVIEW_REQUIRED,
+            TaskState.INPUT_REQUIRED,
+        )
+        waiting_or_preflight = or_(
+            ApplicationTaskModel.state.in_(waiting_states),
+            (
+                (ApplicationTaskModel.state == TaskState.RUNNING)
+                & (ApplicationTaskModel.last_error_code == FORM_PREFLIGHT_RUNNING)
+            ),
+        )
+        waiting_applications = tuple(
+            self._session.scalars(
+                select(ApplicationModel)
+                .join(
+                    ApplicationTaskModel,
+                    ApplicationTaskModel.application_id == ApplicationModel.id,
+                )
+                .where(
+                    ApplicationModel.vacancy_id == vacancy_id,
+                    ApplicationModel.state == ApplicationState.APPLYING,
+                    waiting_or_preflight,
+                )
+            )
+        )
+        for application in waiting_applications:
+            application.state = ApplicationState.CLOSED
+            application.events.append(
+                ApplicationEventModel(
+                    event_type=ApplicationEventType.STATE_CHANGED,
+                    payload={
+                        "previous_state": ApplicationState.APPLYING.value,
+                        "state": ApplicationState.CLOSED.value,
+                        "reason": f"VACANCY_{availability.value}",
+                    },
+                )
+            )
+        application_ids = tuple(application.id for application in waiting_applications)
+        if not application_ids:
+            return
+        waiting_tasks = self._session.scalars(
+            select(ApplicationTaskModel).where(
+                ApplicationTaskModel.application_id.in_(application_ids),
+                waiting_or_preflight,
+            )
+        )
+        for task in waiting_tasks:
+            task.state = TaskState.SKIPPED
+            task.last_error_code = f"VACANCY_{availability.value}"
 
     def list_duplicate_candidates(self, vacancy: VacancyRecord) -> list[VacancyRecord]:
         if not vacancy.employer_name:
@@ -250,16 +351,69 @@ class VacancyRepository:
     ) -> list[VacancyRecord]:
         if limit < 1:
             raise ValueError("limit must be positive")
+        refresh_before = datetime.now(UTC) - timedelta(hours=24)
+        ready_task_exists = exists(
+            select(ApplicationTaskModel.id)
+            .join(
+                ApplicationModel,
+                ApplicationModel.id == ApplicationTaskModel.application_id,
+            )
+            .where(
+                ApplicationModel.vacancy_id == VacancyModel.id,
+                ApplicationModel.direction_id == direction_id,
+                ApplicationModel.state == ApplicationState.APPLYING,
+                ApplicationTaskModel.state.in_((TaskState.PENDING, TaskState.RETRY_SCHEDULED)),
+            )
+        )
+        terminal_application_exists = exists(
+            select(ApplicationModel.id)
+            .outerjoin(
+                ApplicationTaskModel,
+                ApplicationTaskModel.application_id == ApplicationModel.id,
+            )
+            .where(
+                ApplicationModel.vacancy_id == VacancyModel.id,
+                ApplicationModel.direction_id == direction_id,
+                or_(
+                    ApplicationModel.state != ApplicationState.APPLYING,
+                    ApplicationTaskModel.state.in_((TaskState.COMPLETED, TaskState.SKIPPED)),
+                ),
+            )
+        )
+        ready_priority = case((ready_task_exists, 0), else_=1)
+        never_fetched_ready_priority = case(
+            (
+                ready_task_exists & VacancyModel.details_fetched_at.is_(None),
+                0,
+            ),
+            (ready_task_exists, 1),
+            else_=2,
+        )
+        due_at = case(
+            (ready_task_exists, VacancyModel.details_fetched_at),
+            else_=func.coalesce(
+                VacancyModel.details_fetched_at,
+                VacancyModel.created_at,
+            ),
+        )
         models = self._session.scalars(
             select(VacancyModel)
             .join(DirectionVacancyModel)
             .where(
                 DirectionVacancyModel.direction_id == direction_id,
-                VacancyModel.details_fetched_at.is_(None),
+                VacancyModel.availability == VacancyAvailability.ACTIVE,
+                or_(ready_task_exists, ~terminal_application_exists),
+                (
+                    VacancyModel.details_fetched_at.is_(None)
+                    | (VacancyModel.details_fetched_at < refresh_before)
+                ),
             )
             .order_by(
-                VacancyModel.published_at.desc().nulls_last(),
-                VacancyModel.id.desc(),
+                ready_priority,
+                never_fetched_ready_priority,
+                due_at.asc().nulls_first(),
+                VacancyModel.created_at,
+                VacancyModel.id,
             )
             .limit(limit)
         )

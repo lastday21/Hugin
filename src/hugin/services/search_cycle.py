@@ -6,7 +6,11 @@ from hugin.core.settings import Settings
 from hugin.database import create_database
 from hugin.domain.automation import AutomationJobResult
 from hugin.domain.hh import HhProfileData
-from hugin.domain.vacancies import VacancyData, VacancySearchResult
+from hugin.domain.vacancies import (
+    VacancyData,
+    VacancySearchResult,
+    VacancyUnavailableError,
+)
 from hugin.repositories.directions import AccountRepository, DirectionRepository
 from hugin.services.application_automation import ApplicationAutomationService
 from hugin.services.career_directions import CareerDirectionService, VacancySearchTask
@@ -101,6 +105,18 @@ class BackgroundSearchCycle:
         for vacancy in pending:
             try:
                 detailed.append(browser.read_vacancy_details(vacancy.source_url))
+            except VacancyUnavailableError as error:
+                detailed.append(
+                    VacancyData(
+                        hh_id=vacancy.hh_id,
+                        title=vacancy.title,
+                        source_url=vacancy.source_url,
+                        employer_name=vacancy.employer_name,
+                        published_at=vacancy.published_at,
+                        region=vacancy.region,
+                        availability=error.availability,
+                    )
+                )
             except RuntimeError:
                 failed_details += 1
 

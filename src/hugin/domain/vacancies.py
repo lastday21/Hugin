@@ -13,6 +13,19 @@ class VacancyAvailability(StrEnum):
     UNAVAILABLE = "UNAVAILABLE"
 
 
+class VacancyUnavailableError(RuntimeError):
+    def __init__(
+        self,
+        hh_id: str,
+        source_url: str,
+        availability: VacancyAvailability,
+    ) -> None:
+        super().__init__(f"Вакансия {hh_id} недоступна: {availability.value}")
+        self.hh_id = hh_id
+        self.source_url = source_url
+        self.availability = availability
+
+
 @dataclass(frozen=True, slots=True)
 class VacancyData:
     hh_id: str

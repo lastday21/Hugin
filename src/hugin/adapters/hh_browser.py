@@ -1,18 +1,27 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import sys
 import unicodedata
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from email.utils import parsedate_to_datetime
 from math import ceil
 from pathlib import Path
+from time import monotonic, sleep
 from types import TracebackType
+from typing import BinaryIO
 from urllib.parse import urlencode, urlparse, urlunparse
+
+if sys.platform == "win32":
+    import msvcrt
+else:
+    import fcntl
 
 from playwright.sync_api import (
     BrowserContext,
@@ -51,8 +60,17 @@ from hugin.domain.hh_sync import (
     HhNegotiationStatus,
     HhSyncBlockedError,
 )
-from hugin.domain.vacancies import VacancyAvailability, VacancyData, VacancySearchResult
+from hugin.domain.vacancies import (
+    VacancyAvailability,
+    VacancyData,
+    VacancySearchResult,
+    VacancyUnavailableError,
+)
 from hugin.services.hh_login import HhCredentials, LoginStatus
+
+_PROFILE_LOCK_FILENAME = ".hugin-browser.lock"
+_PROFILE_LOCK_TIMEOUT_SECONDS = 180.0
+_PROFILE_LOCK_RETRY_SECONDS = 0.25
 
 PROFILE_SNAPSHOT_SCRIPT = """
 () => {
@@ -92,31 +110,84 @@ PROFILE_SNAPSHOT_SCRIPT = """
 """
 
 VACANCY_SEARCH_SCRIPT = """
-() => ({
+() => {
+const publicationDate = (card, href) => {
+    let vacancyId = '';
+    try {
+        vacancyId = new URL(href, window.location.href).pathname
+            .match(/\\/vacancy\\/(\\d+)/)?.[1] || '';
+    } catch {
+        return '';
+    }
+    if (!vacancyId) return '';
+
+    const fiberKey = Object.keys(card).find((key) => key.startsWith('__reactFiber$'));
+    let fiber = fiberKey ? card[fiberKey] : null;
+    for (let level = 0; fiber && level < 30; level += 1, fiber = fiber.return) {
+        const props = fiber.memoizedProps;
+        const candidates = [props, props?.vacancy];
+        for (const candidate of candidates) {
+            if (
+                !candidate ||
+                typeof candidate !== 'object' ||
+                String(candidate.vacancyId || '') !== vacancyId
+            ) {
+                continue;
+            }
+            const publicationTime = candidate.publicationTime;
+            if (typeof publicationTime === 'string' && publicationTime.trim()) {
+                return publicationTime.trim();
+            }
+            if (!publicationTime || typeof publicationTime !== 'object') continue;
+            if (
+                typeof publicationTime.$ === 'string' &&
+                publicationTime.$.trim()
+            ) {
+                return publicationTime.$.trim();
+            }
+            const timestamp = publicationTime['@timestamp'];
+            if (typeof timestamp === 'number' && Number.isFinite(timestamp)) {
+                return new Date(timestamp * 1000).toISOString();
+            }
+        }
+    }
+    return '';
+};
+return ({
     header: (
         document.querySelector('[data-qa="vacancies-search-header"]')?.textContent || ''
     ).trim(),
     vacancies: Array.from(
         document.querySelectorAll('[data-qa="vacancy-serp__vacancy"]')
-    ).map((card) => ({
-        title: (
-            card.querySelector('[data-qa="serp-item__title"]')?.textContent || ''
-        ).trim(),
-        href: card.querySelector('[data-qa="serp-item__title"]')?.href || '',
-        employer: (
-            card.querySelector(
-                '[data-qa="vacancy-serp__vacancy-employer"]'
-            )?.textContent || ''
-        ).trim(),
-        region: (
-            card.querySelector('[data-qa="vacancy-serp__vacancy-address"]')?.textContent || ''
-        ).trim(),
-        salary: (
-            card.querySelector('[data-qa="vacancy-serp__vacancy-compensation"]')?.textContent || ''
-        ).trim(),
-        publishedAt: card.querySelector('time[datetime]')?.getAttribute('datetime') || '',
-    })),
-})
+    ).map((card) => {
+        const titleLink = card.querySelector('[data-qa="serp-item__title"]');
+        const href = titleLink?.href || '';
+        return ({
+            title: (titleLink?.textContent || '').trim(),
+            href,
+            employer: (
+                card.querySelector(
+                    '[data-qa="vacancy-serp__vacancy-employer"]'
+                )?.textContent || ''
+            ).trim(),
+            region: (
+                card.querySelector('[data-qa="vacancy-serp__vacancy-address"]')
+                    ?.textContent || ''
+            ).trim(),
+            salary: (
+                card.querySelector(
+                    '[data-qa="vacancy-serp__vacancy-compensation"]'
+                )?.textContent || ''
+            ).trim(),
+            publishedAt: (
+                card.querySelector('time[datetime]')?.getAttribute('datetime') ||
+                card.querySelector('[data-qa="vacancy-serp__vacancy-published-text"]')
+                    ?.textContent ||
+                publicationDate(card, href)
+            ).trim(),
+        });
+    }),
+})}
 """
 
 VACANCY_DETAILS_SCRIPT = """
@@ -132,10 +203,45 @@ const externalLinks = Array.from(description?.querySelectorAll('a[href]') || [])
         return false;
     }
 });
+const structuredPublicationDate = (() => {
+    for (const script of document.querySelectorAll('script[type="application/ld+json"]')) {
+        try {
+            const pending = [JSON.parse(script.textContent || 'null')];
+            for (let position = 0; position < pending.length && position < 2000; position += 1) {
+                const candidate = pending[position];
+                if (Array.isArray(candidate)) {
+                    pending.push(...candidate);
+                    continue;
+                }
+                if (!candidate || typeof candidate !== 'object') continue;
+                const rawType = candidate['@type'];
+                const types = Array.isArray(rawType) ? rawType : [rawType];
+                if (types.some((value) => (
+                    typeof value === 'string' && value.toLocaleLowerCase('en-US') === 'jobposting'
+                ))) {
+                    const value = candidate.datePosted || candidate.datePublished;
+                    if (typeof value === 'string' && value.trim()) return value.trim();
+                }
+                pending.push(...Object.values(candidate).filter((value) => (
+                    value && typeof value === 'object'
+                )));
+            }
+        } catch {
+            continue;
+        }
+    }
+    return '';
+})();
+const visiblePublicationDate = bodyText
+    .split('\\n')
+    .map((line) => line.trim())
+    .find((line) => /^Вакансия опубликована(?:\\s|$)/iu.test(line)) || '';
 let availability = 'ACTIVE';
 if (normalizedBody.includes('вакансия в архиве')) availability = 'ARCHIVED';
 else if (normalizedBody.includes('вакансия закрыта')) availability = 'CLOSED';
 else if (normalizedBody.includes('вакансия недоступна')) availability = 'UNAVAILABLE';
+else if (normalizedBody.includes('вакансия не найдена')) availability = 'UNAVAILABLE';
+else if (normalizedBody.includes('такой вакансии нет')) availability = 'UNAVAILABLE';
 return ({
     title: (
         document.querySelector('[data-qa="vacancy-title"]')?.textContent || ''
@@ -171,10 +277,16 @@ return ({
         document.querySelector('[data-qa="vacancy-view-employment-mode"]')?.textContent || ''
     ).trim(),
     publishedAt: (
+        document.querySelector('[data-qa="vacancy-view-creation-time"] time[datetime]')
+            ?.getAttribute('datetime') ||
         document.querySelector('[data-qa="vacancy-creation-time"] time[datetime]')
             ?.getAttribute('datetime') ||
+        structuredPublicationDate ||
+        document.querySelector('[data-qa="vacancy-view-creation-time"]')?.textContent ||
+        document.querySelector('[data-qa="vacancy-creation-time"]')?.textContent ||
+        visiblePublicationDate ||
         document.querySelector('time[datetime]')?.getAttribute('datetime') || ''
-    ),
+    ).trim(),
     hasCoverLetter: normalizedBody.includes('сопроводительн') && normalizedBody.includes('письм'),
     hasScreeningForm: normalizedBody.includes('вопросы работодателя') ||
         Boolean(document.querySelector('[data-qa="task-question"]')),
@@ -711,6 +823,73 @@ class _ResumeSelectionError(RuntimeError):
         self.retryable = retryable
 
 
+class _BrowserProfileLock:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        timeout_seconds: float = _PROFILE_LOCK_TIMEOUT_SECONDS,
+        retry_seconds: float = _PROFILE_LOCK_RETRY_SECONDS,
+    ) -> None:
+        self._path = path
+        self._timeout_seconds = timeout_seconds
+        self._retry_seconds = retry_seconds
+        self._handle: BinaryIO | None = None
+
+    def acquire(self) -> None:
+        if self._handle is not None:
+            raise RuntimeError("Профиль браузера уже занят этим процессом")
+
+        handle = self._path.open("a+b")
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"\0")
+            handle.flush()
+
+        deadline = monotonic() + self._timeout_seconds
+        while True:
+            try:
+                self._try_lock(handle)
+            except OSError as error:
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    handle.close()
+                    raise RuntimeError(
+                        "Профиль hh.ru занят другой задачей дольше допустимого времени"
+                    ) from error
+                sleep(min(self._retry_seconds, remaining))
+            else:
+                self._handle = handle
+                return
+
+    def release(self) -> None:
+        handle = self._handle
+        self._handle = None
+        if handle is None:
+            return
+        try:
+            with suppress(OSError):
+                self._unlock(handle)
+        finally:
+            handle.close()
+
+    @staticmethod
+    def _try_lock(handle: BinaryIO) -> None:
+        handle.seek(0)
+        if sys.platform == "win32":
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    @staticmethod
+    def _unlock(handle: BinaryIO) -> None:
+        handle.seek(0)
+        if sys.platform == "win32":
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 class VisibleHhBrowser:
     def __init__(
         self,
@@ -731,11 +910,13 @@ class VisibleHhBrowser:
         self._playwright: Playwright | None = None
         self._context: BrowserContext | None = None
         self._page: Page | None = None
+        self._profile_lock = _BrowserProfileLock(self._profile_dir / _PROFILE_LOCK_FILENAME)
 
     def __enter__(self) -> VisibleHhBrowser:
         self._profile_dir.mkdir(parents=True, exist_ok=True)
-        self._playwright = sync_playwright().start()
+        self._profile_lock.acquire()
         try:
+            self._playwright = sync_playwright().start()
             chromium_args = (
                 [
                     "--start-minimized",
@@ -754,9 +935,14 @@ class VisibleHhBrowser:
             self._page.set_default_timeout(self._timeout_ms)
             self._page.set_default_navigation_timeout(self._timeout_ms)
             self._minimize_window()
-        except Exception:
-            self._playwright.stop()
+        except BaseException:
+            if self._playwright is not None:
+                with suppress(Exception):
+                    self._playwright.stop()
             self._playwright = None
+            self._context = None
+            self._page = None
+            self._profile_lock.release()
             raise
         return self
 
@@ -786,10 +972,18 @@ class VisibleHhBrowser:
         exc_value: BaseException | None,
         traceback: TracebackType | None,
     ) -> None:
-        if self._context is not None:
-            self._context.close()
-        if self._playwright is not None:
-            self._playwright.stop()
+        try:
+            if self._context is not None:
+                self._context.close()
+        finally:
+            try:
+                if self._playwright is not None:
+                    self._playwright.stop()
+            finally:
+                self._context = None
+                self._page = None
+                self._playwright = None
+                self._profile_lock.release()
 
     def open_login(self) -> None:
         page = self._require_page()
@@ -907,14 +1101,21 @@ class VisibleHhBrowser:
         vacancy_id, normalized_url = self._vacancy_id_and_url(source_url)
         page = self._require_page()
         try:
-            page.goto(normalized_url, wait_until="domcontentloaded")
+            response = page.goto(normalized_url, wait_until="domcontentloaded")
+            payload = page.evaluate(VACANCY_DETAILS_SCRIPT)
+            availability = self._vacancy_availability(response, payload)
+            if availability is not VacancyAvailability.ACTIVE:
+                raise VacancyUnavailableError(vacancy_id, normalized_url, availability)
             page.locator('[data-qa="vacancy-title"]').first.wait_for(
                 state="visible",
                 timeout=self._timeout_ms,
             )
+            payload = page.evaluate(VACANCY_DETAILS_SCRIPT)
+            availability = self._vacancy_availability(response, payload)
+            if availability is not VacancyAvailability.ACTIVE:
+                raise VacancyUnavailableError(vacancy_id, normalized_url, availability)
         except PlaywrightTimeoutError as error:
             raise RuntimeError(f"Страница вакансии {vacancy_id} не загрузилась") from error
-        payload = page.evaluate(VACANCY_DETAILS_SCRIPT)
         if not isinstance(payload, dict):
             raise RuntimeError("hh.ru вернул некорректные подробности вакансии")
 
@@ -1157,6 +1358,8 @@ class VisibleHhBrowser:
             return HhApplyResult(HhApplyStatus.AUTH_REQUIRED, page.url)
         if self._any_visible(page, '[data-qa*="captcha"], iframe[src*="captcha"]'):
             return HhApplyResult(HhApplyStatus.CAPTCHA_REQUIRED, page.url)
+        if self._vacancy_is_closed(initial_response, self._page_body_text(page)):
+            return HhApplyResult(HhApplyStatus.VACANCY_CLOSED, page.url)
         response_links = page.locator('[data-qa="vacancy-response-link-top"]:visible')
         if response_links.count() == 0:
             return HhApplyResult(HhApplyStatus.RETRYABLE_ERROR, page.url)
@@ -1251,9 +1454,18 @@ class VisibleHhBrowser:
             letter.first.fill(cover_letter.strip())
 
         submit_button = page.locator('[data-qa="vacancy-response-submit-popup"]')
-        if submit_button.count() != 1 or not submit_button.first.is_enabled():
+        if submit_button.count() != 1:
             return HhApplyResult(HhApplyStatus.RETRYABLE_ERROR, page.url)
-        if not submit or submit_guard is None:
+        if not submit:
+            return HhApplyResult(
+                HhApplyStatus.MANUAL_REVIEW_REQUIRED,
+                page.url,
+                "Форма заполнена и оставлена открытой без отправки",
+                warnings=initial.warnings,
+            )
+        if not submit_button.first.is_enabled():
+            return HhApplyResult(HhApplyStatus.RETRYABLE_ERROR, page.url)
+        if submit_guard is None:
             return HhApplyResult(
                 HhApplyStatus.MANUAL_REVIEW_REQUIRED,
                 page.url,
@@ -1397,6 +1609,8 @@ class VisibleHhBrowser:
             return HhFormReviewResult(HhFormReviewStatus.AUTH_REQUIRED, page.url)
         if self._any_visible(page, '[data-qa*="captcha"], iframe[src*="captcha"]'):
             return HhFormReviewResult(HhFormReviewStatus.CAPTCHA_REQUIRED, page.url)
+        if self._vacancy_is_closed(response, self._page_body_text(page)):
+            return HhFormReviewResult(HhFormReviewStatus.VACANCY_CLOSED, page.url)
         response_links = page.locator('[data-qa="vacancy-response-link-top"]:visible')
         if response_links.count() == 0:
             return HhFormReviewResult(
@@ -2159,9 +2373,102 @@ class VisibleHhBrowser:
             return None
         try:
             parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        except ValueError as error:
-            raise RuntimeError("hh.ru вернул некорректную дату вакансии") from error
+        except ValueError:
+            normalized = " ".join(value.casefold().replace("\u00a0", " ").split())
+            local_now = datetime.now().astimezone()
+            if "сегодня" in normalized:
+                parsed = local_now.replace(hour=12, minute=0, second=0, microsecond=0)
+            elif "вчера" in normalized:
+                parsed = (local_now - timedelta(days=1)).replace(
+                    hour=12,
+                    minute=0,
+                    second=0,
+                    microsecond=0,
+                )
+            else:
+                months = {
+                    "января": 1,
+                    "февраля": 2,
+                    "марта": 3,
+                    "апреля": 4,
+                    "мая": 5,
+                    "июня": 6,
+                    "июля": 7,
+                    "августа": 8,
+                    "сентября": 9,
+                    "октября": 10,
+                    "ноября": 11,
+                    "декабря": 12,
+                }
+                match = re.search(
+                    r"\b(\d{1,2})\s+(" + "|".join(months) + r")(?:\s+(20\d{2}))?\b",
+                    normalized,
+                )
+                if match is None:
+                    raise RuntimeError("hh.ru вернул некорректную дату вакансии") from None
+                explicit_year = match.group(3)
+                year = int(explicit_year or local_now.year)
+                try:
+                    parsed = local_now.replace(
+                        year=year,
+                        month=months[match.group(2)],
+                        day=int(match.group(1)),
+                        hour=12,
+                        minute=0,
+                        second=0,
+                        microsecond=0,
+                    )
+                except ValueError:
+                    if explicit_year is not None:
+                        raise RuntimeError("hh.ru вернул некорректную дату вакансии") from None
+                    parsed = local_now.replace(
+                        year=year - 1,
+                        month=months[match.group(2)],
+                        day=int(match.group(1)),
+                        hour=12,
+                        minute=0,
+                        second=0,
+                        microsecond=0,
+                    )
+                if explicit_year is None and parsed > local_now + timedelta(days=1):
+                    parsed = parsed.replace(year=parsed.year - 1)
         return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
+
+    @classmethod
+    def _vacancy_availability(
+        cls,
+        response: Response | None,
+        payload: object,
+    ) -> VacancyAvailability:
+        if response is not None and response.status in {404, 410}:
+            return VacancyAvailability.UNAVAILABLE
+        if not isinstance(payload, dict):
+            return VacancyAvailability.ACTIVE
+        raw = cls._optional_string(payload, "availability") or VacancyAvailability.ACTIVE.value
+        try:
+            return VacancyAvailability(raw)
+        except ValueError as error:
+            raise RuntimeError("hh.ru вернул некорректное состояние вакансии") from error
+
+    @classmethod
+    def _vacancy_is_closed(cls, response: Response | None, body_text: str) -> bool:
+        if response is not None and response.status in {404, 410}:
+            return True
+        return cls._contains_any(
+            body_text,
+            "вакансия в архиве",
+            "вакансия закрыта",
+            "вакансия недоступна",
+            "вакансия не найдена",
+            "такой вакансии нет",
+        )
+
+    @staticmethod
+    def _page_body_text(page: Page) -> str:
+        try:
+            return page.locator("body").inner_text()
+        except PlaywrightError:
+            return ""
 
     @staticmethod
     def _salary(value: str) -> tuple[Decimal | None, Decimal | None, str | None, bool | None]:
