@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import ClassVar
 
@@ -19,13 +19,15 @@ from hugin.domain.directions import (
     VacancyState,
     WorkFormat,
 )
+from hugin.domain.time import as_utc
 from hugin.domain.vacancies import VacancyAvailability, VacancyData, VacancyRecord
 from hugin.repositories.directions import AccountRepository, DirectionRepository
 from hugin.repositories.vacancies import VacancyRepository
 from hugin.services.career_directions import CareerDirectionService
 from hugin.services.vacancy_duplicates import VacancyDuplicateDetector
 
-RULES_VERSION = "python_it_v18"
+RULES_VERSION = "python_it_v30"
+MAX_VACANCY_AGE = timedelta(days=30)
 
 
 def _normalize_rule_text(value: str | None) -> str:
@@ -86,11 +88,24 @@ class VacancyAnalysisResult:
 
 
 class VacancyRoleRouter:
+    _non_development_title_markers: ClassVar[tuple[str, ...]] = (
+        "наставник",
+        "преподаватель",
+        "педагог",
+        "учитель",
+        "instructor",
+        "trainer",
+        "ментор",
+        "куратор курса",
+    )
     _adjacent_title_markers: ClassVar[tuple[str, ...]] = (
         "fullstack",
         "full-stack",
         "full stack",
         "фулстек",
+        "бэк и фронт",
+        "бэкенд и фронтенд",
+        "backend/frontend",
         "automation",
         "автоматизац",
         "интеграц",
@@ -98,6 +113,8 @@ class VacancyRoleRouter:
         "автотест",
         "qa automation",
         "test automation",
+        "sdet",
+        "software development engineer in test",
         "etl",
         "data engineer",
         "инженер данных",
@@ -109,6 +126,7 @@ class VacancyRoleRouter:
         "mlops",
         "sql-разработчик",
         "sql разработчик",
+        "разработчик sql",
         "sql developer",
         "bitrix",
         "битрикс",
@@ -120,8 +138,56 @@ class VacancyRoleRouter:
         "ml engineer",
         "ml-инженер",
         "ml инженер",
+        "ml-разработчик",
+        "ml разработчик",
+        "ml developer",
+        "machine learning developer",
         "ml lead",
         "machine learning",
+        "computer vision",
+        "компьютерное зрение",
+        "компьютерного зрения",
+        "техническое зрение",
+        "технического зрения",
+        "ai developer",
+        "ai-разработчик",
+        "ai разработчик",
+        "ai-инженер",
+        "ai инженер",
+        "инженер по ai",
+        "ии-разработчик",
+        "ии разработчик",
+        "ии-инженер",
+        "ии инженер",
+        "инженер по ии",
+        "инженер ии",
+        "разработчик ии",
+        "ai-агент",
+        "ai агент",
+        "искусственный интеллект",
+        "искусственного интеллекта",
+        "искусственному интеллекту",
+        "искусственным интеллектом",
+        "искусственном интеллекте",
+        "generative ai",
+        "ai/ml",
+        "dwh",
+        "data warehouse",
+        "хранилищ данных",
+        "хранилища данных",
+    )
+    _build_infrastructure_markers: ClassVar[tuple[str, ...]] = (
+        "система сборки",
+        "системы сборки",
+        "систему сборки",
+        "ci/cd",
+        "ci cd",
+        "cmake",
+        "makefile",
+        "autotools",
+        "инфраструктур",
+        "build system",
+        "build pipeline",
     )
     _backend_markers: ClassVar[tuple[str, ...]] = (
         "backend",
@@ -146,6 +212,8 @@ class VacancyRoleRouter:
     @classmethod
     def classify(cls, vacancy: VacancyData) -> DirectionScope | None:
         title = _normalize_rule_text(vacancy.title)
+        if any(marker in title for marker in cls._non_development_title_markers):
+            return None
         complete_text = " ".join(
             (
                 title,
@@ -162,13 +230,17 @@ class VacancyRoleRouter:
             marker in complete_text
             for marker in (
                 "автоматизац",
+                "автоматизирован",
                 "автотест",
+                "automation",
                 "test automation",
                 "locust",
                 "pytest",
             )
         )
         if testing_title and automated_testing and "python" in complete_text:
+            return DirectionScope.IT_ADJACENT
+        if cls.is_build_infrastructure_role(title, complete_text):
             return DirectionScope.IT_ADJACENT
         if any(marker in title for marker in cls._adjacent_title_markers):
             return DirectionScope.IT_ADJACENT
@@ -183,6 +255,13 @@ class VacancyRoleRouter:
         if "python" in title and any(marker in title for marker in cls._developer_markers):
             return DirectionScope.IT_ADJACENT
         return None
+
+    @classmethod
+    def is_build_infrastructure_role(cls, title: str, complete_text: str) -> bool:
+        if "python" in title or any(marker in title for marker in cls._backend_markers):
+            return False
+        markers_found = sum(marker in complete_text for marker in cls._build_infrastructure_markers)
+        return markers_found >= 2
 
 
 class PythonBackendRules:
@@ -268,6 +347,32 @@ class PythonBackendRules:
         "данные банковской карты",
         "паспортные данные для регистрации",
     )
+    _unpaid_compensation_pattern: ClassVar[re.Pattern[str]] = re.compile(
+        r"(?:"
+        r"\bбез\s+зарплат\w*\b|"
+        r"\bнеоплачиваем\w*\s+(?:работ|стажиров|занятост|сотрудничеств)\w*\b|"
+        r"\b(?:работ|стажиров|занятост|сотрудничеств)\w*\s+неоплачиваем\w*\b|"
+        r"\b(?:оплата|вознаграждение)\s+"
+        r"(?:только|исключительно)\s+(?:дол\w*|опцион\w*)\b|"
+        r"\b(?:дол\w*|опцион\w*)\s+вместо\s+(?:зарплат\w*|оклад\w*)\b"
+        r")"
+    )
+    _negative_candidate_exclusion_pattern: ClassVar[re.Pattern[str]] = re.compile(
+        r"(?:"
+        r"не\s+(?:откликайтесь|откликаться|рассматриваем|подходят?)|"
+        r"просьба\s+не\s+откликаться"
+        r")[^.!?\n]{0,180}"
+        r"(?:python|fastapi|django|flask|backend|бэкенд|разработчик\w*)"
+    )
+    _support_primary_duties_pattern: ClassVar[re.Pattern[str]] = re.compile(
+        r"(?:техническ\w*\s+поддержк\w*|"
+        r"консультир\w*\s+(?:клиент\w*|пользовател\w*)|"
+        r"настройк\w*\s+оборудован\w*)"
+    )
+    _coding_action_pattern: ClassVar[re.Pattern[str]] = re.compile(
+        r"(?:разрабатыва\w*|реализовыва\w*|писать\s+код|"
+        r"программирова\w*|создава\w*\s+(?:сервис\w*|api|скрипт\w*))"
+    )
     _excluded_roles: ClassVar[tuple[tuple[str, str], ...]] = (
         (
             r"\bquant(?:itative)?\s+trader\b|\bквант\w*\s+трейдер\b",
@@ -289,13 +394,50 @@ class PythonBackendRules:
             "основная роль: no-code/вайбкодинг",
         ),
         (
-            r"\b(?:инженер|специалист)\w*\s+сопровождени\w*\b|"
+            r"\b(?:инженер|специалист)(?:\w*|\s+по)\s+сопровождени\w*\b|"
             r"\bинженер\w*\s+эксплуатаци\w*\b|\bsupport engineer\b",
             "основная роль: сопровождение или эксплуатация",
         ),
         (
             r"\bинженер\w*\s+внедрения\b|\bimplementation engineer\b",
             "основная роль: внедрение и сопровождение",
+        ),
+        (
+            r"\bсетев\w*\s+(?:инженер|администратор)\w*\b|"
+            r"\bnetwork\s+(?:engineer|administrator)\b",
+            "основная роль: сетевое администрирование",
+        ),
+        (
+            r"\b(?:веб[ -]?мастер|web[ -]?master)\b|"
+            r"\b(?:cpa[ -]?маркетолог|арбитражник\w*\s+трафик\w*)\b",
+            "основная роль: привлечение трафика и интернет-маркетинг",
+        ),
+        (
+            r"\bcustomer\s+journey\s+expert\b|\bcje\b",
+            "основная роль: управление клиентским опытом",
+        ),
+        (
+            r"\blinux\s+kernel\b|\bkernel\s+(?:developer|engineer)\b|"
+            r"\bразработчик\w*\s+(?:ядр\w*|модул\w*\s+ядр\w*)",
+            "основная роль: низкоуровневое системное программирование",
+        ),
+        (
+            r"\bасу\s*тп\b|\bscada\b|"
+            r"\b(?:инженер|специалист)\w*\s+по\s+автоматизаци\w*\s+"
+            r"(?:производств\w*|технологическ\w*\s+процесс)",
+            "основная роль: промышленная автоматизация",
+        ),
+        (
+            r"\bинженер\s*[-–—‑]?\s*технолог\b",
+            "основная роль: производственная технология",
+        ),
+        (
+            r"^\s*научн\w*\s+сотрудник\w*\s*$",
+            "основная роль: научные исследования",
+        ),
+        (
+            r"^\s*консультант\w*\s*$",
+            "основная роль: консультации без подтверждённой разработки",
         ),
     )
     _python_backend_excluded_roles: ClassVar[tuple[tuple[str, str], ...]] = (
@@ -406,6 +548,12 @@ class PythonBackendRules:
         r"\bsenior\s*[/\\|–—‑-]\s*middle\b"
         r")"
     )
+    _founding_engineer_pattern: ClassVar[re.Pattern[str]] = re.compile(
+        r"(?:"
+        r"\bfounding\s+(?:(?:ai|llm)\s+)?engineer\b|"
+        r"\bперв\w*\s+(?:(?:ai|ии|llm)[ -]?)?инженер\w*\b"
+        r")"
+    )
     _four_plus_experience_pattern: ClassVar[re.Pattern[str]] = re.compile(
         r"(?:"
         r"\b4\s*[-–—‑]\s*5\s*(?:лет|года)|"
@@ -446,8 +594,12 @@ class PythonBackendRules:
         r"[^.!?]{0,100}\b(?:python|backend|бэкенд|fullstack|разработ\w*)"
     )
     _optional_python_language_pattern: ClassVar[re.Pattern[str]] = re.compile(
+        r"(?:"
         r"\bодн\w+\s+из[^.!?]{0,140}"
-        r"(?:язык\w*\s+программирован\w*[^.!?]{0,100})?\bpython\b"
+        r"(?:язык\w*\s+программирован\w*[^.!?]{0,100})?\bpython\b|"
+        r"\bкакого-либо\s+язык\w*\s+программирован\w*[^.!?]{0,100}"
+        r"\bнапример\s+python\b"
+        r")"
     )
 
     def evaluate(
@@ -470,9 +622,15 @@ class PythonBackendRules:
 
         if vacancy.availability is not VacancyAvailability.ACTIVE:
             rejected.append(f"вакансия недоступна: {vacancy.availability.value}")
+        if self._is_too_old(vacancy.published_at):
+            rejected.append("вакансия опубликована более 30 дней назад")
         scam = next((marker for marker in self._scam_markers if marker in complete_text), None)
         if scam is not None:
             rejected.append(f"подозрительное требование: {scam}")
+        if self._unpaid_compensation_pattern.search(complete_text):
+            rejected.append("работа явно не предусматривает денежную оплату")
+        if self._negative_candidate_exclusion_pattern.search(" ".join((requirements, description))):
+            rejected.append("работодатель прямо исключил кандидатов с текущим профилем разработки")
         destination = VacancyRoleRouter.classify(vacancy)
         if not rejected and destination is not None and destination is not self.scope:
             return RuleEvaluation(
@@ -498,6 +656,10 @@ class PythonBackendRules:
             )
         ):
             excluded_role = None
+            stretch_reasons.append(
+                "роль связана с no-code/вайбкодингом, но содержит существенное "
+                "программирование; требуется ручная проверка"
+            )
         if excluded_role is not None:
             rejected.append(excluded_role)
         if self.scope is DirectionScope.PYTHON_BACKEND:
@@ -511,16 +673,25 @@ class PythonBackendRules:
             )
             if excluded_function is not None:
                 rejected.append(excluded_function)
-            if (
-                "python" not in title
-                and "python" not in skills
-                and self._optional_python_language_pattern.search(
-                    " ".join((requirements, description))
-                )
+            if "python" not in title and self._optional_python_language_pattern.search(
+                " ".join((requirements, description))
             ):
                 rejected.append("Python указан только как один из необязательных языков")
-        experience_requirements = " ".join((requirements, description))
-        if (
+        experience_requirements = self._mandatory_requirements(vacancy)
+        if not experience_requirements:
+            experience_requirements = self._without_optional_requirements(
+                " ".join((requirements, description))
+            )
+        minimum_required_experience = self._minimum_required_experience(vacancy)
+        if minimum_required_experience is not None and minimum_required_experience >= 3:
+            stretch_reasons.append("обязательный стаж от трёх лет требует ручной проверки")
+        elif (
+            hh_experience_minimum := self._experience_minimum(experience)
+        ) is not None and hh_experience_minimum >= 3:
+            stretch_reasons.append(
+                "диапазон опыта hh.ru начинается от трёх лет и требует ручной проверки"
+            )
+        elif (
             self._mandatory_development_experience_pattern.search(experience_requirements)
             or self._mandatory_english_development_experience_pattern.search(
                 experience_requirements
@@ -547,19 +718,33 @@ class PythonBackendRules:
             stretch_reasons.append(
                 "уровень Senior/Lead снижает приоритет, но сам по себе не блокирует"
             )
+        if self._founding_engineer_pattern.search(title):
+            stretch_reasons.append(
+                "роль первого инженера требует ручной проверки масштаба ответственности"
+            )
         if self._described_level_pattern.search(" ".join((description, requirements))):
             stretch_reasons.append(
                 "уровень Middle/Senior указан как риск, а не самостоятельный запрет"
             )
         if self._more_than_six_years(experience):
             rejected.append("hh.ru указывает требуемый опыт более 6 лет")
-        if self._four_plus_experience_pattern.search(" ".join((requirements, description))):
+        if minimum_required_experience is None and self._four_plus_experience_pattern.search(
+            " ".join((requirements, description))
+        ):
             stretch_reasons.append(
                 "требование от четырёх лет требует дополнительной проверки, "
                 "но само по себе не блокирует"
             )
 
         has_development = any(marker in complete_text for marker in self._development_markers)
+        if (
+            self.scope is DirectionScope.IT_ADJACENT
+            and VacancyRoleRouter.is_build_infrastructure_role(title, complete_text)
+        ):
+            stretch_reasons.append(
+                "основные обязанности связаны со сборкой, CI/CD и инфраструктурой; "
+                "требуется ручная проверка"
+            )
         for marker, reason in self._excluded_specializations:
             if marker in title:
                 if marker in {
@@ -571,6 +756,7 @@ class PythonBackendRules:
                     automation in complete_text
                     for automation in (
                         "автоматизац",
+                        "автоматизирован",
                         "автотест",
                         "automation",
                         "locust",
@@ -588,12 +774,28 @@ class PythonBackendRules:
             rejected.append(f"другой обязательный основной стек: {mandatory_other_stack}")
         if not has_development:
             rejected.append("работа не связана с написанием кода или технической автоматизацией")
+        primary_duties = responsibilities or description
+        if (
+            self._support_primary_duties_pattern.search(primary_duties)
+            and self._coding_action_pattern.search(primary_duties) is None
+        ):
+            rejected.append(
+                "основные обязанности связаны с поддержкой и настройкой, а не разработкой"
+            )
 
         profile_tokens = self._profile_skill_tokens(context.skills)
         vacancy_tokens = self._tokens(" ".join((complete_text, skills)))
         skill_overlap = sorted(profile_tokens & vacancy_tokens)
-        for gap in self._mandatory_skill_gaps(vacancy, profile_tokens):
-            rejected.append(gap)
+        mandatory_skill_gaps = self._mandatory_skill_gaps(vacancy, profile_tokens)
+        if len(mandatory_skill_gaps) >= 2:
+            rejected.append(
+                "несколько обязательных профильных технологий не подтверждены: "
+                + "; ".join(mandatory_skill_gaps)
+            )
+        elif mandatory_skill_gaps:
+            stretch_reasons.append(
+                f"{mandatory_skill_gaps[0]}; снижает приоритет и требует ручной проверки"
+            )
         if self.requires_python and "python" not in complete_text:
             rejected.append("Python не указан в названии, описании или навыках")
         elif (
@@ -848,6 +1050,7 @@ class PythonBackendRules:
             "django" in title
             or re.search(
                 r"(?:опыт\w*\s+работ\w*\s+с\s+django|"
+                r"опыт\w*[^.!?]{0,80}\bdjango\b|"
                 r"python\w*\s+и\s+django|"
                 r"приоритетн\w*\s+опыт\w*[^.!?]{0,50}\bdjango\b)",
                 requirements,
@@ -858,8 +1061,10 @@ class PythonBackendRules:
             gaps.append("обязательный Django не подтверждён опытом кандидата")
 
         broker_required = re.search(
-            r"(?:опыт\w*|знан\w*|уверенн\w*)[^.!?]{0,100}"
-            r"(?:rabbitmq|kafka|брокер\w*\s+сообщен)",
+            r"(?:(?:опыт\w*|знан\w*|уверенн\w*|знаком\w*)[^.!?]{0,100}"
+            r"(?:rabbitmq|kafka|брокер\w*\s+сообщен)|"
+            r"(?:rabbitmq|kafka|брокер\w*\s+сообщен)[^.!?]{0,100}"
+            r"(?:опыт\w*|знан\w*|уверенн\w*|знаком\w*))",
             requirements,
         )
         if broker_required is not None and not profile_tokens & {"rabbitmq", "kafka"}:
@@ -883,45 +1088,325 @@ class PythonBackendRules:
         }
         if len(frontend_markers) >= 2 and not profile_tokens & frontend_markers:
             gaps.append("обязательный клиентский стек не подтверждён опытом кандидата")
-        return tuple(gaps)
+        gaps.extend(cls._mandatory_specialist_skill_gaps(requirements, profile_tokens))
+        return tuple(dict.fromkeys(gaps))
 
     @staticmethod
-    def _mandatory_requirements(vacancy: VacancyData) -> str:
+    def _mandatory_specialist_skill_gaps(
+        requirements: str,
+        profile_tokens: set[str],
+    ) -> tuple[str, ...]:
+        specialist_requirements = (
+            (
+                "Apache Spark",
+                r"\b(?:apache\s+)?spark(?:\s+sql)?\b|\bpyspark\b",
+                frozenset({"spark", "pyspark"}),
+            ),
+            (
+                "Hadoop",
+                r"\b(?:apache\s+)?hadoop\b",
+                frozenset({"hadoop"}),
+            ),
+            (
+                "Greenplum",
+                r"\bgreenplum\b",
+                frozenset({"greenplum"}),
+            ),
+            (
+                "CDC",
+                r"\bcdc\b|change[ -]data[ -]capture|"
+                r"инкрементальн\w*\s+загруз\w*\s+данн\w*",
+                frozenset({"cdc", "debezium"}),
+            ),
+            (
+                "ПЛК",
+                r"\bплк\b|\bplc\b|мэк\s*61131|iec\s*61131",
+                frozenset({"плк", "plc", "iec61131"}),
+            ),
+            (
+                "SCADA/HMI",
+                r"\bscada\b|\bhmi\b|\bскада\b",
+                frozenset({"scada", "hmi"}),
+            ),
+            (
+                "промышленные протоколы",
+                r"\bmodbus\b|\bknx\b|\bdali\b|\bprofibus\b|\bprofinet\b",
+                frozenset({"modbus", "knx", "dali", "profibus", "profinet"}),
+            ),
+            (
+                "PyTorch",
+                r"\bpytorch\b|\btorch\b",
+                frozenset({"pytorch", "torch"}),
+            ),
+            (
+                "компьютерное зрение",
+                r"\bopencv\b|\bcomputer\s+vision\b|"
+                r"\bкомпьютерн\w*\s+зрени\w*\b|\bтехническ\w*\s+зрени\w*\b",
+                frozenset({"opencv", "computer-vision", "cv"}),
+            ),
+            (
+                "ROS",
+                r"\bros2?\b|\brobot\s+operating\s+system\b",
+                frozenset({"ros", "ros2"}),
+            ),
+            (
+                "C++",
+                r"(?<!\w)c\+\+(?:11|14|17|20|23)?(?!\w)",
+                frozenset({"c++", "cpp"}),
+            ),
+            (
+                "Qt",
+                r"\bqt(?:5|6)?\b|\bqml\b",
+                frozenset({"qt", "qt5", "qt6", "qml"}),
+            ),
+            (
+                "цифровая обработка сигналов",
+                r"\bdsp\b|цифров\w*\s+обработк\w*\s+сигнал\w*",
+                frozenset({"dsp", "signal-processing"}),
+            ),
+            (
+                "макросы Office",
+                r"(?:\bexcel\b|\boffice\b)[^.!?\n]{0,100}"
+                r"(?:макрос\w*|\bvba\b)|(?:макрос\w*|\bvba\b)[^.!?\n]{0,100}"
+                r"(?:\bexcel\b|\boffice\b)",
+                frozenset({"vba", "excel-macros"}),
+            ),
+            (
+                "BPMN",
+                r"\bbpmn\b",
+                frozenset({"bpmn"}),
+            ),
+            (
+                "сетевые основы TCP/IP и OSI",
+                r"\btcp\s*/?\s*ip\b|\bмодел\w*\s+osi\b|"
+                r"\bсетев\w*\s+протокол\w*\b",
+                frozenset({"tcp/ip", "tcpip", "osi", "networking"}),
+            ),
+            (
+                "Scrapy",
+                r"\bscrapy\b",
+                frozenset({"scrapy"}),
+            ),
+            (
+                "TensorFlow/Keras",
+                r"\btensorflow\b|\bkeras\b",
+                frozenset({"tensorflow", "keras"}),
+            ),
+            (
+                "SIEM",
+                r"\bsiem\b|систем\w*\s+управлен\w*\s+событи\w*\s+"
+                r"информационн\w*\s+безопасност\w*",
+                frozenset({"siem"}),
+            ),
+            (
+                "Elasticsearch/ELK",
+                r"\belasticsearch\b|\belk\b",
+                frozenset({"elasticsearch", "elk"}),
+            ),
+            (
+                "Pandas",
+                r"\bpandas\b",
+                frozenset({"pandas"}),
+            ),
+            (
+                "DWH",
+                r"\bdwh\b|хранилищ\w*\s+данн\w*",
+                frozenset({"dwh", "data-warehouse"}),
+            ),
+            (
+                "Airflow",
+                r"\bairflow\b",
+                frozenset({"airflow"}),
+            ),
+            (
+                "Go",
+                r"\bgolang\b|\bgo\b",
+                frozenset({"go", "golang"}),
+            ),
+            (
+                "Node.js",
+                r"\bnode(?:\.js)?\b|\bnodejs\b",
+                frozenset({"node.js", "nodejs"}),
+            ),
+            (
+                "микросервисная архитектура",
+                r"\bмикросервис\w*\s+архитектур\w*\b|"
+                r"\bmicroservice\w*\s+architecture\b",
+                frozenset({"микросервисы", "microservices", "microservice"}),
+            ),
+            (
+                "RAG",
+                r"\brag\b|retrieval[ -]augmented generation|"
+                r"генерац\w*\s+с\s+поиск\w*\s+контекст",
+                frozenset({"rag"}),
+            ),
+            (
+                "pgvector",
+                r"\bpgvector\b",
+                frozenset({"pgvector"}),
+            ),
+            (
+                "паттерн ReAct",
+                r"(?:\brag\b|\bpgvector\b|\bagent\w*\b|\bагент\w*\b)"
+                r"[^.!?]{0,100}\breact\b|"
+                r"\breact\b[^.!?]{0,100}(?:\bagent\w*\b|\bагент\w*\b)",
+                frozenset({"react", "langgraph", "langchain"}),
+            ),
+            (
+                "LangGraph",
+                r"\blanggraph\b",
+                frozenset({"langgraph"}),
+            ),
+            (
+                "LangChain",
+                r"\blangchain\b",
+                frozenset({"langchain"}),
+            ),
+            (
+                "LlamaIndex",
+                r"\bllama[ -]?index\b",
+                frozenset({"llamaindex", "llama-index"}),
+            ),
+            (
+                "PydanticAI",
+                r"\bpydantic[ -]?ai\b",
+                frozenset({"pydanticai", "pydantic-ai"}),
+            ),
+            (
+                "CrewAI",
+                r"\bcrew[ -]?ai\b",
+                frozenset({"crewai", "crew-ai"}),
+            ),
+            (
+                "AutoGen",
+                r"\bautogen\b",
+                frozenset({"autogen"}),
+            ),
+            (
+                "MCP",
+                r"\bmcp\b[^.!?]{0,80}(?:\bagent\w*\b|\bllm\b)|"
+                r"(?:\bagent\w*\b|\bllm\b)[^.!?]{0,80}\bmcp\b",
+                frozenset({"mcp"}),
+            ),
+            (
+                "векторная база данных",
+                r"\bvector\s+(?:database|db|store)\b|"
+                r"\bвекторн\w*\s+(?:баз\w*\s+данн\w*|хранилищ\w*)",
+                frozenset(
+                    {
+                        "pgvector",
+                        "qdrant",
+                        "milvus",
+                        "weaviate",
+                        "pinecone",
+                        "faiss",
+                        "chroma",
+                        "chromadb",
+                    }
+                ),
+            ),
+            (
+                "архитектура ИИ-агентов",
+                r"\b(?:agent(?:ic)?\s+architecture|architecture\s+of\s+(?:ai\s+)?agents?)\b|"
+                r"\bархитектур\w*[^.!?]{0,80}(?:ии|ai|llm)?[ -]?агент\w*\b",
+                frozenset(
+                    {
+                        "langgraph",
+                        "langchain",
+                        "crewai",
+                        "autogen",
+                        "pydanticai",
+                        "agentic",
+                    }
+                ),
+            ),
+        )
+        return tuple(
+            f"обязательный {label} не подтверждён опытом кандидата"
+            for label, pattern, aliases in specialist_requirements
+            if re.search(pattern, requirements) is not None and not profile_tokens & aliases
+        )
+
+    @classmethod
+    def _mandatory_requirements(cls, vacancy: VacancyData) -> str:
         if vacancy.required_qualifications and vacancy.required_qualifications.strip():
-            return _normalize_rule_text(vacancy.required_qualifications)
+            return cls._without_optional_requirements(vacancy.required_qualifications)
         description = vacancy.description or ""
-        heading = re.search(
-            r"(?im)^\s*(?:"
+        heading_expression = (
+            r"(?:"
             r"требования|"
             r"что\s+мы\s+жд[её]м[^:\n]*|"
+            r"что\s+мы\s+ожидаем|"
+            r"жд[её]м\s+от\s+тебя|"
+            r"мы\s+ожидаем\s+от\s+тебя|"
+            r"что\s+ожидаем\s+от\s+кандидата|"
+            r"будем\s+рады\s+видеть[^:\n]*|"
             r"для\s+нас\s+важно|"
             r"чего\s+мы\s+ожидаем|"
+            r"наши\s+ожидания|"
+            r"наш[и]\s+пожелания\s+к\s+кандидатам|"
+            r"опыт\s+и\s+навыки|"
+            r"кого\s+мы\s+ищем|"
+            r"что\s+для\s+этого\s+необходимо|"
+            r"технические\s+требования|"
             r"какой\s+опыт\s+и\s+знания\s+нужны|"
             r"что\s+нужно\s+уметь|"
             r"стек\s*\(?(?:обязательно|обязательный)\)?|"
             r"(?:тот|та|кандидат)[^:\n]{0,160}\bимеет"
-            r")\s*:?\s*$",
+            r")"
+        )
+        line_heading = re.search(
+            rf"(?im)^\s*{heading_expression}\s*:?\s*$",
             description,
         )
+        inline_heading = re.search(
+            rf"(?i)(?<!\w){heading_expression}\s*:\s*",
+            description,
+        )
+        headings = tuple(match for match in (line_heading, inline_heading) if match is not None)
+        heading = min(headings, key=lambda match: match.start()) if headings else None
         if heading is None:
             return ""
         requirements = description[heading.end() :]
-        ending = re.search(
-            r"(?im)^\s*(?:"
+        return cls._without_optional_requirements(requirements)
+
+    @staticmethod
+    def _without_optional_requirements(value: str) -> str:
+        optional_section = (
+            r"(?:"
             r"будет\s+(?:плюсом|преимуществом)|"
+            r"желательн\w*\s+навык\w*(?:\s*\(будет\s+плюсом\))?|"
+            r"желательно|"
+            r"необязательно|"
+            r"optional|"
+            r"preferred|"
+            r"nice\s+to\s+have|"
             r"условия|"
             r"мы\s+предлагаем|"
             r"что\s+мы\s+предлагаем|"
             r"предлагаем"
-            r")\s*:?\s*$",
-            requirements,
+            r")"
         )
-        if ending is not None:
-            requirements = requirements[: ending.start()]
-        inline_plus = re.search(r"\bбудет\s+плюсом\b", requirements, re.IGNORECASE)
-        if inline_plus is not None:
-            requirements = requirements[: inline_plus.start()]
-        return _normalize_rule_text(requirements)
+        ending = re.search(
+            rf"(?im)^\s*{optional_section}\s*:?\s*$",
+            value,
+        )
+        inline_ending = re.search(
+            rf"(?i)(?<!\w){optional_section}\s*:\s*",
+            value,
+        )
+        endings = tuple(match for match in (ending, inline_ending) if match is not None)
+        if endings:
+            value = value[: min(endings, key=lambda match: match.start()).start()]
+        lines = value.splitlines()
+        if len(lines) > 1:
+            optional_clause = re.compile(
+                r"\b(?:будет\s+(?:плюсом|преимуществом)|"
+                r"желательно|необязательно)\b",
+                re.IGNORECASE,
+            )
+            value = "\n".join(line for line in lines if not optional_clause.search(line))
+        return _normalize_rule_text(value)
 
     @staticmethod
     def _substantial_coding_evidence(text: str) -> bool:
@@ -959,6 +1444,78 @@ class PythonBackendRules:
 
     def _profile_skill_tokens(self, values: tuple[str, ...]) -> set[str]:
         return self._tokens(" ".join(values))
+
+    @classmethod
+    def _minimum_required_experience(
+        cls,
+        vacancy: VacancyData,
+    ) -> float | None:
+        values: list[float] = []
+        mandatory_requirements = cls._mandatory_requirements(vacancy)
+        if not mandatory_requirements:
+            mandatory_requirements = cls._without_optional_requirements(
+                " ".join(
+                    (
+                        vacancy.required_qualifications or "",
+                        vacancy.description or "",
+                    )
+                )
+            )
+        for clause in re.split(r"[.!?;\n]+", mandatory_requirements):
+            has_experience_marker = (
+                re.search(r"\b(?:опыт\w*|стаж\w*|experience)\b", clause) is not None
+            )
+            has_development_duration = (
+                re.search(r"\b(?:лет|год(?:а|ов)?|years?)\b", clause) is not None
+                and re.search(
+                    r"\b(?:разработ\w*|development|python|backend|бэкенд)\b",
+                    clause,
+                )
+                is not None
+            )
+            if not clause or not (has_experience_marker or has_development_duration):
+                continue
+            minimum = cls._experience_minimum(clause)
+            if minimum is not None:
+                values.append(minimum)
+        return max(values) if values else None
+
+    @staticmethod
+    def _experience_minimum(value: str) -> float | None:
+        if not value or "не требуется" in value or "без опыта" in value:
+            return None
+        word_values = {
+            "двух": 2.0,
+            "трех": 3.0,
+            "трёх": 3.0,
+            "четырех": 4.0,
+            "четырёх": 4.0,
+            "пяти": 5.0,
+            "шести": 6.0,
+        }
+        word_match = re.search(
+            r"\b(?:от|не менее|минимум)\s+"
+            r"(двух|тр[её]х|четыр[её]х|пяти|шести)\s+лет\b",
+            value,
+        )
+        if word_match is not None:
+            return word_values[word_match.group(1)]
+
+        patterns = (
+            r"\b(?:от|from)\s+(\d+(?:[.,]\d+)?)\s+"
+            r"(?:до|to)\s+\d+(?:[.,]\d+)?\s*(?:лет|год(?:а|ов)?|years?)\b",
+            r"\b(?:от|не менее|минимум|from|at least|minimum)\s+"
+            r"(\d+(?:[.,]\d+)?)(?:-?х)?\s*(?:лет|год(?:а|ов)?|years?)\b",
+            r"\b(\d+(?:[.,]\d+)?)\s*\+\s*(?:лет|год(?:а|ов)?|years?)\b",
+            r"\b(\d+(?:[.,]\d+)?)\s*[-–—‑]\s*\d+(?:[.,]\d+)?\s*"
+            r"(?:лет|год(?:а|ов)?|years?)\b",
+            r"\b(\d+(?:[.,]\d+)?)(?:-?х)?\s*(?:лет|год(?:а|ов)?|years?)\b",
+        )
+        for pattern in patterns:
+            match = re.search(pattern, value)
+            if match is not None:
+                return float(match.group(1).replace(",", "."))
+        return None
 
     @staticmethod
     def _role_score(title: str, text: str) -> float:
@@ -1144,7 +1701,7 @@ class PythonBackendRules:
     def _freshness_score(published_at: datetime | None) -> float | None:
         if published_at is None:
             return None
-        age_seconds = (datetime.now(UTC) - published_at.astimezone(UTC)).total_seconds()
+        age_seconds = (datetime.now(UTC) - as_utc(published_at)).total_seconds()
         age_days = max(age_seconds / 86400, 0)
         if age_days <= 2:
             return 100
@@ -1153,6 +1710,12 @@ class PythonBackendRules:
         if age_days <= 30:
             return 55
         return 30
+
+    @staticmethod
+    def _is_too_old(published_at: datetime | None) -> bool:
+        if published_at is None:
+            return False
+        return datetime.now(UTC) - as_utc(published_at) > MAX_VACANCY_AGE
 
     @staticmethod
     def _description_score(vacancy: VacancyData) -> float | None:
@@ -1179,8 +1742,50 @@ class AdjacentItRules(PythonBackendRules):
         "ml engineer",
         "ml-инженер",
         "ml инженер",
+        "ml-разработчик",
+        "ml разработчик",
+        "ml developer",
+        "machine learning developer",
         "ml lead",
         "mlops",
+        "devops",
+        "sre",
+        "sdet",
+        "software development engineer in test",
+        "aqa",
+        "тестировщик",
+        "qa engineer",
+        "qa-инженер",
+        "автоматизированн",
+        "автотест",
+        "pyqt",
+        "qml",
+        "ai developer",
+        "ai-разработчик",
+        "ai разработчик",
+        "ai-инженер",
+        "ai инженер",
+        "инженер по ai",
+        "ии-разработчик",
+        "ии разработчик",
+        "ии-инженер",
+        "ии инженер",
+        "инженер по ии",
+        "инженер ии",
+        "разработчик ии",
+        "ai-агент",
+        "ai агент",
+        "искусственный интеллект",
+        "искусственного интеллекта",
+        "искусственному интеллекту",
+        "искусственным интеллектом",
+        "искусственном интеллекте",
+        "generative ai",
+        "ai/ml",
+        "dwh",
+        "data warehouse",
+        "хранилищ данных",
+        "хранилища данных",
     )
     _excluded_specializations: ClassVar[tuple[tuple[str, str], ...]] = (
         ("аналитик", "другое направление: аналитика без разработки"),
@@ -1307,7 +1912,12 @@ class VacancyAnalysisService:
         context: RuleContext,
     ) -> VacancyAnalysisResult:
         tracked = self._directions.get_tracked_vacancy(direction.id, stored.id)
-        if tracked.rules_details.get("manual_override") == "ACCEPT":
+        rules = self._rules[direction.scope]
+        if (
+            vacancy.availability is VacancyAvailability.ACTIVE
+            and tracked.rules_details.get("manual_override") == "ACCEPT"
+            and not rules._is_too_old(vacancy.published_at)
+        ):
             raw_reasons = tracked.rules_details.get("reasons", [])
             reason_values = raw_reasons if isinstance(raw_reasons, list) else []
             reasons = tuple(str(item) for item in reason_values)
@@ -1344,7 +1954,6 @@ class VacancyAnalysisService:
                 duplicate.similarity,
             )
 
-        rules = self._rules[direction.scope]
         evaluation = rules.evaluate(vacancy, context)
         if duplicate is not None:
             evaluation = RuleEvaluation(
