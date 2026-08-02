@@ -124,13 +124,18 @@ class ResumeBlockExtractor:
         lines = self._clean_lines(source_text)
         work_start = self._find_work_start(lines)
         work_end = self._find_work_end(lines, work_start)
-        entry_starts = [
+        date_starts = [
             index
             for index in range(work_start, work_end)
             if self._date_start.search(lines[index]) is not None
         ]
-        if not entry_starts:
+        if not date_starts:
             raise ValueError("В разделе опыта не найдены отдельные места работы")
+        company_first = self._has_pre_date_headers(lines, work_start, date_starts[0])
+        entry_starts = [
+            self._entry_start(lines, work_start, date_start, company_first)
+            for date_start in date_starts
+        ]
 
         blocks: list[ResumeNarrativeBlock] = []
         for entry_number, entry_start in enumerate(entry_starts, start=1):
@@ -214,6 +219,52 @@ class ResumeBlockExtractor:
             len(lines),
         )
 
+    def _entry_start(
+        self,
+        lines: list[str],
+        work_start: int,
+        date_start: int,
+        company_first: bool,
+    ) -> int:
+        if not company_first:
+            return date_start
+        if self._has_pre_date_headers(lines, work_start, date_start):
+            return date_start - 2
+        return date_start
+
+    def _has_pre_date_headers(
+        self,
+        lines: list[str],
+        work_start: int,
+        date_start: int,
+    ) -> bool:
+        candidate = date_start - 2
+        if candidate < work_start:
+            return False
+        headers = lines[candidate:date_start]
+        return len(headers) == 2 and all(self._is_pre_date_header(line) for line in headers)
+
+    def _is_pre_date_header(self, line: str) -> bool:
+        lowered = line.casefold()
+        return (
+            len(line) <= 100
+            and not line.startswith(("-", "•"))
+            and not line.endswith((".", "!", "?", ":"))
+            and not lowered.startswith(
+                (
+                    "обязанности",
+                    "достижения",
+                    "проект",
+                    "стек",
+                    "технологии",
+                    "открытая версия",
+                )
+            )
+            and self._date_start.search(line) is None
+            and self._duration.search(line) is None
+            and re.fullmatch(r"https?://\S+", line, re.IGNORECASE) is None
+        )
+
     def _find_narrative_start(self, lines: list[str], start: int, end: int) -> int:
         for index in range(start + 1, end):
             line = lines[index]
@@ -291,6 +342,7 @@ class ResumeBlockExtractor:
         for line in lines[start:narrative_start]:
             if (
                 self._date_line.search(line) is not None
+                or self._date_start.search(line) is not None
                 or self._duration.search(line) is not None
                 or line.casefold() == "настоящее время"
                 or line.startswith("•")

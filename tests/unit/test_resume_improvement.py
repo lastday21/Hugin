@@ -120,6 +120,62 @@ def test_extractor_splits_workplaces_and_projects_and_assembles() -> None:
     assert all(f"Улучшенный блок {index}" in assembled for index in range(1, 6))
 
 
+def test_extractor_supports_company_and_role_before_date() -> None:
+    source = """Опыт работы
+PointPulse
+Python backend-разработчик
+январь 2026 — настоящее время
+- Разрабатываю REST API на FastAPI.
+Яндекс Крауд
+Специалист по автоматизации
+август 2025 — декабрь 2025
+- Создавал backend-прототипы с LLM и AI Studio.
+- Интегрировал WebSocket и внешние API.
+Газпромнефть
+Ведущий специалист
+август 2022 — июнь 2025
+- Анализировал производственные данные.
+Образование
+Университет
+"""
+
+    structure = ResumeBlockExtractor().extract(source)
+
+    assert [(block.kind.value, block.label) for block in structure.blocks] == [
+        ("WORK_EXPERIENCE", "PointPulse — Python backend-разработчик"),
+        ("WORK_EXPERIENCE", "Яндекс Крауд — Специалист по автоматизации"),
+        ("WORK_EXPERIENCE", "Газпромнефть — Ведущий специалист"),
+    ]
+    assert "Яндекс Крауд" not in structure.blocks[0].source_text
+    assert "LLM и AI Studio" in structure.blocks[1].source_text
+    assert "Газпромнефть" not in structure.blocks[1].source_text
+
+
+def test_extractor_keeps_date_first_layout_after_short_narrative_lines() -> None:
+    source = """Опыт работы
+Январь 2024 —
+Компания Альфа
+Разработчик
+- Делал сервис.
+Короткий итог
+Ещё один итог
+Август 2023 —
+Компания Бета
+Аналитик
+- Анализировал данные.
+Образование
+Университет
+"""
+
+    structure = ResumeBlockExtractor().extract(source)
+
+    assert [block.label for block in structure.blocks] == [
+        "Компания Альфа — Разработчик",
+        "Компания Бета — Аналитик",
+    ]
+    assert "Короткий итог\nЕщё один итог" in structure.blocks[0].source_text
+
+
 @pytest.mark.parametrize(
     ("source", "message"),
     [
