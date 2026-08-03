@@ -1,37 +1,24 @@
 from __future__ import annotations
 
-import json
 import sys
 from dataclasses import dataclass
 from importlib import import_module
+from pathlib import Path
 from typing import Protocol, cast
 
 
 @dataclass(frozen=True, slots=True)
-class TelegramGatewayCredentials:
-    access_token: str
+class NotificationGatewayCredentials:
+    service_key: str
+
+    def __post_init__(self) -> None:
+        selected = self.service_key.strip()
+        if len(selected) < 32 or len(selected) > 512:
+            raise ValueError("Некорректный ключ службы уведомлений")
+        object.__setattr__(self, "service_key", selected)
 
     def __repr__(self) -> str:
-        return "TelegramGatewayCredentials(access_token='***')"
-
-
-@dataclass(frozen=True, slots=True)
-class EmailCredentials:
-    smtp_host: str
-    smtp_port: int
-    username: str
-    password: str
-    sender: str
-    recipient: str
-    starttls: bool = True
-
-    def __repr__(self) -> str:
-        return (
-            "EmailCredentials(smtp_host="
-            f"{self.smtp_host!r}, smtp_port={self.smtp_port}, username='***', "
-            "password='***', sender='***', recipient='***', "
-            f"starttls={self.starttls})"
-        )
+        return "NotificationGatewayCredentials(service_key='***')"
 
 
 class KeyringBackend(Protocol):
@@ -43,6 +30,7 @@ class KeyringBackend(Protocol):
 
 
 class WindowsNotificationCredentialStore:
+    _NOTIFICATION_GATEWAY_KEY = "notification.service_key"
     _TELEGRAM_LEGACY_KEY = "telegram"
     _TELEGRAM_TOKEN_KEY = "telegram.bot_token"
     _TELEGRAM_CHAT_KEY = "telegram.chat_id"
@@ -56,120 +44,41 @@ class WindowsNotificationCredentialStore:
         self._backend = backend
         self._service_name = service_name
 
-    def save_telegram_gateway(self, credentials: TelegramGatewayCredentials) -> None:
-        access_token = credentials.access_token.strip()
-        if not access_token:
-            raise ValueError("Служба Telegram не выдала ключ подключения")
+    def save_notification_gateway(
+        self,
+        credentials: NotificationGatewayCredentials,
+    ) -> None:
         self._get_backend().set_password(
             self._service_name,
-            self._TELEGRAM_GATEWAY_KEY,
-            access_token,
+            self._NOTIFICATION_GATEWAY_KEY,
+            credentials.service_key,
         )
-        self._delete_direct_telegram_credentials()
+        self._delete_legacy_credentials()
 
-    def load_telegram_gateway(self) -> TelegramGatewayCredentials | None:
-        access_token = self._load_required_text(
-            self._TELEGRAM_GATEWAY_KEY,
-            "Сохранённое подключение Telegram повреждено",
+    def load_notification_gateway(self) -> NotificationGatewayCredentials | None:
+        service_key = self._load_required_text(
+            self._NOTIFICATION_GATEWAY_KEY,
+            "Сохранённый ключ службы уведомлений повреждён",
         )
-        if access_token is None:
+        if service_key is None:
             return None
-        return TelegramGatewayCredentials(access_token)
+        try:
+            return NotificationGatewayCredentials(service_key)
+        except ValueError as error:
+            raise RuntimeError("Сохранённый ключ службы уведомлений повреждён") from error
 
-    def save_email(self, credentials: EmailCredentials) -> None:
-        host = credentials.smtp_host.strip()
-        username = credentials.username.strip()
-        sender = credentials.sender.strip()
-        recipient = credentials.recipient.strip()
-        if not host or not sender or not recipient:
-            raise ValueError("Настройки электронной почты заполнены не полностью")
-        if credentials.smtp_port < 1 or credentials.smtp_port > 65_535:
-            raise ValueError("Некорректный порт почтового сервера")
-        self._save(
+    def delete_notification_gateway(self) -> bool:
+        return self._delete(self._NOTIFICATION_GATEWAY_KEY)
+
+    def _delete_legacy_credentials(self) -> None:
+        for key in (
+            self._TELEGRAM_GATEWAY_KEY,
+            self._TELEGRAM_TOKEN_KEY,
+            self._TELEGRAM_CHAT_KEY,
+            self._TELEGRAM_LEGACY_KEY,
             "email",
-            {
-                "smtp_host": host,
-                "smtp_port": credentials.smtp_port,
-                "username": username,
-                "password": credentials.password,
-                "sender": sender,
-                "recipient": recipient,
-                "starttls": credentials.starttls,
-            },
-        )
-
-    def load_email(self) -> EmailCredentials | None:
-        value = self._load("email")
-        if value is None:
-            return None
-        try:
-            host = value["smtp_host"]
-            port = value["smtp_port"]
-            username = value["username"]
-            password = value["password"]
-            sender = value["sender"]
-            recipient = value["recipient"]
-            starttls = value["starttls"]
-            if not isinstance(host, str) or not host.strip():
-                raise TypeError
-            if not isinstance(port, int) or not 1 <= port <= 65_535:
-                raise TypeError
-            if not isinstance(username, str) or not isinstance(password, str):
-                raise TypeError
-            if not isinstance(sender, str) or not isinstance(recipient, str):
-                raise TypeError
-            if not sender.strip() or not recipient.strip() or not isinstance(starttls, bool):
-                raise TypeError
-            return EmailCredentials(
-                host.strip(),
-                port,
-                username.strip(),
-                password,
-                sender.strip(),
-                recipient.strip(),
-                starttls,
-            )
-        except (KeyError, TypeError, ValueError) as error:
-            raise RuntimeError("Настройки электронной почты повреждены") from error
-
-    def delete_telegram(self) -> bool:
-        deleted = [
-            self._delete(self._TELEGRAM_GATEWAY_KEY),
-            self._delete(self._TELEGRAM_TOKEN_KEY),
-            self._delete(self._TELEGRAM_CHAT_KEY),
-            self._delete(self._TELEGRAM_LEGACY_KEY),
-        ]
-        return any(deleted)
-
-    def delete_email(self) -> bool:
-        return self._delete("email")
-
-    def _save(self, key: str, value: dict[str, object]) -> None:
-        self._get_backend().set_password(
-            self._service_name,
-            key,
-            json.dumps(value, ensure_ascii=False),
-        )
-
-    def _load(self, key: str) -> dict[str, object] | None:
-        payload = self._get_backend().get_password(self._service_name, key)
-        if payload is None:
-            return None
-        try:
-            value = json.loads(payload)
-        except json.JSONDecodeError as error:
-            raise RuntimeError("Сохранённые настройки уведомлений повреждены") from error
-        if not isinstance(value, dict):
-            raise RuntimeError("Сохранённые настройки уведомлений повреждены")
-        return cast(dict[str, object], value)
-
-    def _delete_direct_telegram_credentials(self) -> bool:
-        deleted = [
-            self._delete(self._TELEGRAM_TOKEN_KEY),
-            self._delete(self._TELEGRAM_CHAT_KEY),
-            self._delete(self._TELEGRAM_LEGACY_KEY),
-        ]
-        return any(deleted)
+        ):
+            self._delete(key)
 
     def _load_required_text(self, key: str, error_message: str) -> str | None:
         value = self._get_backend().get_password(self._service_name, key)
@@ -193,3 +102,20 @@ class WindowsNotificationCredentialStore:
         if sys.platform != "win32":
             raise RuntimeError("Защищённое хранилище уведомлений доступно только в Windows")
         return cast(KeyringBackend, import_module("keyring"))
+
+
+def load_notification_gateway_credentials(
+    key_file: Path | None,
+    store: WindowsNotificationCredentialStore | None = None,
+) -> NotificationGatewayCredentials | None:
+    if key_file is not None:
+        try:
+            service_key = key_file.read_text(encoding="utf-8-sig").strip()
+        except OSError as error:
+            raise RuntimeError("Файл ключа службы уведомлений недоступен") from error
+        try:
+            return NotificationGatewayCredentials(service_key)
+        except ValueError as error:
+            raise RuntimeError("Файл ключа службы уведомлений повреждён") from error
+    selected_store = store or WindowsNotificationCredentialStore()
+    return selected_store.load_notification_gateway()

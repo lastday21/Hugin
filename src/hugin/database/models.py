@@ -1186,6 +1186,7 @@ class ApplicationSettingsModel(Base):
     telegram_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     email_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     notification_routing: Mapped[ConfigPayload] = mapped_column(JSONB, default=dict, nullable=False)
+    notification_cutoffs: Mapped[ConfigPayload] = mapped_column(JSONB, default=dict, nullable=False)
     ai_prompt_overrides: Mapped[ConfigPayload] = mapped_column(
         JSONB,
         default=dict,

@@ -42,7 +42,7 @@ def test_migration_reaches_baseline(settings: Settings) -> None:
         database.close()
 
     upgrade_database(settings)
-    assert current_revision(settings) == "0017_supervised_lease"
+    assert current_revision(settings) == "0018_notification_cutoffs"
     check_database_schema(settings)
 
     downgrade_database(settings)
@@ -58,7 +58,7 @@ def test_database_cli_manages_schema(
 
     assert cli.main(["upgrade"]) == 0
     assert cli.main(["current"]) == 0
-    assert capsys.readouterr().out.strip() == "0017_supervised_lease"
+    assert capsys.readouterr().out.strip() == "0018_notification_cutoffs"
     assert cli.main(["check"]) == 0
     assert cli.main(["downgrade"]) == 0
 
@@ -103,6 +103,56 @@ def test_safe_defaults_migration_pauses_existing_queue(settings: Settings) -> No
         downgraded.close()
 
 
+def test_notification_cutoff_migration_blocks_pending_external_history(
+    settings: Settings,
+) -> None:
+    upgrade_database(settings, "0017_supervised_lease")
+    database = create_database(settings)
+    try:
+        with database.engine.begin() as connection:
+            connection.execute(
+                text(
+                    "UPDATE application_settings "
+                    "SET telegram_enabled = TRUE, email_enabled = TRUE, "
+                    "notification_routing = "
+                    """'{"NEW_MESSAGE":["TELEGRAM","EMAIL"]}'::jsonb """
+                    "WHERE id = 1"
+                )
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO notifications "
+                    "(deduplication_key, event_type, channel, state, payload, "
+                    "scheduled_at, created_at) VALUES "
+                    "('old-telegram', 'NEW_MESSAGE', 'TELEGRAM', 'PENDING', "
+                    "'{}'::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP), "
+                    "('old-email', 'NEW_MESSAGE', 'EMAIL', 'PENDING', "
+                    "'{}'::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+                )
+            )
+    finally:
+        database.close()
+
+    upgrade_database(settings)
+    migrated = create_database(settings)
+    try:
+        with migrated.engine.connect() as connection:
+            result = connection.execute(
+                text("SELECT state, error_code FROM notifications ORDER BY deduplication_key")
+            ).all()
+            rows = [(str(row.state), str(row.error_code)) for row in result]
+            cutoffs = connection.execute(
+                text("SELECT notification_cutoffs FROM application_settings WHERE id = 1")
+            ).scalar_one()
+        assert rows == [
+            ("FAILED", "HISTORICAL_EVENT_SUPPRESSED"),
+            ("FAILED", "HISTORICAL_EVENT_SUPPRESSED"),
+        ]
+        assert {"NEW_MESSAGE:TELEGRAM", "NEW_MESSAGE:EMAIL"} <= set(cutoffs)
+    finally:
+        migrated.close()
+
+
 def test_direction_migration_preserves_existing_application(settings: Settings) -> None:
     upgrade_database(settings, "0003_queue_and_states")
     database = create_database(settings)
@@ -139,6 +189,6 @@ def test_direction_migration_preserves_existing_application(settings: Settings) 
             ).one()
 
         assert row == ("Imported data", "legacy-resume", "APPLYING")
-        assert current_revision(settings) == "0017_supervised_lease"
+        assert current_revision(settings) == "0018_notification_cutoffs"
     finally:
         migrated.close()

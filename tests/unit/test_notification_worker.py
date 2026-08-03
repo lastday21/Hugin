@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 from datetime import UTC, datetime
+from hashlib import sha256
 from pathlib import Path
 
 import pytest
@@ -14,8 +15,15 @@ from hugin.domain.communications import NotificationRecord
 from hugin.domain.content import DeliveryState, NotificationChannel
 
 
-def notification(channel: NotificationChannel) -> NotificationRecord:
+def notification(
+    channel: NotificationChannel,
+    *,
+    action_url: str | None = None,
+) -> NotificationRecord:
     now = datetime(2026, 7, 27, 8, 0, tzinfo=UTC)
+    payload: dict[str, object] = {"title": "Hugin", "body": "Новое сообщение"}
+    if action_url is not None:
+        payload["action_url"] = action_url
     return NotificationRecord(
         id=1,
         application_id=None,
@@ -24,7 +32,7 @@ def notification(channel: NotificationChannel) -> NotificationRecord:
         event_type="NEW_MESSAGE",
         channel=channel,
         state=DeliveryState.PENDING,
-        payload={"title": "Hugin", "body": "Новое сообщение"},
+        payload=payload,
         scheduled_at=now,
         sent_at=None,
         error_code=None,
@@ -35,70 +43,105 @@ def notification(channel: NotificationChannel) -> NotificationRecord:
 def test_worker_routes_each_channel(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    sent: list[tuple[str, str]] = []
+    windows: list[NotificationContent] = []
+    gateway_calls: list[dict[str, object]] = []
+    gateway_initialization: list[tuple[str, object, int]] = []
+    credentials = object()
 
-    class Sender:
-        def __init__(self, *_args: object, **_kwargs: object) -> None:
-            pass
-
+    class WindowsSender:
         def send(self, content: NotificationContent) -> None:
-            sent.append((type(self).__name__, content.body))
+            windows.append(content)
 
-    class Credentials:
-        def load_telegram_gateway(self) -> object:
-            return object()
+    class GatewaySender:
+        def __init__(
+            self,
+            base_url: str,
+            selected_credentials: object,
+            *,
+            timeout_seconds: int,
+        ) -> None:
+            gateway_initialization.append((base_url, selected_credentials, timeout_seconds))
 
-        def load_email(self) -> object:
-            return object()
+        def send(self, **values: object) -> None:
+            gateway_calls.append(values)
 
-    monkeypatch.setattr(worker_module, "WindowsToastSender", Sender)
-    monkeypatch.setattr(worker_module, "TelegramGatewayNotificationSender", Sender)
-    monkeypatch.setattr(worker_module, "EmailNotificationSender", Sender)
-    monkeypatch.setattr(worker_module, "WindowsNotificationCredentialStore", Credentials)
+    monkeypatch.setattr(worker_module, "WindowsToastSender", WindowsSender)
+    monkeypatch.setattr(worker_module, "NotificationGatewaySender", GatewaySender)
+    monkeypatch.setattr(
+        worker_module,
+        "load_notification_gateway_credentials",
+        lambda _path: credentials,
+    )
     worker = worker_module.NotificationWorker(Settings(environment="test"))
 
     worker._send(notification(NotificationChannel.WINDOWS))
-    worker._send(notification(NotificationChannel.TELEGRAM))
+    telegram = notification(
+        NotificationChannel.TELEGRAM,
+        action_url="https://hh.ru/vacancy/101",
+    )
+    worker._send(telegram)
     worker._send(notification(NotificationChannel.EMAIL))
 
-    assert len(sent) == 3
-    assert all(body == "Новое сообщение" for _sender, body in sent)
+    assert windows == [NotificationContent("Hugin", "Новое сообщение")]
+    assert gateway_initialization == [
+        (
+            worker._settings.notification_gateway_url,
+            credentials,
+            worker._settings.notification_gateway_timeout_seconds,
+        ),
+        (
+            worker._settings.notification_gateway_url,
+            credentials,
+            worker._settings.notification_gateway_timeout_seconds,
+        ),
+    ]
+    assert [call["channel"] for call in gateway_calls] == ["TELEGRAM", "EMAIL"]
+    assert gateway_calls[0]["action_url"] == "https://hh.ru/vacancy/101"
+    assert gateway_calls[1]["action_url"] is None
+    assert gateway_calls[0]["event_id"] == (
+        "hugin:" + sha256(telegram.deduplication_key.encode("utf-8")).hexdigest()
+    )
+    assert telegram.deduplication_key not in str(gateway_calls[0]["event_id"])
 
 
-def test_worker_requires_connected_telegram_gateway(
+@pytest.mark.parametrize(
+    "channel",
+    [NotificationChannel.TELEGRAM, NotificationChannel.EMAIL],
+)
+def test_worker_requires_notification_service_credentials(
     monkeypatch: pytest.MonkeyPatch,
+    channel: NotificationChannel,
 ) -> None:
-    class Credentials:
-        def load_telegram_gateway(self) -> None:
-            return None
-
-    monkeypatch.setattr(worker_module, "WindowsNotificationCredentialStore", Credentials)
+    monkeypatch.setattr(
+        worker_module,
+        "load_notification_gateway_credentials",
+        lambda _path: None,
+    )
     worker = worker_module.NotificationWorker(Settings(environment="test"))
 
     with pytest.raises(
         worker_module.NotificationChannelNotConfigured,
-        match="Telegram не настроен",
+        match="Служба внешних уведомлений не настроена",
     ) as error:
-        worker._send(notification(NotificationChannel.TELEGRAM))
-    assert error.value.code == "TELEGRAM_NOT_CONFIGURED"
+        worker._send(notification(channel))
+    assert error.value.code == "NOTIFICATION_SERVICE_NOT_CONFIGURED"
 
 
-def test_worker_requires_connected_email(
+def test_worker_treats_unreadable_service_key_as_configuration_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    class Credentials:
-        def load_email(self) -> None:
-            return None
+    def load(_path: Path | None) -> None:
+        raise RuntimeError("Файл служебного ключа недоступен")
 
-    monkeypatch.setattr(worker_module, "WindowsNotificationCredentialStore", Credentials)
+    monkeypatch.setattr(worker_module, "load_notification_gateway_credentials", load)
     worker = worker_module.NotificationWorker(Settings(environment="test"))
 
     with pytest.raises(
         worker_module.NotificationChannelNotConfigured,
-        match="Электронная почта не настроена",
+        match="Файл служебного ключа недоступен",
     ) as error:
         worker._send(notification(NotificationChannel.EMAIL))
-    assert error.value.code == "EMAIL_NOT_CONFIGURED"
+    assert error.value.code == "NOTIFICATION_SERVICE_NOT_CONFIGURED"
 
 
 def test_worker_retries_failed_delivery(
@@ -183,8 +226,8 @@ def test_worker_blocks_unconfigured_channel_and_records_journal(
         "_send",
         lambda _notification: (_ for _ in ()).throw(
             worker_module.NotificationChannelNotConfigured(
-                "EMAIL_NOT_CONFIGURED",
-                "Электронная почта не настроена",
+                "NOTIFICATION_SERVICE_NOT_CONFIGURED",
+                "Служба внешних уведомлений не настроена",
             )
         ),
     )
@@ -239,11 +282,11 @@ def test_worker_blocks_unconfigured_channel_and_records_journal(
     now = datetime(2026, 7, 27, 8, 0, tzinfo=UTC)
 
     assert worker.run_once(now)
-    assert recorded == [(selected.id, "EMAIL_NOT_CONFIGURED", now)]
+    assert recorded == [(selected.id, "NOTIFICATION_SERVICE_NOT_CONFIGURED", now)]
     entries = list(journal.entries(component="notifications"))
     assert [entry["status"] for entry in entries] == ["started", "blocked"]
-    assert entries[-1]["details"]["error_code"] == "EMAIL_NOT_CONFIGURED"
-    assert entries[-1]["details"]["reason"] == "Электронная почта не настроена"
+    assert entries[-1]["details"]["error_code"] == "NOTIFICATION_SERVICE_NOT_CONFIGURED"
+    assert entries[-1]["details"]["reason"] == "Служба внешних уведомлений не настроена"
 
 
 def test_worker_rejects_invalid_configuration() -> None:

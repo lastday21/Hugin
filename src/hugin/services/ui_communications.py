@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -17,6 +17,7 @@ from hugin.database.models import (
 )
 from hugin.domain.content import InvitationState, MessageDirection, RecruiterMessageState
 from hugin.domain.directions import ConfigPayload
+from hugin.domain.time import as_utc
 from hugin.services.ai_prompts import (
     AI_MODEL_OPTIONS,
     AI_REASONING_OPTIONS,
@@ -273,6 +274,7 @@ class UiCommunicationService:
         telegram_enabled: bool,
         email_enabled: bool,
         events: tuple[str, ...],
+        now: datetime | None = None,
     ) -> UiCommunications:
         if self._session.get(HhAccountModel, account_id) is None:
             raise LookupError("Аккаунт hh.ru не найден")
@@ -284,6 +286,8 @@ class UiCommunicationService:
         if unknown:
             raise ValueError("Выбран неизвестный вид уведомления")
 
+        changed_at = as_utc(now or datetime.now(UTC))
+        previous = self._all_routing(settings.notification_routing)
         selected_channels = [
             channel
             for channel, enabled in (
@@ -296,11 +300,29 @@ class UiCommunicationService:
         updated: dict[str, list[str]] = {event: [] for event in WINDOWS_NOTIFICATION_EVENTS}
         for event in selected_events:
             updated[event].extend(selected_channels)
+        cutoffs = {
+            str(key): str(value)
+            for key, value in settings.notification_cutoffs.items()
+            if isinstance(value, str)
+        }
+        active_cutoff_keys: set[str] = set()
+        for event, channels in updated.items():
+            previous_channels = previous.get(event, [])
+            for channel in channels:
+                key = f"{event}:{channel}"
+                active_cutoff_keys.add(key)
+                if channel not in previous_channels:
+                    cutoffs[key] = changed_at.isoformat()
+                elif key not in cutoffs and channel != "WINDOWS":
+                    cutoffs[key] = as_utc(settings.updated_at).isoformat()
         settings.windows_notifications_enabled = windows_enabled
         settings.telegram_enabled = telegram_enabled
         settings.email_enabled = email_enabled
         routing: ConfigPayload = {event: channels for event, channels in updated.items()}
         settings.notification_routing = routing
+        settings.notification_cutoffs = {
+            key: value for key, value in cutoffs.items() if key in active_cutoff_keys
+        }
         self._session.flush()
         return self.get(account_id)
 

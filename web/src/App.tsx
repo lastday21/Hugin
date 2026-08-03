@@ -3161,17 +3161,13 @@ function NotificationSettingsForm({
   const [emailEnabled, setEmailEnabled] = useState(settings.email_enabled);
   const [events, setEvents] = useState(initialEvents);
   const [saving, setSaving] = useState(false);
-  const [telegramBotConfigured, setTelegramBotConfigured] = useState(false);
+  const [serviceAvailable, setServiceAvailable] = useState(false);
+  const [gatewayKeyConfigured, setGatewayKeyConfigured] = useState(false);
+  const [telegramAvailable, setTelegramAvailable] = useState(false);
   const [telegramConnected, setTelegramConnected] = useState(false);
   const [telegramBotUsername, setTelegramBotUsername] = useState("hugin_workbot");
-  const [telegramStatusLoading, setTelegramStatusLoading] = useState(true);
+  const [serviceStatusLoading, setServiceStatusLoading] = useState(true);
   const [emailConfigured, setEmailConfigured] = useState(false);
-  const [smtpHost, setSmtpHost] = useState("");
-  const [smtpPort, setSmtpPort] = useState("587");
-  const [smtpUsername, setSmtpUsername] = useState("");
-  const [smtpPassword, setSmtpPassword] = useState("");
-  const [emailSender, setEmailSender] = useState("");
-  const [emailRecipient, setEmailRecipient] = useState("");
   const [credentialsSaving, setCredentialsSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const dirty =
@@ -3197,26 +3193,28 @@ function NotificationSettingsForm({
 
   useEffect(() => {
     let active = true;
-    async function loadTelegramStatus(): Promise<void> {
+    async function loadNotificationStatus(): Promise<void> {
       if (!window.pywebview?.api) {
-        if (active) setTelegramStatusLoading(false);
+        if (active) setServiceStatusLoading(false);
         return;
       }
       try {
         const result = await window.pywebview.api.notification_credentials_status();
         if (!active) return;
         if (result.status === "UNAVAILABLE") throw new Error(result.message);
-        setTelegramBotConfigured(result.telegram_bot_configured === true);
-        setTelegramConnected(result.telegram_configured === true);
+        setServiceAvailable(result.service_available === true);
+        setGatewayKeyConfigured(result.key_configured === true);
+        setTelegramAvailable(result.telegram === true);
+        setTelegramConnected(result.paired === true);
         setTelegramBotUsername(result.telegram_bot_username ?? "hugin_workbot");
-        setEmailConfigured(result.email_configured === true);
+        setEmailConfigured(result.email === true);
       } catch (reason) {
         if (active) setError(readableError(reason));
       } finally {
-        if (active) setTelegramStatusLoading(false);
+        if (active) setServiceStatusLoading(false);
       }
     }
-    void loadTelegramStatus();
+    void loadNotificationStatus();
     return () => {
       active = false;
     };
@@ -3275,6 +3273,9 @@ function NotificationSettingsForm({
     try {
       const result = await window.pywebview.api.connect_telegram_notifications();
       if (result.status !== "READY") throw new Error(result.message);
+      setServiceAvailable(result.service_available === true);
+      setGatewayKeyConfigured(result.key_configured === true);
+      setTelegramAvailable(result.telegram === true);
       setTelegramConnected(true);
       setTelegramEnabled(true);
       setTelegramBotUsername(result.telegram_bot_username ?? telegramBotUsername);
@@ -3289,15 +3290,16 @@ function NotificationSettingsForm({
     }
   }
 
-  async function disconnectTelegram(): Promise<void> {
-    if (!window.pywebview?.api || credentialsSaving) return;
+  async function testTelegram(): Promise<void> {
+    if (!window.pywebview?.api || credentialsSaving) {
+      setError("Проверка Telegram доступна в оконном приложении Hugin.");
+      return;
+    }
     setCredentialsSaving(true);
     setError(null);
     try {
-      const result = await window.pywebview.api.disconnect_telegram_notifications();
+      const result = await window.pywebview.api.test_telegram_notifications();
       if (result.status !== "READY") throw new Error(result.message);
-      setTelegramConnected(false);
-      setTelegramEnabled(false);
       onToast({ kind: "success", message: result.message });
     } catch (reason) {
       setError(readableError(reason));
@@ -3306,32 +3308,17 @@ function NotificationSettingsForm({
     }
   }
 
-  async function saveEmail(): Promise<void> {
+  async function testEmail(): Promise<void> {
     if (!window.pywebview?.api || credentialsSaving) {
-      setError("Настройка почты доступна в оконном приложении Hugin.");
-      return;
-    }
-    const port = Number(smtpPort);
-    if (!Number.isInteger(port) || port < 1 || port > 65535) {
-      setError("Укажите корректный порт почтового сервера.");
+      setError("Проверка почты доступна в оконном приложении Hugin.");
       return;
     }
     setCredentialsSaving(true);
     setError(null);
     try {
-      const result = await window.pywebview.api.save_email_notifications(
-        smtpHost,
-        port,
-        smtpUsername,
-        smtpPassword,
-        emailSender,
-        emailRecipient,
-        true,
-      );
+      const result = await window.pywebview.api.test_email_notifications();
       if (result.status !== "READY") throw new Error(result.message);
-      setSmtpPassword("");
       setEmailConfigured(true);
-      setEmailEnabled(true);
       onToast({ kind: "success", message: result.message });
     } catch (reason) {
       setError(readableError(reason));
@@ -3355,19 +3342,23 @@ function NotificationSettingsForm({
             title: "Telegram",
             description: telegramConnected
               ? `Отправлять через @${telegramBotUsername}.`
-              : "Сначала подключите чат с ботом ниже.",
+              : "Сначала подключите чат через службу уведомлений.",
             enabled: telegramEnabled,
             setEnabled: setTelegramEnabled,
-            disabled: !telegramConnected,
+            disabled:
+              !serviceAvailable ||
+              !gatewayKeyConfigured ||
+              !telegramAvailable ||
+              !telegramConnected,
           },
           {
             title: "Электронная почта",
             description: emailConfigured
-              ? "Отправлять на сохранённый адрес."
-              : "Сначала сохраните настройки почты ниже.",
+              ? "Отправлять через настроенный служебный ящик."
+              : "Почта на службе уведомлений пока не готова.",
             enabled: emailEnabled,
             setEnabled: setEmailEnabled,
-            disabled: !emailConfigured,
+            disabled: !serviceAvailable || !gatewayKeyConfigured || !emailConfigured,
           },
         ].map((channel) => (
           <label className="notification-master" key={channel.title}>
@@ -3391,141 +3382,121 @@ function NotificationSettingsForm({
         ))}
       </div>
 
-      <div className="notification-connection-grid">
-        <section className="notification-connection telegram-connection">
-          <div className="telegram-connection-heading">
-            <span>
-              <strong>Telegram</strong>
-              <small>@{telegramBotUsername}</small>
-            </span>
-            <span
-              className={
-                telegramConnected
-                  ? "status-pill positive"
-                  : telegramBotConfigured
-                    ? "status-pill warning"
-                    : "status-pill"
-              }
-            >
-              {telegramStatusLoading
-                ? "Проверяем"
-                : telegramConnected
-                  ? "Подключён"
-                  : telegramBotConfigured
-                    ? "Ждёт подключения"
-                    : "Временно недоступен"}
-            </span>
-          </div>
+      <section className="notification-connection telegram-connection">
+        <div className="telegram-connection-heading">
+          <span>
+            <strong>Служба уведомлений</strong>
+            <small>Telegram и электронная почта</small>
+          </span>
+          <span
+            className={
+              serviceAvailable && gatewayKeyConfigured
+                ? "status-pill positive"
+                : !gatewayKeyConfigured
+                  ? "status-pill warning"
+                  : "status-pill"
+            }
+          >
+            {serviceStatusLoading
+              ? "Проверяем"
+              : !gatewayKeyConfigured
+                ? "Нет ключа связи"
+                : serviceAvailable
+                  ? "Работает"
+                  : "Недоступна"}
+          </span>
+        </div>
+        <div className="telegram-connect-actions">
+          <p>
+            Токен бота и почтовый пароль остаются в отдельной службе. Hugin получает только
+            возможность отправлять подготовленные уведомления.
+          </p>
+        </div>
 
-          {telegramConnected ? (
-            <div className="telegram-connected-actions">
-              <p>Hugin может отправлять важные события в личный чат с ботом.</p>
-              <button
-                type="button"
-                className="quiet-button"
-                disabled={credentialsSaving}
-                onClick={() => void disconnectTelegram()}
-              >
-                Отключить чат
-              </button>
-            </div>
-          ) : telegramBotConfigured ? (
-            <div className="telegram-connect-actions">
-              <p>
-                Нажмите кнопку, затем в Telegram нажмите «Старт». Hugin сам привяжет этот аккаунт
-                и пришлёт проверочное сообщение.
-              </p>
-              <button
-                type="button"
-                className="primary-button"
-                disabled={credentialsSaving}
-                onClick={() => void connectTelegram()}
-              >
-                {credentialsSaving ? "Ждём нажатия «Старт»…" : "Подключить Telegram"}
-              </button>
-            </div>
-          ) : (
-            <div className="telegram-connect-actions">
-              <p>
-                Служба Telegram пока недоступна. Токена бота в Hugin нет: после запуска службы
-                здесь появится обычная кнопка подключения.
-              </p>
-              <button
-                type="button"
-                className="secondary-button"
-                disabled
-              >
-                Telegram временно недоступен
-              </button>
-            </div>
-          )}
-        </section>
-        <details className="notification-connection">
-          <summary>Подключить электронную почту</summary>
-          <div>
-            <label>
-              <span>Почтовый сервер</span>
-              <input
-                type="text"
-                value={smtpHost}
-                onChange={(event) => setSmtpHost(event.target.value)}
-              />
-            </label>
-            <label>
-              <span>Порт</span>
-              <input
-                type="number"
-                min="1"
-                max="65535"
-                value={smtpPort}
-                onChange={(event) => setSmtpPort(event.target.value)}
-              />
-            </label>
-            <label>
-              <span>Имя пользователя</span>
-              <input
-                type="text"
-                autoComplete="username"
-                value={smtpUsername}
-                onChange={(event) => setSmtpUsername(event.target.value)}
-              />
-            </label>
-            <label>
-              <span>Пароль приложения</span>
-              <input
-                type="password"
-                autoComplete="new-password"
-                value={smtpPassword}
-                onChange={(event) => setSmtpPassword(event.target.value)}
-              />
-            </label>
-            <label>
-              <span>Адрес отправителя</span>
-              <input
-                type="email"
-                value={emailSender}
-                onChange={(event) => setEmailSender(event.target.value)}
-              />
-            </label>
-            <label>
-              <span>Куда отправлять</span>
-              <input
-                type="email"
-                value={emailRecipient}
-                onChange={(event) => setEmailRecipient(event.target.value)}
-              />
-            </label>
+        <div className="telegram-connection-heading">
+          <span>
+            <strong>Telegram</strong>
+            <small>@{telegramBotUsername}</small>
+          </span>
+          <span
+            className={
+              telegramConnected
+                ? "status-pill positive"
+                : telegramAvailable
+                  ? "status-pill warning"
+                  : "status-pill"
+            }
+          >
+            {serviceStatusLoading
+              ? "Проверяем"
+              : telegramConnected
+                ? "Подключён"
+                : telegramAvailable
+                  ? "Ждёт подключения"
+                  : "Недоступен"}
+          </span>
+        </div>
+        <div className="telegram-connected-actions">
+          <p>
+            {telegramConnected
+              ? "Важные события можно отправлять в личный чат."
+              : "Создайте одноразовую ссылку и нажмите «Старт» в Telegram."}
+          </p>
+          {telegramConnected && (
             <button
               type="button"
               className="secondary-button"
               disabled={credentialsSaving}
-              onClick={() => void saveEmail()}
+              onClick={() => void testTelegram()}
             >
-              Сохранить почту
+              Проверить Telegram
             </button>
-          </div>
-        </details>
-      </div>
+          )}
+          {!telegramConnected && (
+            <button
+              type="button"
+              className="primary-button"
+              disabled={
+                credentialsSaving ||
+                !serviceAvailable ||
+                !gatewayKeyConfigured ||
+                !telegramAvailable
+              }
+              onClick={() => void connectTelegram()}
+            >
+              {credentialsSaving ? "Ждём нажатия «Старт»…" : "Подключить Telegram"}
+            </button>
+          )}
+        </div>
+
+        <div className="telegram-connection-heading">
+          <span>
+            <strong>Электронная почта</strong>
+            <small>Служебный отправитель и получатель настроены отдельно</small>
+          </span>
+          <span className={emailConfigured ? "status-pill positive" : "status-pill"}>
+            {serviceStatusLoading ? "Проверяем" : emailConfigured ? "Готова" : "Недоступна"}
+          </span>
+        </div>
+        <div className="telegram-connected-actions">
+          <p>
+            Hugin не хранит почтовый пароль и не принимает адрес получателя через это окно.
+          </p>
+          <button
+            type="button"
+            className="secondary-button"
+            disabled={
+              credentialsSaving ||
+              !serviceAvailable ||
+              !gatewayKeyConfigured ||
+              !emailConfigured
+            }
+            onClick={() => void testEmail()}
+          >
+            {credentialsSaving ? "Выполняем проверку…" : "Отправить проверочное письмо"}
+          </button>
+        </div>
+      </section>
 
       <div className="notification-event-grid">
         {notificationEventOptions.map((event) => (
@@ -3549,8 +3520,8 @@ function NotificationSettingsForm({
 
       <div className="notification-settings-footer">
         <span className="notification-unavailable">
-          Hugin хранит только ограниченный ключ подключённого чата. Токен бота остаётся в отдельной
-          службе.
+          Ключ связи используется только кодом Hugin и не передаётся в это окно. Токен бота и
+          почтовый пароль остаются в отдельной службе.
         </span>
         {error && (
           <span className="settings-submit-error" role="alert">

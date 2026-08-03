@@ -1,17 +1,11 @@
 from __future__ import annotations
 
 import base64
-import smtplib
-import ssl
 import subprocess
 from dataclasses import dataclass
-from email.message import EmailMessage
 
-from hugin.adapters.notification_credentials import (
-    EmailCredentials,
-    TelegramGatewayCredentials,
-)
-from hugin.adapters.telegram_gateway import TelegramGatewayClient
+from hugin.adapters.notification_credentials import NotificationGatewayCredentials
+from hugin.adapters.notification_gateway import NotificationGatewayClient
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,54 +56,35 @@ class WindowsToastSender:
             raise RuntimeError("Windows не приняла уведомление")
 
 
-class TelegramGatewayNotificationSender:
+class NotificationGatewaySender:
     def __init__(
         self,
-        gateway_url: str,
-        credentials: TelegramGatewayCredentials,
+        base_url: str,
+        credentials: NotificationGatewayCredentials,
         timeout_seconds: int = 15,
     ) -> None:
-        self._gateway_url = gateway_url
+        self._base_url = base_url
         self._credentials = credentials
         self._timeout_seconds = timeout_seconds
 
-    def send(self, content: NotificationContent) -> None:
-        TelegramGatewayClient(
-            self._gateway_url,
+    def send(
+        self,
+        *,
+        event_id: str,
+        channel: str,
+        event_type: str,
+        content: NotificationContent,
+        action_url: str | None = None,
+    ) -> None:
+        NotificationGatewayClient(
+            self._base_url,
+            self._credentials,
             timeout_seconds=self._timeout_seconds,
         ).send(
-            self._credentials.access_token,
+            event_id,
+            channel,
+            event_type,
             content.title,
             content.body,
+            action_url,
         )
-
-
-class EmailNotificationSender:
-    def __init__(self, credentials: EmailCredentials, timeout_seconds: int = 20) -> None:
-        self._credentials = credentials
-        self._timeout_seconds = timeout_seconds
-
-    def send(self, content: NotificationContent) -> None:
-        message = EmailMessage()
-        message["Subject"] = content.title
-        message["From"] = self._credentials.sender
-        message["To"] = self._credentials.recipient
-        message.set_content(content.body)
-        try:
-            with smtplib.SMTP(
-                self._credentials.smtp_host,
-                self._credentials.smtp_port,
-                timeout=self._timeout_seconds,
-            ) as client:
-                if self._credentials.starttls:
-                    client.starttls(context=ssl.create_default_context())
-                if self._credentials.username:
-                    client.login(
-                        self._credentials.username,
-                        self._credentials.password,
-                    )
-                refused = client.send_message(message)
-        except (OSError, smtplib.SMTPException) as error:
-            raise RuntimeError("Почтовый сервер не принял уведомление") from error
-        if refused:
-            raise RuntimeError("Получатель отклонил уведомление")

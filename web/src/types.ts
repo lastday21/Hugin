@@ -340,10 +340,12 @@ export interface BridgeResult {
   message: string;
   filled?: number;
   skipped?: number;
-  telegram_bot_configured?: boolean;
-  telegram_configured?: boolean;
+  service_available?: boolean;
+  key_configured?: boolean;
+  telegram?: boolean | null;
+  paired?: boolean | null;
+  email?: boolean | null;
   telegram_bot_username?: string;
-  email_configured?: boolean;
   body?: string;
 }
 
@@ -362,16 +364,8 @@ declare global {
         generate_reply: (applicationId: number) => Promise<BridgeResult>;
         notification_credentials_status: () => Promise<BridgeResult>;
         connect_telegram_notifications: () => Promise<BridgeResult>;
-        disconnect_telegram_notifications: () => Promise<BridgeResult>;
-        save_email_notifications: (
-          smtpHost: string,
-          smtpPort: number,
-          username: string,
-          password: string,
-          sender: string,
-          recipient: string,
-          starttls: boolean,
-        ) => Promise<BridgeResult>;
+        test_telegram_notifications: () => Promise<BridgeResult>;
+        test_email_notifications: () => Promise<BridgeResult>;
       };
     };
   }

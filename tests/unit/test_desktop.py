@@ -7,6 +7,7 @@ import webbrowser
 from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import ClassVar
@@ -15,13 +16,12 @@ from urllib.error import URLError
 import pytest
 
 from hugin import desktop
-from hugin.adapters.notification_credentials import TelegramGatewayCredentials
-from hugin.adapters.telegram_gateway import (
-    GatewayConnection,
-    GatewayStatus,
-    Pairing,
-    TelegramGatewayAuthorizationError,
-    TelegramGatewayError,
+from hugin.adapters.notification_credentials import NotificationGatewayCredentials
+from hugin.adapters.notification_gateway import (
+    NotificationGatewayError,
+    NotificationGatewayStatus,
+    NotificationGatewayTimeout,
+    PairingLink,
 )
 from hugin.core.settings import Settings
 from hugin.domain import HhFormReviewResult, HhFormReviewStatus, HhScreeningForm
@@ -402,264 +402,283 @@ def test_bridge_generates_editable_reply_draft(
     }
 
 
-def test_bridge_saves_notification_credentials_in_windows_store(
+def test_bridge_reports_notification_service_status_and_sends_tests(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    values: dict[str, object] = {
-        "telegram": TelegramGatewayCredentials(
-            "hgt_connectionid.abcdefghijklmnopqrstuvwxyzABCDEFG"
-        ),
-    }
-
-    class Store:
-        def load_telegram_gateway(self) -> object | None:
-            return values.get("telegram")
-
-        def load_email(self) -> object | None:
-            return values.get("email")
-
-        def delete_telegram(self) -> bool:
-            return values.pop("telegram", None) is not None
-
-        def save_email(self, credentials: object) -> None:
-            values["email"] = credentials
+    credentials = NotificationGatewayCredentials("s" * 32)
+    calls: list[tuple[str, object]] = []
 
     class Gateway:
-        def __init__(self, _url: str, *, timeout_seconds: int) -> None:
+        def __init__(
+            self,
+            url: str,
+            selected: NotificationGatewayCredentials,
+            *,
+            timeout_seconds: int,
+        ) -> None:
+            assert url == "http://127.0.0.1:8088"
+            assert selected == credentials
             assert timeout_seconds == 15
 
-        def status(self) -> GatewayStatus:
-            return GatewayStatus(True, "hugin_workbot")
+        def status(self) -> NotificationGatewayStatus:
+            return NotificationGatewayStatus(True, True, True, True)
 
-        def connection_status(self, _access_token: str) -> GatewayStatus:
-            return GatewayStatus(True, "hugin_workbot")
+        def send(self, **payload: object) -> None:
+            calls.append(("telegram", payload))
 
-        def disconnect(self, _access_token: str) -> None:
-            pass
+        def send_test_email(self) -> None:
+            calls.append(("email", True))
 
-    monkeypatch.setattr(desktop, "WindowsNotificationCredentialStore", Store)
-    monkeypatch.setattr(desktop, "TelegramGatewayClient", Gateway)
-    bridge = desktop.DesktopBridge(Settings(environment="test", data_dir=tmp_path))
-
-    initial = bridge.notification_credentials_status()
-    assert initial["telegram_bot_configured"] is True
-    assert initial["telegram_configured"] is True
-    assert initial["telegram_bot_username"] == "hugin_workbot"
-    assert (
-        bridge.save_email_notifications(
-            "smtp.example.com",
-            587,
-            "user",
-            "password",
-            "from@example.com",
-            "to@example.com",
-            True,
-        )["status"]
-        == "READY"
+    key_file = tmp_path / "service_key"
+    monkeypatch.setattr(
+        desktop,
+        "load_notification_gateway_credentials",
+        lambda selected: credentials if selected == key_file else None,
     )
+    monkeypatch.setattr(desktop, "NotificationGatewayClient", Gateway)
+    bridge = desktop.DesktopBridge(
+        Settings(
+            environment="test",
+            data_dir=tmp_path,
+            notification_gateway_key_file=key_file,
+        )
+    )
+
     status = bridge.notification_credentials_status()
-    assert status["telegram_configured"] is True
-    assert status["email_configured"] is True
-    assert bridge.disconnect_telegram_notifications()["status"] == "READY"
-    assert "telegram" not in values
+    assert status == {
+        "status": "READY",
+        "message": "Состояние службы уведомлений проверено",
+        "service_available": True,
+        "key_configured": True,
+        "telegram": True,
+        "paired": True,
+        "email": True,
+        "telegram_bot_username": "hugin_workbot",
+    }
+    assert "service_key" not in status
+    assert bridge.test_telegram_notifications()["status"] == "READY"
+    assert bridge.test_email_notifications()["status"] == "READY"
+    telegram_call = calls[0][1]
+    assert isinstance(telegram_call, dict)
+    assert str(telegram_call["event_id"]).startswith("test.telegram.")
+    assert telegram_call["channel"] == "TELEGRAM"
+    assert telegram_call["event_type"] == "DAILY_SUMMARY"
+    assert calls[1] == ("email", True)
 
 
 def test_bridge_connects_telegram_through_safe_one_time_start_link(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    values: dict[str, object] = {}
     events: list[object] = []
-    access_token = "hgt_connectionid.abcdefghijklmnopqrstuvwxyzABCDEFG"
-    pairing = Pairing(
-        "pairing-id",
-        "pairing-secret",
+    credentials = NotificationGatewayCredentials("s" * 32)
+    pairing = PairingLink(
         "https://t.me/hugin_workbot?start=one_time",
-        "hugin_workbot",
+        datetime(2026, 8, 3, 12, 5, tzinfo=UTC),
     )
 
-    class Store:
-        def save_telegram_gateway(self, credentials: object) -> None:
-            values["telegram"] = credentials
-
     class Gateway:
-        def __init__(self, url: str, *, timeout_seconds: int) -> None:
-            assert url == "http://127.0.0.1:8020"
+        def __init__(
+            self,
+            url: str,
+            selected: NotificationGatewayCredentials,
+            *,
+            timeout_seconds: int,
+        ) -> None:
+            assert url == "http://127.0.0.1:8088"
+            assert selected == credentials
             assert timeout_seconds == 15
 
-        def create_pairing(self) -> Pairing:
+        def create_pairing_link(self) -> PairingLink:
             events.append("create")
             return pairing
 
-        def wait_for_connection(
-            self,
-            selected: Pairing,
-            *,
-            timeout_seconds: int,
-        ) -> GatewayConnection:
-            events.append(("wait", selected.pairing_id, timeout_seconds))
-            return GatewayConnection(access_token, "hugin_workbot")
+        def wait_until_paired(self, *, timeout_seconds: int) -> NotificationGatewayStatus:
+            events.append(("wait", timeout_seconds))
+            return NotificationGatewayStatus(True, True, True, True)
 
     def open_link(url: str, *, new: int) -> bool:
         events.append(("open", url, new))
         return True
 
-    monkeypatch.setattr(desktop, "WindowsNotificationCredentialStore", Store)
-    monkeypatch.setattr(desktop, "TelegramGatewayClient", Gateway)
+    key_file = tmp_path / "service_key"
+    monkeypatch.setattr(desktop, "load_notification_gateway_credentials", lambda _path: credentials)
+    monkeypatch.setattr(desktop, "NotificationGatewayClient", Gateway)
     monkeypatch.setattr("hugin.desktop.webbrowser.open", open_link)
-    bridge = desktop.DesktopBridge(Settings(environment="test", data_dir=tmp_path))
+    bridge = desktop.DesktopBridge(
+        Settings(
+            environment="test",
+            data_dir=tmp_path,
+            notification_gateway_key_file=key_file,
+        )
+    )
 
-    assert bridge.connect_telegram_notifications()["status"] == "READY"
+    assert bridge.connect_telegram_notifications() == {
+        "status": "READY",
+        "message": "Telegram подключён к службе уведомлений.",
+        "service_available": True,
+        "key_configured": True,
+        "telegram": True,
+        "paired": True,
+        "telegram_bot_username": "hugin_workbot",
+    }
     assert events == [
         "create",
         ("open", "https://t.me/hugin_workbot?start=one_time", 2),
-        ("wait", "pairing-id", 120),
+        ("wait", 120),
     ]
-    assert values["telegram"] == TelegramGatewayCredentials(access_token)
 
 
-def test_bridge_does_not_bind_failed_telegram_chat(
+def test_bridge_reports_telegram_pairing_timeout(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    values: dict[str, object] = {}
-    pairing = Pairing(
-        "pairing-id",
-        "pairing-secret",
+    credentials = NotificationGatewayCredentials("s" * 32)
+    pairing = PairingLink(
         "https://t.me/hugin_workbot?start=one_time",
-        "hugin_workbot",
+        datetime(2026, 8, 3, 12, 5, tzinfo=UTC),
     )
 
-    class Store:
-        def save_telegram_gateway(self, credentials: object) -> None:
-            values["telegram"] = credentials
-
     class FailingGateway:
-        def __init__(self, _url: str, *, timeout_seconds: int) -> None:
-            assert timeout_seconds == 15
-
-        def create_pairing(self) -> Pairing:
-            return pairing
-
-        def wait_for_connection(
+        def __init__(
             self,
-            _pairing: Pairing,
+            _url: str,
+            _credentials: NotificationGatewayCredentials,
             *,
             timeout_seconds: int,
-        ) -> GatewayConnection:
+        ) -> None:
+            assert timeout_seconds == 15
+
+        def create_pairing_link(self) -> PairingLink:
+            return pairing
+
+        def wait_until_paired(self, *, timeout_seconds: int) -> NotificationGatewayStatus:
             assert timeout_seconds == 120
-            raise TelegramGatewayError("Служба не подтвердила подключение")
+            raise NotificationGatewayTimeout("Служба не подтвердила подключение")
 
-    monkeypatch.setattr(desktop, "WindowsNotificationCredentialStore", Store)
-    monkeypatch.setattr(desktop, "TelegramGatewayClient", FailingGateway)
+    monkeypatch.setattr(desktop, "load_notification_gateway_credentials", lambda _path: credentials)
+    monkeypatch.setattr(desktop, "NotificationGatewayClient", FailingGateway)
     monkeypatch.setattr("hugin.desktop.webbrowser.open", lambda _url, *, new: new == 2)
-    bridge = desktop.DesktopBridge(Settings(environment="test", data_dir=tmp_path))
+    bridge = desktop.DesktopBridge(
+        Settings(
+            environment="test",
+            data_dir=tmp_path,
+            notification_gateway_key_file=tmp_path / "service_key",
+        )
+    )
     failed = bridge.connect_telegram_notifications()
-    assert failed["status"] == "UNAVAILABLE"
-    assert "telegram" not in values
+    assert failed == {
+        "status": "TIMEOUT",
+        "message": "Служба не подтвердила подключение",
+    }
 
 
-def test_bridge_reports_unavailable_when_shared_telegram_bot_is_missing(
+def test_bridge_reports_missing_notification_gateway_key(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    class Store:
-        def load_telegram_gateway(self) -> None:
-            return None
-
-        def load_email(self) -> None:
-            return None
-
-    class Gateway:
-        def __init__(self, _url: str, *, timeout_seconds: int) -> None:
-            assert timeout_seconds == 15
-
-        def status(self) -> GatewayStatus:
-            return GatewayStatus(False, "hugin_workbot")
-
-        def create_pairing(self) -> Pairing:
-            raise TelegramGatewayError("Служба Telegram ещё не готова")
-
-    monkeypatch.setattr(desktop, "WindowsNotificationCredentialStore", Store)
-    monkeypatch.setattr(desktop, "TelegramGatewayClient", Gateway)
+    monkeypatch.setattr(desktop, "load_notification_gateway_credentials", lambda _path: None)
     monkeypatch.setattr(
         "hugin.desktop.webbrowser.open",
         lambda *_args, **_kwargs: pytest.fail("Telegram must not open before gateway is ready"),
     )
     bridge = desktop.DesktopBridge(Settings(environment="test", data_dir=tmp_path))
 
-    result = bridge.connect_telegram_notifications()
+    assert bridge.notification_credentials_status() == {
+        "status": "READY",
+        "message": "Не настроен ключ связи со службой уведомлений",
+        "service_available": False,
+        "key_configured": False,
+        "telegram": None,
+        "paired": None,
+        "email": None,
+        "telegram_bot_username": "hugin_workbot",
+    }
+    assert bridge.connect_telegram_notifications() == {
+        "status": "UNAVAILABLE",
+        "message": "Не настроен ключ связи со службой уведомлений",
+    }
 
-    assert result["status"] == "UNAVAILABLE"
-    assert "ещё не готова" in str(result["message"])
 
-
-def test_bridge_keeps_email_status_when_telegram_service_is_offline(
+def test_bridge_reports_notification_service_offline_without_hiding_key_state(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    class Store:
-        def load_telegram_gateway(self) -> None:
-            return None
-
-        def load_email(self) -> object:
-            return object()
+    credentials = NotificationGatewayCredentials("s" * 32)
 
     class Gateway:
-        def __init__(self, _url: str, *, timeout_seconds: int) -> None:
+        def __init__(
+            self,
+            _url: str,
+            _credentials: NotificationGatewayCredentials,
+            *,
+            timeout_seconds: int,
+        ) -> None:
             assert timeout_seconds == 15
 
-        def status(self) -> GatewayStatus:
-            raise TelegramGatewayError("offline")
+        def status(self) -> NotificationGatewayStatus:
+            raise NotificationGatewayError("Служба уведомлений сейчас недоступна")
 
-    monkeypatch.setattr(desktop, "WindowsNotificationCredentialStore", Store)
-    monkeypatch.setattr(desktop, "TelegramGatewayClient", Gateway)
-    bridge = desktop.DesktopBridge(Settings(environment="test", data_dir=tmp_path))
+    monkeypatch.setattr(desktop, "load_notification_gateway_credentials", lambda _path: credentials)
+    monkeypatch.setattr(desktop, "NotificationGatewayClient", Gateway)
+    bridge = desktop.DesktopBridge(
+        Settings(
+            environment="test",
+            data_dir=tmp_path,
+            notification_gateway_key_file=tmp_path / "service_key",
+        )
+    )
 
     result = bridge.notification_credentials_status()
 
-    assert result["status"] == "READY"
-    assert result["telegram_bot_configured"] is False
-    assert result["email_configured"] is True
+    assert result == {
+        "status": "READY",
+        "message": "Служба уведомлений сейчас недоступна",
+        "service_available": False,
+        "key_configured": True,
+        "telegram": None,
+        "paired": None,
+        "email": None,
+        "telegram_bot_username": "hugin_workbot",
+    }
 
 
-def test_bridge_removes_revoked_gateway_connection(
+def test_bridge_reports_independent_notification_channel_states(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    deleted: list[bool] = []
-
-    class Store:
-        def load_telegram_gateway(self) -> TelegramGatewayCredentials:
-            return TelegramGatewayCredentials("hgt_connectionid.abcdefghijklmnopqrstuvwxyzABCDEFG")
-
-        def load_email(self) -> None:
-            return None
-
-        def delete_telegram(self) -> bool:
-            deleted.append(True)
-            return True
+    credentials = NotificationGatewayCredentials("s" * 32)
 
     class Gateway:
-        def __init__(self, _url: str, *, timeout_seconds: int) -> None:
+        def __init__(
+            self,
+            _url: str,
+            _credentials: NotificationGatewayCredentials,
+            *,
+            timeout_seconds: int,
+        ) -> None:
             assert timeout_seconds == 15
 
-        def status(self) -> GatewayStatus:
-            return GatewayStatus(True, "hugin_workbot")
+        def status(self) -> NotificationGatewayStatus:
+            return NotificationGatewayStatus(True, True, False, True)
 
-        def connection_status(self, _access_token: str) -> GatewayStatus:
-            raise TelegramGatewayAuthorizationError("revoked")
-
-    monkeypatch.setattr(desktop, "WindowsNotificationCredentialStore", Store)
-    monkeypatch.setattr(desktop, "TelegramGatewayClient", Gateway)
-    bridge = desktop.DesktopBridge(Settings(environment="test", data_dir=tmp_path))
+    monkeypatch.setattr(desktop, "load_notification_gateway_credentials", lambda _path: credentials)
+    monkeypatch.setattr(desktop, "NotificationGatewayClient", Gateway)
+    bridge = desktop.DesktopBridge(
+        Settings(
+            environment="test",
+            data_dir=tmp_path,
+            notification_gateway_key_file=tmp_path / "service_key",
+        )
+    )
 
     result = bridge.notification_credentials_status()
 
-    assert result["telegram_bot_configured"] is True
-    assert result["telegram_configured"] is False
-    assert deleted == [True]
+    assert result["service_available"] is True
+    assert result["telegram"] is True
+    assert result["paired"] is False
+    assert result["email"] is True
 
 
 def test_bridge_does_not_wait_when_telegram_link_cannot_be_opened(
@@ -667,35 +686,38 @@ def test_bridge_does_not_wait_when_telegram_link_cannot_be_opened(
     tmp_path: Path,
 ) -> None:
     waited: list[bool] = []
-
-    class Store:
-        pass
+    credentials = NotificationGatewayCredentials("s" * 32)
 
     class Gateway:
-        def __init__(self, _url: str, *, timeout_seconds: int) -> None:
-            assert timeout_seconds == 15
-
-        def create_pairing(self) -> Pairing:
-            return Pairing(
-                "pairing-id",
-                "pairing-secret",
-                "https://t.me/hugin_workbot?start=one_time",
-                "hugin_workbot",
-            )
-
-        def wait_for_connection(
+        def __init__(
             self,
-            _pairing: Pairing,
+            _url: str,
+            _credentials: NotificationGatewayCredentials,
             *,
             timeout_seconds: int,
-        ) -> GatewayConnection:
+        ) -> None:
+            assert timeout_seconds == 15
+
+        def create_pairing_link(self) -> PairingLink:
+            return PairingLink(
+                "https://t.me/hugin_workbot?start=one_time",
+                datetime(2026, 8, 3, 12, 5, tzinfo=UTC),
+            )
+
+        def wait_until_paired(self, *, timeout_seconds: int) -> NotificationGatewayStatus:
             waited.append(True)
             raise AssertionError(timeout_seconds)
 
-    monkeypatch.setattr(desktop, "WindowsNotificationCredentialStore", Store)
-    monkeypatch.setattr(desktop, "TelegramGatewayClient", Gateway)
+    monkeypatch.setattr(desktop, "load_notification_gateway_credentials", lambda _path: credentials)
+    monkeypatch.setattr(desktop, "NotificationGatewayClient", Gateway)
     monkeypatch.setattr("hugin.desktop.webbrowser.open", lambda _url, *, new: new != 2)
-    bridge = desktop.DesktopBridge(Settings(environment="test", data_dir=tmp_path))
+    bridge = desktop.DesktopBridge(
+        Settings(
+            environment="test",
+            data_dir=tmp_path,
+            notification_gateway_key_file=tmp_path / "service_key",
+        )
+    )
 
     result = bridge.connect_telegram_notifications()
 

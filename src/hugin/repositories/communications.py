@@ -37,6 +37,8 @@ from hugin.domain.time import as_utc
 _NON_RETRYABLE_NOTIFICATION_ERRORS = frozenset(
     {
         "EMAIL_NOT_CONFIGURED",
+        "HISTORICAL_EVENT_SUPPRESSED",
+        "NOTIFICATION_SERVICE_NOT_CONFIGURED",
         "TELEGRAM_NOT_CONFIGURED",
     }
 )

@@ -557,6 +557,17 @@ def test_workspace_endpoints_return_real_data_and_protect_changes(settings: Sett
         assert saved_notifications["routing"]["AUTH_REQUIRED"] == ["TELEGRAM"]
         assert saved_notifications["routing"]["INVITATION"] == []
         assert "CAPTCHA_REQUIRED" not in saved_notifications["routing"]
+        database = create_database(settings)
+        try:
+            with database.sessions() as session:
+                stored_settings = session.get(ApplicationSettingsModel, 1)
+                assert stored_settings is not None
+                assert set(stored_settings.notification_cutoffs) == {
+                    "NEW_MESSAGE:TELEGRAM",
+                    "AUTH_REQUIRED:TELEGRAM",
+                }
+        finally:
+            database.close()
 
         direction_values = {
             "is_active": False,

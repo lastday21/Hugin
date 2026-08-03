@@ -109,7 +109,7 @@ def test_communications_migration_preserves_existing_rows(settings: Settings) ->
         database.close()
 
     upgrade_database(settings)
-    assert current_revision(settings) == "0017_supervised_lease"
+    assert current_revision(settings) == "0018_notification_cutoffs"
     check_database_schema(settings)
 
     migrated = create_database(settings)
@@ -125,6 +125,10 @@ def test_communications_migration_preserves_existing_rows(settings: Settings) ->
             column["name"] for column in inspect(migrated.engine).get_columns("notifications")
         }
         assert "ai_prompt_overrides" in {
+            column["name"]
+            for column in inspect(migrated.engine).get_columns("application_settings")
+        }
+        assert "notification_cutoffs" in {
             column["name"]
             for column in inspect(migrated.engine).get_columns("application_settings")
         }

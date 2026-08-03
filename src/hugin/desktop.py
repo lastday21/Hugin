@@ -14,24 +14,20 @@ from typing import Protocol, cast
 from urllib.error import URLError
 from urllib.parse import urlsplit
 from urllib.request import ProxyHandler, build_opener
+from uuid import uuid4
 
 from sqlalchemy import select
 
 from hugin.adapters.credentials import WindowsCredentialStore
 from hugin.adapters.hh_browser import VisibleHhBrowser
 from hugin.adapters.hh_messages import HhBrowserMessageSender
-from hugin.adapters.notification_credentials import (
-    EmailCredentials,
-    TelegramGatewayCredentials,
-    WindowsNotificationCredentialStore,
+from hugin.adapters.notification_credentials import load_notification_gateway_credentials
+from hugin.adapters.notification_gateway import (
+    NotificationGatewayClient,
+    NotificationGatewayError,
+    NotificationGatewayTimeout,
 )
 from hugin.adapters.postgres_backup import DockerPostgresBackupAdapter
-from hugin.adapters.telegram_gateway import (
-    TelegramGatewayAuthorizationError,
-    TelegramGatewayClient,
-    TelegramGatewayError,
-    TelegramGatewayTimeout,
-)
 from hugin.adapters.yandex_ai import YandexAIError
 from hugin.core.settings import Settings, get_settings
 from hugin.database import create_database, upgrade_database
@@ -332,47 +328,38 @@ class DesktopBridge:
         )
 
     def notification_credentials_status(self) -> dict[str, object]:
-        store = WindowsNotificationCredentialStore()
         try:
-            telegram = store.load_telegram_gateway()
-            email = store.load_email() is not None
-        except RuntimeError as error:
+            client = self._notification_gateway_client()
+        except (OSError, RuntimeError, ValueError) as error:
             return {
-                **self._result("UNAVAILABLE", str(error)),
-                "telegram_bot_configured": False,
-                "telegram_configured": False,
+                **self._result("READY", str(error)),
+                "service_available": False,
+                "key_configured": False,
+                "telegram": None,
+                "paired": None,
+                "email": None,
                 "telegram_bot_username": self._settings.telegram_bot_username,
-                "email_configured": False,
             }
-        gateway = self._telegram_gateway_client()
         try:
-            gateway_status = gateway.status()
-        except TelegramGatewayError:
+            gateway_status = client.status()
+        except NotificationGatewayError as error:
             return {
-                **self._result("READY", "Служба Telegram сейчас недоступна"),
-                "telegram_bot_configured": False,
-                "telegram_configured": False,
+                **self._result("READY", str(error)),
+                "service_available": False,
+                "key_configured": True,
+                "telegram": None,
+                "paired": None,
+                "email": None,
                 "telegram_bot_username": self._settings.telegram_bot_username,
-                "email_configured": email,
             }
-        telegram_connected = False
-        bot_username = gateway_status.bot_username
-        if gateway_status.bot_ready and telegram is not None:
-            try:
-                connection = gateway.connection_status(telegram.access_token)
-            except TelegramGatewayAuthorizationError:
-                store.delete_telegram()
-            except TelegramGatewayError:
-                pass
-            else:
-                telegram_connected = True
-                bot_username = connection.bot_username
         return {
-            **self._result("READY", "Настройки уведомлений проверены"),
-            "telegram_bot_configured": gateway_status.bot_ready,
-            "telegram_configured": telegram_connected,
-            "telegram_bot_username": bot_username,
-            "email_configured": email,
+            **self._result("READY", "Состояние службы уведомлений проверено"),
+            "service_available": gateway_status.available,
+            "key_configured": True,
+            "telegram": gateway_status.telegram,
+            "paired": gateway_status.paired,
+            "email": gateway_status.email,
+            "telegram_bot_username": self._settings.telegram_bot_username,
         }
 
     def connect_telegram_notifications(self) -> dict[str, object]:
@@ -390,84 +377,40 @@ class DesktopBridge:
         finally:
             self._telegram_lock.release()
 
-    def disconnect_telegram_notifications(self) -> dict[str, object]:
+    def test_telegram_notifications(self) -> dict[str, object]:
         return self._record_action(
-            "telegram.chat.disconnect",
-            self._disconnect_telegram_notifications,
+            "telegram.notification.test",
+            self._test_telegram_notifications,
         )
 
-    def _disconnect_telegram_notifications(self) -> dict[str, object]:
-        try:
-            store = WindowsNotificationCredentialStore()
-            credentials = store.load_telegram_gateway()
-            if credentials is not None:
-                self._telegram_gateway_client().disconnect(credentials.access_token)
-            store.delete_telegram()
-            gateway_status = self._telegram_gateway_client().status()
-        except (RuntimeError, TelegramGatewayError, ValueError) as error:
-            return self._result("UNAVAILABLE", str(error))
-        return self._result(
-            "READY",
-            "Чат Telegram отключён.",
-            telegram_bot_configured=gateway_status.bot_ready,
-            telegram_configured=False,
-            telegram_bot_username=gateway_status.bot_username,
-        )
-
-    def save_email_notifications(
-        self,
-        smtp_host: str,
-        smtp_port: int,
-        username: str,
-        password: str,
-        sender: str,
-        recipient: str,
-        starttls: bool,
-    ) -> dict[str, object]:
+    def test_email_notifications(self) -> dict[str, object]:
         return self._record_action(
-            "email.credentials.save",
-            lambda: self._save_email_notifications(
-                smtp_host,
-                smtp_port,
-                username,
-                password,
-                sender,
-                recipient,
-                starttls,
-            ),
-            smtp_host=smtp_host,
-            smtp_port=smtp_port,
-            starttls=starttls,
+            "email.notification.test",
+            self._test_email_notifications,
         )
 
-    def _save_email_notifications(
-        self,
-        smtp_host: str,
-        smtp_port: int,
-        username: str,
-        password: str,
-        sender: str,
-        recipient: str,
-        starttls: bool,
-    ) -> dict[str, object]:
+    def _test_telegram_notifications(self) -> dict[str, object]:
         try:
-            WindowsNotificationCredentialStore().save_email(
-                EmailCredentials(
-                    smtp_host,
-                    smtp_port,
-                    username,
-                    password,
-                    sender,
-                    recipient,
-                    starttls,
-                )
+            self._notification_gateway_client().send(
+                event_id=f"test.telegram.{uuid4().hex}",
+                channel="TELEGRAM",
+                event_type="DAILY_SUMMARY",
+                title="Проверка Telegram",
+                body="Hugin успешно отправляет уведомления в Telegram.",
             )
-        except (RuntimeError, ValueError) as error:
+        except (OSError, RuntimeError, ValueError) as error:
             return self._result("UNAVAILABLE", str(error))
         return self._result(
             "READY",
-            "Электронная почта сохранена в защищённом хранилище Windows",
+            "Проверочное уведомление отправлено в Telegram.",
         )
+
+    def _test_email_notifications(self) -> dict[str, object]:
+        try:
+            self._notification_gateway_client().send_test_email()
+        except (OSError, RuntimeError, ValueError) as error:
+            return self._result("UNAVAILABLE", str(error))
+        return self._result("READY", "Проверочное письмо отправлено.")
 
     def close(self) -> None:
         self._journal.record(
@@ -480,9 +423,8 @@ class DesktopBridge:
 
     def _connect_telegram_notifications(self) -> dict[str, object]:
         try:
-            store = WindowsNotificationCredentialStore()
-            client = self._telegram_gateway_client()
-            pairing = client.create_pairing()
+            client = self._notification_gateway_client()
+            pairing = client.create_pairing_link()
             try:
                 opened = webbrowser.open(pairing.start_url, new=2)
             except (OSError, webbrowser.Error):
@@ -492,27 +434,33 @@ class DesktopBridge:
                     "UNAVAILABLE",
                     "Не удалось открыть Telegram. Откройте бота вручную и повторите.",
                 )
-            connection = client.wait_for_connection(
-                pairing,
-                timeout_seconds=self._settings.telegram_connection_timeout_seconds,
+            client.wait_until_paired(
+                timeout_seconds=self._settings.notification_gateway_connection_timeout_seconds,
             )
-            store.save_telegram_gateway(TelegramGatewayCredentials(connection.access_token))
-        except TelegramGatewayTimeout as error:
+        except NotificationGatewayTimeout as error:
             return self._result("TIMEOUT", str(error))
-        except (RuntimeError, TelegramGatewayError, ValueError) as error:
+        except (OSError, RuntimeError, ValueError) as error:
             return self._result("UNAVAILABLE", str(error))
         return self._result(
             "READY",
-            "Telegram подключён. Проверочное сообщение отправлено.",
-            telegram_bot_configured=True,
-            telegram_configured=True,
-            telegram_bot_username=connection.bot_username,
+            "Telegram подключён к службе уведомлений.",
+            service_available=True,
+            key_configured=True,
+            telegram=True,
+            paired=True,
+            telegram_bot_username=self._settings.telegram_bot_username,
         )
 
-    def _telegram_gateway_client(self) -> TelegramGatewayClient:
-        return TelegramGatewayClient(
-            self._settings.telegram_gateway_url,
-            timeout_seconds=self._settings.telegram_gateway_timeout_seconds,
+    def _notification_gateway_client(self) -> NotificationGatewayClient:
+        credentials = load_notification_gateway_credentials(
+            self._settings.notification_gateway_key_file,
+        )
+        if credentials is None:
+            raise RuntimeError("Не настроен ключ связи со службой уведомлений")
+        return NotificationGatewayClient(
+            self._settings.notification_gateway_url,
+            credentials,
+            timeout_seconds=self._settings.notification_gateway_timeout_seconds,
         )
 
     def _open_form(self, vacancy_id: str) -> dict[str, object]:

@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import threading
 from datetime import UTC, datetime, timedelta
+from hashlib import sha256
 
-from hugin.adapters.notification_credentials import WindowsNotificationCredentialStore
+from hugin.adapters.notification_credentials import load_notification_gateway_credentials
 from hugin.adapters.notifications import (
-    EmailNotificationSender,
     NotificationContent,
-    TelegramGatewayNotificationSender,
+    NotificationGatewaySender,
     WindowsToastSender,
 )
 from hugin.core.settings import Settings
@@ -142,27 +142,35 @@ class NotificationWorker:
         if notification.channel is NotificationChannel.WINDOWS:
             WindowsToastSender().send(content)
             return
-        credentials = WindowsNotificationCredentialStore()
-        if notification.channel is NotificationChannel.TELEGRAM:
-            telegram = credentials.load_telegram_gateway()
-            if telegram is None:
-                raise NotificationChannelNotConfigured(
-                    "TELEGRAM_NOT_CONFIGURED",
-                    "Telegram не настроен",
-                )
-            TelegramGatewayNotificationSender(
-                self._settings.telegram_gateway_url,
-                telegram,
-                timeout_seconds=self._settings.telegram_gateway_timeout_seconds,
-            ).send(content)
-            return
-        email = credentials.load_email()
-        if email is None:
-            raise NotificationChannelNotConfigured(
-                "EMAIL_NOT_CONFIGURED",
-                "Электронная почта не настроена",
+        try:
+            credentials = load_notification_gateway_credentials(
+                self._settings.notification_gateway_key_file
             )
-        EmailNotificationSender(email).send(content)
+        except RuntimeError as error:
+            raise NotificationChannelNotConfigured(
+                "NOTIFICATION_SERVICE_NOT_CONFIGURED",
+                str(error),
+            ) from error
+        if credentials is None:
+            raise NotificationChannelNotConfigured(
+                "NOTIFICATION_SERVICE_NOT_CONFIGURED",
+                "Служба внешних уведомлений не настроена",
+            )
+        action_url = notification.payload.get("action_url")
+        if action_url is not None and not isinstance(action_url, str):
+            raise ValueError("Некорректная ссылка в уведомлении")
+        selected_action_url = action_url.strip() if isinstance(action_url, str) else None
+        NotificationGatewaySender(
+            self._settings.notification_gateway_url,
+            credentials,
+            timeout_seconds=self._settings.notification_gateway_timeout_seconds,
+        ).send(
+            event_id=_gateway_event_id(notification.deduplication_key),
+            channel=notification.channel.value,
+            event_type=notification.event_type,
+            content=content,
+            action_url=selected_action_url or None,
+        )
 
     def _record_success(self, notification_id: int, sent_at: datetime) -> None:
         database = create_database(self._settings)
@@ -208,3 +216,8 @@ class NotificationWorker:
                 worked = False
             if not worked:
                 self._stop.wait(self._poll_seconds)
+
+
+def _gateway_event_id(deduplication_key: str) -> str:
+    digest = sha256(deduplication_key.encode("utf-8")).hexdigest()
+    return f"hugin:{digest}"
