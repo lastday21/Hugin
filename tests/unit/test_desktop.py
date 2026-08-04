@@ -235,10 +235,28 @@ def test_bridge_rejects_bad_input_missing_draft_and_foreign_link(
         "message": "Черновик не найден",
     }
     assert bridge.open_url("https://example.com/")["status"] == "UNAVAILABLE"
-    monkeypatch.setattr(webbrowser, "open", lambda *_args, **_kwargs: True)
+    assert bridge.open_url("http://ufa.hh.ru/vacancy/101")["status"] == "UNAVAILABLE"
+    assert bridge.open_url("https://not-hh.ru/vacancy/101")["status"] == "UNAVAILABLE"
+    assert bridge.open_url("https://hh.ru@example.com/vacancy/101")["status"] == "UNAVAILABLE"
+    assert bridge.open_url("https://hh.ru:8443/vacancy/101")["status"] == "UNAVAILABLE"
+
+    opened: list[str] = []
+
+    def open_link(url: str, **_kwargs: object) -> bool:
+        opened.append(url)
+        return True
+
+    monkeypatch.setattr(webbrowser, "open", open_link)
     assert bridge.open_url(" https://hh.ru/vacancy/101 ")["status"] == "READY"
-    monkeypatch.setattr(webbrowser, "open", lambda *_args, **_kwargs: False)
-    assert bridge.open_url("https://www.hh.ru/vacancy/101")["status"] == "UNAVAILABLE"
+    assert bridge.open_url("https://www.hh.ru/vacancy/101")["status"] == "READY"
+    assert bridge.open_url("https://ufa.hh.ru/vacancy/101")["status"] == "READY"
+    assert bridge.open_url("https://uchaly.hh.ru/vacancy/101")["status"] == "READY"
+    assert opened == [
+        "https://hh.ru/vacancy/101",
+        "https://www.hh.ru/vacancy/101",
+        "https://ufa.hh.ru/vacancy/101",
+        "https://uchaly.hh.ru/vacancy/101",
+    ]
 
 
 def test_bridge_opens_only_saved_secure_invitation_link(

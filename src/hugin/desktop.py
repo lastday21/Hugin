@@ -92,6 +92,22 @@ class WindowsLibraries(Protocol):
     user32: WindowsUser32
 
 
+def _is_safe_hh_url(value: str) -> bool:
+    try:
+        target = urlsplit(value)
+        port = target.port
+    except ValueError:
+        return False
+    hostname = (target.hostname or "").lower()
+    return (
+        target.scheme == "https"
+        and (hostname == "hh.ru" or hostname.endswith(".hh.ru"))
+        and target.username is None
+        and target.password is None
+        and port in {None, 443}
+    )
+
+
 class DesktopBridge:
     def __init__(
         self,
@@ -123,7 +139,7 @@ class DesktopBridge:
 
     def _open_url(self, url: str) -> dict[str, object]:
         value = url.strip()
-        if not value.startswith(("https://hh.ru/", "https://www.hh.ru/")):
+        if not _is_safe_hh_url(value):
             return self._result("UNAVAILABLE", "Разрешены только ссылки hh.ru")
         opened = webbrowser.open(value, new=2)
         return self._result("READY" if opened else "UNAVAILABLE", "Ссылка открыта")

@@ -197,6 +197,10 @@ function readableError(reason: unknown): string {
   return reason instanceof Error ? reason.message : "Не удалось выполнить действие";
 }
 
+function openedByDesktop(status: string): boolean {
+  return status === "READY" || status === "ok";
+}
+
 function formatDate(value: string | null, includeDate = false): string {
   if (!value) return "Не назначено";
   const date = new Date(value);
@@ -1565,7 +1569,7 @@ function AttentionView({
     try {
       if (window.pywebview?.api) {
         const result = await window.pywebview.api.open_form(form.vacancy_id);
-        if (result.status !== "ok") throw new Error(result.message);
+        if (!openedByDesktop(result.status)) throw new Error(result.message);
         onToast({ kind: "success", message: result.message });
       } else {
         window.open(form.source_url, "_blank", "noopener,noreferrer");
@@ -1640,7 +1644,7 @@ function AttentionView({
                 >
                   <ExternalLink size={18} aria-hidden="true" />
                   {busyForm === form.form_id
-                    ? "Открываем…"
+                    ? "Проверяем вход и открываем…"
                     : tab === "input"
                       ? "Открыть анкету"
                       : "Проверить ответы"}
@@ -1829,7 +1833,7 @@ function CommunicationsView({
     try {
       if (window.pywebview?.api) {
         const result = await window.pywebview.api.open_url(url);
-        if (result.status !== "ok" && result.status !== "READY") {
+        if (!openedByDesktop(result.status)) {
           throw new Error(result.message);
         }
       } else {
@@ -1851,7 +1855,7 @@ function CommunicationsView({
     }
     try {
       const result = await window.pywebview.api.open_invitation(invitationId);
-      if (result.status !== "ok" && result.status !== "READY") {
+      if (!openedByDesktop(result.status)) {
         throw new Error(result.message);
       }
     } catch (reason) {
@@ -4322,7 +4326,7 @@ function VacancyDrawer({
     try {
       if (window.pywebview?.api) {
         const result = await window.pywebview.api.open_url(vacancy.source_url);
-        if (result.status !== "ok") throw new Error(result.message);
+        if (!openedByDesktop(result.status)) throw new Error(result.message);
       } else {
         window.open(vacancy.source_url, "_blank", "noopener,noreferrer");
       }
