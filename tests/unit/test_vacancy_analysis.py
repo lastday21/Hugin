@@ -17,8 +17,8 @@ from hugin.services.vacancy_analysis import (
 )
 
 
-def test_rules_version_is_python_it_v32() -> None:
-    assert RULES_VERSION == "python_it_v32"
+def test_rules_version_is_python_it_v34() -> None:
+    assert RULES_VERSION == "python_it_v34"
 
 
 @pytest.mark.parametrize(
@@ -465,7 +465,7 @@ def test_live_non_target_roles_are_rejected_in_both_directions(
         assert any(reason in item for item in result.reasons)
 
 
-def test_live_sql_only_role_is_routed_to_it_and_rejected_there() -> None:
+def test_live_sql_role_is_routed_to_it_and_remains_eligible() -> None:
     vacancy = VacancyData(
         "135422937",
         "Младший Разработчик SQL (PIX BI)",
@@ -483,11 +483,10 @@ def test_live_sql_only_role_is_routed_to_it_and_rejected_there() -> None:
 
     assert backend.category is RuleCategory.ROUTED
     assert backend.target_scope is DirectionScope.IT_ADJACENT
-    assert adjacent.category is RuleCategory.REJECTED
-    assert any("разработка баз данных" in reason for reason in adjacent.reasons)
+    assert adjacent.category is RuleCategory.MATCH
 
 
-def test_live_data_engineer_requires_confirmed_big_data_stack() -> None:
+def test_live_data_engineer_gap_does_not_block_application() -> None:
     vacancy = VacancyData(
         "135686059",
         "Data Engineer (Риски розничного бизнеса)",
@@ -509,7 +508,7 @@ def test_live_data_engineer_requires_confirmed_big_data_stack() -> None:
         RuleContext(skills=("Python, SQL, ETL, Git",)),
     )
 
-    assert result.category is RuleCategory.REJECTED
+    assert result.category is RuleCategory.MATCH
     assert any(
         "несколько обязательных профильных технологий не подтверждены" in reason
         for reason in result.reasons
@@ -519,7 +518,7 @@ def test_live_data_engineer_requires_confirmed_big_data_stack() -> None:
     assert any("Greenplum" in reason for reason in result.reasons)
 
 
-def test_live_python_role_with_large_unconfirmed_stack_is_rejected() -> None:
+def test_live_python_role_with_large_unconfirmed_stack_remains_eligible() -> None:
     vacancy = VacancyData(
         "135596795",
         "Python - разработчик",
@@ -538,7 +537,7 @@ def test_live_python_role_with_large_unconfirmed_stack_is_rejected() -> None:
         RuleContext(skills=("Python, Pandas, NumPy, PostgreSQL, REST",)),
     )
 
-    assert result.category is RuleCategory.REJECTED
+    assert result.category is RuleCategory.MATCH
     assert any("Apache Spark" in reason for reason in result.reasons)
     assert any("Scrapy" in reason for reason in result.reasons)
     assert any("TensorFlow/Keras" in reason for reason in result.reasons)
@@ -562,7 +561,7 @@ def test_inline_mandatory_heading_detects_siem_and_message_broker() -> None:
         RuleContext(skills=("Python, FastAPI, Redis, Docker",)),
     )
 
-    assert result.category is RuleCategory.REJECTED
+    assert result.category is RuleCategory.MATCH
     assert any("брокер сообщений" in reason for reason in result.reasons)
     assert any("SIEM" in reason for reason in result.reasons)
 
@@ -630,8 +629,7 @@ def test_live_inline_requirement_headings_detect_specialist_gaps(
 
     result = PythonBackendRules().evaluate(vacancy, RuleContext(skills=("Python",)))
 
-    expected_category = RuleCategory.REJECTED if len(expected_reasons) > 1 else RuleCategory.STRETCH
-    assert result.category is expected_category
+    assert result.category is RuleCategory.MATCH
     for reason in expected_reasons:
         assert any(reason in item for item in result.reasons)
 
@@ -657,7 +655,7 @@ def test_optional_skill_line_does_not_hide_later_mandatory_requirements() -> Non
         RuleContext(skills=("Python, FastAPI, REST, pytest",)),
     )
 
-    assert result.category is RuleCategory.STRETCH
+    assert result.category is RuleCategory.MATCH
     assert any("Elasticsearch/ELK" in reason for reason in result.reasons)
     assert not any("Django" in reason for reason in result.reasons)
 
@@ -682,14 +680,14 @@ def test_welcome_section_stops_mandatory_requirements() -> None:
         RuleContext(skills=("Python, FastAPI, PostgreSQL",)),
     )
 
-    assert result.category is RuleCategory.STRETCH
+    assert result.category is RuleCategory.MATCH
     assert any("Kubernetes" in reason for reason in result.reasons)
     assert not any("LangGraph" in reason for reason in result.reasons)
     assert not any("брокер сообщений" in reason for reason in result.reasons)
 
 
 @pytest.mark.parametrize(
-    ("description", "has_test_assignment", "expected_reason"),
+    ("description", "has_test_assignment", "expected_reason", "expected_category"),
     [
         (
             (
@@ -697,7 +695,8 @@ def test_welcome_section_stops_mandatory_requirements() -> None:
                 "Просим в сопроводительном письме коротко ответить на три вопроса."
             ),
             False,
-            "ответы в сопроводительном письме",
+            "учитывается при подготовке письма",
+            RuleCategory.MATCH,
         ),
         (
             (
@@ -706,11 +705,13 @@ def test_welcome_section_stops_mandatory_requirements() -> None:
             ),
             False,
             "внешнюю форму",
+            RuleCategory.STRETCH,
         ),
         (
             "Разработка backend на Python и FastAPI.",
             True,
             "испытательное задание",
+            RuleCategory.STRETCH,
         ),
     ],
 )
@@ -718,6 +719,7 @@ def test_manual_application_actions_are_not_exact_matches(
     description: str,
     has_test_assignment: bool,
     expected_reason: str,
+    expected_category: RuleCategory,
 ) -> None:
     vacancy = VacancyData(
         "manual-application-action",
@@ -733,11 +735,32 @@ def test_manual_application_actions_are_not_exact_matches(
         RuleContext(skills=("Python, FastAPI, PostgreSQL",)),
     )
 
-    assert result.category is RuleCategory.STRETCH
+    assert result.category is expected_category
     assert any(expected_reason in reason for reason in result.reasons)
 
 
-def test_multilanguage_backend_requirements_are_not_treated_as_python_only() -> None:
+def test_marketplace_experience_request_does_not_block_application() -> None:
+    vacancy = VacancyData(
+        "135753418",
+        "Junior Full Stack Developer (стажёр)",
+        "https://hh.ru/vacancy/135753418",
+        description=(
+            "Разработка интеграций с маркетплейсами через API на Python. "
+            "Откликайся и опиши опыт ИМЕННО С ИНТЕГРАЦИЕЙ ДЛЯ МАРЕТПЛЕЙСОВ."
+        ),
+        key_skills=("Python", "REST API", "PostgreSQL"),
+    )
+
+    result = AdjacentItRules().evaluate(
+        vacancy,
+        RuleContext(skills=("Python, REST API, PostgreSQL",)),
+    )
+
+    assert result.category is RuleCategory.MATCH
+    assert not any("ручн" in reason for reason in result.reasons)
+
+
+def test_multilanguage_backend_gaps_do_not_block_application() -> None:
     vacancy = VacancyData(
         "135721455",
         "Middle Backend Developer / Backend-разработчик (Go / Python)",
@@ -753,7 +776,7 @@ def test_multilanguage_backend_requirements_are_not_treated_as_python_only() -> 
 
     result = PythonBackendRules().evaluate(vacancy, RuleContext(skills=("Python",)))
 
-    assert result.category is RuleCategory.REJECTED
+    assert result.category is RuleCategory.MATCH
     assert any("Go" in reason for reason in result.reasons)
     assert any("Node.js" in reason for reason in result.reasons)
     assert any("микросервисная архитектура" in reason for reason in result.reasons)
@@ -778,7 +801,7 @@ def test_colleague_expectation_heading_detects_required_message_broker() -> None
         RuleContext(skills=("Python, FastAPI, Celery",)),
     )
 
-    assert result.category is RuleCategory.STRETCH
+    assert result.category is RuleCategory.MATCH
     assert any("брокер сообщений" in reason for reason in result.reasons)
 
 
@@ -816,7 +839,7 @@ def test_backend_and_frontend_title_is_routed_to_it() -> None:
 
     assert backend.category is RuleCategory.ROUTED
     assert backend.target_scope is DirectionScope.IT_ADJACENT
-    assert adjacent.category is RuleCategory.STRETCH
+    assert adjacent.category is RuleCategory.MATCH
     assert any("клиентский стек" in reason for reason in adjacent.reasons)
 
 
@@ -859,7 +882,7 @@ def test_live_industrial_automation_rejects_python_false_positive() -> None:
         assert any("прямо исключил кандидатов" in reason for reason in result.reasons)
 
 
-def test_live_computer_vision_role_requires_confirmed_specialist_stack() -> None:
+def test_live_computer_vision_gap_does_not_block_application() -> None:
     vacancy = VacancyData(
         "135500790",
         "Разработчик компьютерного зрения / Computer vision research engineer",
@@ -877,7 +900,7 @@ def test_live_computer_vision_role_requires_confirmed_specialist_stack() -> None
 
     assert backend.category is RuleCategory.ROUTED
     assert backend.target_scope is DirectionScope.IT_ADJACENT
-    assert adjacent.category is RuleCategory.REJECTED
+    assert adjacent.category is RuleCategory.MATCH
     assert any("PyTorch" in reason for reason in adjacent.reasons)
     assert any("компьютерное зрение" in reason for reason in adjacent.reasons)
 
@@ -1223,20 +1246,31 @@ def test_no_code_action_and_python_in_separate_sentences_do_not_prove_coding() -
     assert any("no-code" in reason for reason in adjacent_result.reasons)
 
 
-def test_sql_or_bitrix_primary_role_is_not_accepted() -> None:
-    for title in ("Стажёр SQL-разработчик", "Разработчик 1С-Битрикс"):
-        vacancy = VacancyData(
-            f"other-stack-{title}",
-            title,
-            "https://hh.ru/vacancy/other-stack",
-            description="Основная разработка на SQL или Битрикс, Python будет плюсом.",
-        )
+def test_sql_primary_role_is_accepted_in_adjacent_direction() -> None:
+    vacancy = VacancyData(
+        "sql-role",
+        "Стажёр SQL-разработчик",
+        "https://hh.ru/vacancy/sql-role",
+        description="Разработка запросов на SQL, Python будет плюсом.",
+    )
 
-        backend = PythonBackendRules().evaluate(vacancy)
-        adjacent = AdjacentItRules().evaluate(vacancy)
+    backend = PythonBackendRules().evaluate(vacancy)
+    adjacent = AdjacentItRules().evaluate(vacancy)
 
-        assert not backend.accepted
-        assert not adjacent.accepted
+    assert not backend.accepted
+    assert adjacent.category is RuleCategory.MATCH
+
+
+def test_bitrix_primary_role_is_not_accepted() -> None:
+    vacancy = VacancyData(
+        "bitrix-role",
+        "Разработчик 1С-Битрикс",
+        "https://hh.ru/vacancy/bitrix-role",
+        description="Основная разработка на Битрикс, Python будет плюсом.",
+    )
+
+    assert not PythonBackendRules().evaluate(vacancy).accepted
+    assert not AdjacentItRules().evaluate(vacancy).accepted
 
 
 def test_mlops_with_python_automation_is_routed_as_stretch() -> None:
@@ -1713,7 +1747,7 @@ def test_salary_maximum_below_desired_salary_is_only_a_soft_score() -> None:
     assert not any("ниже установленного порога" in reason for reason in result.reasons)
 
 
-def test_mandatory_frontend_stack_missing_from_profile_is_stretch() -> None:
+def test_mandatory_frontend_stack_missing_from_profile_does_not_block() -> None:
     result = PythonBackendRules().evaluate(
         VacancyData(
             "mandatory-frontend",
@@ -1732,11 +1766,11 @@ def test_mandatory_frontend_stack_missing_from_profile_is_stretch() -> None:
         RuleContext(skills=("Python, FastAPI, PostgreSQL",)),
     )
 
-    assert result.category is RuleCategory.STRETCH
+    assert result.category is RuleCategory.MATCH
     assert any("клиентский стек" in reason for reason in result.reasons)
 
 
-def test_mandatory_message_broker_missing_from_profile_is_stretch() -> None:
+def test_mandatory_message_broker_missing_from_profile_does_not_block() -> None:
     result = PythonBackendRules().evaluate(
         VacancyData(
             "mandatory-broker",
@@ -1753,11 +1787,11 @@ Kubernetes.""",
         RuleContext(skills=("Python, FastAPI, PostgreSQL, Docker",)),
     )
 
-    assert result.category is RuleCategory.STRETCH
+    assert result.category is RuleCategory.MATCH
     assert any("брокер сообщений" in reason for reason in result.reasons)
 
 
-def test_mandatory_django_missing_from_profile_is_stretch() -> None:
+def test_mandatory_django_missing_from_profile_does_not_block() -> None:
     result = PythonBackendRules().evaluate(
         VacancyData(
             "mandatory-django",
@@ -1775,11 +1809,11 @@ def test_mandatory_django_missing_from_profile_is_stretch() -> None:
         RuleContext(skills=("Python, FastAPI, PostgreSQL, Git",)),
     )
 
-    assert result.category is RuleCategory.STRETCH
+    assert result.category is RuleCategory.MATCH
     assert any("Django" in reason for reason in result.reasons)
 
 
-def test_bell_integrator_pattern_is_rejected_for_hard_experience_and_skill_gaps() -> None:
+def test_bell_integrator_skill_gaps_do_not_add_a_hard_rejection() -> None:
     result = AdjacentItRules().evaluate(
         VacancyData(
             "bell-integrator-live-pattern",
@@ -1795,14 +1829,14 @@ def test_bell_integrator_pattern_is_rejected_for_hard_experience_and_skill_gaps(
         RuleContext(skills=("Python, FastAPI, PostgreSQL, RAG",)),
     )
 
-    assert result.category is RuleCategory.REJECTED
+    assert result.category is RuleCategory.STRETCH
     assert any("обязательный стаж от трёх лет" in reason for reason in result.reasons)
     assert any(
         "несколько обязательных профильных технологий" in reason for reason in result.reasons
     )
 
 
-def test_founding_ai_engineer_with_multiple_unverified_requirements_is_rejected() -> None:
+def test_founding_ai_engineer_gaps_do_not_add_a_hard_rejection() -> None:
     result = AdjacentItRules().evaluate(
         VacancyData(
             "founding-ai-live-pattern",
@@ -1818,7 +1852,7 @@ def test_founding_ai_engineer_with_multiple_unverified_requirements_is_rejected(
         RuleContext(skills=("Python, FastAPI, PostgreSQL, LLM, RAG",)),
     )
 
-    assert result.category is RuleCategory.REJECTED
+    assert result.category is RuleCategory.STRETCH
     assert any(
         "несколько обязательных профильных технологий" in reason for reason in result.reasons
     )
@@ -1842,7 +1876,7 @@ def test_sbermed_qa_with_three_to_six_years_requires_manual_review() -> None:
     assert any("диапазон опыта hh.ru" in reason for reason in result.reasons)
 
 
-def test_one_unverified_specialist_requirement_is_stretch() -> None:
+def test_one_unverified_specialist_requirement_does_not_block() -> None:
     result = AdjacentItRules().evaluate(
         VacancyData(
             "one-specialist-gap",
@@ -1854,8 +1888,8 @@ def test_one_unverified_specialist_requirement_is_stretch() -> None:
         RuleContext(skills=("Python, FastAPI, PostgreSQL, LLM, RAG",)),
     )
 
-    assert result.category is RuleCategory.STRETCH
-    assert any("LangGraph" in reason and "ручной проверки" in reason for reason in result.reasons)
+    assert result.category is RuleCategory.MATCH
+    assert any("LangGraph" in reason and "не блокируется" in reason for reason in result.reasons)
 
 
 def test_junior_role_ignores_optional_experience_and_specialist_technologies() -> None:

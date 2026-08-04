@@ -26,7 +26,7 @@ from hugin.repositories.vacancies import VacancyRepository
 from hugin.services.career_directions import CareerDirectionService
 from hugin.services.vacancy_duplicates import VacancyDuplicateDetector
 
-RULES_VERSION = "python_it_v32"
+RULES_VERSION = "python_it_v34"
 MAX_VACANCY_AGE = timedelta(days=30)
 
 
@@ -648,9 +648,9 @@ class PythonBackendRules:
         if self._negative_candidate_exclusion_pattern.search(" ".join((requirements, description))):
             rejected.append("работодатель прямо исключил кандидатов с текущим профилем разработки")
         if self._cover_letter_questions_pattern.search(description):
-            stretch_reasons.append(
-                "работодатель требует отдельные ответы в сопроводительном письме; "
-                "нужна ручная проверка"
+            reasons.append(
+                "работодатель просит отдельный ответ в сопроводительном письме; "
+                "это учитывается при подготовке письма и не блокирует отклик"
             )
         if self._external_application_form_pattern.search(description):
             stretch_reasons.append("работодатель требует внешнюю форму; нужна ручная проверка")
@@ -820,13 +820,15 @@ class PythonBackendRules:
         skill_overlap = sorted(profile_tokens & vacancy_tokens)
         mandatory_skill_gaps = self._mandatory_skill_gaps(vacancy, profile_tokens)
         if len(mandatory_skill_gaps) >= 2:
-            rejected.append(
+            reasons.append(
                 "несколько обязательных профильных технологий не подтверждены: "
                 + "; ".join(mandatory_skill_gaps)
+                + "; письмо не должно приписывать этот опыт, но отклик не блокируется"
             )
         elif mandatory_skill_gaps:
-            stretch_reasons.append(
-                f"{mandatory_skill_gaps[0]}; снижает приоритет и требует ручной проверки"
+            reasons.append(
+                f"{mandatory_skill_gaps[0]}; письмо не должно приписывать этот опыт, "
+                "но отклик не блокируется"
             )
         if self.requires_python and "python" not in complete_text:
             rejected.append("Python не указан в названии, описании или навыках")
@@ -1870,10 +1872,6 @@ class AdjacentItRules(PythonBackendRules):
         ("robotics", "другое основное направление: робототехника"),
         ("робототех", "другое основное направление: робототехника"),
         ("power bi", "другое основное направление: отчётность"),
-        ("разработчик sql", "другое основное направление: разработка баз данных"),
-        ("sql-разработчик", "другое основное направление: разработка баз данных"),
-        ("sql разработчик", "другое основное направление: разработка баз данных"),
-        ("sql developer", "другое основное направление: разработка баз данных"),
         ("bitrix", "другой основной стек: Bitrix"),
         ("битрикс", "другой основной стек: Битрикс"),
         ("преподаватель", "другое основное направление: обучение"),
