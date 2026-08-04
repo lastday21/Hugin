@@ -166,6 +166,14 @@ def build_parser() -> argparse.ArgumentParser:
     analyze.add_argument("--account-id", type=positive_int, default=1)
     analyze.add_argument("--direction", required=True, help="название направления")
     analyze.add_argument("--limit", type=positive_int, default=20, help="число вакансий")
+    analyze.add_argument(
+        "--include-stretch",
+        action="store_true",
+        help=(
+            "добавить в очередь пограничные вакансии; "
+            "по умолчанию добавляются только точные совпадения"
+        ),
+    )
 
     rejected = subparsers.add_parser("rejected", help="показать отклонённые вакансии")
     rejected.add_argument("--account-id", type=positive_int, default=1)
@@ -203,7 +211,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     apply.add_argument("--account-id", type=positive_int, default=1)
     apply.add_argument("--direction", required=True, help="название направления")
-    apply.add_argument("--limit", type=positive_int, default=5, help="не более откликов за запуск")
+    apply.add_argument(
+        "--limit",
+        type=positive_int,
+        default=5,
+        help="цель по числу подтверждённых откликов за запуск",
+    )
     apply.add_argument(
         "--exclude-stretch",
         action="store_true",
@@ -356,6 +369,7 @@ def run(argv: Sequence[str] | None = None) -> int:
         if login_result.status in {
             LoginStatus.CONFIRMATION_REQUIRED,
             LoginStatus.CAPTCHA_REQUIRED,
+            LoginStatus.INVALID_CREDENTIALS,
             LoginStatus.MANUAL_ACTION_REQUIRED,
         }:
             input("После завершения входа нажмите Enter: ")
@@ -500,7 +514,7 @@ def run(argv: Sequence[str] | None = None) -> int:
                 queued = ApplicationAutomationService(session).prepare(
                     account_external_id=profile.external_id,
                     direction_name=arguments.direction,
-                    include_stretch=True,
+                    include_stretch=arguments.include_stretch,
                 )
         finally:
             database.close()
@@ -706,7 +720,7 @@ def _run_vacancy_review(arguments: argparse.Namespace) -> int:
                 prepared = ApplicationAutomationService(session).prepare_for_account_id(
                     account_id=arguments.account_id,
                     direction_name=arguments.direction,
-                    include_stretch=True,
+                    include_stretch=False,
                 )
                 entries = (entry,)
             else:
@@ -919,8 +933,8 @@ def _run_applications(
             return 0
 
         attempts = 0
-        attempt_limit = arguments.limit if arguments.send else 1
-        while attempts < attempt_limit:
+        attempt_limit = max(run_limit * 3, run_limit + 5) if arguments.send else 1
+        while attempts < attempt_limit and sent < run_limit:
             with database.sessions.begin() as session:
                 runtime_service = ApplicationAutomationService(session)
                 runtime_policy = runtime_service.policy()
@@ -932,6 +946,7 @@ def _run_applications(
                     prepared.direction_id,
                     require_cover_letter=True,
                     allow_paused_review=not arguments.send,
+                    include_stretch=not arguments.exclude_stretch,
                 )
             if job is None:
                 break
@@ -994,13 +1009,18 @@ def _run_applications(
                 print("  Форма заполнена. Кнопка отправки не нажата.")
                 input("  Проверьте форму в браузере и нажмите Enter, чтобы закрыть окно: ")
                 break
-            if recorded.sent and sent < arguments.limit and recorded.next_apply_at is not None:
+            if recorded.sent and sent < run_limit and recorded.next_apply_at is not None:
                 wait_seconds = max(
                     (recorded.next_apply_at - datetime.now(UTC)).total_seconds(),
                     0,
                 )
                 print(f"  Пауза до следующего отклика: {wait_seconds:.0f} секунд.")
                 time.sleep(wait_seconds)
+        if arguments.send and attempts >= attempt_limit and sent < run_limit and not blocking:
+            print(
+                f"Достигнут защитный предел проверок: {attempts}. "
+                "Неподходящие для автоматической отправки задания оставлены для разбора."
+            )
     finally:
         database.close()
 

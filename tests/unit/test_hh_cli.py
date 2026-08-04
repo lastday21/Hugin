@@ -262,6 +262,28 @@ def test_manual_confirmation_can_finish_in_open_browser(
     assert hh_cli.run(["login"]) == 0
 
 
+def test_rejected_password_can_be_corrected_in_open_browser(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    FakeBrowser.authenticated = False
+    FakeBrowser.result = LoginStatus.INVALID_CREDENTIALS
+    install_fakes(
+        monkeypatch,
+        tmp_path,
+        FakeStore(HhCredentials("person@example.com", "secret")),
+    )
+
+    def finish_login(prompt: str) -> str:
+        assert "нажмите Enter" in prompt
+        assert FakeBrowser.created is not None
+        FakeBrowser.created.authenticated = True
+        return ""
+
+    monkeypatch.setattr("builtins.input", finish_login)
+
+    assert hh_cli.run(["login"]) == 0
+
+
 def test_login_without_credentials_fails_cleanly(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -678,6 +700,7 @@ def test_rejected_card_and_restore_commands_work_without_browser(
         def prepare_for_account_id(self, **kwargs: object) -> SimpleNamespace:
             assert kwargs["account_id"] == 1
             assert kwargs["direction_name"] == "ИТ"
+            assert kwargs["include_stretch"] is False
             return SimpleNamespace(created=1)
 
     install_fakes(monkeypatch, tmp_path, FakeStore())
@@ -830,10 +853,12 @@ def test_print_pending_questions(capsys: pytest.CaptureFixture[str]) -> None:
     assert "поиск продолжится без соответствующего ограничения" in output
 
 
+@pytest.mark.parametrize("include_stretch", [False, True])
 def test_analyze_loads_details_and_prints_rule_reasons(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
+    include_stretch: bool,
 ) -> None:
     FakeBrowser.authenticated = True
     install_fakes(monkeypatch, tmp_path, FakeStore())
@@ -880,7 +905,7 @@ def test_analyze_loads_details_and_prints_rule_reasons(
             assert session is not None
 
         def prepare(self, **kwargs: object) -> SimpleNamespace:
-            assert kwargs["include_stretch"] is True
+            assert kwargs["include_stretch"] is include_stretch
             return SimpleNamespace(created=1, existing=0)
 
     monkeypatch.setattr(hh_cli, "upgrade_database", lambda settings: None)
@@ -893,7 +918,10 @@ def test_analyze_loads_details_and_prints_rule_reasons(
     monkeypatch.setattr(hh_cli, "VacancyAnalysisService", FakeAnalysisService)
     monkeypatch.setattr(hh_cli, "ApplicationAutomationService", FakeAutomationService)
 
-    assert hh_cli.run(["analyze", "--direction", "Python backend"]) == 0
+    arguments = ["analyze", "--direction", "Python backend"]
+    if include_stretch:
+        arguments.append("--include-stretch")
+    assert hh_cli.run(arguments) == 0
 
     output = capsys.readouterr().out
     assert "Проверено вакансий: 1" in output
@@ -905,11 +933,13 @@ def test_analyze_loads_details_and_prints_rule_reasons(
 
 
 @pytest.mark.parametrize("send", [False, True])
+@pytest.mark.parametrize("exclude_stretch", [False, True])
 def test_apply_runs_queue_and_records_confirmed_result(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
     send: bool,
+    exclude_stretch: bool,
 ) -> None:
     FakeBrowser.authenticated = True
     install_fakes(monkeypatch, tmp_path, FakeStore())
@@ -944,7 +974,7 @@ def test_apply_runs_queue_and_records_confirmed_result(
             )
 
         def prepare(self, **kwargs: object) -> SimpleNamespace:
-            assert kwargs["include_stretch"] is True
+            assert kwargs["include_stretch"] is (not exclude_stretch)
             return SimpleNamespace(
                 account_id=1,
                 direction_id=3,
@@ -964,10 +994,12 @@ def test_apply_runs_queue_and_records_confirmed_result(
             *,
             require_cover_letter: bool = False,
             allow_paused_review: bool = False,
+            include_stretch: bool = True,
         ) -> SimpleNamespace | None:
             assert direction_id == 3
             assert require_cover_letter
             assert allow_paused_review is (not send)
+            assert include_stretch is (not exclude_stretch)
             return self.jobs.pop(0) if self.jobs else None
 
         def record_result(
@@ -1015,6 +1047,8 @@ def test_apply_runs_queue_and_records_confirmed_result(
     arguments = ["apply", "--direction", "Python backend", "--limit", "1"]
     if send:
         arguments.append("--send")
+    if exclude_stretch:
+        arguments.append("--exclude-stretch")
     assert hh_cli.run(arguments) == 0
 
     output = capsys.readouterr().out
@@ -1038,6 +1072,138 @@ def test_apply_runs_queue_and_records_confirmed_result(
     entries = list(OperationJournal(tmp_path).entries(component="applications"))
     event = "manual.send" if send else "manual.preview"
     assert any(entry["event"] == event for entry in entries)
+
+
+def test_apply_limit_counts_only_confirmed_applications(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    FakeBrowser.authenticated = True
+    install_fakes(monkeypatch, tmp_path, FakeStore())
+    database = FakeDatabase()
+    jobs = [
+        SimpleNamespace(
+            vacancy=SimpleNamespace(
+                hh_id="100",
+                source_url="https://hh.ru/vacancy/100",
+                title="Вакансия: обязательная анкета",
+            ),
+            resume=SimpleNamespace(hh_id="resume-1", title="Python backend разработчик"),
+            cover_letter="Письмо 1",
+        ),
+        SimpleNamespace(
+            vacancy=SimpleNamespace(
+                hh_id="101",
+                source_url="https://hh.ru/vacancy/101",
+                title="Python backend developer",
+            ),
+            resume=SimpleNamespace(hh_id="resume-1", title="Python backend разработчик"),
+            cover_letter="Письмо 2",
+        ),
+    ]
+    results = iter(
+        [
+            HhApplyResult(
+                HhApplyStatus.QUESTIONS_REQUIRED,
+                "https://hh.ru/vacancy/100",
+                questions=("Расскажите про опыт",),
+            ),
+            HhApplyResult(
+                HhApplyStatus.APPLIED,
+                "https://hh.ru/vacancy/101",
+                "успешно",
+            ),
+        ]
+    )
+    attempted_urls: list[str] = []
+    recorded_statuses: list[HhApplyStatus] = []
+
+    class FakeAutomationService:
+        queued_jobs: ClassVar[list[SimpleNamespace]] = jobs.copy()
+
+        def __init__(self, session: object) -> None:
+            assert session is not None
+
+        def resume_after_authentication(self) -> None:
+            return None
+
+        def recover_interrupted(self) -> int:
+            return 0
+
+        def policy(self, timezone_name: str | None = None) -> SimpleNamespace:
+            return SimpleNamespace(
+                daily_limit=25,
+                delay_min_seconds=30,
+                delay_max_seconds=60,
+            )
+
+        def prepare(self, **kwargs: object) -> SimpleNamespace:
+            return SimpleNamespace(
+                account_id=1,
+                direction_id=3,
+                created=2,
+                existing=0,
+            )
+
+        def applied_since(self, account_id: int, since: object) -> int:
+            return 0
+
+        def claim_next(
+            self,
+            direction_id: int,
+            *,
+            require_cover_letter: bool = False,
+            allow_paused_review: bool = False,
+            include_stretch: bool = True,
+        ) -> SimpleNamespace | None:
+            assert direction_id == 3
+            assert require_cover_letter
+            assert not allow_paused_review
+            assert include_stretch
+            return self.queued_jobs.pop(0) if self.queued_jobs else None
+
+        def record_result(
+            self,
+            queued_job: object,
+            result: HhApplyResult,
+            **kwargs: object,
+        ) -> SimpleNamespace:
+            recorded_statuses.append(result.status)
+            sent = result.status is HhApplyStatus.APPLIED
+            assert (kwargs["apply_delay"] is not None) is sent
+            return SimpleNamespace(sent=sent, blocking=False, next_apply_at=None)
+
+    def apply_to_vacancy(
+        _browser: FakeBrowser,
+        source_url: str,
+        **kwargs: object,
+    ) -> HhApplyResult:
+        assert kwargs["submit"] is True
+        attempted_urls.append(source_url)
+        return next(results)
+
+    monkeypatch.setattr(hh_cli, "upgrade_database", lambda settings: None)
+    monkeypatch.setattr(hh_cli, "create_database", lambda settings: database)
+    monkeypatch.setattr(
+        hh_cli,
+        "HhProfileSyncService",
+        lambda session: SimpleNamespace(synchronize=lambda profile: None),
+    )
+    monkeypatch.setattr(hh_cli, "ApplicationAutomationService", FakeAutomationService)
+    monkeypatch.setattr(FakeBrowser, "apply_to_vacancy", apply_to_vacancy)
+
+    assert hh_cli.run(["apply", "--direction", "Python backend", "--limit", "1", "--send"]) == 0
+
+    assert attempted_urls == [
+        "https://hh.ru/vacancy/100",
+        "https://hh.ru/vacancy/101",
+    ]
+    assert recorded_statuses == [
+        HhApplyStatus.QUESTIONS_REQUIRED,
+        HhApplyStatus.APPLIED,
+    ]
+    assert "Новых подтверждённых откликов: 1" in capsys.readouterr().out
 
 
 def test_apply_keeps_queue_available_when_one_result_is_unknown(
@@ -1094,9 +1260,11 @@ def test_apply_keeps_queue_available_when_one_result_is_unknown(
             *,
             require_cover_letter: bool = False,
             allow_paused_review: bool = False,
+            include_stretch: bool = True,
         ) -> SimpleNamespace | None:
             assert require_cover_letter
             assert not allow_paused_review
+            assert include_stretch
             return self.jobs.pop(0) if self.jobs else None
 
         def record_result(

@@ -671,6 +671,97 @@ def test_rule_change_skips_and_can_restore_pending_task(settings: Settings) -> N
         database.close()
 
 
+def test_routed_pending_application_moves_to_target_direction(settings: Settings) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    try:
+        with database.sessions.begin() as session:
+            account = AccountRepository(session).create("Иван", "routed-account")
+            resume = ResumeRepository(session).upsert(
+                account.id,
+                "routed-resume",
+                "Python backend",
+            )
+            directions = DirectionRepository(session)
+            source = directions.create(account.id, "Python backend")
+            target = directions.create(account.id, "ИТ")
+            directions.attach_resume(source.id, resume.id)
+            directions.attach_resume(target.id, resume.id)
+            vacancy = VacancyRepository(session).upsert(
+                VacancyData(
+                    "routed-vacancy",
+                    "Junior Data-инженер",
+                    "https://hh.ru/vacancy/routed-vacancy",
+                )
+            )
+            directions.track_vacancy(source.id, vacancy.id)
+            directions.track_vacancy(target.id, vacancy.id)
+            directions.apply_rules(
+                source.id,
+                vacancy.id,
+                state=VacancyState.ANALYZED,
+                score=80,
+                details={"category": "MATCH", "accepted": True},
+                rules_version=RULES_VERSION,
+            )
+            service = ApplicationAutomationService(session)
+            assert (
+                service.prepare_for_account_id(
+                    account_id=account.id,
+                    direction_name=source.name,
+                    include_stretch=False,
+                ).created
+                == 1
+            )
+            application = ApplicationRepository(session).get_by_key(
+                account.id,
+                vacancy.id,
+                resume.id,
+            )
+            assert application is not None
+            task = QueueTaskRepository(session).get_by_application_id(application.id)
+            assert task is not None
+
+            directions.apply_rules(
+                source.id,
+                vacancy.id,
+                state=VacancyState.SKIPPED,
+                score=0,
+                details={
+                    "category": "ROUTED",
+                    "accepted": False,
+                    "target_scope": "IT_ADJACENT",
+                },
+                rules_version=RULES_VERSION,
+            )
+            directions.apply_rules(
+                target.id,
+                vacancy.id,
+                state=VacancyState.ANALYZED,
+                score=75,
+                details={"category": "MATCH", "accepted": True},
+                rules_version=RULES_VERSION,
+            )
+            service.prepare_for_account_id(
+                account_id=account.id,
+                direction_name=source.name,
+                include_stretch=False,
+            )
+
+            prepared = service.prepare_for_account_id(
+                account_id=account.id,
+                direction_name=target.name,
+                include_stretch=False,
+            )
+
+            assert prepared.created == 1
+            moved = ApplicationRepository(session).get(application.id)
+            assert moved.direction_id == target.id
+            assert QueueTaskRepository(session).get(task.id).state is TaskState.PENDING
+    finally:
+        database.close()
+
+
 def test_reanalysis_skips_pending_task_for_vacancy_older_than_thirty_days(
     settings: Settings,
 ) -> None:

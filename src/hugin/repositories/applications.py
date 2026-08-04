@@ -124,6 +124,25 @@ class ApplicationRepository:
             raise ApplicationNotFoundError(application_id)
         return _application_record(model)
 
+    def reassign_direction(
+        self,
+        application_id: int,
+        direction_id: int,
+    ) -> ApplicationRecord:
+        model = self._session.get(ApplicationModel, application_id)
+        if model is None:
+            raise ApplicationNotFoundError(application_id)
+        if model.state is not ApplicationState.APPLYING:
+            raise ValueError("Можно перенести только неотправленный отклик")
+        direction_account_id = self._session.scalar(
+            select(CareerDirectionModel.account_id).where(CareerDirectionModel.id == direction_id)
+        )
+        if direction_account_id != model.account_id:
+            raise ValueError("Направление должно принадлежать аккаунту отклика")
+        model.direction_id = direction_id
+        self._session.flush()
+        return _application_record(model)
+
     def count_applied_since(self, account_id: int, since: datetime) -> int:
         return (
             self._session.scalar(

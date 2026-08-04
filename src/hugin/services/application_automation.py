@@ -28,6 +28,7 @@ from hugin.domain.content import (
 )
 from hugin.domain.directions import (
     AccountRecord,
+    DirectionRecord,
     DirectionVacancyRecord,
     ResumeRecord,
     VacancyState,
@@ -152,10 +153,31 @@ class ApplicationAutomationService:
                 continue
             current = self._applications.get_by_key(account.id, tracked.vacancy_id, resume.id)
             if current is not None:
+                task = self._tasks.get_by_application_id(current.id)
                 if current.direction_id != direction.id:
+                    if self._can_reassign_routed_application(
+                        current,
+                        task,
+                        direction,
+                        tracked.vacancy_id,
+                    ):
+                        self._applications.reassign_direction(current.id, direction.id)
+                        if task is None:
+                            self._tasks.enqueue(current.id, self._priority(tracked))
+                        else:
+                            self._tasks.requeue_after_rule_change(
+                                task.id,
+                                priority_score=self._priority(tracked),
+                            )
+                        self._directions.set_vacancy_state(
+                            direction.id,
+                            tracked.vacancy_id,
+                            VacancyState.QUEUED,
+                        )
+                        created += 1
+                        continue
                     existing += 1
                     continue
-                task = self._tasks.get_by_application_id(current.id)
                 if task is None and current.state is ApplicationState.APPLYING:
                     self._tasks.enqueue(current.id, self._priority(tracked))
                     self._directions.set_vacancy_state(
@@ -210,6 +232,33 @@ class ApplicationAutomationService:
             allowed_categories=frozenset(allowed),
         )
         return PreparationResult(account.id, direction.id, resume, created, existing)
+
+    def _can_reassign_routed_application(
+        self,
+        application: ApplicationRecord,
+        task: TaskRecord | None,
+        target_direction: DirectionRecord,
+        vacancy_id: int,
+    ) -> bool:
+        if application.state is not ApplicationState.APPLYING:
+            return False
+        if task is not None and (
+            task.state is not TaskState.SKIPPED or task.last_error_code != "VACANCY_RULES_CHANGED"
+        ):
+            return False
+        if application.direction_id is None:
+            return False
+        try:
+            source = self._directions.get_tracked_vacancy(
+                application.direction_id,
+                vacancy_id,
+            )
+        except LookupError:
+            return False
+        return (
+            source.rules_details.get("category") == RuleCategory.ROUTED.value
+            and source.rules_details.get("target_scope") == target_direction.scope.value
+        )
 
     @staticmethod
     def _priority(tracked: DirectionVacancyRecord) -> float:

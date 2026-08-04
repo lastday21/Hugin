@@ -6,8 +6,8 @@ import pytest
 
 from hugin.core.settings import Settings
 from hugin.database import create_database, upgrade_database
-from hugin.domain import AutomationJobKind, AutomationJobState
-from hugin.repositories import AccountRepository, DirectionRepository
+from hugin.domain import AutomationJobKind, AutomationJobState, SystemState
+from hugin.repositories import AccountRepository, DirectionRepository, SystemStateRepository
 from hugin.services.automation import AutomationSchedulerService
 
 pytestmark = pytest.mark.integration
@@ -225,6 +225,7 @@ def test_blocked_and_disabled_jobs_are_not_claimed(settings: Settings) -> None:
 
         with database.sessions.begin() as session:
             scheduler = AutomationSchedulerService(session)
+            SystemStateRepository(session).transition(SystemState.PAUSED)
             enabled = scheduler.enable(statuses.key, due_at + timedelta(days=1))
             unblocked = scheduler.unblock(messages.key, due_at + timedelta(days=1))
             assert enabled.state is AutomationJobState.WAITING
@@ -232,6 +233,43 @@ def test_blocked_and_disabled_jobs_are_not_claimed(settings: Settings) -> None:
             claimed = scheduler.claim_due(due_at + timedelta(days=1))
             assert claimed is not None
             assert claimed.kind is AutomationJobKind.MESSAGES
+    finally:
+        database.close()
+
+
+@pytest.mark.parametrize(
+    ("error_code", "protective_state"),
+    (
+        ("INVALID_CREDENTIALS", SystemState.AUTH_REQUIRED),
+        ("CAPTCHA_REQUIRED", SystemState.CAPTCHA_REQUIRED),
+        ("ACCOUNT_WARNING", SystemState.ACCOUNT_WARNING),
+    ),
+)
+def test_protective_system_state_stops_all_background_jobs(
+    settings: Settings,
+    error_code: str,
+    protective_state: SystemState,
+) -> None:
+    account_id, _query_id = seed_search_query(settings)
+    database = create_database(settings)
+    due_at = datetime(2026, 7, 26, 12, 30, tzinfo=UTC)
+
+    try:
+        with database.sessions.begin() as session:
+            scheduler = AutomationSchedulerService(session)
+            messages, statuses = scheduler.ensure_account_jobs(account_id, due_at)
+            scheduler.block(
+                messages.key,
+                error_code=error_code,
+                error_message="Требуется действие пользователя",
+                now=due_at,
+            )
+
+            assert SystemStateRepository(session).get().state is protective_state
+            assert scheduler.claim_due(due_at) is None
+            jobs = {job.key: job for job in scheduler.list_for_account(account_id)}
+            assert jobs[messages.key].state is AutomationJobState.BLOCKED
+            assert jobs[statuses.key].state is AutomationJobState.WAITING
     finally:
         database.close()
 

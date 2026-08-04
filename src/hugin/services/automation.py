@@ -10,6 +10,7 @@ from hugin.database.models import (
     CareerDirectionModel,
     DirectionSearchQueryModel,
     HhAccountModel,
+    SystemStateModel,
 )
 from hugin.domain.automation import (
     AutomationJobKind,
@@ -17,6 +18,7 @@ from hugin.domain.automation import (
     AutomationJobResult,
     AutomationJobState,
 )
+from hugin.domain.tasks import SystemState
 from hugin.domain.time import as_utc
 from hugin.repositories.automation import AutomationJobRepository
 
@@ -30,6 +32,22 @@ RESOURCE_SAVING_SEARCH_INTERVAL_MINUTES = 240
 RESOURCE_SAVING_MESSAGE_INTERVAL_MINUTES = 15
 RESOURCE_SAVING_STATUS_INTERVAL_MINUTES = 60
 RESOURCE_SAVING_SEARCH_STAGGER = timedelta(minutes=5)
+PROTECTIVE_SYSTEM_STATES = frozenset(
+    {
+        SystemState.AUTH_REQUIRED,
+        SystemState.CAPTCHA_REQUIRED,
+        SystemState.ACCOUNT_WARNING,
+    }
+)
+PROTECTIVE_ERROR_STATES = {
+    "ACCOUNT_WARNING": SystemState.ACCOUNT_WARNING,
+    "CAPTCHA_REQUIRED": SystemState.CAPTCHA_REQUIRED,
+    "AUTH_REQUIRED": SystemState.AUTH_REQUIRED,
+    "CONFIRMATION_REQUIRED": SystemState.AUTH_REQUIRED,
+    "CREDENTIALS_REQUIRED": SystemState.AUTH_REQUIRED,
+    "INVALID_CREDENTIALS": SystemState.AUTH_REQUIRED,
+    "MANUAL_ACTION_REQUIRED": SystemState.AUTH_REQUIRED,
+}
 
 
 class AutomationSchedulerService:
@@ -163,6 +181,9 @@ class AutomationSchedulerService:
         settings = self._settings()
         if not settings.search_enabled:
             self._disable_search_jobs(selected_at)
+        system = self._session.get(SystemStateModel, 1)
+        if system is not None and system.state in PROTECTIVE_SYSTEM_STATES:
+            return None
         return self._jobs.claim_due(
             selected_at,
             search_enabled=settings.search_enabled,
@@ -240,6 +261,7 @@ class AutomationSchedulerService:
             error_message=error_message,
             now=self._now(now),
         )
+        self._protect_system(error_code)
         return self._disable_finished_search_if_paused(blocked, now)
 
     def unblock(
@@ -353,6 +375,18 @@ class AutomationSchedulerService:
         if settings is None:
             raise LookupError("Настройки фоновых проверок не найдены")
         return settings
+
+    def _protect_system(self, error_code: str) -> None:
+        target = PROTECTIVE_ERROR_STATES.get(error_code.strip().upper())
+        if target is None:
+            return
+        system = self._session.get(SystemStateModel, 1)
+        if system is not None and system.state in {
+            SystemState.RUNNING,
+            SystemState.PAUSED,
+        }:
+            system.state = target
+            self._session.flush()
 
     @staticmethod
     def _retry_delay(failure_number: int) -> timedelta:
