@@ -9,6 +9,7 @@ from typing import cast
 
 import pytest
 from pydantic import SecretStr
+from sqlalchemy import select
 
 from hugin import cover_letter_cli
 from hugin.adapters.yandex_credentials import (
@@ -17,7 +18,7 @@ from hugin.adapters.yandex_credentials import (
 )
 from hugin.core.settings import Settings
 from hugin.database import create_database, upgrade_database
-from hugin.database.models import CoverLetterModel
+from hugin.database.models import CoverLetterModel, CoverLetterRejectionModel
 from hugin.domain.content import CoverLetterState, cover_letter_instruction_version
 from hugin.domain.vacancies import VacancyData
 from hugin.repositories import AccountRepository, ApplicationRepository, ResumeRepository
@@ -74,9 +75,11 @@ def test_configure_keeps_key_out_of_output(
     assert "secret-key" not in capsys.readouterr().out
 
 
+@pytest.mark.parametrize("exclude_stretch", [False, True])
 def test_prepare_creates_letters_without_browser_or_hh_submission(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    exclude_stretch: bool,
 ) -> None:
     database = FakeDatabase()
     prepared = CoverLetterPreparationResult(
@@ -104,7 +107,7 @@ def test_prepare_creates_letters_without_browser_or_hh_submission(
             assert kwargs == {
                 "account_id": 1,
                 "direction_name": "Python backend",
-                "include_stretch": True,
+                "include_stretch": not exclude_stretch,
             }
             return SimpleNamespace(created=3, existing=4)
 
@@ -118,6 +121,7 @@ def test_prepare_creates_letters_without_browser_or_hh_submission(
                 "direction_name": "Python backend",
                 "limit": 5,
                 "vacancy_hh_id": "123",
+                "include_stretch": not exclude_stretch,
             }
             return prepared
 
@@ -147,20 +151,18 @@ def test_prepare_creates_letters_without_browser_or_hh_submission(
     monkeypatch.setattr(cover_letter_cli, "ApplicationAutomationService", FakeAutomation)
     monkeypatch.setattr(cover_letter_cli, "CoverLetterService", FakeLetters)
 
-    assert (
-        cover_letter_cli.run(
-            [
-                "prepare",
-                "--direction",
-                "Python backend",
-                "--limit",
-                "5",
-                "--vacancy-id",
-                "123",
-            ]
-        )
-        == 0
-    )
+    arguments = [
+        "prepare",
+        "--direction",
+        "Python backend",
+        "--limit",
+        "5",
+        "--vacancy-id",
+        "123",
+    ]
+    if exclude_stretch:
+        arguments.append("--exclude-stretch")
+    assert cover_letter_cli.run(arguments) == 0
     output = capsys.readouterr().out
     assert "№ 123" in output
     assert "На hh.ru ничего не отправлено" in output
@@ -233,18 +235,26 @@ def test_show_reads_saved_letter(
                 vacancy.id,
                 resume.id,
             )
+            letter = CoverLetterModel(
+                application_id=application.id,
+                vacancy_id=vacancy.id,
+                resume_id=resume.id,
+                text="Сохраненное индивидуальное письмо",
+                instruction_version=cover_letter_instruction_version(DEFAULT_COVER_LETTER_PROMPT),
+                model_name="yandexgpt-test",
+                context_hash="hash",
+                state=CoverLetterState.READY,
+            )
+            session.add(letter)
+            session.flush()
             session.add(
-                CoverLetterModel(
-                    application_id=application.id,
-                    vacancy_id=vacancy.id,
-                    resume_id=resume.id,
-                    text="Сохраненное индивидуальное письмо",
-                    instruction_version=cover_letter_instruction_version(
-                        DEFAULT_COVER_LETTER_PROMPT
-                    ),
-                    model_name="yandexgpt-test",
-                    context_hash="hash",
-                    state=CoverLetterState.READY,
+                CoverLetterRejectionModel(
+                    cover_letter_id=letter.id,
+                    sequence_number=1,
+                    text="Черновик с неподтверждёнными пятью годами опыта.",
+                    reason_code="UNCONFIRMED_EXPERIENCE",
+                    reason_message="В письме появился неподтверждённый срок опыта",
+                    rejected_fragment="У меня пять лет опыта.",
                 )
             )
     finally:
@@ -257,6 +267,10 @@ def test_show_reads_saved_letter(
     output = capsys.readouterr().out
     assert "Python-разработчик" in output
     assert "Сохраненное индивидуальное письмо" in output
+    assert "Отклонённый вариант № 1" in output
+    assert "UNCONFIRMED_EXPERIENCE" in output
+    assert "У меня пять лет опыта." in output
+    assert "Черновик с неподтверждёнными пятью годами опыта." in output
 
 
 def test_reject_clears_reviewed_letter_and_allows_regeneration(
@@ -323,6 +337,15 @@ def test_reject_clears_reviewed_letter_and_allows_regeneration(
             assert rejected.state is CoverLetterState.FAILED
             assert rejected.text is None
             assert rejected.failure_reason == "MANUAL_REVIEW: нет подтверждения"
+            rejection = session.scalar(
+                select(CoverLetterRejectionModel).where(
+                    CoverLetterRejectionModel.cover_letter_id == letter_id
+                )
+            )
+            assert rejection is not None
+            assert rejection.text == "Неподтвержденное утверждение"
+            assert rejection.reason_code == "MANUAL_REVIEW"
+            assert rejection.reason_message == "нет подтверждения"
     finally:
         database.close()
     assert "можно создать новый вариант" in capsys.readouterr().out

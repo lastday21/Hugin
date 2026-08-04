@@ -812,6 +812,32 @@ class CoverLetterModel(Base):
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
+class CoverLetterRejectionModel(Base):
+    __tablename__ = "cover_letter_rejections"
+    __table_args__ = (
+        UniqueConstraint(
+            "cover_letter_id",
+            "sequence_number",
+            name="uq_cover_letter_rejections_letter_sequence",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    cover_letter_id: Mapped[int] = mapped_column(
+        ForeignKey("cover_letters.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    sequence_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    reason_code: Mapped[str] = mapped_column(String(128), nullable=False)
+    reason_message: Mapped[str] = mapped_column(Text, nullable=False)
+    rejected_fragment: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+
+
 class CoverLetterFactModel(Base):
     __tablename__ = "cover_letter_facts"
 

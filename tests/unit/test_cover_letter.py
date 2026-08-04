@@ -13,6 +13,7 @@ from hugin.database.models import (
     CandidateProfileModel,
     CoverLetterFactModel,
     CoverLetterModel,
+    CoverLetterRejectionModel,
     ResumeModel,
     VacancyModel,
     VerifiedFactModel,
@@ -428,7 +429,7 @@ def test_ready_model_letter_without_current_prompt_version_is_regenerated(
         database.close()
 
 
-def test_unconfirmed_number_fails_without_fallback(settings: Settings) -> None:
+def test_unconfirmed_number_is_corrected_once(settings: Settings) -> None:
     upgrade_database(settings)
     database = create_database(settings)
     model = FakeModel(
@@ -436,31 +437,27 @@ def test_unconfirmed_number_fails_without_fallback(settings: Settings) -> None:
             "Здравствуйте!\n\nРазрабатывал серверные приложения на Python и FastAPI, работал "
             "с PostgreSQL и настраивал автоматические проверки. У меня 5 лет опыта, поэтому "
             "задачи серверной разработки хорошо знакомы. Также реализовывал прикладную логику "
-            "и интеграции. Буду рад подробнее рассказать о проектах и обсудить задачи команды."
+            "и интеграции. Буду рад подробнее рассказать о проектах и обсудить задачи команды.",
+            _letter(),
         ]
     )
     try:
         with database.sessions.begin() as session:
-            account_id, direction_id, _, _ = _prepare_data(session)
+            account_id, _, _, _ = _prepare_data(session)
             result = CoverLetterService(session, model).prepare(
                 account_id=account_id,
                 direction_name="Python backend",
             )
 
-            assert result.failed == 1
+            assert result.generated == 1
+            assert result.failed == 0
             letter = session.scalar(select(CoverLetterModel))
             assert letter is not None
-            assert letter.state is CoverLetterState.FAILED
-            assert letter.text is None
-            assert letter.failure_reason == "UNCONFIRMED_NUMBER"
-            assert len(model.prompts) == 1
-            assert (
-                ApplicationAutomationService(session).claim_next(
-                    direction_id,
-                    require_cover_letter=True,
-                )
-                is None
-            )
+            assert letter.state is CoverLetterState.READY
+            assert letter.text == _letter()
+            assert letter.failure_reason is None
+            assert len(model.prompts) == 2
+            assert "Код проверки: UNCONFIRMED_NUMBER" in model.prompts[1][1]
     finally:
         database.close()
 
@@ -514,7 +511,9 @@ def test_template_phrase_is_corrected_once_with_specific_reason(
             assert correction_prompt.startswith(first_prompt)
             assert "Код проверки: TEMPLATE_PHRASE" in correction_prompt
             assert "запрещённая шаблонная фраза «вижу, что»" in correction_prompt
-            assert _letter_with_template_phrase() not in correction_prompt
+            assert "<rejected_letter>" in correction_prompt
+            assert _letter_with_template_phrase() in correction_prompt
+            assert "не заменяй его другим требованием из вакансии" in correction_prompt
             assert result.items[0].reason is not None
             assert "«вижу, что»" in result.items[0].reason
 
@@ -523,6 +522,14 @@ def test_template_phrase_is_corrected_once_with_specific_reason(
             assert letter.state is CoverLetterState.READY
             assert letter.text == _letter()
             assert letter.failure_reason is None
+            rejection = session.scalar(select(CoverLetterRejectionModel))
+            assert rejection is not None
+            assert rejection.sequence_number == 1
+            assert rejection.text == _letter_with_template_phrase()
+            assert rejection.reason_code == "TEMPLATE_PHRASE"
+            assert "запрещённая шаблонная фраза" in rejection.reason_message
+            assert rejection.rejected_fragment is not None
+            assert "Вижу, что вы ищете" in rejection.rejected_fragment
     finally:
         database.close()
 
@@ -571,6 +578,22 @@ def test_failed_template_correction_requires_review_and_stops_retries(
                 letter.failure_reason
                 == "COVER_LETTER_RETRY_FAILED:TEMPLATE_PHRASE->UNCONFIRMED_NUMBER"
             )
+            rejections = tuple(
+                session.scalars(
+                    select(CoverLetterRejectionModel)
+                    .where(CoverLetterRejectionModel.cover_letter_id == letter.id)
+                    .order_by(CoverLetterRejectionModel.sequence_number)
+                )
+            )
+            assert len(rejections) == 2
+            assert rejections[0].text == _letter_with_template_phrase()
+            assert rejections[0].reason_code == "TEMPLATE_PHRASE"
+            assert rejections[0].rejected_fragment is not None
+            assert "Вижу, что вы ищете" in rejections[0].rejected_fragment
+            assert rejections[1].text == unconfirmed_number
+            assert rejections[1].reason_code == "UNCONFIRMED_NUMBER"
+            assert rejections[1].rejected_fragment is not None
+            assert "5 лет опыта" in rejections[1].rejected_fragment
             assert task is not None
             assert task.state is TaskState.REVIEW_REQUIRED
             assert task.last_error_code == "COVER_LETTER_RETRY_FAILED"
@@ -614,21 +637,43 @@ def test_related_publication_is_not_prepared_twice(settings: Settings) -> None:
         database.close()
 
 
-def test_unrelated_near_duplicate_is_rejected_without_second_model_call(
+def test_unrelated_near_duplicate_is_rejected_after_one_correction(
     settings: Settings,
 ) -> None:
     upgrade_database(settings)
     database = create_database(settings)
-    model = FakeModel([_letter(), _letter().replace("Буду рад", "Готов")])
+    model = FakeModel(
+        [
+            _letter(),
+            _letter().replace("Буду рад", "Готов"),
+            _letter().replace("Буду рад", "Готов"),
+        ]
+    )
     try:
         with database.sessions.begin() as session:
-            account_id, direction_id, _, _ = _prepare_data(session)
+            account_id, direction_id, resume_id, _ = _prepare_data(session)
             first = CoverLetterService(session, model).prepare(
                 account_id=account_id,
                 direction_name="Python backend",
                 vacancy_hh_id="letter-1",
             )
             assert first.generated == 1
+            profile = session.scalar(
+                select(CandidateProfileModel).where(CandidateProfileModel.account_id == account_id)
+            )
+            assert profile is not None
+            session.add(
+                VerifiedFactModel(
+                    profile_id=profile.id,
+                    category="work_experience",
+                    content="Реализовывал серверные интеграции и фоновые задачи.",
+                    source_type="resume",
+                    resume_id=resume_id,
+                    state=ConfirmationState.CONFIRMED,
+                    allow_in_letters=True,
+                )
+            )
+            session.flush()
 
             vacancy = VacancyRepository(session).upsert(
                 VacancyData(
@@ -677,8 +722,11 @@ def test_unrelated_near_duplicate_is_rejected_without_second_model_call(
                 .where(VacancyModel.hh_id == "letter-unrelated")
             )
             assert failed_letter is not None
-            assert failed_letter.failure_reason == "NEAR_DUPLICATE_TEXT"
-            assert len(model.prompts) == 2
+            assert (
+                failed_letter.failure_reason
+                == "COVER_LETTER_RETRY_FAILED:NEAR_DUPLICATE_TEXT->NEAR_DUPLICATE_TEXT"
+            )
+            assert len(model.prompts) == 3
     finally:
         database.close()
 
@@ -1172,12 +1220,290 @@ def test_unchanged_manual_failure_does_not_block_next_vacancy(
             "и подход к проверке результата.",
             "UNCONFIRMED_CLAIM",
         ),
+        (
+            "Здравствуйте!\n\nРазрабатывал серверные приложения на Python и FastAPI, работал "
+            "с PostgreSQL и настраивал автоматические проверки. Для одновременной обработки "
+            "запросов подбирал стратегии блокировок. Также реализовывал прикладную логику "
+            "и обработку ошибок. Готов подробно обсудить выполненные проекты и подход "
+            "к проверке результата.",
+            "UNCONFIRMED_CLAIM",
+        ),
+        (
+            "Здравствуйте!\n\nРазрабатывал серверные приложения на Python и FastAPI, работал "
+            "с PostgreSQL и настраивал автоматические проверки. Реализовывал прикладную логику "
+            "и обработку ошибок. Готов обсудить детали реализации и рассказать о выполненных "
+            "проектах команды.",
+            "TEMPLATE_PHRASE",
+        ),
+        (
+            "Здравствуйте!\n\nРазрабатывал серверные приложения на Python и FastAPI, работал "
+            "с PostgreSQL и настраивал автоматические проверки. Этот опыт напрямую связан "
+            "с задачами создания надёжных ETL-процессов. Также реализовывал прикладную логику "
+            "и интеграции. Готов подробно разобрать выполненный проект и проверку результата.",
+            "UNCONFIRMED_CLAIM",
+        ),
+        (
+            "Здравствуйте!\n\nРазрабатывал обработку данных на Python и FastAPI, работал "
+            "с PostgreSQL и настраивал автоматические проверки. Выполнял группировки, "
+            "merge и pivot с преобразованием типов. Также реализовывал прикладную логику "
+            "и интеграции. Готов подробно разобрать выполненный проект и проверку результата.",
+            "UNCONFIRMED_CLAIM",
+        ),
+        (
+            "Здравствуйте!\n\nРаботаю с автоматизацией процессов через внешние API и "
+            "WebSocket, подготавливаю техническую документацию и передаю решения командам. "
+            "Также разрабатывал серверные приложения на Python и FastAPI и работал с "
+            "PostgreSQL. Готов подробно разобрать выполненный проект и проверку результата.",
+            "UNCONFIRMED_CLAIM",
+        ),
+        (
+            "Здравствуйте!\n\nРазрабатывал обработку данных на Python и FastAPI, работал "
+            "с PostgreSQL и настраивал автоматические проверки. Проектировал потоки данных, "
+            "выполнял сложные выборки и оптимизировал запросы. Готов подробно разобрать "
+            "выполненный проект и проверку результата.",
+            "UNCONFIRMED_CLAIM",
+        ),
+        (
+            "Здравствуйте!\n\nРазрабатывал серверные приложения на Python и FastAPI, работал "
+            "с PostgreSQL и настраивал автоматические проверки. Реализовывал прикладную логику "
+            "и обработку ошибок. Готов рассказать, как этот опыт может быть полезен "
+            "при развитии сервисов команды.",
+            "TEMPLATE_PHRASE",
+        ),
+        (
+            "Здравствуйте!\n\nРазрабатывал серверные приложения на Python и FastAPI, работал "
+            "с PostgreSQL и настраивал автоматические проверки. Реализовывал прикладную логику "
+            "и обработку ошибок. Готов подробнее рассказать о применении этих решений "
+            "в ваших задачах.",
+            "TEMPLATE_PHRASE",
+        ),
     ],
 )
 def test_objective_letter_validation(text: str, code: str) -> None:
     with pytest.raises(CoverLetterValidationError) as error:
         validate_cover_letter(text, _vacancy(), _fact())
     assert error.value.code == code
+
+
+def test_unconfirmed_claim_identifies_exact_sentence() -> None:
+    text = (
+        "Здравствуйте!\n\nРазрабатывал серверные приложения на Python и FastAPI. "
+        "Обеспечивал целостность данных при высокой нагрузке и проверял прикладную логику. "
+        "Также работал с PostgreSQL и настраивал автоматические проверки."
+    )
+
+    with pytest.raises(CoverLetterValidationError) as error:
+        validate_cover_letter(text, _vacancy(), _fact())
+
+    assert error.value.code == "UNCONFIRMED_CLAIM"
+    assert error.value.rejected_fragment == (
+        "Обеспечивал целостность данных при высокой нагрузке и проверял прикладную логику."
+    )
+
+
+def test_current_research_wording_does_not_require_exact_tense_in_fact() -> None:
+    vacancy = _vacancy()
+    vacancy.title = "Стажёр в ИИ-лабораторию"
+    vacancy.description = "Исследования и разработка решений с использованием LLM."
+    vacancy.key_skills = ["Python", "LLM"]
+    text = (
+        "Здравствуйте!\n\nПровожу исследования с использованием LLM и речевых сервисов. "
+        "Ранее создавал серверные приложения на Python и FastAPI, работал с PostgreSQL "
+        "и настраивал автоматические проверки. Также реализовывал прикладную логику "
+        "и интеграции с LLM и речевыми сервисами. При доработке серверных приложений "
+        "отдельно проверял обработку запросов и поведение прикладной логики. Готов "
+        "подробно разобрать выполненный проект и проверку результата на собеседовании."
+    )
+    facts = (
+        _SelectedFact(
+            id=1,
+            category="work_experience",
+            content=(
+                "Создавал серверные приложения на Python и FastAPI. Работал с PostgreSQL. "
+                "Реализовывал интеграции с LLM и речевыми сервисами."
+            ),
+        ),
+    )
+
+    validate_cover_letter(text, vacancy, facts)
+
+
+def test_backend_data_words_do_not_count_as_etl_vacancy_focus() -> None:
+    vacancy = _vacancy()
+    vacancy.title = "ETL-разработчик"
+    vacancy.description = "Разработка ETL-процессов на Airflow и поддержка FastAPI."
+    vacancy.responsibilities = "Строить потоки загрузки данных и развивать FastAPI."
+    vacancy.required_qualifications = "Python, FastAPI, Airflow."
+
+    with pytest.raises(CoverLetterValidationError) as error:
+        validate_cover_letter(_letter(), vacancy, _fact())
+
+    assert error.value.code == "NO_VACANCY_FOCUS"
+
+
+def test_pandas_fact_keeps_etl_vacancy_focus() -> None:
+    vacancy = _vacancy()
+    vacancy.title = "ETL-разработчик Python/Pandas"
+    vacancy.description = "Подготовка данных и расчёты на Python с pandas."
+    vacancy.responsibilities = "Автоматизировать подготовку и проверку данных."
+    vacancy.required_qualifications = "Python, pandas."
+    vacancy.key_skills = ["Python", "pandas"]
+    facts = (
+        _SelectedFact(
+            id=1,
+            category="work_experience",
+            content=(
+                "Автоматизировал анализ производственных данных на Python с pandas. "
+                "Самостоятельно собрал и подготовил данные, реализовал расчёты и код. "
+                "Проверил результат на двух независимых выборках."
+            ),
+        ),
+    )
+    text = (
+        "Здравствуйте!\n\nАвтоматизировал анализ производственных данных на Python "
+        "с pandas: самостоятельно собрал и подготовил данные, затем реализовал расчёты "
+        "и код. Проверил результат на двух независимых выборках и передал решение "
+        "в дальнейшую разработку.\n\nВ этом проекте отвечал именно за подготовку данных "
+        "и проверку результата расчётов. Готов подробно разобрать последовательность "
+        "подготовки данных и способ проверки на двух выборках."
+    )
+
+    validate_cover_letter(text, vacancy, facts)
+
+
+def test_pandas_data_preparation_supports_high_level_aggregation_wording() -> None:
+    vacancy = _vacancy()
+    vacancy.title = "ETL-разработчик Python/Pandas"
+    vacancy.description = "Подготовка и преобразование данных на Python с pandas."
+    vacancy.responsibilities = "Автоматизировать подготовку и проверку данных."
+    vacancy.required_qualifications = "Python, pandas."
+    vacancy.key_skills = ["Python", "pandas"]
+    facts = (
+        _SelectedFact(
+            id=1,
+            category="work_experience",
+            content=(
+                "Автоматизировал анализ производственных данных на Python с pandas и numpy. "
+                "Самостоятельно собрал и подготовил данные, реализовал расчёты и код. "
+                "Проверил результат на двух независимых выборках."
+            ),
+        ),
+    )
+    text = (
+        "Здравствуйте!\n\nАвтоматизировал анализ производственных данных на Python "
+        "с pandas и numpy: самостоятельно собрал и подготовил данные, реализовал расчёты "
+        "и код. В ходе обработки выполнял агрегации и преобразование структуры данных, "
+        "после чего проверил результат на двух независимых выборках.\n\n"
+        "В этом проекте отвечал за подготовку данных и проверку результата расчётов. "
+        "Готов подробно разобрать последовательность обработки данных и способ проверки "
+        "на двух выборках."
+    )
+
+    validate_cover_letter(text, vacancy, facts)
+
+
+def test_confirmed_locking_fact_supports_claim() -> None:
+    text = (
+        "Здравствуйте!\n\nРазрабатывал серверные приложения на Python и FastAPI, работал "
+        "с PostgreSQL и настраивал автоматические проверки. Для одновременной обработки "
+        "запросов подбирал стратегии блокировок и проверял сохранение изменений. Также "
+        "реализовывал прикладную логику и обработку ошибок при доступе к данным.\n\n"
+        "Готов подробнее разобрать проверку одновременных изменений перед выпуском."
+    )
+    facts = (
+        _SelectedFact(
+            1,
+            "work_experience",
+            (
+                "Разрабатывал серверные приложения на Python и FastAPI. Работал с PostgreSQL. "
+                "Для одновременной обработки запросов подбирал стратегии блокировок и проверял "
+                "сохранение изменений. Реализовывал прикладную логику и обработку ошибок."
+            ),
+        ),
+    )
+
+    validate_cover_letter(text, _vacancy(), facts)
+
+
+def test_common_stack_is_not_vacancy_focus_when_confirmed_duty_exists() -> None:
+    vacancy = _vacancy()
+    vacancy.responsibilities = (
+        "Настраивать повторную проверку цен и остатков при одновременных запросах."
+    )
+    facts = (
+        _SelectedFact(
+            1,
+            "work_experience",
+            (
+                "Разрабатывал серверные приложения на Python и FastAPI. Работал с PostgreSQL. "
+                "Реализовал повторную проверку цен и остатков при одновременных запросах."
+            ),
+        ),
+    )
+    common_stack_only = (
+        "Здравствуйте!\n\nРазрабатывал серверные приложения на Python и FastAPI, работал "
+        "с PostgreSQL и отделял прикладную логику от доступа к данным. При доработке служб "
+        "поддерживал понятную структуру модулей и обработку ошибок. Такой подход помогал "
+        "последовательно развивать серверную часть и сохранять читаемость кода.\n\n"
+        "Готов подробнее разобрать устройство серверного приложения."
+    )
+
+    with pytest.raises(CoverLetterValidationError) as error:
+        validate_cover_letter(common_stack_only, vacancy, facts)
+
+    assert error.value.code == "NO_VACANCY_FOCUS"
+
+
+def test_common_stack_facts_do_not_cover_specific_vacancy_duty() -> None:
+    vacancy = _vacancy()
+    vacancy.responsibilities = (
+        "Настраивать повторную проверку цен и остатков при одновременных запросах."
+    )
+    facts = (
+        _SelectedFact(
+            1,
+            "work_experience",
+            "Разрабатывал серверные приложения на Python и FastAPI. Работал с PostgreSQL.",
+        ),
+    )
+    common_stack_only = (
+        "Здравствуйте!\n\nРазрабатывал серверные приложения на Python и FastAPI, работал "
+        "с PostgreSQL и отделял прикладную логику от доступа к данным. При доработке служб "
+        "поддерживал понятную структуру модулей и обработку ошибок. Такой подход помогал "
+        "последовательно развивать серверную часть и сохранять читаемость кода.\n\n"
+        "Готов подробнее разобрать устройство серверного приложения."
+    )
+
+    with pytest.raises(CoverLetterValidationError) as error:
+        validate_cover_letter(common_stack_only, vacancy, facts)
+
+    assert error.value.code == "NO_VACANCY_FOCUS"
+
+
+def test_confirmed_duty_is_accepted_as_vacancy_focus() -> None:
+    vacancy = _vacancy()
+    vacancy.responsibilities = (
+        "Настраивать повторную проверку цен и остатков при одновременных запросах."
+    )
+    facts = (
+        _SelectedFact(
+            1,
+            "work_experience",
+            (
+                "Разрабатывал серверные приложения на Python и FastAPI. Работал с PostgreSQL. "
+                "Реализовал повторную проверку цен и остатков при одновременных запросах."
+            ),
+        ),
+    )
+    focused_letter = (
+        "Здравствуйте!\n\nРазрабатывал серверные приложения на Python и FastAPI, работал "
+        "с PostgreSQL и отделял прикладную логику от доступа к данным. Для одновременных "
+        "запросов реализовал повторную проверку цен и остатков, чтобы сохранять изменения "
+        "последовательно. При доработке службы также проверял обработку ошибок и основные "
+        "сценарии перед выпуском.\n\nГотов подробнее разобрать проверку цен и остатков."
+    )
+
+    validate_cover_letter(focused_letter, vacancy, facts)
 
 
 def test_prompt_normalization_and_context_selection() -> None:
@@ -1215,6 +1541,13 @@ def test_prompt_normalization_and_context_selection() -> None:
     assert "не смешивай сведения разных должностей и проектов" in prompt
     assert "нет требуемой технологии" in prompt
     assert "список навыков подтверждает знание технологии" in prompt
+    assert "один конкретный акцент из обязанностей вакансии" in prompt
+    assert "общего стека Python, FastAPI и PostgreSQL" in prompt
+    assert "слова из обязанностей и требований вакансии" in prompt
+    assert "не повышай техническую конкретность факта" in prompt
+    assert "merge, join, groupby, pivot" in prompt
+    assert "заверши конкретным предложением" in prompt
+    assert "готов обсудить детали реализации" in prompt
     assert "Здравствуйте!" in prompt
 
 
@@ -1480,6 +1813,8 @@ def test_specialist_term_boundaries_do_not_match_storage() -> None:
     [
         ("Django", "В другом проекте разрабатывал серверную часть на Django."),
         ("Kafka", "В другом проекте интегрировал Kafka для обмена событиями."),
+        ("Django", "В другом проекте вёл разработку на Django."),
+        ("Kafka", "Сейчас веду интеграцию Kafka для обмена событиями."),
     ],
 )
 def test_skill_list_does_not_confirm_technology_experience(
@@ -1517,6 +1852,29 @@ def test_confirmed_work_fact_supports_technology_experience() -> None:
             (
                 "Разрабатывал серверные приложения на Python и Django. Работал с PostgreSQL. "
                 "Интегрировал Kafka для обмена событиями."
+            ),
+        ),
+    )
+
+    validate_cover_letter(text, _vacancy(), facts)
+
+
+def test_confirmed_work_fact_with_verb_vesti_supports_technology_experience() -> None:
+    text = (
+        "Здравствуйте!\n\nВёл разработку серверного приложения на Python и Django, работал "
+        "с PostgreSQL и настраивал автоматические проверки. Реализовывал прикладную логику "
+        "и обработку ошибок. При доработке службы отделял прикладную логику от доступа "
+        "к данным и проверял основные сценарии перед выпуском изменений.\n\n"
+        "Готов подробнее разобрать проверку изменений в серверной части."
+    )
+    facts = (
+        _SelectedFact(
+            1,
+            "work_experience",
+            (
+                "Вёл разработку серверного приложения на Python и Django. Работал "
+                "с PostgreSQL и настраивал автоматические проверки. Реализовывал "
+                "прикладную логику и обработку ошибок."
             ),
         ),
     )

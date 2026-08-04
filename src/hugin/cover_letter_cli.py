@@ -7,7 +7,7 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
-from sqlalchemy import delete, select
+from sqlalchemy import select
 
 from hugin.adapters.yandex_ai import YandexAIClient, YandexAIError
 from hugin.adapters.yandex_credentials import (
@@ -18,12 +18,12 @@ from hugin.core.settings import Settings, get_settings
 from hugin.database import create_database, upgrade_database
 from hugin.database.models import (
     ApplicationModel,
-    CoverLetterFactModel,
     CoverLetterModel,
+    CoverLetterRejectionModel,
     VacancyModel,
 )
 from hugin.diagnostics import OperationJournal
-from hugin.domain.content import CoverLetterState, cover_letter_instruction_version
+from hugin.domain.content import cover_letter_instruction_version
 from hugin.services.ai_prompts import AiPromptSettingsService
 from hugin.services.application_automation import ApplicationAutomationService
 from hugin.services.cover_letter import SYSTEM_PROMPT, CoverLetterService
@@ -72,6 +72,10 @@ def build_parser() -> argparse.ArgumentParser:
     reject.add_argument("--account-id", type=positive_int, default=1)
     reject.add_argument("--letter-id", type=positive_int, required=True)
     reject.add_argument("--reason", required=True, help="краткая причина отклонения")
+    reject.add_argument(
+        "--fragment",
+        help="конкретное спорное предложение или фраза",
+    )
 
     replace = subparsers.add_parser(
         "replace",
@@ -143,6 +147,13 @@ def run(argv: Sequence[str] | None = None) -> int:
                     if row is None:
                         raise LookupError("Письмо для этой вакансии не найдено")
                     letter, vacancy = row
+                    rejections = tuple(
+                        session.scalars(
+                            select(CoverLetterRejectionModel)
+                            .where(CoverLetterRejectionModel.cover_letter_id == letter.id)
+                            .order_by(CoverLetterRejectionModel.sequence_number)
+                        )
+                    )
                     print(f"Вакансия: {vacancy.title} (№ {vacancy.hh_id})")
                     print(f"Идентификатор письма: {letter.id}")
                     print(f"Состояние: {letter.state.value}")
@@ -152,36 +163,29 @@ def run(argv: Sequence[str] | None = None) -> int:
                         print(letter.text)
                     elif letter.failure_reason:
                         print(f"Причина: {letter.failure_reason}")
+                    for rejection in rejections:
+                        print("-----")
+                        print(f"Отклонённый вариант № {rejection.sequence_number}")
+                        print(f"Код причины: {rejection.reason_code}")
+                        print(f"Причина: {rejection.reason_message}")
+                        if rejection.rejected_fragment:
+                            print(f"Спорная фраза: {rejection.rejected_fragment}")
+                        print(rejection.text)
                 return 0
             if arguments.command == "reject":
                 reason = " ".join(arguments.reason.split())
                 if not reason:
                     raise ValueError("Причина отклонения не может быть пустой")
+                fragment = (
+                    " ".join(arguments.fragment.split()) if arguments.fragment is not None else None
+                )
                 with database.sessions.begin() as session:
-                    letter = session.scalar(
-                        select(CoverLetterModel)
-                        .join(
-                            ApplicationModel,
-                            ApplicationModel.id == CoverLetterModel.application_id,
-                        )
-                        .where(
-                            CoverLetterModel.id == arguments.letter_id,
-                            ApplicationModel.account_id == arguments.account_id,
-                        )
+                    CoverLetterService(session).reject_reviewed(
+                        account_id=arguments.account_id,
+                        letter_id=arguments.letter_id,
+                        reason=reason,
+                        rejected_fragment=fragment,
                     )
-                    if letter is None:
-                        raise LookupError("Письмо не найдено")
-                    if letter.state is CoverLetterState.SENT:
-                        raise ValueError("Уже отправленное письмо отклонить нельзя")
-                    session.execute(
-                        delete(CoverLetterFactModel).where(
-                            CoverLetterFactModel.cover_letter_id == letter.id
-                        )
-                    )
-                    letter.text = None
-                    letter.state = CoverLetterState.FAILED
-                    letter.failure_reason = f"MANUAL_REVIEW: {reason}"[:512]
-                    letter.reused_from_id = None
                 print(
                     f"Письмо № {arguments.letter_id} отклонено. "
                     "Для вакансии можно создать новый вариант."
@@ -232,6 +236,7 @@ def run(argv: Sequence[str] | None = None) -> int:
                     direction_name=arguments.direction,
                     limit=arguments.limit,
                     vacancy_hh_id=arguments.vacancy_id,
+                    include_stretch=not arguments.exclude_stretch,
                 )
         finally:
             database.close()
