@@ -268,6 +268,19 @@ class QueueTaskRepository:
         self._session.flush()
         return _task_record(task)
 
+    def requeue_after_cover_letter_change(self, task_id: int) -> TaskRecord:
+        task = self._session.get(ApplicationTaskModel, task_id)
+        if task is None or task.state not in {
+            TaskState.REVIEW_REQUIRED,
+            TaskState.SKIPPED,
+        }:
+            raise ValueError("Задание не было остановлено при подготовке письма")
+        task.state = TaskState.RETRY_SCHEDULED
+        task.scheduled_at = datetime.now(UTC)
+        task.last_error_code = "COVER_LETTER_INSTRUCTION_CHANGED"
+        self._session.flush()
+        return _task_record(task)
+
     def skip_ineligible(
         self,
         direction_id: int,

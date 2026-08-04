@@ -277,6 +277,57 @@ def test_yandex_letter_uses_only_confirmed_facts_and_is_saved(settings: Settings
         database.close()
 
 
+@pytest.mark.parametrize(
+    "blocked_state",
+    (TaskState.REVIEW_REQUIRED, TaskState.SKIPPED),
+)
+def test_changed_instruction_retries_previous_letter_failure(
+    settings: Settings,
+    blocked_state: TaskState,
+) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    model = FakeModel([_letter()])
+    try:
+        with database.sessions.begin() as session:
+            account_id, direction_id, resume_id, vacancy_ids = _prepare_data(session)
+            application = session.scalar(select(ApplicationModel))
+            assert application is not None
+            task = QueueTaskRepository(session).get_by_application_id(application.id)
+            assert task is not None
+            QueueTaskRepository(session).transition(
+                task.id,
+                blocked_state,
+                error_code="MANUAL_INPUT_REQUIRED",
+            )
+            session.add(
+                CoverLetterModel(
+                    application_id=application.id,
+                    vacancy_id=vacancy_ids[0],
+                    direction_id=direction_id,
+                    resume_id=resume_id,
+                    text=None,
+                    instruction_version="cover_letter_v13_previous",
+                    model_name=model.model_name,
+                    state=CoverLetterState.FAILED,
+                    failure_reason="MANUAL_INPUT_REQUIRED",
+                )
+            )
+            session.flush()
+
+            result = CoverLetterService(session, model).prepare(
+                account_id=account_id,
+                direction_name="Python backend",
+            )
+
+            assert result.generated == 1
+            updated_task = QueueTaskRepository(session).get(task.id)
+            assert updated_task.state is TaskState.RETRY_SCHEDULED
+            assert updated_task.last_error_code == "COVER_LETTER_INSTRUCTION_CHANGED"
+    finally:
+        database.close()
+
+
 def test_prepare_uses_at_most_two_sources_and_links_only_reflected_fact(
     settings: Settings,
 ) -> None:
@@ -959,12 +1010,18 @@ def _fact() -> tuple[_SelectedFact, ...]:
         ),
         "Откликайся и опиши опыт ИМЕННО С ИНТЕГРАЦИЕЙ ДЛЯ МАРКЕТПЛЕЙСОВ.",
         "При отклике, пожалуйста, укажите Telegram.",
-        "Пожалуйста, заполните данную форму https://forms.gle/example.",
     ],
 )
-def test_mandatory_letter_answers_require_manual_review(description: str) -> None:
+def test_mandatory_letter_answers_are_handled_by_prompt(description: str) -> None:
     vacancy = _vacancy()
     vacancy.description = description
+
+    _ensure_relevant_evidence(vacancy, _fact())
+
+
+def test_external_application_form_requires_manual_review() -> None:
+    vacancy = _vacancy()
+    vacancy.description = "Пожалуйста, заполните данную форму https://forms.gle/example."
 
     with pytest.raises(CoverLetterValidationError) as error:
         _ensure_relevant_evidence(vacancy, _fact())
@@ -1090,7 +1147,7 @@ def test_unchanged_manual_failure_does_not_block_next_vacancy(
             first_vacancy = session.get(VacancyModel, vacancy_ids[0])
             assert first_vacancy is not None
             first_vacancy.description = (
-                "В сопроводительном письме обязательно ответьте на отдельные вопросы."
+                "Для отклика заполните внешнюю форму https://forms.gle/example."
             )
 
             first = CoverLetterService(session, model).prepare(
@@ -1202,6 +1259,14 @@ def test_unchanged_manual_failure_does_not_block_next_vacancy(
             "работы с транзакциями и согласованностью данных. Также реализовывал прикладную "
             "логику и интеграции. Готов подробно обсудить выполненные проекты и подход к "
             "проверке результата.",
+            "UNCONFIRMED_CLAIM",
+        ),
+        (
+            "Здравствуйте!\n\nРазрабатывал серверные приложения на Python и FastAPI, работал "
+            "с PostgreSQL и настраивал автоматические проверки. Сохранял согласованность "
+            "состояния через транзакции и проверял конкурентные изменения. Также "
+            "реализовывал прикладную логику и интеграции. Готов подробно обсудить "
+            "выполненные проекты и подход к проверке результата.",
             "UNCONFIRMED_CLAIM",
         ),
         (
@@ -1328,17 +1393,14 @@ def test_current_research_wording_does_not_require_exact_tense_in_fact() -> None
     validate_cover_letter(text, vacancy, facts)
 
 
-def test_backend_data_words_do_not_count_as_etl_vacancy_focus() -> None:
+def test_backend_data_work_supports_etl_vacancy_without_claiming_etl() -> None:
     vacancy = _vacancy()
     vacancy.title = "ETL-разработчик"
     vacancy.description = "Разработка ETL-процессов на Airflow и поддержка FastAPI."
     vacancy.responsibilities = "Строить потоки загрузки данных и развивать FastAPI."
     vacancy.required_qualifications = "Python, FastAPI, Airflow."
 
-    with pytest.raises(CoverLetterValidationError) as error:
-        validate_cover_letter(_letter(), vacancy, _fact())
-
-    assert error.value.code == "NO_VACANCY_FOCUS"
+    validate_cover_letter(_letter(), vacancy, _fact())
 
 
 def test_pandas_fact_keeps_etl_vacancy_focus() -> None:
@@ -1366,6 +1428,64 @@ def test_pandas_fact_keeps_etl_vacancy_focus() -> None:
         "в дальнейшую разработку.\n\nВ этом проекте отвечал именно за подготовку данных "
         "и проверку результата расчётов. Готов подробно разобрать последовательность "
         "подготовки данных и способ проверки на двух выборках."
+    )
+
+    validate_cover_letter(text, vacancy, facts)
+
+
+def test_pandas_fact_supports_data_engineer_with_unconfirmed_airflow() -> None:
+    vacancy = _vacancy()
+    vacancy.title = "Data Engineer (Junior)"
+    vacancy.description = "Разработка процессов обработки данных на Airflow и ClickHouse."
+    vacancy.required_qualifications = "Python, SQL, Airflow, ClickHouse."
+    vacancy.key_skills = ["Python", "SQL", "Airflow", "ClickHouse"]
+    facts = (
+        _SelectedFact(
+            id=1,
+            category="work_experience",
+            content=(
+                "Автоматизировал анализ производственных данных на Python с pandas и numpy. "
+                "Самостоятельно собрал и подготовил данные, реализовал расчёты и код. "
+                "Проверил результат на двух независимых выборках."
+            ),
+        ),
+    )
+    text = (
+        "Здравствуйте!\n\nАвтоматизировал анализ производственных данных на Python "
+        "с pandas и numpy: самостоятельно собрал и подготовил данные, затем реализовал "
+        "расчёты и код. Проверил результат на двух независимых выборках и передал решение "
+        "в дальнейшую разработку.\n\nВ этом проекте отвечал за подготовку данных и проверку "
+        "результата расчётов. Готов подробно разобрать последовательность подготовки "
+        "данных и способ проверки на двух выборках."
+    )
+
+    validate_cover_letter(text, vacancy, facts)
+
+
+def test_pandas_fact_supports_sql_role_with_unconfirmed_complex_sql() -> None:
+    vacancy = _vacancy()
+    vacancy.title = "Младший разработчик SQL"
+    vacancy.description = "Разработка и оптимизация сложных SQL-запросов."
+    vacancy.required_qualifications = "Python, SQL, pandas, Airflow."
+    vacancy.key_skills = ["Python", "SQL", "pandas", "Airflow"]
+    facts = (
+        _SelectedFact(
+            id=1,
+            category="work_experience",
+            content=(
+                "Автоматизировал анализ производственных данных на Python с pandas и numpy. "
+                "Самостоятельно собрал и подготовил данные, реализовал расчёты и код. "
+                "Проверил результат на двух независимых выборках."
+            ),
+        ),
+    )
+    text = (
+        "Здравствуйте!\n\nАвтоматизировал анализ производственных данных на Python "
+        "с pandas и numpy: самостоятельно собрал и подготовил данные, затем реализовал "
+        "расчёты и код. Проверил результат на двух независимых выборках и передал решение "
+        "в дальнейшую разработку.\n\nВ этом проекте отвечал за подготовку данных и проверку "
+        "результата расчётов. Готов подробно разобрать последовательность подготовки "
+        "данных и способ проверки на двух выборках."
     )
 
     validate_cover_letter(text, vacancy, facts)
@@ -1540,6 +1660,10 @@ def test_prompt_normalization_and_context_selection() -> None:
     assert "1–2 наиболее подходящих проекта" in prompt
     assert "не смешивай сведения разных должностей и проектов" in prompt
     assert "нет требуемой технологии" in prompt
+    assert "Прямого опыта с ..." in prompt
+    assert "ближайший подтвержденный опыт" in prompt
+    assert "не заменяй прямой ответ" in prompt
+    assert "при отсутствии Airflow, Kafka или ClickHouse" in prompt
     assert "список навыков подтверждает знание технологии" in prompt
     assert "один конкретный акцент из обязанностей вакансии" in prompt
     assert "общего стека Python, FastAPI и PostgreSQL" in prompt
@@ -1775,6 +1899,7 @@ def test_irrelevant_cloud_details_are_rejected() -> None:
         ("OpenTelemetry", "Настройка трассировки через OpenTelemetry."),
         ("Yandex Cloud", "Разработка облачных служб в Yandex Cloud."),
         ("OpenAI", "Разработка ИИ-служб с использованием OpenAI."),
+        ("Airflow", "Построение процессов обработки данных через Airflow."),
     ],
 )
 def test_relevant_but_unconfirmed_technology_is_rejected(
@@ -1794,6 +1919,54 @@ def test_relevant_but_unconfirmed_technology_is_rejected(
         validate_cover_letter(text, vacancy, _fact())
 
     assert error.value.code == "UNCONFIRMED_SPECIALIST_TERM"
+
+
+def test_honest_absence_of_unconfirmed_technology_is_allowed() -> None:
+    text = (
+        "Здравствуйте!\n\nПрямого опыта с Airflow у меня пока нет. Разрабатывал серверные "
+        "приложения на Python и FastAPI, работал с PostgreSQL и настраивал автоматические "
+        "проверки. При доработке служб отделял прикладную логику от доступа к данным и "
+        "проверял обработку ошибок. Также разбирал требования к интеграциям и проверял "
+        "основные сценарии перед выпуском изменений.\n\nГотов подробнее рассказать "
+        "о реализованных серверных решениях и работе с данными."
+    )
+    vacancy = _vacancy()
+    vacancy.description = "Откликайся и опиши опыт работы с Airflow."
+
+    validate_cover_letter(text, vacancy, _fact())
+
+
+def test_marketplace_experience_request_rejects_evasive_answer() -> None:
+    text = (
+        "Здравствуйте!\n\nРазрабатывал серверные приложения на Python и FastAPI, работал "
+        "с PostgreSQL и настраивал автоматические проверки. При доработке служб отделял "
+        "прикладную логику от доступа к данным, проверял обработку ошибок и основные "
+        "сценарии перед выпуском изменений. Этот подход можно применить к интеграциям "
+        "с маркетплейсами.\n\nГотов подробнее рассказать о реализованных серверных "
+        "решениях и работе с данными."
+    )
+    vacancy = _vacancy()
+    vacancy.description = "Откликайся и опиши опыт ИМЕННО С ИНТЕГРАЦИЕЙ ДЛЯ МАРЕТПЛЕЙСОВ."
+
+    with pytest.raises(CoverLetterValidationError) as error:
+        validate_cover_letter(text, vacancy, _fact())
+
+    assert error.value.code == "MISSING_REQUIRED_EXPERIENCE_ANSWER"
+
+
+def test_marketplace_experience_request_accepts_honest_answer() -> None:
+    text = (
+        "Здравствуйте!\n\nПрямого опыта интеграций с маркетплейсами у меня пока нет. "
+        "Разрабатывал серверные приложения на Python и FastAPI, работал с PostgreSQL "
+        "и настраивал автоматические проверки. При доработке служб отделял прикладную "
+        "логику от доступа к данным, проверял обработку ошибок и основные сценарии перед "
+        "выпуском изменений.\n\nГотов подробнее рассказать о реализованных серверных "
+        "решениях и работе с данными."
+    )
+    vacancy = _vacancy()
+    vacancy.description = "Откликайся и опиши опыт ИМЕННО С ИНТЕГРАЦИЕЙ ДЛЯ МАРКЕТПЛЕЙСОВ."
+
+    validate_cover_letter(text, vacancy, _fact())
 
 
 def test_specialist_term_boundaries_do_not_match_storage() -> None:

@@ -1,7 +1,7 @@
 import hashlib
 from enum import StrEnum
 
-CURRENT_COVER_LETTER_INSTRUCTION = "cover_letter_v13"
+CURRENT_COVER_LETTER_INSTRUCTION = "cover_letter_v20"
 
 
 def cover_letter_instruction_version(user_instruction: str) -> str:
