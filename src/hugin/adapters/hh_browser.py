@@ -203,6 +203,7 @@ const externalLinks = Array.from(description?.querySelectorAll('a[href]') || [])
         return false;
     }
 });
+const externalApplicationText = /(?:forms\\.gle|docs\\.google\\.com\\/forms)/iu.test(bodyText);
 const structuredPublicationDate = (() => {
     for (const script of document.querySelectorAll('script[type="application/ld+json"]')) {
         try {
@@ -240,6 +241,7 @@ let availability = 'ACTIVE';
 if (normalizedBody.includes('вакансия в архиве')) availability = 'ARCHIVED';
 else if (normalizedBody.includes('вакансия закрыта')) availability = 'CLOSED';
 else if (normalizedBody.includes('вакансия недоступна')) availability = 'UNAVAILABLE';
+else if (normalizedBody.includes('недоступна эта вакансия')) availability = 'UNAVAILABLE';
 else if (normalizedBody.includes('вакансия не найдена')) availability = 'UNAVAILABLE';
 else if (normalizedBody.includes('такой вакансии нет')) availability = 'UNAVAILABLE';
 return ({
@@ -290,7 +292,7 @@ return ({
     hasCoverLetter: normalizedBody.includes('сопроводительн') && normalizedBody.includes('письм'),
     hasScreeningForm: normalizedBody.includes('вопросы работодателя') ||
         Boolean(document.querySelector('[data-qa="task-question"]')),
-    hasExternalLink: externalLinks.length > 0,
+    hasExternalLink: externalLinks.length > 0 || externalApplicationText,
     hasTestAssignment: normalizedBody.includes('тестовое задание') ||
         normalizedBody.includes('испытательное задание'),
     availability,
@@ -1104,6 +1106,11 @@ class VisibleHhBrowser:
             response = page.goto(normalized_url, wait_until="domcontentloaded")
             payload = page.evaluate(VACANCY_DETAILS_SCRIPT)
             availability = self._vacancy_availability(response, payload)
+            if availability is VacancyAvailability.ACTIVE and self._vacancy_is_closed(
+                response,
+                self._page_body_text(page),
+            ):
+                availability = VacancyAvailability.UNAVAILABLE
             if availability is not VacancyAvailability.ACTIVE:
                 raise VacancyUnavailableError(vacancy_id, normalized_url, availability)
             page.locator('[data-qa="vacancy-title"]').first.wait_for(
@@ -1112,6 +1119,11 @@ class VisibleHhBrowser:
             )
             payload = page.evaluate(VACANCY_DETAILS_SCRIPT)
             availability = self._vacancy_availability(response, payload)
+            if availability is VacancyAvailability.ACTIVE and self._vacancy_is_closed(
+                response,
+                self._page_body_text(page),
+            ):
+                availability = VacancyAvailability.UNAVAILABLE
             if availability is not VacancyAvailability.ACTIVE:
                 raise VacancyUnavailableError(vacancy_id, normalized_url, availability)
         except PlaywrightTimeoutError as error:
@@ -2459,6 +2471,7 @@ class VisibleHhBrowser:
             "вакансия в архиве",
             "вакансия закрыта",
             "вакансия недоступна",
+            "недоступна эта вакансия",
             "вакансия не найдена",
             "такой вакансии нет",
         )

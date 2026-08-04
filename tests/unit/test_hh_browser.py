@@ -551,6 +551,30 @@ def test_unavailable_vacancy_details_are_reported_before_title_wait(
     assert error.value.availability is availability
 
 
+def test_restricted_vacancy_page_is_reported_without_waiting_for_title(
+    tmp_path: Path,
+) -> None:
+    page = FakePage()
+    page.details_payload = {"availability": VacancyAvailability.ACTIVE.value}
+    page.locators["body"] = FakeLocator(
+        text=(
+            "Вам недоступна эта вакансия. Войдите как пользователь, "
+            "у которого есть доступ на просмотр."
+        )
+    )
+
+    with pytest.raises(VacancyUnavailableError) as error:
+        make_browser(page, tmp_path).read_vacancy_details("https://uchaly.hh.ru/vacancy/134858747")
+
+    assert error.value.availability is VacancyAvailability.UNAVAILABLE
+    assert "недоступна эта вакансия" in browser_module.VACANCY_DETAILS_SCRIPT
+
+
+def test_vacancy_details_script_recognizes_plain_external_form_urls() -> None:
+    assert r"forms\.gle" in browser_module.VACANCY_DETAILS_SCRIPT
+    assert "externalApplicationText" in browser_module.VACANCY_DETAILS_SCRIPT
+
+
 def test_visible_russian_publication_date_is_parsed() -> None:
     parsed = VisibleHhBrowser._date_time("Вакансия опубликована 30 июля 2026")
 

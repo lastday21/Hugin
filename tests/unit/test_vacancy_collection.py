@@ -158,6 +158,43 @@ def test_rejected_list_validates_sort_and_restore_state(settings: Settings) -> N
         database.close()
 
 
+def test_review_can_accept_queued_stretch_vacancy(settings: Settings) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    try:
+        with database.sessions.begin() as session:
+            account = AccountRepository(session).create("Тест", "account-stretch-review")
+            directions = DirectionRepository(session)
+            direction = directions.create(account.id, "Python backend")
+            vacancy = VacancyRepository(session).upsert(
+                detailed_vacancy("stretch-200", "Python backend разработчик")
+            )
+            directions.track_vacancy(direction.id, vacancy.id)
+            directions.apply_rules(
+                direction.id,
+                vacancy.id,
+                state=VacancyState.QUEUED,
+                score=85,
+                details={
+                    "accepted": True,
+                    "category": "STRETCH",
+                    "reasons": ["требуется ручная проверка"],
+                },
+            )
+
+            restored = VacancyReviewService(session).restore(
+                account_id=account.id,
+                direction_name="Python backend",
+                hh_id="stretch-200",
+            )
+
+            assert restored.tracking.state is VacancyState.ANALYZED
+            assert restored.tracking.rules_details["category"] == "MATCH"
+            assert restored.tracking.rules_details["manual_override"] == "ACCEPT"
+    finally:
+        database.close()
+
+
 def test_exact_body_repost_with_changed_title_is_not_queued_twice(
     settings: Settings,
 ) -> None:

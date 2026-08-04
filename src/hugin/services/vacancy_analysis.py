@@ -26,7 +26,7 @@ from hugin.repositories.vacancies import VacancyRepository
 from hugin.services.career_directions import CareerDirectionService
 from hugin.services.vacancy_duplicates import VacancyDuplicateDetector
 
-RULES_VERSION = "python_it_v30"
+RULES_VERSION = "python_it_v32"
 MAX_VACANCY_AGE = timedelta(days=30)
 
 
@@ -117,6 +117,8 @@ class VacancyRoleRouter:
         "software development engineer in test",
         "etl",
         "data engineer",
+        "data-инженер",
+        "data инженер",
         "инженер данных",
         "дата-инженер",
         "дата инженер",
@@ -364,6 +366,19 @@ class PythonBackendRules:
         r")[^.!?\n]{0,180}"
         r"(?:python|fastapi|django|flask|backend|бэкенд|разработчик\w*)"
     )
+    _cover_letter_questions_pattern: ClassVar[re.Pattern[str]] = re.compile(
+        r"(?:"
+        r"сопроводительн\w*\s+письм\w*[^.!?\n]{0,200}"
+        r"(?:ответ\w*[^.!?\n]{0,80}вопрос\w*|вопрос\w*)|"
+        r"(?:ответ\w*[^.!?\n]{0,80}вопрос\w*|вопрос\w*)[^.!?\n]{0,200}"
+        r"сопроводительн\w*\s+письм\w*"
+        r")"
+    )
+    _external_application_form_pattern: ClassVar[re.Pattern[str]] = re.compile(
+        r"(?:forms\.gle|docs\.google\.com/forms)|"
+        r"(?:заполн\w*|пройд\w*)[^.!?\n]{0,100}(?:внешн\w*\s+)?"
+        r"(?:форм\w*|анкет\w*)[^.!?\n]{0,100}https?://"
+    )
     _support_primary_duties_pattern: ClassVar[re.Pattern[str]] = re.compile(
         r"(?:техническ\w*\s+поддержк\w*|"
         r"консультир\w*\s+(?:клиент\w*|пользовател\w*)|"
@@ -551,7 +566,8 @@ class PythonBackendRules:
     _founding_engineer_pattern: ClassVar[re.Pattern[str]] = re.compile(
         r"(?:"
         r"\bfounding\s+(?:(?:ai|llm)\s+)?engineer\b|"
-        r"\bперв\w*\s+(?:(?:ai|ии|llm)[ -]?)?инженер\w*\b"
+        r"\bперв\w*(?:\s+и\s+единственн\w*)?\s+"
+        r"(?:(?:ai|ии|llm)[ -]?)?инженер\w*\b"
         r")"
     )
     _four_plus_experience_pattern: ClassVar[re.Pattern[str]] = re.compile(
@@ -631,6 +647,17 @@ class PythonBackendRules:
             rejected.append("работа явно не предусматривает денежную оплату")
         if self._negative_candidate_exclusion_pattern.search(" ".join((requirements, description))):
             rejected.append("работодатель прямо исключил кандидатов с текущим профилем разработки")
+        if self._cover_letter_questions_pattern.search(description):
+            stretch_reasons.append(
+                "работодатель требует отдельные ответы в сопроводительном письме; "
+                "нужна ручная проверка"
+            )
+        if self._external_application_form_pattern.search(description):
+            stretch_reasons.append("работодатель требует внешнюю форму; нужна ручная проверка")
+        if vacancy.has_test_assignment:
+            stretch_reasons.append(
+                "работодатель указал испытательное задание; нужна ручная проверка"
+            )
         destination = VacancyRoleRouter.classify(vacancy)
         if not rejected and destination is not None and destination is not self.scope:
             return RuleEvaluation(
@@ -718,7 +745,7 @@ class PythonBackendRules:
             stretch_reasons.append(
                 "уровень Senior/Lead снижает приоритет, но сам по себе не блокирует"
             )
-        if self._founding_engineer_pattern.search(title):
+        if self._founding_engineer_pattern.search(complete_text):
             stretch_reasons.append(
                 "роль первого инженера требует ручной проверки масштаба ответственности"
             )
@@ -772,6 +799,11 @@ class PythonBackendRules:
         mandatory_other_stack = self._mandatory_other_stack(" ".join((requirements, description)))
         if mandatory_other_stack is not None:
             rejected.append(f"другой обязательный основной стек: {mandatory_other_stack}")
+        described_other_stack = self._described_other_stack(description)
+        if described_other_stack is not None and "python" not in title:
+            stretch_reasons.append(
+                f"основной стек вакансии — {described_other_stack}; требуется ручная проверка"
+            )
         if not has_development:
             rejected.append("работа не связана с написанием кода или технической автоматизацией")
         primary_duties = responsibilities or description
@@ -891,7 +923,8 @@ class PythonBackendRules:
             category = RuleCategory.STRETCH
             if specialization_stretch:
                 reasons.append(
-                    "профильная работа по LLM или NLP; потребуется дополнительная подготовка"
+                    "отдельная специализация; потребуется дополнительная подготовка "
+                    "и ручная проверка"
                 )
         else:
             category = RuleCategory.MATCH
@@ -965,6 +998,8 @@ class PythonBackendRules:
             (r"\brust\b", "Rust"),
             (r"\btypescript\b|\bjavascript\b", "JavaScript/TypeScript"),
             (r"\breact\b|\bvue(?:\.js)?\b|\bangular\b", "клиентский JavaScript"),
+            (r"\bruby\b|\bruby\s+on\s+rails\b|\brails\b", "Ruby/Rails"),
+            (r"\babap\b|\bsap\b", "ABAP/SAP"),
         )
         return next(
             (label for pattern, label in patterns if re.search(pattern, title) is not None),
@@ -1031,6 +1066,20 @@ class PythonBackendRules:
         ):
             return "Python указан только как вспомогательный язык"
         return None
+
+    @staticmethod
+    def _described_other_stack(description: str) -> str | None:
+        patterns = (
+            (
+                r"(?:наш|основн\w*|технологическ\w*)\s+стек\s*:?"
+                r"[^.!?\n]{0,100}\b(?:ruby|rails)\b",
+                "Ruby/Rails",
+            ),
+        )
+        return next(
+            (label for pattern, label in patterns if re.search(pattern, description) is not None),
+            None,
+        )
 
     @classmethod
     def _mandatory_skill_gaps(
@@ -1219,6 +1268,11 @@ class PythonBackendRules:
                 frozenset({"airflow"}),
             ),
             (
+                "Kubernetes",
+                r"\bkubernetes\b|\bk8s\b",
+                frozenset({"kubernetes", "k8s"}),
+            ),
+            (
                 "Go",
                 r"\bgolang\b|\bgo\b",
                 frozenset({"go", "golang"}),
@@ -1339,10 +1393,12 @@ class PythonBackendRules:
             r"что\s+мы\s+ожидаем|"
             r"жд[её]м\s+от\s+тебя|"
             r"мы\s+ожидаем\s+от\s+тебя|"
+            r"мы\s+жд[её]м\s+от\s+вас|"
             r"что\s+ожидаем\s+от\s+кандидата|"
             r"будем\s+рады\s+видеть[^:\n]*|"
             r"для\s+нас\s+важно|"
             r"чего\s+мы\s+ожидаем|"
+            r"ожидания|"
             r"наши\s+ожидания|"
             r"наш[и]\s+пожелания\s+к\s+кандидатам|"
             r"опыт\s+и\s+навыки|"
@@ -1378,6 +1434,7 @@ class PythonBackendRules:
             r"желательн\w*\s+навык\w*(?:\s*\(будет\s+плюсом\))?|"
             r"желательно|"
             r"необязательно|"
+            r"приветствуется|"
             r"optional|"
             r"preferred|"
             r"nice\s+to\s+have|"
@@ -1402,7 +1459,7 @@ class PythonBackendRules:
         if len(lines) > 1:
             optional_clause = re.compile(
                 r"\b(?:будет\s+(?:плюсом|преимуществом)|"
-                r"желательно|необязательно)\b",
+                r"желательно|необязательно|приветствуется)\b",
                 re.IGNORECASE,
             )
             value = "\n".join(line for line in lines if not optional_clause.search(line))
@@ -1468,7 +1525,8 @@ class PythonBackendRules:
             has_development_duration = (
                 re.search(r"\b(?:лет|год(?:а|ов)?|years?)\b", clause) is not None
                 and re.search(
-                    r"\b(?:разработ\w*|development|python|backend|бэкенд)\b",
+                    r"\b(?:разработ\w*|development|python|backend|бэкенд|"
+                    r"автоматизац\w*|интеграц\w*|etl|rpa|n8n)\b",
                     clause,
                 )
                 is not None

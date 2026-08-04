@@ -551,9 +551,16 @@ class DirectionRepository:
         model = self._session.get(DirectionVacancyModel, (direction_id, vacancy_id))
         if model is None:
             raise LookupError("Вакансия не относится к выбранному направлению")
-        if model.state not in {VacancyState.FILTERED_OUT, VacancyState.SKIPPED}:
-            raise ValueError("Вакансия не находится в списке отклонённых")
         details = dict(model.rules_details)
+        reviewable_stretch = details.get("category") == "STRETCH" and model.state in {
+            VacancyState.ANALYZED,
+            VacancyState.QUEUED,
+        }
+        if (
+            model.state not in {VacancyState.FILTERED_OUT, VacancyState.SKIPPED}
+            and not reviewable_stretch
+        ):
+            raise ValueError("Вакансия не находится в списке отклонённых")
         reasons = details.get("reasons", [])
         normalized_reasons = (
             [str(reason) for reason in reasons] if isinstance(reasons, list) else []
