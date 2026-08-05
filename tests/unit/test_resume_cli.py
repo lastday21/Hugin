@@ -229,6 +229,22 @@ def test_live_resume_rejects_id_from_another_account(
     assert browser.read_resume_ids == []
 
 
+def test_live_resume_reports_missing_browser_components(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(
+        resume_cli,
+        "get_settings",
+        lambda: Settings(environment="test", data_dir=tmp_path / "data"),
+    )
+    monkeypatch.setattr(resume_cli, "VisibleHhBrowser", None)
+
+    assert resume_cli.run(["live", "--resume-id", "abc123"]) == 2
+    assert "требует браузерные компоненты" in capsys.readouterr().err
+
+
 def test_active_hh_resume_id_reads_selected_resume(settings: Settings) -> None:
     upgrade_database(settings)
     database = create_database(settings)

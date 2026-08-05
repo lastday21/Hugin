@@ -6,12 +6,11 @@ import sys
 from collections.abc import Sequence
 from dataclasses import asdict
 from pathlib import Path
+from typing import Any
 
-from playwright.sync_api import Error as PlaywrightError
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 
-from hugin.adapters.hh_browser import VisibleHhBrowser
 from hugin.adapters.resume_documents import ResumeDocumentError, ResumeDocumentReader
 from hugin.core.settings import Settings, get_settings
 from hugin.database import create_database, upgrade_database
@@ -23,6 +22,16 @@ from hugin.services.resume_profile import (
     ResumeImportService,
     ResumeProfileExtractor,
 )
+
+try:
+    from playwright.sync_api import Error as PlaywrightError
+
+    from hugin.adapters.hh_browser import VisibleHhBrowser
+except ModuleNotFoundError as error:
+    if error.name is None or not error.name.startswith("playwright"):
+        raise
+    PlaywrightError = RuntimeError  # type: ignore[misc,assignment]
+    VisibleHhBrowser: Any = None  # type: ignore[no-redef]
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -215,6 +224,11 @@ def _active_hh_resume_id(settings: Settings, account_id: int) -> str:
 
 
 def _read_live_resume(settings: Settings, account_id: int, resume_id: str) -> HhResumeDetails:
+    if VisibleHhBrowser is None:
+        raise RuntimeError(
+            "Команда live требует браузерные компоненты; "
+            "установите вариант Hugin с поддержкой браузера"
+        )
     with VisibleHhBrowser(
         settings.browser_profile_dir(account_id),
         settings.hh_login_url,

@@ -117,6 +117,15 @@ class ResumeProfileExtractor:
         "driving": "Опыт вождения",
         "about": "Дополнительная информация",
     }
+    _experience_duration_summary: ClassVar[re.Pattern[str]] = re.compile(
+        r"^(?:[—–-]\s*)?\d+\s+(?:год|года|лет)"
+        r"(?:\s+\d+\s+(?:месяц|месяца|месяцев))?$",
+        re.IGNORECASE,
+    )
+    _about_marker: ClassVar[re.Pattern[str]] = re.compile(
+        r"(?<!\w)обо\s+мне(?:\s*[:—–-]\s*|\s+|$)",
+        re.IGNORECASE,
+    )
 
     def extract(self, document: ResumeDocument) -> ParsedResumeProfile:
         lines = self._content_lines(document.text)
@@ -217,8 +226,31 @@ class ResumeProfileExtractor:
         ]
         end = following[0] if following else len(lines)
         first_line = lines[start].removeprefix(heading).strip()
-        content = "\n".join([first_line, *lines[start + 1 : end]]).strip()
+        values = [first_line, *lines[start + 1 : end]]
+        if category == "work_experience":
+            values = self._without_experience_duration_summary(values)
+        elif category == "about":
+            values = self._without_recommendations(values)
+        content = "\n".join(values).strip()
         return content or None
+
+    @classmethod
+    def _without_experience_duration_summary(cls, lines: list[str]) -> list[str]:
+        values = list(lines)
+        while values and not values[0].strip():
+            values.pop(0)
+        if values and cls._experience_duration_summary.fullmatch(values[0].strip()):
+            values.pop(0)
+        return values
+
+    @classmethod
+    def _without_recommendations(cls, lines: list[str]) -> list[str]:
+        for index, line in enumerate(lines):
+            marker = cls._about_marker.search(line)
+            if marker is None:
+                continue
+            return [line[marker.end() :].strip(), *lines[index + 1 :]]
+        return lines
 
     @staticmethod
     def _languages(lines: list[str]) -> str | None:
@@ -553,6 +585,8 @@ class ProfileQuestionService:
 
 
 class ProfileFactService:
+    MAX_CONTENT_LENGTH = 20_000
+
     def __init__(self, session: Session) -> None:
         self._session = session
 
@@ -578,11 +612,53 @@ class ProfileFactService:
         allow_in_messages: bool = False,
     ) -> None:
         fact = self._fact(account_id, fact_id)
-        fact.state = ConfirmationState.CONFIRMED
-        fact.allow_in_letters = allow_in_letters
-        fact.allow_in_forms = allow_in_forms
-        fact.allow_in_messages = allow_in_messages
+        self._activate(
+            fact,
+            allow_in_letters=allow_in_letters,
+            allow_in_forms=allow_in_forms,
+            allow_in_messages=allow_in_messages,
+        )
         self._session.flush()
+
+    def correct(
+        self,
+        account_id: int,
+        fact_id: int,
+        content: str,
+        *,
+        allow_in_letters: bool = False,
+        allow_in_forms: bool = False,
+        allow_in_messages: bool = False,
+    ) -> VerifiedFactModel:
+        fact = self._fact(account_id, fact_id)
+        value = self._validated_content(content)
+        if value == fact.content:
+            corrected = fact
+        else:
+            fact.state = ConfirmationState.REJECTED
+            fact.allow_in_letters = False
+            fact.allow_in_forms = False
+            fact.allow_in_messages = False
+            corrected = VerifiedFactModel(
+                profile_id=fact.profile_id,
+                category=fact.category,
+                content=value,
+                source_type="user",
+                source_reference=f"profile-fact:{fact.id}",
+                actual_at=fact.actual_at,
+                resume_id=fact.resume_id,
+                direction_id=fact.direction_id,
+            )
+            self._session.add(corrected)
+            self._session.flush()
+        self._activate(
+            corrected,
+            allow_in_letters=allow_in_letters,
+            allow_in_forms=allow_in_forms,
+            allow_in_messages=allow_in_messages,
+        )
+        self._session.flush()
+        return corrected
 
     def reject(self, account_id: int, fact_id: int) -> None:
         fact = self._fact(account_id, fact_id)
@@ -591,6 +667,45 @@ class ProfileFactService:
         fact.allow_in_forms = False
         fact.allow_in_messages = False
         self._session.flush()
+
+    def _activate(
+        self,
+        fact: VerifiedFactModel,
+        *,
+        allow_in_letters: bool,
+        allow_in_forms: bool,
+        allow_in_messages: bool,
+    ) -> None:
+        statement = select(VerifiedFactModel).where(
+            VerifiedFactModel.profile_id == fact.profile_id,
+            VerifiedFactModel.category == fact.category,
+            VerifiedFactModel.state == ConfirmationState.CONFIRMED,
+            VerifiedFactModel.id != fact.id,
+        )
+        if fact.direction_id is None:
+            statement = statement.where(VerifiedFactModel.direction_id.is_(None))
+        else:
+            statement = statement.where(VerifiedFactModel.direction_id == fact.direction_id)
+        for previous in self._session.scalars(statement):
+            previous.state = ConfirmationState.REJECTED
+            previous.allow_in_letters = False
+            previous.allow_in_forms = False
+            previous.allow_in_messages = False
+        fact.state = ConfirmationState.CONFIRMED
+        fact.allow_in_letters = allow_in_letters
+        fact.allow_in_forms = allow_in_forms
+        fact.allow_in_messages = allow_in_messages
+
+    @classmethod
+    def _validated_content(cls, content: str) -> str:
+        value = content.strip().lstrip("\ufeff").strip()
+        if not value:
+            raise ValueError("Сведение не может быть пустым")
+        if len(value) > cls.MAX_CONTENT_LENGTH:
+            raise ValueError("Сведение слишком длинное")
+        if "???" in value or "\ufffd" in value or value.startswith(("ï»¿", "п»ї")):
+            raise ValueError("Сведение содержит повреждённые символы; введите его заново")
+        return value
 
     def _fact(self, account_id: int, fact_id: int) -> VerifiedFactModel:
         profile = self._profile(account_id)

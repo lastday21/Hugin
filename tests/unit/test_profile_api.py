@@ -88,6 +88,10 @@ def test_profile_api_previews_imports_and_reviews_resume(
             assert profile["active_resume"]["source_original_name"] == source.name
             pending_facts = [fact for fact in profile["facts"] if fact["state"] == "PENDING"]
             assert len(pending_facts) >= 2
+            assert pending_facts[0]["source_type"] == "resume"
+            assert pending_facts[0]["source_reference"]
+            assert pending_facts[0]["created_at"]
+            assert pending_facts[0]["updated_at"]
 
             confirmed = await client.post(
                 f"/api/profile/facts/{pending_facts[0]['id']}/confirm?account_id={account_id}",
@@ -116,9 +120,70 @@ def test_profile_api_previews_imports_and_reviews_resume(
             )
             assert rejected_fact["state"] == "REJECTED"
 
+            corrected = await client.put(
+                f"/api/profile/facts/{rejected_fact['id']}?account_id={account_id}",
+                headers=headers,
+                json={
+                    "content": "Исправленное подтверждённое сведение",
+                    "allow_in_letters": True,
+                    "allow_in_forms": True,
+                    "allow_in_messages": False,
+                },
+            )
+            assert corrected.status_code == 200
+            corrected_facts = corrected.json()["facts"]
+            corrected_fact = next(
+                fact
+                for fact in corrected_facts
+                if fact["content"] == "Исправленное подтверждённое сведение"
+            )
+            assert corrected_fact["id"] != rejected_fact["id"]
+            assert corrected_fact["state"] == "CONFIRMED"
+            assert corrected_fact["source_type"] == "user"
+            assert corrected_fact["source_reference"] == f"profile-fact:{rejected_fact['id']}"
+            assert corrected_fact["allow_in_letters"] is True
+            assert corrected_fact["allow_in_forms"] is True
+            assert corrected_fact["allow_in_messages"] is False
+            assert (
+                next(fact for fact in corrected_facts if fact["id"] == rejected_fact["id"])["state"]
+                == "REJECTED"
+            )
+
+            fact_count = len(corrected_facts)
+            reactivated = await client.put(
+                f"/api/profile/facts/{corrected_fact['id']}?account_id={account_id}",
+                headers=headers,
+                json={
+                    "content": " Исправленное подтверждённое сведение ",
+                    "allow_in_letters": False,
+                    "allow_in_forms": True,
+                    "allow_in_messages": True,
+                },
+            )
+            assert reactivated.status_code == 200
+            assert len(reactivated.json()["facts"]) == fact_count
+            reactivated_fact = next(
+                fact for fact in reactivated.json()["facts"] if fact["id"] == corrected_fact["id"]
+            )
+            assert reactivated_fact["state"] == "CONFIRMED"
+            assert reactivated_fact["allow_in_letters"] is False
+            assert reactivated_fact["allow_in_messages"] is True
+
+            invalid_correction = await client.put(
+                f"/api/profile/facts/{corrected_fact['id']}?account_id={account_id}",
+                headers=headers,
+                json={
+                    "content": "   ",
+                    "allow_in_letters": False,
+                    "allow_in_forms": False,
+                    "allow_in_messages": False,
+                },
+            )
+            assert invalid_correction.status_code == 422
+
             pending_questions = [
                 question
-                for question in rejected.json()["questions"]
+                for question in reactivated.json()["questions"]
                 if question["state"] == "PENDING"
             ]
             answered = await client.put(

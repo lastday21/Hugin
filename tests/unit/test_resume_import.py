@@ -130,3 +130,118 @@ def test_resume_import_is_idempotent_and_questions_are_reusable(
             }
     finally:
         database.close()
+
+
+def test_profile_fact_confirmation_and_correction_keep_one_active_version(
+    settings: Settings,
+    tmp_path: Path,
+) -> None:
+    local_settings = settings.model_copy(update={"data_dir": tmp_path / "data"})
+    source = tmp_path / "Резюме ИТ.docx"
+    write_resume(source)
+    upgrade_database(local_settings)
+    database = create_database(local_settings)
+
+    try:
+        with database.sessions.begin() as session:
+            account = AccountRepository(session).create("Иван", "account-fact-correction")
+            ResumeRepository(session).upsert(
+                account.id,
+                "resume-fact-correction",
+                "Python backend разработчик",
+            )
+            ResumeImportService(session, local_settings.data_dir).import_file(
+                account.id,
+                source,
+            )
+            profile = session.scalar(select(CandidateProfileModel))
+            assert profile is not None
+            original = session.scalar(
+                select(VerifiedFactModel).where(VerifiedFactModel.category == "work_experience")
+            )
+            assert original is not None
+            service = ProfileFactService(session)
+            service.confirm(
+                account.id,
+                original.id,
+                allow_in_letters=True,
+                allow_in_forms=True,
+                allow_in_messages=True,
+            )
+            replacement_resume = ResumeRepository(session).upsert(
+                account.id,
+                "resume-fact-correction-new",
+                "Python backend разработчик",
+            )
+
+            replacement = VerifiedFactModel(
+                profile_id=profile.id,
+                category=original.category,
+                content="Обновлённый опыт работы",
+                source_type="resume",
+                source_reference="new-resume#section:work_experience",
+                resume_id=replacement_resume.id,
+                direction_id=original.direction_id,
+            )
+            session.add(replacement)
+            session.flush()
+            service.confirm(
+                account.id,
+                replacement.id,
+                allow_in_letters=True,
+                allow_in_forms=False,
+                allow_in_messages=False,
+            )
+
+            assert original.state is ConfirmationState.REJECTED
+            assert not original.allow_in_letters
+            assert not original.allow_in_forms
+            assert not original.allow_in_messages
+            assert replacement.state.value == ConfirmationState.CONFIRMED.value
+
+            corrected = service.correct(
+                account.id,
+                replacement.id,
+                "Исправленный опыт работы",
+                allow_in_letters=True,
+                allow_in_forms=True,
+                allow_in_messages=False,
+            )
+
+            assert corrected.id != replacement.id
+            assert corrected.profile_id == replacement.profile_id
+            assert corrected.resume_id == replacement.resume_id
+            assert corrected.direction_id == replacement.direction_id
+            assert corrected.source_type == "user"
+            assert corrected.source_reference == f"profile-fact:{replacement.id}"
+            assert corrected.state is ConfirmationState.CONFIRMED
+            assert corrected.allow_in_letters
+            assert corrected.allow_in_forms
+            assert not corrected.allow_in_messages
+            assert replacement.state is ConfirmationState.REJECTED
+            assert not replacement.allow_in_letters
+
+            service.reject(account.id, corrected.id)
+            fact_count = len(list(session.scalars(select(VerifiedFactModel))))
+            reactivated = service.correct(
+                account.id,
+                corrected.id,
+                "\nИсправленный опыт работы\n",
+                allow_in_letters=False,
+                allow_in_forms=True,
+                allow_in_messages=True,
+            )
+
+            assert reactivated.id == corrected.id
+            assert len(list(session.scalars(select(VerifiedFactModel)))) == fact_count
+            assert reactivated.state is ConfirmationState.CONFIRMED
+            assert not reactivated.allow_in_letters
+            assert reactivated.allow_in_forms
+            assert reactivated.allow_in_messages
+
+            with pytest.raises(ValueError, match="не может быть пустым"):
+                service.correct(account.id, corrected.id, "   ")
+            with pytest.raises(ValueError, match="повреждённые символы"):
+                service.correct(account.id, corrected.id, "???")
+    finally:
+        database.close()

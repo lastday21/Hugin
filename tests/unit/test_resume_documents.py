@@ -63,6 +63,11 @@ def test_docx_is_read_and_profile_is_extracted(tmp_path: Path) -> None:
         "skills",
         "work_experience",
     }
+    work_experience = next(
+        fact.content for fact in profile.facts if fact.category == "work_experience"
+    )
+    assert work_experience.startswith("Компания")
+    assert "3 года" not in work_experience
     missing = {question.key for question in profile.missing_questions}
     assert "salary_expectation" in missing
     assert "available_from" in missing
@@ -84,6 +89,29 @@ def test_repeated_inline_skills_heading_is_extracted() -> None:
 
     assert extractor._section(lines, "skills") == ("Python FastAPI SQL Docker Git PostgreSQL Redis")
     assert extractor._languages(lines) == "Русский — Родной\nАнглийский — B1 — Средний"
+
+
+def test_resume_sections_drop_total_experience_and_recommendations() -> None:
+    extractor = ResumeProfileExtractor()
+    lines = [
+        "Опыт работы",
+        "— 4 года 2 месяца",
+        "PointPulse",
+        "Python-разработчик",
+        "Образование",
+        "Высшее",
+        "Дополнительная информация",
+        "Рекомендации",
+        "Яндекс",
+        "Денис Разбицкий",
+        "Обо мне Python backend-разработчик с практическим опытом.",
+        "GitHub: https://github.com/example",
+    ]
+
+    assert extractor._section(lines, "work_experience") == ("PointPulse\nPython-разработчик")
+    assert extractor._section(lines, "about") == (
+        "Python backend-разработчик с практическим опытом.\nGitHub: https://github.com/example"
+    )
 
 
 def test_pdf_with_cyrillic_name_is_read(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

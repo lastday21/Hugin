@@ -34,10 +34,14 @@ class UiProfileFact:
     id: int
     category: str
     content: str
+    source_type: str
+    source_reference: str | None
     state: str
     allow_in_letters: bool
     allow_in_forms: bool
     allow_in_messages: bool
+    created_at: datetime
+    updated_at: datetime
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,10 +129,14 @@ class UiProfileService:
                     id=fact.id,
                     category=fact.category,
                     content=fact.content,
+                    source_type=fact.source_type,
+                    source_reference=fact.source_reference,
                     state=fact.state.value,
                     allow_in_letters=fact.allow_in_letters,
                     allow_in_forms=fact.allow_in_forms,
                     allow_in_messages=fact.allow_in_messages,
+                    created_at=fact.created_at,
+                    updated_at=fact.updated_at,
                 )
                 for fact in facts
             ),

@@ -42,10 +42,14 @@ class ProfileFactResponse(BaseModel):
     id: int
     category: str
     content: str
+    source_type: str
+    source_reference: str | None
     state: str
     allow_in_letters: bool
     allow_in_forms: bool
     allow_in_messages: bool
+    created_at: datetime
+    updated_at: datetime
 
 
 class ProfileQuestionResponse(BaseModel):
@@ -88,6 +92,10 @@ class ProfileFactConfirmUpdate(BaseModel):
     allow_in_letters: bool
     allow_in_forms: bool
     allow_in_messages: bool
+
+
+class ProfileFactUpdate(ProfileFactConfirmUpdate):
+    content: str = Field(min_length=1, max_length=ProfileFactService.MAX_CONTENT_LENGTH)
 
 
 class ResumePreviewFactResponse(BaseModel):
@@ -295,6 +303,30 @@ def reject_fact(
         return _profile(session, account_id)
     except LookupError as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
+
+
+@router.put("/facts/{fact_id}", response_model=ProfileResponse)
+def correct_fact(
+    fact_id: int,
+    values: ProfileFactUpdate,
+    session: WriteSession,
+    _guard: SessionGuard,
+    account_id: int = Query(default=1, ge=1),
+) -> ProfileResponse:
+    try:
+        ProfileFactService(session).correct(
+            account_id,
+            fact_id,
+            values.content,
+            allow_in_letters=values.allow_in_letters,
+            allow_in_forms=values.allow_in_forms,
+            allow_in_messages=values.allow_in_messages,
+        )
+        return _profile(session, account_id)
+    except LookupError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
 
 
 @router.put("/questions/{key}", response_model=ProfileResponse)
