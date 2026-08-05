@@ -71,6 +71,7 @@ from hugin.services.hh_login import HhCredentials, LoginStatus
 _PROFILE_LOCK_FILENAME = ".hugin-browser.lock"
 _PROFILE_LOCK_TIMEOUT_SECONDS = 180.0
 _PROFILE_LOCK_RETRY_SECONDS = 0.25
+_WINDOW_LIVENESS_SCRIPT = "() => true"
 
 PROFILE_SNAPSHOT_SCRIPT = """
 () => {
@@ -572,10 +573,10 @@ APPLICATION_FORM_SCRIPT = """
 const clean = (value) => (value || '').trim().replace(/\\s+/g, ' ');
 const questionNodes = Array.from(document.querySelectorAll('[data-qa="task-question"]'));
 const fieldFromNode = (node, position) => {
-    const controls = Array.from(node.querySelectorAll(
-        'textarea, select, input:not([type="hidden"]), [role="combobox"]'
-    ));
-    const control = controls[0] || null;
+    const fieldRoot = node.closest('[data-qa="task-body"]') || node;
+    const control = fieldRoot.querySelector(
+        'textarea, select, input:not([type="hidden"])'
+    ) || fieldRoot.querySelector('[role="combobox"]');
     const question = clean(
         node.querySelector('label, legend, [data-qa*="question-title"]')?.textContent ||
         node.innerText
@@ -583,9 +584,11 @@ const fieldFromNode = (node, position) => {
     const qa = clean(control?.getAttribute('data-qa'));
     const name = clean(control?.getAttribute('name'));
     const id = clean(control?.getAttribute('id'));
+    const controlIsInsideQuestion = Boolean(control && node.contains(control));
     const key = (
-        qa ? `${position}:qa:${qa}` : name ? `${position}:name:${name}` :
-        id ? `${position}:id:${id}` :
+        controlIsInsideQuestion && qa ? `${position}:qa:${qa}` :
+        controlIsInsideQuestion && name ? `${position}:name:${name}` :
+        controlIsInsideQuestion && id ? `${position}:id:${id}` :
         `question:${position}:${question.toLocaleLowerCase('ru-RU')}`
     ).slice(0, 255);
     const tag = (control?.tagName || '').toLocaleLowerCase('en-US');
@@ -593,7 +596,7 @@ const fieldFromNode = (node, position) => {
     let fieldType = tag === 'textarea' ? 'textarea' : tag === 'select' ? 'select' : inputType;
     if (!fieldType && control?.getAttribute('role') === 'combobox') fieldType = 'combobox';
     if (!fieldType) fieldType = control ? 'text' : 'unknown';
-    const optionControls = Array.from(node.querySelectorAll('input[type="radio"]'));
+    const optionControls = Array.from(fieldRoot.querySelectorAll('input[type="radio"]'));
     const options = tag === 'select'
         ? Array.from(control.options || []).map(
             (option) => clean(option.textContent || option.value)
@@ -618,8 +621,9 @@ const fieldFromNode = (node, position) => {
         formatHint: clean(
             control?.getAttribute('placeholder') || control?.getAttribute('inputmode')
         ),
-        hasAttachment: Boolean(node.querySelector('input[type="file"]')),
-        hasExternalAction: Boolean(node.querySelector('a[href]')),
+        controlOutsideQuestion: Boolean(control && !controlIsInsideQuestion),
+        hasAttachment: Boolean(fieldRoot.querySelector('input[type="file"]')),
+        hasExternalAction: Boolean(fieldRoot.querySelector('a[href]')),
         hasTestAssignment: normalized.includes('тестов') || normalized.includes('испытательн'),
     };
 };
@@ -642,10 +646,10 @@ const clean = (value) => (value || '').trim().replace(/\\s+/g, ' ');
 const normalized = (value) => clean(value).toLocaleLowerCase('ru-RU');
 const nodes = Array.from(document.querySelectorAll('[data-qa="task-question"]'));
 const controls = nodes.map((node, position) => {
-    const items = Array.from(node.querySelectorAll(
-        'textarea, select, input:not([type="hidden"]), [role="combobox"]'
-    ));
-    const control = items[0] || null;
+    const fieldRoot = node.closest('[data-qa="task-body"]') || node;
+    const control = fieldRoot.querySelector(
+        'textarea, select, input:not([type="hidden"])'
+    ) || fieldRoot.querySelector('[role="combobox"]');
     const question = clean(
         node.querySelector('label, legend, [data-qa*="question-title"]')?.textContent ||
         node.innerText
@@ -653,12 +657,14 @@ const controls = nodes.map((node, position) => {
     const qa = clean(control?.getAttribute('data-qa'));
     const name = clean(control?.getAttribute('name'));
     const id = clean(control?.getAttribute('id'));
+    const controlIsInsideQuestion = Boolean(control && node.contains(control));
     const key = (
-        qa ? `${position}:qa:${qa}` : name ? `${position}:name:${name}` :
-        id ? `${position}:id:${id}` :
+        controlIsInsideQuestion && qa ? `${position}:qa:${qa}` :
+        controlIsInsideQuestion && name ? `${position}:name:${name}` :
+        controlIsInsideQuestion && id ? `${position}:id:${id}` :
         `question:${position}:${question.toLocaleLowerCase('ru-RU')}`
     ).slice(0, 255);
-    return {key, node, control};
+    return {key, node: fieldRoot, control};
 });
 const setValue = (control, value) => {
     const prototype = control instanceof HTMLTextAreaElement
@@ -804,6 +810,7 @@ class _ApplicationSnapshot:
     screening_form: HhScreeningForm
     resume_title: str
     body_text: str
+    compatible_version_hashes: tuple[str, ...] = ()
 
     @property
     def questions(self) -> tuple[str, ...]:
@@ -990,13 +997,23 @@ class VisibleHhBrowser:
     def open_login(self) -> None:
         page = self._require_page()
         try:
-            page.goto(self._login_url, wait_until="domcontentloaded")
+            page.goto(self._login_url, wait_until="commit")
         except PlaywrightError as error:
             if "ERR_ABORTED" not in str(error):
                 raise
             page.wait_for_timeout(500)
             if not self.is_authenticated():
                 raise
+
+    def is_open(self) -> bool:
+        page = self._page
+        if page is None or page.is_closed():
+            return False
+        try:
+            page.evaluate(_WINDOW_LIVENESS_SCRIPT)
+        except PlaywrightError:
+            return False
+        return True
 
     def read_profile(self) -> HhProfileData:
         page = self._require_page()
@@ -1688,7 +1705,11 @@ class VisibleHhBrowser:
                 current_form=snapshot.screening_form,
                 message="Анкета работодателя не найдена",
             )
-        if screening_form_hash(snapshot.screening_form) != expected_version_hash:
+        current_version_hash = screening_form_hash(snapshot.screening_form)
+        if (
+            current_version_hash != expected_version_hash
+            and expected_version_hash not in snapshot.compatible_version_hashes
+        ):
             return HhFormReviewResult(
                 HhFormReviewStatus.FORM_CHANGED,
                 page.url,
@@ -2264,6 +2285,8 @@ class VisibleHhBrowser:
         ):
             raise RuntimeError("hh.ru вернул некорректные предупреждения")
         fields: list[HhScreeningField] = []
+        legacy_fields: list[HhScreeningField] = []
+        has_detached_controls = False
         for raw_field in raw_fields:
             raw_options = raw_field.get("options", [])
             if not isinstance(raw_options, list) or not all(
@@ -2273,28 +2296,45 @@ class VisibleHhBrowser:
             raw_max_length = raw_field.get("maxLength")
             if raw_max_length is not None and not isinstance(raw_max_length, int):
                 raise RuntimeError("hh.ru вернул некорректное ограничение длины")
-            fields.append(
-                HhScreeningField(
-                    key=self._required_string(raw_field, "key", "ключа вопроса"),
-                    question=self._required_string(raw_field, "question", "текста вопроса"),
-                    field_type=self._required_string(raw_field, "fieldType", "типа вопроса"),
-                    is_required=raw_field.get("isRequired") is True,
-                    options=tuple(option.strip() for option in raw_options if option.strip()),
-                    max_length=raw_max_length,
-                    format_hint=self._optional_string(raw_field, "formatHint"),
-                    has_attachment=raw_field.get("hasAttachment") is True,
-                    has_external_action=raw_field.get("hasExternalAction") is True,
-                    has_test_assignment=raw_field.get("hasTestAssignment") is True,
-                )
+            field = HhScreeningField(
+                key=self._required_string(raw_field, "key", "ключа вопроса"),
+                question=self._required_string(raw_field, "question", "текста вопроса"),
+                field_type=self._required_string(raw_field, "fieldType", "типа вопроса"),
+                is_required=raw_field.get("isRequired") is True,
+                options=tuple(option.strip() for option in raw_options if option.strip()),
+                max_length=raw_max_length,
+                format_hint=self._optional_string(raw_field, "formatHint"),
+                has_attachment=raw_field.get("hasAttachment") is True,
+                has_external_action=raw_field.get("hasExternalAction") is True,
+                has_test_assignment=raw_field.get("hasTestAssignment") is True,
             )
+            fields.append(field)
+            if raw_field.get("controlOutsideQuestion") is True:
+                has_detached_controls = True
+                legacy_fields.append(
+                    HhScreeningField(
+                        key=field.key,
+                        question=field.question,
+                        field_type="unknown",
+                        is_required=bool(re.search(r"(^|\s)\*(\s|$)", field.question)),
+                    )
+                )
+            else:
+                legacy_fields.append(field)
         screening_form = HhScreeningForm(
             fields=tuple(fields),
             warnings=tuple(item.strip() for item in raw_warnings if item.strip()),
+        )
+        compatible_version_hashes = (
+            (screening_form_hash(HhScreeningForm(fields=tuple(legacy_fields))),)
+            if has_detached_controls
+            else ()
         )
         return _ApplicationSnapshot(
             screening_form=screening_form,
             resume_title=self._optional_string(payload, "resumeTitle"),
             body_text=self._optional_string(payload, "bodyText"),
+            compatible_version_hashes=compatible_version_hashes,
         )
 
     def _application_response_url(self, source_url: str) -> str:

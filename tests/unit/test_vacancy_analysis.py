@@ -17,8 +17,8 @@ from hugin.services.vacancy_analysis import (
 )
 
 
-def test_rules_version_is_python_it_v34() -> None:
-    assert RULES_VERSION == "python_it_v34"
+def test_rules_version_is_python_it_v35() -> None:
+    assert RULES_VERSION == "python_it_v35"
 
 
 @pytest.mark.parametrize(
@@ -130,7 +130,7 @@ def test_rules_accept_junior_python_backend_with_explanation() -> None:
     assert "Python указан в названии" in result.reasons
 
 
-def test_three_to_six_years_requires_manual_review_for_non_senior_role() -> None:
+def test_three_to_six_years_lowers_priority_without_blocking_non_senior_role() -> None:
     result = PythonBackendRules().evaluate(
         VacancyData(
             "5",
@@ -143,8 +143,8 @@ def test_three_to_six_years_requires_manual_review_for_non_senior_role() -> None
     )
 
     assert result.accepted
-    assert result.category is RuleCategory.STRETCH
-    assert any("ручной проверки" in reason for reason in result.reasons)
+    assert result.category is RuleCategory.MATCH
+    assert any("не блокирует" in reason for reason in result.reasons)
 
 
 @pytest.mark.parametrize(
@@ -711,7 +711,7 @@ def test_welcome_section_stops_mandatory_requirements() -> None:
             "Разработка backend на Python и FastAPI.",
             True,
             "испытательное задание",
-            RuleCategory.STRETCH,
+            RuleCategory.MATCH,
         ),
     ],
 )
@@ -1495,7 +1495,7 @@ def test_more_than_six_years_hh_experience_is_rejected() -> None:
         "Backend development experience: 4+ years.",
     ],
 )
-def test_four_plus_year_requirement_requires_manual_review(
+def test_four_plus_year_requirement_does_not_block_application(
     required_qualifications: str,
 ) -> None:
     result = PythonBackendRules().evaluate(
@@ -1509,7 +1509,7 @@ def test_four_plus_year_requirement_requires_manual_review(
         )
     )
 
-    assert result.category is RuleCategory.STRETCH
+    assert result.category is RuleCategory.MATCH
     assert any("обязательный стаж от трёх лет" in reason for reason in result.reasons)
 
 
@@ -1546,7 +1546,7 @@ def test_mandatory_two_plus_years_of_development_is_stretch(
         "Python development experience: 3+ years.",
     ],
 )
-def test_mandatory_three_plus_years_of_development_requires_manual_review(
+def test_mandatory_three_plus_years_of_development_does_not_block_application(
     required_qualifications: str,
 ) -> None:
     result = PythonBackendRules().evaluate(
@@ -1559,7 +1559,7 @@ def test_mandatory_three_plus_years_of_development_requires_manual_review(
         )
     )
 
-    assert result.category is RuleCategory.STRETCH
+    assert result.category is RuleCategory.MATCH
     assert any("обязательный стаж от трёх лет" in reason for reason in result.reasons)
 
 
@@ -1829,7 +1829,7 @@ def test_bell_integrator_skill_gaps_do_not_add_a_hard_rejection() -> None:
         RuleContext(skills=("Python, FastAPI, PostgreSQL, RAG",)),
     )
 
-    assert result.category is RuleCategory.STRETCH
+    assert result.category is RuleCategory.MATCH
     assert any("обязательный стаж от трёх лет" in reason for reason in result.reasons)
     assert any(
         "несколько обязательных профильных технологий" in reason for reason in result.reasons

@@ -42,7 +42,7 @@ from hugin.services.resume_improvement import ResumeBlockExtractor
 from hugin.services.vacancy_analysis import RULES_VERSION, RuleCategory
 
 PROMPT_PURPOSE = "cover_letter"
-PROMPT_VERSION = 21
+PROMPT_VERSION = 26
 INSTRUCTION_VERSION = CURRENT_COVER_LETTER_INSTRUCTION
 MANUAL_REVIEW_MODEL = "manual-review"
 MIN_LETTER_LENGTH = 350
@@ -78,7 +78,6 @@ SYSTEM_PROMPT = """Ты пишешь индивидуальные сопрово
 _ALLOWED_FACT_CATEGORIES = {
     "desired_position",
     "work_experience",
-    "skills",
     "about",
     "courses",
     "education",
@@ -249,7 +248,8 @@ _COMPANY_REFERENCE = re.compile(
 )
 _TOKEN = re.compile(r"[A-Za-zА-Яа-яЁё][A-Za-zА-Яа-яЁё0-9+#.-]{2,}")
 _FUTURE_LINE = re.compile(
-    r"\b(?:планир\w*|в будущем|будущ\w*|опциональн\w*|предстоит|"
+    r"\b(?:планир(?:ую|уем|уете|уют|ует|уется|уются)|в будущем|будущ\w*|"
+    r"опциональн\w*|предстоит|"
     r"возможност\w+\s+(?:добавить|расшир)|заложил\w*\s+возможност)\b",
     re.IGNORECASE,
 )
@@ -313,6 +313,7 @@ _DISTINCTIVE_RELEVANCE_TERMS = (_STRONG_RELEVANCE_TERMS - {"python"}) | {
     "typescript",
 }
 _COMMON_STACK_PERSONALIZATION_TERMS = {"python", "fastapi", "postgresql"}
+_PYTHON_ROLE = re.compile(r"\bpython\b", re.IGNORECASE)
 _DATA_ROLE_TITLE = re.compile(
     r"\b(?:data[- ]?инженер\w*|data engineer\w*|etl|"
     r"sql[- ]?разработчик\w*|разработчик\w*\s+sql|sql developer\w*)\b",
@@ -539,22 +540,26 @@ _GROUNDED_CLAIMS = (
         "работа в промышленной среде не подтверждена фактами кандидата",
     ),
     (
-        re.compile(r"\b(?:высок\w*\s+нагруз\w*|highload)\b", re.IGNORECASE),
-        re.compile(r"\b(?:высок\w*\s+нагруз\w*|highload)\b", re.IGNORECASE),
+        re.compile(
+            r"\b(?:высок\w*\s+нагруз\w*|высоконагруж\w*|highload)\b",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"\b(?:высок\w*\s+нагруз\w*|высоконагруж\w*|highload)\b",
+            re.IGNORECASE,
+        ),
         "работа под высокой нагрузкой не подтверждена фактами кандидата",
     ),
     (
         re.compile(
-            r"\b(?:асинхрон\w*|async)\b[^.!?\n]{0,80}"
-            r"\b(?:баз\w*\s+данн\w*|бд|sqlalchemy|postgres\w*)\b",
+            r"\b(?:асинхрон\w*|async)\b",
             re.IGNORECASE,
         ),
         re.compile(
-            r"\b(?:асинхрон\w*|async)\b[^.!?\n]{0,80}"
-            r"\b(?:баз\w*\s+данн\w*|бд|sqlalchemy|postgres\w*)\b",
+            r"\b(?:асинхрон\w*|async)\b",
             re.IGNORECASE,
         ),
-        "асинхронная работа с базой данных не подтверждена фактами кандидата",
+        "асинхронная обработка не подтверждена фактами кандидата",
     ),
     (
         re.compile(r"\b(?:стратег\w*\s+)?блокиров(?:к\w*|ок)\b", re.IGNORECASE),
@@ -578,12 +583,39 @@ _PERMANENT_PREPARATION_FAILURES = frozenset(
 )
 _AUTO_RETRY_FAILURE_PREFIX = "COVER_LETTER_RETRY_FAILED:"
 _AUTO_RETRY_ERROR_CODE = "COVER_LETTER_RETRY_FAILED"
+_MAX_VALIDATION_CORRECTION_ATTEMPTS = 3
+_FACTUAL_RISK_CODES = frozenset(
+    {
+        "UNCONFIRMED_CLAIM",
+        "UNCONFIRMED_SPECIALIST_TERM",
+        "UNCONFIRMED_TECHNOLOGY_EXPERIENCE",
+    }
+)
 _ACTION_LINE = re.compile(
     r"\b(?:разработ|реализ|настро|интегр|автоматиз|созда|поддерж|проектир|тестир|"
     r"оптимиз|анализир|внедр)",
     re.IGNORECASE,
 )
 _EMPLOYER_LINE = re.compile(r"^(?:ООО|АО|ПАО|ЗАО|ИП)\b", re.IGNORECASE)
+_EXPERIENCE_ITEM_CONTENT = re.compile(
+    r"<experience_item\b[^>]*>\s*(.*?)\s*</experience_item>",
+    re.IGNORECASE | re.DOTALL,
+)
+_HISTORY_PREFIX = re.compile(r"^[^:]{0,100}\b(?:19|20)\d{2}\b[^:]*:\s*")
+_CONSERVATIVE_FOCUS_TERMS = (
+    ("FastAPI", re.compile(r"\bfastapi\b", re.IGNORECASE)),
+    ("PostgreSQL", re.compile(r"\bpostgres(?:ql)?\b", re.IGNORECASE)),
+    ("Redis", re.compile(r"\bredis\b", re.IGNORECASE)),
+    ("Python", re.compile(r"\bpython\b", re.IGNORECASE)),
+    ("SQL", re.compile(r"(?<![A-Za-z])sql(?![A-Za-z])", re.IGNORECASE)),
+    ("YT", re.compile(r"(?<![A-Za-z])yt(?![A-Za-z])", re.IGNORECASE)),
+    ("YQL", re.compile(r"(?<![A-Za-z])yql(?![A-Za-z])", re.IGNORECASE)),
+    ("Yandex DataLens", re.compile(r"\b(?:yandex\s+)?datalens\b", re.IGNORECASE)),
+    ("pandas", re.compile(r"\bpandas\b", re.IGNORECASE)),
+    ("NumPy", re.compile(r"\bnumpy\b", re.IGNORECASE)),
+    ("Excel", re.compile(r"\bexcel\b", re.IGNORECASE)),
+    ("VBA", re.compile(r"\bvba\b", re.IGNORECASE)),
+)
 _STOP_WORDS = {
     "для",
     "или",
@@ -665,20 +697,30 @@ def _is_permanent_preparation_failure(reason: str | None) -> bool:
 
 def _validation_correction_prompt(
     original_prompt: str,
-    error: CoverLetterValidationError,
+    errors: tuple[CoverLetterValidationError, ...],
 ) -> str:
-    rejected_text = escape(error.rejected_text or "")
+    rejected_attempts = "\n".join(
+        (
+            f'<rejection attempt="{index}">\n'
+            f"Код проверки: {escape(error.code)}.\n"
+            f"Конкретная причина: {escape(str(error))}.\n"
+            "Ниже находится именно отклонённый вариант, а не новый источник фактов:\n"
+            f"<rejected_letter>\n{escape(error.rejected_text or '')}\n</rejected_letter>\n"
+            "</rejection>"
+        )
+        for index, error in enumerate(errors, start=1)
+    )
     return (
         f"{original_prompt.rstrip()}\n\n"
         "<local_validation_correction>\n"
-        "Предыдущий вариант не прошёл локальную проверку и не был сохранён.\n"
-        f"Код проверки: {error.code}.\n"
-        f"Конкретная причина: {error}.\n"
-        "Ниже находится именно отклонённый вариант, а не новый источник фактов:\n"
-        f"<rejected_letter>\n{rejected_text}\n</rejected_letter>\n"
-        "Исправь именно указанную неточность. Если утверждение нельзя подтвердить фактом, "
-        "удали его целиком, не заменяй его другим требованием из вакансии и не повышай "
-        "техническую конкретность формулировки. "
+        "Предыдущие варианты не прошли локальную проверку и не были сохранены.\n"
+        f"{rejected_attempts}\n"
+        "Составь новый вариант по исходным подтверждённым фактам. Устрани каждую причину "
+        "из всей цепочки выше, а не только последнюю. Если утверждение нельзя подтвердить "
+        "фактом, удали его целиком. Не сохраняй его смысл другими словами, не заменяй его "
+        "другим требованием из вакансии и не повышай техническую конкретность формулировки. "
+        "Технология, задача или ожидаемый результат из вакансии сами по себе не подтверждают, "
+        "что кандидат с ними работал. Отклонённые варианты также не являются источником фактов. "
         "Сохрани все требования точности, подтверждённости и связи с вакансией "
         "из исходного запроса.\n"
         "</local_validation_correction>"
@@ -718,6 +760,7 @@ class _SelectedFact:
     id: int
     category: str
     content: str
+    source_type: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -1261,7 +1304,45 @@ class CoverLetterService:
             )
             return self._item(candidate, CoverLetterState.READY, "reused")
 
-        correction_reason: str | None = None
+        if any(
+            fact.category in _EXPERIENCE_FACT_CATEGORIES and fact.source_type == "user"
+            for fact in facts
+        ):
+            conservative_text = ""
+            try:
+                conservative_text = _conservative_cover_letter(candidate.vacancy, facts)
+                conservative_facts = validate_cover_letter(
+                    conservative_text,
+                    candidate.vacancy,
+                    facts,
+                )
+            except CoverLetterValidationError as error:
+                error.rejected_text = error.rejected_text or conservative_text
+                if error.rejected_text:
+                    self._record_rejection(letter, error)
+                failure_reason = f"{_AUTO_RETRY_FAILURE_PREFIX}{error.code}"
+                self._save_failed(letter, failure_reason)
+                self._mark_preparation_blocked(candidate.application.id, failure_reason)
+                return self._item(
+                    candidate,
+                    CoverLetterState.FAILED,
+                    "failed",
+                    f"Письмо из подтверждённых сведений не прошло проверку: {error}",
+                )
+            else:
+                self._save_ready(
+                    letter,
+                    conservative_text,
+                    tuple(fact.id for fact in conservative_facts),
+                )
+                return self._item(
+                    candidate,
+                    CoverLetterState.READY,
+                    "generated",
+                    "Сформировано только из подтверждённых пользователем сведений",
+                )
+
+        validation_errors: list[CoverLetterValidationError] = []
         try:
             text, used_facts = self._generate_validated_letter(
                 model,
@@ -1271,18 +1352,41 @@ class CoverLetterService:
             )
         except CoverLetterValidationError as error:
             self._record_rejection(letter, error)
-            correction_reason = str(error)
-            correction_prompt = _validation_correction_prompt(user_prompt, error)
-            try:
-                text, used_facts = self._generate_validated_letter(
-                    model,
-                    correction_prompt,
-                    candidate,
-                    facts,
+            validation_errors.append(error)
+            for _ in range(_MAX_VALIDATION_CORRECTION_ATTEMPTS):
+                correction_prompt = _validation_correction_prompt(
+                    user_prompt,
+                    tuple(validation_errors),
                 )
-            except CoverLetterValidationError as retry_error:
-                self._record_rejection(letter, retry_error)
-                failure_reason = f"{_AUTO_RETRY_FAILURE_PREFIX}{error.code}->{retry_error.code}"
+                try:
+                    text, used_facts = self._generate_validated_letter(
+                        model,
+                        correction_prompt,
+                        candidate,
+                        facts,
+                    )
+                except CoverLetterValidationError as retry_error:
+                    self._record_rejection(letter, retry_error)
+                    validation_errors.append(retry_error)
+                    continue
+                except YandexAIError:
+                    error_codes = "->".join(error.code for error in validation_errors)
+                    failure_reason = f"{_AUTO_RETRY_FAILURE_PREFIX}{error_codes}->YANDEXGPT_ERROR"
+                    self._save_failed(letter, failure_reason)
+                    self._mark_preparation_blocked(
+                        candidate.application.id,
+                        failure_reason,
+                    )
+                    return self._item(
+                        candidate,
+                        CoverLetterState.FAILED,
+                        "failed",
+                        "Исправляющий повтор не вернул допустимый текст",
+                    )
+                break
+            else:
+                error_codes = "->".join(error.code for error in validation_errors)
+                failure_reason = f"{_AUTO_RETRY_FAILURE_PREFIX}{error_codes}"
                 self._save_failed(letter, failure_reason)
                 self._mark_preparation_blocked(
                     candidate.application.id,
@@ -1293,22 +1397,9 @@ class CoverLetterService:
                     CoverLetterState.FAILED,
                     "failed",
                     (
-                        f"Исправляющий повтор после причины «{error}» "
-                        f"не прошёл проверку: {retry_error}"
+                        f"Три исправляющих повтора не прошли проверку. "
+                        f"Последняя причина: {validation_errors[-1]}"
                     ),
-                )
-            except YandexAIError:
-                failure_reason = f"{_AUTO_RETRY_FAILURE_PREFIX}{error.code}->YANDEXGPT_ERROR"
-                self._save_failed(letter, failure_reason)
-                self._mark_preparation_blocked(
-                    candidate.application.id,
-                    failure_reason,
-                )
-                return self._item(
-                    candidate,
-                    CoverLetterState.FAILED,
-                    "failed",
-                    "Исправляющий повтор не вернул допустимый текст",
                 )
         except YandexAIError:
             self._save_failed(letter, "YANDEXGPT_ERROR")
@@ -1319,10 +1410,38 @@ class CoverLetterService:
                 "YandexGPT не вернул допустимый текст",
             )
 
+        if any(error.code in _FACTUAL_RISK_CODES for error in validation_errors):
+            conservative_text = ""
+            try:
+                conservative_text = _conservative_cover_letter(candidate.vacancy, facts)
+                conservative_facts = validate_cover_letter(
+                    conservative_text,
+                    candidate.vacancy,
+                    facts,
+                )
+            except CoverLetterValidationError as fallback_error:
+                fallback_error.rejected_text = fallback_error.rejected_text or conservative_text
+                self._record_rejection(letter, fallback_error)
+                error_codes = "->".join(
+                    [*(error.code for error in validation_errors), fallback_error.code]
+                )
+                failure_reason = f"{_AUTO_RETRY_FAILURE_PREFIX}{error_codes}"
+                self._save_failed(letter, failure_reason)
+                self._mark_preparation_blocked(candidate.application.id, failure_reason)
+                return self._item(
+                    candidate,
+                    CoverLetterState.FAILED,
+                    "failed",
+                    f"Осторожный вариант не прошёл проверку: {fallback_error}",
+                )
+            text = conservative_text
+            used_facts = conservative_facts
+
         self._save_ready(letter, text, tuple(fact.id for fact in used_facts))
         reason = (
-            f"Исправлено после локальной проверки: {correction_reason}"
-            if correction_reason is not None
+            "Исправлено после локальной проверки: "
+            + " → ".join(str(error) for error in validation_errors)
+            if validation_errors
             else None
         )
         return self._item(candidate, CoverLetterState.READY, "generated", reason)
@@ -1436,8 +1555,8 @@ class CoverLetterService:
         rows = self._session.execute(
             statement.order_by(
                 case((VacancyModel.duplicate_of_id.is_(None), 0), else_=1),
-                VacancyModel.published_at.desc().nulls_last(),
                 ApplicationTaskModel.priority_score.desc(),
+                VacancyModel.published_at.desc().nulls_last(),
                 ApplicationTaskModel.id,
             )
         )
@@ -1529,7 +1648,12 @@ class CoverLetterService:
                 (
                     score,
                     overlap,
-                    _SelectedFact(fact.id, fact.category, content),
+                    _SelectedFact(
+                        fact.id,
+                        fact.category,
+                        content,
+                        fact.source_type,
+                    ),
                 )
             )
 
@@ -1946,6 +2070,99 @@ def build_cover_letter_prompt(
 Верни только текст письма."""
 
 
+def _conservative_cover_letter(
+    vacancy: VacancyModel,
+    facts: tuple[_SelectedFact, ...],
+) -> str:
+    vacancy_text = _vacancy_text(vacancy)
+    items: list[tuple[int, str, tuple[str, ...]]] = []
+    for fact in facts:
+        if fact.category not in _EXPERIENCE_FACT_CATEGORIES:
+            continue
+        raw_items = _EXPERIENCE_ITEM_CONTENT.findall(fact.content)
+        if not raw_items:
+            raw_items = [line for line in fact.content.splitlines() if line.strip()]
+        for index, raw_item in enumerate(raw_items):
+            item = " ".join(raw_item.split())
+            item = _HISTORY_PREFIX.sub("", item)
+            if ";" in item:
+                context, action = item.split(";", 1)
+                if "проект" in context.casefold():
+                    project_context = re.sub(
+                        r"^проект\s+",
+                        "",
+                        context.strip(),
+                        flags=re.IGNORECASE,
+                    )
+                    project_name, separator, project_role = project_context.partition(",")
+                    if separator and project_role.strip().casefold() == "серверная разработка":
+                        item = (
+                            f"В проекте {project_name.strip()} занимался серверной "
+                            f"разработкой: {action.strip()}"
+                        )
+                    else:
+                        item = f"В проекте {project_context}: {action.strip()}"
+                else:
+                    item = action
+            item = item.strip(" ;")
+            if not item:
+                continue
+            item = item[:1].upper() + item[1:]
+            if item[-1] not in ".!?":
+                item += "."
+            focus = tuple(
+                label
+                for label, pattern in _CONSERVATIVE_FOCUS_TERMS
+                if pattern.search(item) is not None and pattern.search(vacancy_text) is not None
+            )
+            items.append((index, item, focus))
+    if not items:
+        raise CoverLetterValidationError(
+            "NO_RELEVANT_EVIDENCE",
+            "Для осторожного письма не найден подтверждённый пример работы",
+        )
+
+    items.sort(key=lambda value: (-len(value[2]), value[0]))
+    first = items[0]
+    second = next((item for item in items[1:] if item[1] != first[1]), None)
+    focus_terms = first[2]
+    if focus_terms:
+        rendered_focus = _russian_join(focus_terms[:3])
+        focus_sentence = (
+            "Для задач позиции особенно подходит этот подтверждённый опыт "
+            f"с {rendered_focus}."
+        )
+    else:
+        focus_sentence = (
+            "Для задач позиции особенно подходит этот подтверждённый пример работы."
+        )
+
+    paragraphs = [f"{first[1]} {focus_sentence}"]
+    if second is not None:
+        paragraphs.append(second[1])
+    paragraphs.append(
+        "На собеседовании готов подробно разобрать первый пример и ответить "
+        "на вопросы по своей роли и указанным технологиям."
+    )
+    return (
+        f"Здравствуйте!\n\n{_vacancy_target_line(vacancy)}\n\n"
+        + "\n\n".join(paragraphs)
+    )
+
+
+def _vacancy_target_line(vacancy: VacancyModel) -> str:
+    vacancy_title = " ".join(vacancy.title.split()).replace("«", '"').replace("»", '"')
+    return f"Откликаюсь на вакансию «{vacancy_title[:180].strip()}»."
+
+
+def _russian_join(values: tuple[str, ...]) -> str:
+    if len(values) == 1:
+        return values[0]
+    if len(values) == 2:
+        return f"{values[0]} и {values[1]}"
+    return f"{', '.join(values[:-1])} и {values[-1]}"
+
+
 def normalize_cover_letter(response: str) -> str:
     value = response.strip()
     fenced = re.fullmatch(
@@ -2063,36 +2280,42 @@ def validate_cover_letter(
             ),
         )
 
+    target_line = _vacancy_target_line(vacancy).casefold()
+    claim_text = "\n".join(
+        line for line in text.splitlines() if line.strip().casefold() != target_line
+    )
     fact_text = "\n".join(fact.content for fact in facts)
     experience_facts = _confirmed_experience_facts(facts)
     experience_fact_text = "\n".join(fact.content for fact in experience_facts)
     vacancy_text = _vacancy_text(vacancy).casefold()
     for claim, evidence, reason in _GROUNDED_CLAIMS:
-        claim_match = claim.search(text)
+        claim_match = claim.search(claim_text)
         if claim_match is not None and evidence.search(experience_fact_text) is None:
             raise CoverLetterValidationError(
                 "UNCONFIRMED_CLAIM",
                 reason,
-                rejected_fragment=_fragment_around_match(text, claim_match),
+                rejected_fragment=_fragment_around_match(claim_text, claim_match),
             )
     for pattern, vacancy_markers, reason in _CONTEXTUAL_DETAILS:
-        detail_match = pattern.search(text)
+        detail_match = pattern.search(claim_text)
         if detail_match is not None and not any(
             marker in vacancy_text for marker in vacancy_markers
         ):
             raise CoverLetterValidationError(
                 "IRRELEVANT_DETAIL",
                 reason,
-                rejected_fragment=_fragment_around_match(text, detail_match),
+                rejected_fragment=_fragment_around_match(claim_text, detail_match),
             )
     for label, pattern in _unconfirmed_requested_experience(
         vacancy,
         experience_fact_text,
     ):
-        topic_match = pattern.search(text)
+        topic_match = pattern.search(claim_text)
         if (
             topic_match is None
-            or _NEGATED_TECHNOLOGY_EXPERIENCE.search(_fragment_around_match(text, topic_match))
+            or _NEGATED_TECHNOLOGY_EXPERIENCE.search(
+                _fragment_around_match(claim_text, topic_match)
+            )
             is None
         ):
             raise CoverLetterValidationError(
@@ -2102,27 +2325,29 @@ def validate_cover_letter(
                     "сообщить, что подтверждённого прямого опыта пока нет"
                 ),
                 rejected_fragment=(
-                    _fragment_around_match(text, topic_match) if topic_match is not None else label
+                    _fragment_around_match(claim_text, topic_match)
+                    if topic_match is not None
+                    else label
                 ),
             )
     for pattern in _CONFIRMED_TECHNOLOGY_PATTERNS:
-        technology_match = pattern.search(text)
+        technology_match = pattern.search(claim_text)
         if (
             technology_match is not None
             and pattern.search(fact_text) is None
             and _NEGATED_TECHNOLOGY_EXPERIENCE.search(
-                _fragment_around_match(text, technology_match)
+                _fragment_around_match(claim_text, technology_match)
             )
             is None
         ):
             raise CoverLetterValidationError(
                 "UNCONFIRMED_SPECIALIST_TERM",
                 "В письме появилась технология, которой нет в подтвержденных фактах",
-                rejected_fragment=_fragment_around_match(text, technology_match),
+                rejected_fragment=_fragment_around_match(claim_text, technology_match),
             )
-    for technology, pattern in _claimed_technology_experience(text):
+    for technology, pattern in _claimed_technology_experience(claim_text):
         if not any(pattern.search(fact.content) is not None for fact in experience_facts):
-            technology_match = pattern.search(text)
+            technology_match = pattern.search(claim_text)
             raise CoverLetterValidationError(
                 "UNCONFIRMED_TECHNOLOGY_EXPERIENCE",
                 (
@@ -2130,7 +2355,7 @@ def validate_cover_letter(
                     "но он не подтверждён описанием выполненной работы"
                 ),
                 rejected_fragment=(
-                    _fragment_around_match(text, technology_match)
+                    _fragment_around_match(claim_text, technology_match)
                     if technology_match is not None
                     else technology
                 ),
@@ -2174,16 +2399,16 @@ def validate_cover_letter(
                 else None
             ),
         )
-    for match in _WORD_NUMBER_YEARS.finditer(text):
+    for match in _WORD_NUMBER_YEARS.finditer(claim_text):
         if match.group(0).casefold() not in fact_text.casefold():
             raise CoverLetterValidationError(
                 "UNCONFIRMED_EXPERIENCE",
                 "В письме появился неподтвержденный срок опыта",
-                rejected_fragment=_fragment_around_match(text, match),
+                rejected_fragment=_fragment_around_match(claim_text, match),
             )
 
     employer = (vacancy.employer_name or "").casefold()
-    for match in _COMPANY_REFERENCE.finditer(text):
+    for match in _COMPANY_REFERENCE.finditer(claim_text):
         mentioned = " ".join(match.group(1).casefold().split())
         same_company = (
             mentioned in employer
@@ -2194,11 +2419,11 @@ def validate_cover_letter(
             raise CoverLetterValidationError(
                 "OTHER_EMPLOYER",
                 "В письме упомянут другой работодатель",
-                rejected_fragment=_fragment_around_match(text, match),
+                rejected_fragment=_fragment_around_match(claim_text, match),
             )
     if len(text) < MIN_LETTER_LENGTH:
         raise CoverLetterValidationError("TOO_SHORT", "Письмо получилось слишком коротким")
-    used_facts = _used_facts_for_text(text, facts)
+    used_facts = _used_facts_for_text(claim_text, facts)
     if not used_facts:
         raise CoverLetterValidationError(
             "UNATTRIBUTED_CONTENT",
@@ -2210,7 +2435,7 @@ def validate_cover_letter(
         allow_manual_input=allow_manual_input,
     )
     has_checkable_focus = bool(_vacancy_focus_tokens(vacancy) - _GENERIC_RELEVANCE_TERMS)
-    if not _has_distinctive_vacancy_accent(text, vacancy, used_facts) and (
+    if not _has_distinctive_vacancy_accent(claim_text, vacancy, used_facts) and (
         not allow_manual_input or has_checkable_focus
     ):
         raise CoverLetterValidationError(
@@ -2366,8 +2591,25 @@ def _has_distinctive_vacancy_accent(
             specific_vacancy_focus,
             fact_tokens,
         )
-        return bool(_matching_tokens(confirmed_specific_focus, letter_tokens))
-    return bool(letter_focus & _DISTINCTIVE_RELEVANCE_TERMS) or len(letter_focus) >= 2
+        if _matching_tokens(confirmed_specific_focus, letter_tokens):
+            return True
+        if any(fact.source_type == "user" for fact in facts):
+            return (
+                bool(letter_focus & _DISTINCTIVE_RELEVANCE_TERMS)
+                or len(letter_focus) >= 2
+                or (
+                    _PYTHON_ROLE.search(vacancy.title) is not None
+                    and _PYTHON_ROLE.search(text) is not None
+                )
+            )
+        return False
+    if bool(letter_focus & _DISTINCTIVE_RELEVANCE_TERMS) or len(letter_focus) >= 2:
+        return True
+    return (
+        any(fact.source_type == "user" for fact in facts)
+        and _PYTHON_ROLE.search(vacancy.title) is not None
+        and _PYTHON_ROLE.search(text) is not None
+    )
 
 
 def _relevant_excerpt(
@@ -2427,23 +2669,35 @@ def _work_experience_excerpt(
     try:
         structure = ResumeBlockExtractor().extract(f"Опыт работы\n{content.strip()}\nОбразование")
     except ValueError:
-        return _relevant_excerpt(content, vacancy_tokens, limit)
+        candidates = [
+            (
+                (vacancy_tokens & _tokens(line)) - _RELEVANCE_STOP_WORDS,
+                index,
+                (
+                    '<experience_item type="ROLE" label="Опыт работы">\n'
+                    f"{line}\n"
+                    "</experience_item>"
+                ),
+            )
+            for index, line in enumerate(content.splitlines())
+            if line.strip()
+        ]
+    else:
+        candidates = []
+        for block in structure.blocks:
+            overlap_tokens = (
+                vacancy_tokens & _tokens(f"{block.label}\n{block.source_text}")
+            ) - _RELEVANCE_STOP_WORDS
+            label = block.label.rsplit(" — ", 1)[-1]
+            rendered = (
+                f'<experience_item type="{escape(block.kind.value)}" '
+                f'label="{escape(label, quote=True)}">\n'
+                f"{block.source_text}\n"
+                "</experience_item>"
+            )
+            candidates.append((overlap_tokens, block.index, rendered))
 
     preferred = (priority_tokens or set()) - _RELEVANCE_STOP_WORDS
-    candidates: list[tuple[set[str], int, str]] = []
-    for block in structure.blocks:
-        overlap_tokens = (
-            vacancy_tokens & _tokens(f"{block.label}\n{block.source_text}")
-        ) - _RELEVANCE_STOP_WORDS
-        label = block.label.rsplit(" — ", 1)[-1]
-        rendered = (
-            f'<experience_item type="{escape(block.kind.value)}" '
-            f'label="{escape(label, quote=True)}">\n'
-            f"{block.source_text}\n"
-            "</experience_item>"
-        )
-        candidates.append((overlap_tokens, block.index, rendered))
-
     selected: list[str] = []
     used = 0
     covered: set[str] = set()
@@ -2554,6 +2808,12 @@ def _ensure_relevant_evidence(
     if _DATA_ROLE_TITLE.search(vacancy.title) and _matching_tokens(
         _DATA_ROLE_FOCUS_TERMS,
         narrative_tokens,
+    ):
+        return
+    if (
+        any(fact.source_type == "user" for fact in narrative_facts)
+        and _PYTHON_ROLE.search(vacancy.title) is not None
+        and _PYTHON_ROLE.search("\n".join(fact.content for fact in narrative_facts)) is not None
     ):
         return
     raise CoverLetterValidationError(

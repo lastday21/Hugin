@@ -178,6 +178,8 @@ class FakePage:
         self.goto_response: FakeResponse | None = None
         self.goto_final_url: str | None = None
         self.goto_error: Error | None = None
+        self.window_probe_error: Error | None = None
+        self.closed = False
         self.locators['[data-qa="resume-title"]'] = FakeLocator()
         self.locators['[data-qa="vacancy-response-link-top"]:visible'] = FakeLocator()
         selected_resume = FakeLocator(
@@ -206,10 +208,17 @@ class FakePage:
     def set_default_navigation_timeout(self, timeout: int) -> None:
         self.navigation_timeout = timeout
 
+    def is_closed(self) -> bool:
+        return self.closed
+
     def wait_for_timeout(self, timeout: int) -> None:
         assert timeout in {500, 1_000, 1_500, 3_000}
 
     def evaluate(self, expression: str, argument: object = None) -> object:
+        if expression == browser_module._WINDOW_LIVENESS_SCRIPT:
+            if self.window_probe_error is not None:
+                raise self.window_probe_error
+            return True
         if expression == browser_module.FILL_APPLICATION_FORM_SCRIPT:
             self.fill_payload = argument
             return self.fill_result
@@ -334,7 +343,7 @@ def test_browser_opens_login_page_and_detects_session(tmp_path: Path) -> None:
 
     browser.open_login()
 
-    assert page.goto_calls == [("https://hh.ru/account/login?role=applicant", "domcontentloaded")]
+    assert page.goto_calls == [("https://hh.ru/account/login?role=applicant", "commit")]
     assert not browser.is_authenticated()
     page.url = "https://hh.ru/applicant/resumes"
     assert browser.is_authenticated()
@@ -342,6 +351,24 @@ def test_browser_opens_login_page_and_detects_session(tmp_path: Path) -> None:
     assert browser.is_authenticated()
     page.url = "https://not-hh.ru/applicant/resumes"
     assert not browser.is_authenticated()
+
+
+def test_browser_reports_whether_review_window_is_open(tmp_path: Path) -> None:
+    page = FakePage()
+    browser = make_browser(page, tmp_path)
+
+    assert browser.is_open()
+    page.closed = True
+    assert not browser.is_open()
+
+
+def test_browser_detects_closed_window_before_page_flag_updates(tmp_path: Path) -> None:
+    page = FakePage()
+    browser = make_browser(page, tmp_path)
+    page.window_probe_error = Error("Target page, context or browser has been closed")
+
+    assert not page.is_closed()
+    assert not browser.is_open()
 
 
 def test_aborted_login_redirect_is_accepted_for_authenticated_page(tmp_path: Path) -> None:
@@ -1257,6 +1284,68 @@ def test_saved_form_answers_are_refilled_without_submit(tmp_path: Path) -> None:
     assert result.status is HhFormReviewStatus.READY
     assert result.filled_keys == ("name:telegram",)
     assert page.fill_payload == [{"key": "name:telegram", "value": "@timur"}]
+    assert submit.clicked == 0
+
+
+def test_salary_answer_is_refilled_when_textarea_is_sibling_of_question(
+    tmp_path: Path,
+) -> None:
+    page = FakePage("https://hh.ru/applicant/resumes")
+    question = (
+        "Добрый день, уважаемый соискатель! "
+        "Укажите пожалуйста ваши зарплатные ожидания"
+    )
+    field_key = f"question:0:{question.casefold()}"
+    legacy_form = HhScreeningForm(
+        fields=(
+            HhScreeningField(
+                key=field_key,
+                question=question,
+                field_type="unknown",
+            ),
+        )
+    )
+    page.application_payload = {
+        "fields": [
+            {
+                "key": field_key,
+                "question": question,
+                "fieldType": "textarea",
+                "isRequired": False,
+                "options": [],
+                "maxLength": None,
+                "formatHint": "",
+                "controlOutsideQuestion": True,
+                "hasAttachment": False,
+                "hasExternalAction": False,
+                "hasTestAssignment": False,
+            }
+        ],
+        "warnings": [],
+        "resumeTitle": "Python backend разработчик",
+        "bodyText": "Форма отклика",
+    }
+    page.fill_result = {"filled": [field_key], "skipped": []}
+    page.locators['[data-qa*="captcha"], iframe[src*="captcha"]'] = FakeLocator(0)
+    submit = FakeLocator()
+    page.locators['[data-qa="vacancy-response-submit-popup"]'] = submit
+
+    result = make_browser(page, tmp_path).open_screening_form(
+        "https://hh.ru/vacancy/135702392",
+        expected_resume_hh_id=TEST_RESUME_HH_ID,
+        expected_resume_title="Python backend разработчик",
+        expected_version_hash=screening_form_hash(legacy_form),
+        answers={field_key: "от 120 000 рублей на руки"},
+    )
+
+    assert result.status is HhFormReviewStatus.READY
+    assert result.current_form is not None
+    assert result.current_form.fields[0].field_type == "textarea"
+    assert result.filled_keys == (field_key,)
+    assert result.skipped_keys == ()
+    assert page.fill_payload == [
+        {"key": field_key, "value": "от 120 000 рублей на руки"}
+    ]
     assert submit.clicked == 0
 
 

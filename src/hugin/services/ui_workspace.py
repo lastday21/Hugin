@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -169,6 +170,7 @@ class UiRejectedVacancy:
     direction: str
     score: float | None
     reasons: tuple[str, ...]
+    decision_reasons: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -503,7 +505,7 @@ class UiWorkspaceService:
             ) in rows
         )
 
-    def rejected(self, account_id: int, limit: int = 100) -> tuple[UiRejectedVacancy, ...]:
+    def rejected(self, account_id: int, limit: int = 1000) -> tuple[UiRejectedVacancy, ...]:
         self._account(account_id)
         rows = self._session.execute(
             select(VacancyModel, DirectionVacancyModel, CareerDirectionModel)
@@ -532,6 +534,7 @@ class UiWorkspaceService:
                 direction=_direction_name(direction),
                 score=tracking.rules_score,
                 reasons=self._reasons(tracking.rules_details),
+                decision_reasons=self._decision_reasons(tracking.rules_details),
             )
             for vacancy, tracking, direction in rows
         )
@@ -809,6 +812,33 @@ class UiWorkspaceService:
         if not isinstance(reasons, list):
             return ()
         return tuple(str(reason) for reason in reasons)
+
+    @staticmethod
+    def _decision_reasons(details: dict[str, object]) -> tuple[str, ...]:
+        nonblocking_markers = (
+            "не блокир",
+            "не запрет",
+            "снижает приоритет",
+            "сам по себе не",  # noqa: RUF001
+            "само по себе не",  # noqa: RUF001
+            "нужна ручная проверка",
+            "требует ручной проверки",
+            "требуется ручная проверка",
+        )
+        reasons = UiWorkspaceService._reasons(details)
+        return tuple(
+            reason
+            for reason in reasons
+            if not re.fullmatch(r"[\wА-Яа-яЁё -]+:\s*[\d._-]+", reason)  # noqa: RUF001
+            and not any(marker in reason.casefold() for marker in nonblocking_markers)
+            and not reason.casefold().startswith(
+                (
+                    "python указан",
+                    "совпали подтверждённые навыки",
+                    "требования к опыту не являются",
+                )
+            )
+        )
 
     @staticmethod
     def _optional_int(value: object) -> int | None:

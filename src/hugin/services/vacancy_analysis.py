@@ -26,7 +26,7 @@ from hugin.repositories.vacancies import VacancyRepository
 from hugin.services.career_directions import CareerDirectionService
 from hugin.services.vacancy_duplicates import VacancyDuplicateDetector
 
-RULES_VERSION = "python_it_v34"
+RULES_VERSION = "python_it_v35"
 MAX_VACANCY_AGE = timedelta(days=30)
 
 
@@ -655,8 +655,8 @@ class PythonBackendRules:
         if self._external_application_form_pattern.search(description):
             stretch_reasons.append("работодатель требует внешнюю форму; нужна ручная проверка")
         if vacancy.has_test_assignment:
-            stretch_reasons.append(
-                "работодатель указал испытательное задание; нужна ручная проверка"
+            reasons.append(
+                "работодатель указал испытательное задание; это не блокирует отклик"
             )
         destination = VacancyRoleRouter.classify(vacancy)
         if not rejected and destination is not None and destination is not self.scope:
@@ -711,12 +711,15 @@ class PythonBackendRules:
             )
         minimum_required_experience = self._minimum_required_experience(vacancy)
         if minimum_required_experience is not None and minimum_required_experience >= 3:
-            stretch_reasons.append("обязательный стаж от трёх лет требует ручной проверки")
+            reasons.append(
+                "обязательный стаж от трёх лет снижает приоритет, но не блокирует отклик"
+            )
         elif (
             hh_experience_minimum := self._experience_minimum(experience)
         ) is not None and hh_experience_minimum >= 3:
-            stretch_reasons.append(
-                "диапазон опыта hh.ru начинается от трёх лет и требует ручной проверки"
+            reasons.append(
+                "диапазон опыта hh.ru начинается от трёх лет; это снижает приоритет, "
+                "но не блокирует отклик"
             )
         elif (
             self._mandatory_development_experience_pattern.search(experience_requirements)

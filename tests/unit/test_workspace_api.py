@@ -218,7 +218,12 @@ def seed_workspace(settings: Settings) -> tuple[int, str, str]:
                 rejected.id,
                 state=VacancyState.FILTERED_OUT,
                 score=25,
-                details={"reasons": ["другой основной язык"]},
+                details={
+                    "reasons": [
+                        "другой основной язык",
+                        "обязательный стаж от трёх лет требует ручной проверки",
+                    ]
+                },
                 rules_version="ui-test",
             )
 
@@ -350,7 +355,11 @@ def test_workspace_endpoints_return_real_data_and_protect_changes(settings: Sett
         rejected = request(app, "GET", f"/api/rejected?account_id={account_id}")
         assert rejected.status_code == 200
         assert rejected.json()[0]["vacancy_id"] == rejected_id
-        assert rejected.json()[0]["reasons"] == ["другой основной язык"]
+        assert rejected.json()[0]["reasons"] == [
+            "другой основной язык",
+            "обязательный стаж от трёх лет требует ручной проверки",
+        ]
+        assert rejected.json()[0]["decision_reasons"] == ["другой основной язык"]
 
         sent = request(app, "GET", f"/api/sent?account_id={account_id}")
         assert sent.status_code == 200

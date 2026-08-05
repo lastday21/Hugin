@@ -154,6 +154,7 @@ class RejectedVacancyResponse(BaseModel):
     direction: str
     score: float | None
     reasons: tuple[str, ...]
+    decision_reasons: tuple[str, ...]
 
 
 class SentApplicationResponse(BaseModel):
@@ -442,7 +443,7 @@ def forms(
 def rejected(
     session: ReadSession,
     account_id: int = Query(default=1, ge=1),
-    limit: int = Query(default=100, ge=1, le=500),
+    limit: int = Query(default=1000, ge=1, le=2000),
 ) -> tuple[RejectedVacancyResponse, ...]:
     try:
         return tuple(
@@ -457,7 +458,7 @@ def rejected(
 def sent(
     session: ReadSession,
     account_id: int = Query(default=1, ge=1),
-    limit: int = Query(default=100, ge=1, le=500),
+    limit: int = Query(default=1000, ge=1, le=2000),
 ) -> tuple[SentApplicationResponse, ...]:
     try:
         return tuple(

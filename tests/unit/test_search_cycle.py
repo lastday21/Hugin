@@ -157,7 +157,7 @@ def test_background_search_reads_and_queues_without_applying(settings: Settings)
     assert result["found"] == 2
     assert result["unique_vacancies"] == 2
     assert result["details_loaded"] == 1
-    assert result["queued"] == 0
+    assert result["queued"] == 1
     assert browser.searches == [
         ("Python backend разработчик", "1", 0),
         ("Python backend разработчик", "1", 1),
@@ -180,8 +180,8 @@ def test_background_search_reads_and_queues_without_applying(settings: Settings)
                 legacy_vacancy.id,
             )
             assert legacy_link.rules_version == RULES_VERSION
-            assert legacy_link.state is VacancyState.ANALYZED
-            assert legacy_link.rules_details["category"] == "STRETCH"
+            assert legacy_link.state is VacancyState.QUEUED
+            assert legacy_link.rules_details["category"] == "MATCH"
     finally:
         database.close()
 

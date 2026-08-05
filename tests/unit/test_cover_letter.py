@@ -38,6 +38,7 @@ from hugin.services.cover_letter import (
     MAX_LETTER_LENGTH,
     CoverLetterService,
     CoverLetterValidationError,
+    _conservative_cover_letter,
     _ensure_relevant_evidence,
     _letter_similarity,
     _relevant_excerpt,
@@ -277,6 +278,101 @@ def test_yandex_letter_uses_only_confirmed_facts_and_is_saved(settings: Settings
         database.close()
 
 
+def test_user_confirmed_work_fact_uses_conservative_letter_without_model(
+    settings: Settings,
+) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    model = FakeModel([])
+    try:
+        with database.sessions.begin() as session:
+            account_id, direction_id, _, _ = _prepare_data(session)
+            fact = session.scalar(
+                select(VerifiedFactModel).where(
+                    VerifiedFactModel.category == "work_experience",
+                    VerifiedFactModel.state == ConfirmationState.CONFIRMED,
+                )
+            )
+            assert fact is not None
+            fact.source_type = "user"
+            fact.content = (
+                "Январь 2026 — август 2026: проект CartCase; руководил серверной "
+                "разработкой, планировал задачи, проверял изменения и разрабатывал "
+                "сервис на FastAPI и PostgreSQL.\n"
+                "Декабрь 2022 — июнь 2025: производственный проект; применял Python "
+                "к производственным данным и самостоятельно разработал SmartPVD."
+            )
+            session.flush()
+
+            result = CoverLetterService(session, model).prepare(
+                account_id=account_id,
+                direction_name="Python backend",
+            )
+
+            assert result.generated == 1
+            assert result.failed == 0
+            assert model.prompts == []
+            letter = session.scalar(select(CoverLetterModel))
+            assert letter is not None
+            assert letter.state is CoverLetterState.READY
+            assert "планировал задачи" in (letter.text or "")
+            assert "самостоятельно разработал SmartPVD" in (letter.text or "")
+            assert "На собеседовании готов подробно разобрать" in (letter.text or "")
+
+            second_vacancy = VacancyRepository(session).upsert(
+                VacancyData(
+                    hh_id="letter-second-user-fact",
+                    title="Backend-разработчик Python",
+                    source_url="https://hh.ru/vacancy/letter-second-user-fact",
+                    employer_name="Другая компания",
+                    description="Разработка сервисов на Python, FastAPI и PostgreSQL.",
+                    responsibilities="Развивать серверную часть.",
+                    required_qualifications="Python, FastAPI, PostgreSQL.",
+                    key_skills=("Python", "FastAPI", "PostgreSQL"),
+                    details_fetched_at=datetime(2026, 7, 24, tzinfo=UTC),
+                )
+            )
+            directions = DirectionRepository(session)
+            directions.track_vacancy(direction_id, second_vacancy.id)
+            directions.apply_rules(
+                direction_id,
+                second_vacancy.id,
+                state=VacancyState.ANALYZED,
+                score=85,
+                details={
+                    "category": "MATCH",
+                    "accepted": True,
+                    "reasons": ["совпадают Python, FastAPI и PostgreSQL"],
+                },
+                rules_version=RULES_VERSION,
+            )
+            ApplicationAutomationService(session).prepare_for_account_id(
+                account_id=account_id,
+                direction_name="Python backend",
+                include_stretch=True,
+            )
+
+            second_result = CoverLetterService(session, model).prepare(
+                account_id=account_id,
+                direction_name="Python backend",
+                vacancy_hh_id="letter-second-user-fact",
+            )
+
+            assert second_result.generated == 1
+            assert second_result.failed == 0
+            assert model.prompts == []
+            second_letter = session.scalar(
+                select(CoverLetterModel)
+                .join(VacancyModel, VacancyModel.id == CoverLetterModel.vacancy_id)
+                .where(VacancyModel.hh_id == "letter-second-user-fact")
+            )
+            assert second_letter is not None
+            assert second_letter.state is CoverLetterState.READY
+            assert "Backend-разработчик Python" in (second_letter.text or "")
+    finally:
+        database.close()
+
+
 @pytest.mark.parametrize(
     "blocked_state",
     (TaskState.REVIEW_REQUIRED, TaskState.SKIPPED),
@@ -328,7 +424,7 @@ def test_changed_instruction_retries_previous_letter_failure(
         database.close()
 
 
-def test_prepare_uses_at_most_two_sources_and_links_only_reflected_fact(
+def test_prepare_does_not_expose_skill_list_as_completed_work(
     settings: Settings,
 ) -> None:
     upgrade_database(settings)
@@ -394,8 +490,9 @@ def test_prepare_uses_at_most_two_sources_and_links_only_reflected_fact(
             )
 
             assert result.generated == 1
-            assert model.prompts[0][1].count("<fact id=") == 2
-            assert "Redis" in model.prompts[0][1]
+            confirmed_facts = model.prompts[0][1].split("<confirmed_facts>", 1)[1]
+            assert confirmed_facts.count("<fact id=") == 1
+            assert 'category="skills"' not in confirmed_facts
             letter = session.scalar(select(CoverLetterModel))
             assert letter is not None
             linked_ids = tuple(
@@ -585,7 +682,82 @@ def test_template_phrase_is_corrected_once_with_specific_reason(
         database.close()
 
 
-def test_failed_template_correction_requires_review_and_stops_retries(
+def test_third_correction_can_pass_with_all_previous_rejections_in_prompt(
+    settings: Settings,
+) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    unconfirmed_five_years = (
+        "Здравствуйте!\n\nРазрабатывал серверные приложения на Python и FastAPI, работал "
+        "с PostgreSQL и настраивал автоматические проверки. У меня 5 лет опыта, поэтому "
+        "задачи серверной разработки хорошо знакомы. Также реализовывал прикладную логику "
+        "и интеграции. Буду рад подробнее рассказать о проектах и обсудить задачи команды."
+    )
+    unconfirmed_four_years = unconfirmed_five_years.replace(
+        "5 лет опыта",
+        "4 года опыта",
+    )
+    model = FakeModel(
+        [
+            _letter_with_template_phrase(),
+            unconfirmed_five_years,
+            unconfirmed_four_years,
+            _letter(),
+        ]
+    )
+    try:
+        with database.sessions.begin() as session:
+            account_id, _, _, _ = _prepare_data(session)
+
+            result = CoverLetterService(session, model).prepare(
+                account_id=account_id,
+                direction_name="Python backend",
+                limit=1,
+            )
+
+            assert result.generated == 1
+            assert result.failed == 0
+            assert len(model.prompts) == 4
+            assert model.responses == []
+
+            original_prompt = model.prompts[0][1]
+            assert model.prompts[1][1].startswith(original_prompt)
+            assert model.prompts[2][1].startswith(original_prompt)
+            assert model.prompts[3][1].startswith(original_prompt)
+            assert model.prompts[3][1].count("<rejected_letter>") == 3
+            assert _letter_with_template_phrase() in model.prompts[3][1]
+            assert unconfirmed_five_years in model.prompts[3][1]
+            assert unconfirmed_four_years in model.prompts[3][1]
+            assert "Устрани каждую причину из всей цепочки выше" in model.prompts[3][1]
+            assert (
+                "Отклонённые варианты также не являются источником фактов" in (model.prompts[3][1])
+            )
+
+            letter = session.scalar(select(CoverLetterModel))
+            task = session.scalar(select(ApplicationTaskModel))
+            assert letter is not None
+            assert letter.state is CoverLetterState.READY
+            assert letter.text == _letter()
+            assert letter.failure_reason is None
+            rejections = tuple(
+                session.scalars(
+                    select(CoverLetterRejectionModel)
+                    .where(CoverLetterRejectionModel.cover_letter_id == letter.id)
+                    .order_by(CoverLetterRejectionModel.sequence_number)
+                )
+            )
+            assert [rejection.reason_code for rejection in rejections] == [
+                "TEMPLATE_PHRASE",
+                "UNCONFIRMED_NUMBER",
+                "UNCONFIRMED_NUMBER",
+            ]
+            assert task is not None
+            assert task.state is TaskState.PENDING
+    finally:
+        database.close()
+
+
+def test_exhausted_corrections_require_review_and_stop_retries(
     settings: Settings,
 ) -> None:
     upgrade_database(settings)
@@ -600,7 +772,8 @@ def test_failed_template_correction_requires_review_and_stops_retries(
         [
             _letter_with_template_phrase(),
             unconfirmed_number,
-            _letter(),
+            _letter_with_template_phrase(),
+            unconfirmed_number,
         ]
     )
     try:
@@ -616,18 +789,20 @@ def test_failed_template_correction_requires_review_and_stops_retries(
 
             assert result.generated == 0
             assert result.failed == 1
-            assert len(model.prompts) == 2
-            assert len(model.responses) == 1
-            assert "не прошёл проверку" in (result.items[0].reason or "")
+            assert len(model.prompts) == 4
+            assert model.responses == []
+            assert "Три исправляющих повтора" in (result.items[0].reason or "")
+            assert model.prompts[3][1].count("<rejected_letter>") == 3
 
             letter = session.scalar(select(CoverLetterModel))
             task = session.scalar(select(ApplicationTaskModel))
             assert letter is not None
             assert letter.state is CoverLetterState.FAILED
             assert letter.text is None
-            assert (
-                letter.failure_reason
-                == "COVER_LETTER_RETRY_FAILED:TEMPLATE_PHRASE->UNCONFIRMED_NUMBER"
+            assert letter.failure_reason == (
+                "COVER_LETTER_RETRY_FAILED:"
+                "TEMPLATE_PHRASE->UNCONFIRMED_NUMBER->"
+                "TEMPLATE_PHRASE->UNCONFIRMED_NUMBER"
             )
             rejections = tuple(
                 session.scalars(
@@ -636,7 +811,7 @@ def test_failed_template_correction_requires_review_and_stops_retries(
                     .order_by(CoverLetterRejectionModel.sequence_number)
                 )
             )
-            assert len(rejections) == 2
+            assert len(rejections) == 4
             assert rejections[0].text == _letter_with_template_phrase()
             assert rejections[0].reason_code == "TEMPLATE_PHRASE"
             assert rejections[0].rejected_fragment is not None
@@ -645,6 +820,8 @@ def test_failed_template_correction_requires_review_and_stops_retries(
             assert rejections[1].reason_code == "UNCONFIRMED_NUMBER"
             assert rejections[1].rejected_fragment is not None
             assert "5 лет опыта" in rejections[1].rejected_fragment
+            assert rejections[2].reason_code == "TEMPLATE_PHRASE"
+            assert rejections[3].reason_code == "UNCONFIRMED_NUMBER"
             assert task is not None
             assert task.state is TaskState.REVIEW_REQUIRED
             assert task.last_error_code == "COVER_LETTER_RETRY_FAILED"
@@ -657,8 +834,8 @@ def test_failed_template_correction_requires_review_and_stops_retries(
             assert repeated.generated == 0
             assert repeated.failed == 0
             assert repeated.items == ()
-            assert len(model.prompts) == 2
-            assert len(model.responses) == 1
+            assert len(model.prompts) == 4
+            assert model.responses == []
     finally:
         database.close()
 
@@ -688,7 +865,60 @@ def test_related_publication_is_not_prepared_twice(settings: Settings) -> None:
         database.close()
 
 
-def test_unrelated_near_duplicate_is_rejected_after_one_correction(
+def test_prepare_prioritizes_match_score_before_publication_date(settings: Settings) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    model = FakeModel([_letter()])
+    try:
+        with database.sessions.begin() as session:
+            account_id, direction_id, _, _ = _prepare_data(session)
+            fresh_vacancy = VacancyRepository(session).upsert(
+                VacancyData(
+                    hh_id="letter-fresh-low-score",
+                    title="Python-разработчик",
+                    source_url="https://hh.ru/vacancy/letter-fresh-low-score",
+                    employer_name="Другая компания",
+                    published_at=datetime(2026, 7, 23, tzinfo=UTC),
+                    description="Разработка сервисов на Python и FastAPI.",
+                    responsibilities="Развивать серверную часть.",
+                    required_qualifications="Python, FastAPI.",
+                    key_skills=("Python", "FastAPI"),
+                    details_fetched_at=datetime(2026, 7, 23, tzinfo=UTC),
+                )
+            )
+            directions = DirectionRepository(session)
+            directions.track_vacancy(direction_id, fresh_vacancy.id)
+            directions.apply_rules(
+                direction_id,
+                fresh_vacancy.id,
+                state=VacancyState.ANALYZED,
+                score=25,
+                details={
+                    "category": "MATCH",
+                    "accepted": True,
+                    "reasons": ["подходит по Python"],
+                },
+                rules_version=RULES_VERSION,
+            )
+            ApplicationAutomationService(session).prepare_for_account_id(
+                account_id=account_id,
+                direction_name="Python backend",
+                include_stretch=True,
+            )
+
+            result = CoverLetterService(session, model).prepare(
+                account_id=account_id,
+                direction_name="Python backend",
+                limit=1,
+            )
+
+            assert result.generated == 1
+            assert result.items[0].hh_id == "letter-1"
+    finally:
+        database.close()
+
+
+def test_unrelated_near_duplicate_is_rejected_after_all_corrections(
     settings: Settings,
 ) -> None:
     upgrade_database(settings)
@@ -696,6 +926,8 @@ def test_unrelated_near_duplicate_is_rejected_after_one_correction(
     model = FakeModel(
         [
             _letter(),
+            _letter().replace("Буду рад", "Готов"),
+            _letter().replace("Буду рад", "Готов"),
             _letter().replace("Буду рад", "Готов"),
             _letter().replace("Буду рад", "Готов"),
         ]
@@ -773,11 +1005,12 @@ def test_unrelated_near_duplicate_is_rejected_after_one_correction(
                 .where(VacancyModel.hh_id == "letter-unrelated")
             )
             assert failed_letter is not None
-            assert (
-                failed_letter.failure_reason
-                == "COVER_LETTER_RETRY_FAILED:NEAR_DUPLICATE_TEXT->NEAR_DUPLICATE_TEXT"
+            assert failed_letter.failure_reason == (
+                "COVER_LETTER_RETRY_FAILED:"
+                "NEAR_DUPLICATE_TEXT->NEAR_DUPLICATE_TEXT->"
+                "NEAR_DUPLICATE_TEXT->NEAR_DUPLICATE_TEXT"
             )
-            assert len(model.prompts) == 3
+            assert len(model.prompts) == 5
     finally:
         database.close()
 
@@ -1283,6 +1516,14 @@ def test_unchanged_manual_failure_does_not_block_next_vacancy(
             "взаимодействие с базой данных через SQLAlchemy. Также реализовывал прикладную "
             "логику и обработку ошибок. Готов подробно обсудить выполненные проекты "
             "и подход к проверке результата.",
+            "UNCONFIRMED_CLAIM",
+        ),
+        (
+            "Здравствуйте!\n\nРазрабатывал серверные приложения на Python и FastAPI, работал "
+            "с PostgreSQL и настраивал автоматические проверки. Сервис спроектирован для "
+            "асинхронной обработки и задач высоконагруженных систем. Также реализовывал "
+            "прикладную логику и обработку ошибок. Готов подробно обсудить выполненные "
+            "проекты и подход к проверке результата.",
             "UNCONFIRMED_CLAIM",
         ),
         (
@@ -1812,6 +2053,64 @@ Python backend-разработчик
     assert "производственные данные" not in excerpt
 
 
+def test_compact_work_history_keeps_each_line_as_separate_source() -> None:
+    content = (
+        "Декабрь 2022 — июнь 2025: Газпромнефть; применял Python к данным.\n"
+        "Август 2025 — декабрь 2025: Яндекс Крауд; работал с YT и YQL.\n"
+        "Январь 2026 — август 2026: проект CartCase; руководил серверной разработкой, "
+        "планировал задачи, проверял изменения и разрабатывал сервис на FastAPI, "
+        "PostgreSQL и Redis."
+    )
+
+    excerpt = _work_experience_excerpt(
+        content,
+        {"python", "fastapi", "postgresql", "redis"},
+        3000,
+        priority_tokens={"python", "backend"},
+    )
+
+    assert '<experience_item type="ROLE" label="Опыт работы">' in excerpt
+    assert "планировал задачи" in excerpt
+    assert "FastAPI" in excerpt
+    assert "PostgreSQL и Redis" in excerpt
+    assert "Яндекс Крауд" not in excerpt
+
+
+def test_conservative_letter_uses_only_separate_confirmed_items() -> None:
+    vacancy = _vacancy()
+    vacancy.title = "Python-разработчик AI/LLM"
+    vacancy.description = "Доработка Python-сервисов для обработки данных."
+    facts = (
+        _SelectedFact(
+                1,
+                "work_experience",
+                (
+                    '<experience_item type="ROLE" label="Опыт работы">\n'
+                    "Январь 2026 — август 2026: проект CartCase, серверная разработка; "
+                    "руководил работой серверной команды, планировал задачи, проверял "
+                    "изменения и разрабатывал сервис на FastAPI, PostgreSQL и Redis.\n"
+                "</experience_item>\n"
+                '<experience_item type="ROLE" label="Опыт работы">\n'
+                "Декабрь 2022 — июнь 2025: Газпромнефть; применял Python к "
+                "производственным данным и самостоятельно разработал SmartPVD.\n"
+                "</experience_item>"
+            ),
+            "user",
+        ),
+    )
+
+    text = _conservative_cover_letter(vacancy, facts)
+
+    assert f"Откликаюсь на вакансию «{vacancy.title}»." in text
+    assert "Газпромнефть" not in text
+    assert "асинхрон" not in text.casefold()
+    assert "высоконагруж" not in text.casefold()
+    assert "В проекте CartCase занимался серверной разработкой:" in text
+    assert "планировал задачи" in text
+    assert "самостоятельно разработал SmartPVD" in text
+    validate_cover_letter(text, vacancy, facts)
+
+
 def test_work_experience_context_prefers_new_llm_evidence_over_repeated_python() -> None:
     content = """PointPulse
 Python backend-разработчик
@@ -1868,6 +2167,17 @@ def test_future_technology_is_removed_from_letter_context() -> None:
     assert "Kafka" not in cleaned
     assert "Python" in cleaned
     assert "FastAPI" in cleaned
+
+
+def test_completed_planning_work_is_not_removed_from_letter_context() -> None:
+    content = """Январь 2026 — август 2026: проект CartCase, серверная разработка;
+руководил работой серверной команды, планировал задачи, проверял изменения
+и разрабатывал сервис на FastAPI, PostgreSQL и Redis."""
+
+    cleaned = _without_future_plans(content)
+
+    assert "планировал задачи" in cleaned
+    assert "FastAPI, PostgreSQL и Redis" in cleaned
 
 
 def test_irrelevant_cloud_details_are_rejected() -> None:
