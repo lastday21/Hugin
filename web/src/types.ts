@@ -107,10 +107,14 @@ export interface ProfileFact {
   id: number;
   category: string;
   content: string;
+  source_type: string;
+  source_reference: string | null;
   state: "PENDING" | "CONFIRMED" | "REJECTED";
   allow_in_letters: boolean;
   allow_in_forms: boolean;
   allow_in_messages: boolean;
+  created_at: string;
+  updated_at: string;
 }
 
 export interface ProfileQuestion {
@@ -205,6 +209,7 @@ export interface RejectedVacancy {
   direction: string;
   score: number | null;
   reasons: string[];
+  decision_reasons: string[];
 }
 
 export interface SentApplication {

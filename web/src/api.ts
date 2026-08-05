@@ -71,8 +71,8 @@ export async function loadWorkspace(): Promise<{
     request<Profile>(`/api/profile?account_id=${ACCOUNT_ID}`),
     request<QueueItem[]>(`/api/queue?account_id=${ACCOUNT_ID}`),
     request<FormDraft[]>(`/api/forms?account_id=${ACCOUNT_ID}`),
-    request<RejectedVacancy[]>(`/api/rejected?account_id=${ACCOUNT_ID}`),
-    request<SentApplication[]>(`/api/sent?account_id=${ACCOUNT_ID}`),
+    request<RejectedVacancy[]>(`/api/rejected?account_id=${ACCOUNT_ID}&limit=1000`),
+    request<SentApplication[]>(`/api/sent?account_id=${ACCOUNT_ID}&limit=1000`),
     request<Communications>(`/api/communications?account_id=${ACCOUNT_ID}`),
   ]);
   return {
@@ -199,6 +199,23 @@ export async function reviewProfileFact(
       body: action === "confirm" ? JSON.stringify(permissions) : undefined,
     },
   );
+}
+
+export async function correctProfileFact(
+  factId: number,
+  content: string,
+  permissions: {
+    allow_in_letters: boolean;
+    allow_in_forms: boolean;
+    allow_in_messages: boolean;
+  },
+): Promise<Profile> {
+  const session = await request<{ key: string }>("/api/session");
+  return request<Profile>(`/api/profile/facts/${factId}?account_id=${ACCOUNT_ID}`, {
+    method: "PUT",
+    headers: { "X-Hugin-Session": session.key },
+    body: JSON.stringify({ content, ...permissions }),
+  });
 }
 
 export async function saveProfileAnswer(key: string, answer: string): Promise<Profile> {

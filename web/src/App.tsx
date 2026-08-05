@@ -38,6 +38,7 @@ import {
 import {
   changeQueueState,
   changeSearchState,
+  correctProfileFact,
   dismissProfileQuestion,
   importResume,
   loadCommunications,
@@ -102,6 +103,7 @@ type View =
   | "settings";
 type VacancyTab = "queue" | "sent" | "rejected";
 type AttentionTab = "input" | "review";
+type CommunicationsTab = "messages" | "invitations";
 type Toast = { kind: "success" | "error"; message: string };
 
 interface Workspace {
@@ -311,6 +313,13 @@ function useDialog(
 
 export default function App() {
   const [view, setView] = useState<View>("dashboard");
+  const [vacancyTab, setVacancyTab] = useState<VacancyTab>("queue");
+  const [attentionTab, setAttentionTab] = useState<AttentionTab>("input");
+  const [communicationsTab, setCommunicationsTab] =
+    useState<CommunicationsTab>("messages");
+  const [selectedConversationId, setSelectedConversationId] = useState<number | null>(
+    null,
+  );
   const [workspace, setWorkspace] = useState<Workspace | null>(null);
   const [initialLoading, setInitialLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -501,7 +510,19 @@ export default function App() {
                 className={view === item.id ? "nav-item active" : "nav-item"}
                 aria-label={item.label}
                 aria-current={view === item.id ? "page" : undefined}
-                onClick={() => setView(item.id)}
+                onClick={() => {
+                  if (item.id === "attention" && view !== "attention" && workspace) {
+                    const hasInput = workspace.forms.some(
+                      (form) => form.state === "INPUT_REQUIRED",
+                    );
+                    const hasReview = workspace.forms.some(
+                      (form) => form.state === "REVIEW_REQUIRED",
+                    );
+                    if (!hasInput && hasReview) setAttentionTab("review");
+                    else if (!hasReview && hasInput) setAttentionTab("input");
+                  }
+                  setView(item.id);
+                }}
               >
                 <Icon size={20} aria-hidden="true" />
                 <span>{item.label}</span>
@@ -586,8 +607,14 @@ export default function App() {
                   workspace={workspace}
                   widgets={widgets}
                   onOpenVacancy={openVacancy}
-                  onOpenAttention={() => setView("attention")}
-                  onOpenVacancies={() => setView("vacancies")}
+                  onOpenAttention={(tab) => {
+                    setAttentionTab(tab);
+                    setView("attention");
+                  }}
+                  onOpenVacancies={() => {
+                    setVacancyTab("queue");
+                    setView("vacancies");
+                  }}
                   onOpenPreferences={() => setPreferencesOpen(true)}
                   onRefresh={() => void refresh(false)}
                   onToast={showToast}
@@ -598,17 +625,28 @@ export default function App() {
                   queue={workspace.queue}
                   sent={workspace.sent}
                   rejected={workspace.rejected}
+                  tab={vacancyTab}
+                  onTabChanged={setVacancyTab}
                   loading={vacancyLoading}
                   onOpenVacancy={openVacancy}
                   onReconcile={reconcileUnknown}
                 />
               )}
               {view === "attention" && (
-                <AttentionView forms={workspace.forms} onToast={showToast} />
+                <AttentionView
+                  forms={workspace.forms}
+                  tab={attentionTab}
+                  onTabChanged={setAttentionTab}
+                  onToast={showToast}
+                />
               )}
               {view === "communications" && (
                 <CommunicationsView
                   communications={workspace.communications}
+                  tab={communicationsTab}
+                  onTabChanged={setCommunicationsTab}
+                  selectedApplicationId={selectedConversationId}
+                  onSelectedApplicationChanged={setSelectedConversationId}
                   onChanged={(communications) =>
                     setWorkspace((current) =>
                       current ? { ...current, communications } : current,
@@ -724,7 +762,7 @@ function DashboardView({
   workspace: Workspace;
   widgets: DashboardWidget[];
   onOpenVacancy: (vacancyId: string) => Promise<void>;
-  onOpenAttention: () => void;
+  onOpenAttention: (tab: AttentionTab) => void;
   onOpenVacancies: () => void;
   onOpenPreferences: () => void;
   onRefresh: () => void;
@@ -1010,7 +1048,7 @@ function AttentionWidget({
   onOpen,
 }: {
   forms: FormDraft[];
-  onOpen: () => void;
+  onOpen: (tab: AttentionTab) => void;
 }) {
   const inputCount = forms.filter((form) => form.state === "INPUT_REQUIRED").length;
   const reviewCount = forms.filter((form) => form.state === "REVIEW_REQUIRED").length;
@@ -1029,7 +1067,11 @@ function AttentionWidget({
       {forms.length ? (
         <div className="attention-summary">
           {inputCount > 0 && (
-            <button type="button" className="attention-link" onClick={onOpen}>
+            <button
+              type="button"
+              className="attention-link"
+              onClick={() => onOpen("input")}
+            >
               <span>
                 <strong>{plural(inputCount, "анкета", "анкеты", "анкет")}</strong>
                 <small>нужно заполнить</small>
@@ -1038,7 +1080,11 @@ function AttentionWidget({
             </button>
           )}
           {reviewCount > 0 && (
-            <button type="button" className="attention-link" onClick={onOpen}>
+            <button
+              type="button"
+              className="attention-link"
+              onClick={() => onOpen("review")}
+            >
               <span>
                 <strong>{plural(reviewCount, "анкета", "анкеты", "анкет")}</strong>
                 <small>нужно проверить</small>
@@ -1185,6 +1231,8 @@ function VacanciesView({
   queue,
   sent,
   rejected,
+  tab,
+  onTabChanged,
   loading,
   onOpenVacancy,
   onReconcile,
@@ -1192,11 +1240,12 @@ function VacanciesView({
   queue: QueueItem[];
   sent: SentApplication[];
   rejected: RejectedVacancy[];
+  tab: VacancyTab;
+  onTabChanged: (tab: VacancyTab) => void;
   loading: boolean;
   onOpenVacancy: (vacancyId: string) => Promise<void>;
   onReconcile: (taskId: number, status: "APPLIED" | "NOT_FOUND") => Promise<void>;
 }) {
-  const [tab, setTab] = useState<VacancyTab>("queue");
   const [search, setSearch] = useState("");
   const [reconcilingTask, setReconcilingTask] = useState<number | null>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
@@ -1246,7 +1295,7 @@ function VacanciesView({
           : event.key === "ArrowRight"
             ? tabs[(currentIndex + 1) % tabs.length]
             : tabs[(currentIndex - 1 + tabs.length) % tabs.length];
-    setTab(nextTab);
+    onTabChanged(nextTab);
     const tabRefs: Record<VacancyTab, RefObject<HTMLButtonElement | null>> = {
       queue: queueTabRef,
       sent: sentTabRef,
@@ -1282,7 +1331,7 @@ function VacanciesView({
             aria-controls="queue-panel"
             tabIndex={tab === "queue" ? 0 : -1}
             className={tab === "queue" ? "active" : undefined}
-            onClick={() => setTab("queue")}
+            onClick={() => onTabChanged("queue")}
             onKeyDown={onTabKeyDown}
           >
             В очереди <span>{queue.length}</span>
@@ -1296,7 +1345,7 @@ function VacanciesView({
             aria-controls="sent-panel"
             tabIndex={tab === "sent" ? 0 : -1}
             className={tab === "sent" ? "active" : undefined}
-            onClick={() => setTab("sent")}
+            onClick={() => onTabChanged("sent")}
             onKeyDown={onTabKeyDown}
           >
             Отправлены <span>{sent.length}</span>
@@ -1310,7 +1359,7 @@ function VacanciesView({
             aria-controls="rejected-panel"
             tabIndex={tab === "rejected" ? 0 : -1}
             className={tab === "rejected" ? "active" : undefined}
-            onClick={() => setTab("rejected")}
+            onClick={() => onTabChanged("rejected")}
             onKeyDown={onTabKeyDown}
           >
             Не подошли <span>{rejected.length}</span>
@@ -1460,7 +1509,7 @@ function VacanciesView({
           {filteredRejected.length ? (
             <ul className="vacancy-list">
               {filteredRejected.map((item) => {
-                const reason = visibleReasons(item.reasons)[0];
+                const reason = visibleReasons(item.decision_reasons)[0];
                 return (
                   <li
                     className="vacancy-row rejected"
@@ -1533,12 +1582,15 @@ function SearchEmpty({
 
 function AttentionView({
   forms,
+  tab,
+  onTabChanged,
   onToast,
 }: {
   forms: FormDraft[];
+  tab: AttentionTab;
+  onTabChanged: (tab: AttentionTab) => void;
   onToast: (toast: Toast) => void;
 }) {
-  const [tab, setTab] = useState<AttentionTab>("input");
   const [busyForm, setBusyForm] = useState<number | null>(null);
   const inputTabRef = useRef<HTMLButtonElement>(null);
   const reviewTabRef = useRef<HTMLButtonElement>(null);
@@ -1557,7 +1609,7 @@ function AttentionView({
           : tab === "input"
             ? "review"
             : "input";
-    setTab(nextTab);
+    onTabChanged(nextTab);
     window.requestAnimationFrame(() =>
       (nextTab === "input" ? inputTabRef : reviewTabRef).current?.focus(),
     );
@@ -1601,7 +1653,7 @@ function AttentionView({
           aria-controls="input-panel"
           tabIndex={tab === "input" ? 0 : -1}
           className={tab === "input" ? "active" : undefined}
-          onClick={() => setTab("input")}
+          onClick={() => onTabChanged("input")}
           onKeyDown={onTabKeyDown}
         >
           Нужно заполнить <span>{inputForms.length}</span>
@@ -1615,7 +1667,7 @@ function AttentionView({
           aria-controls="review-panel"
           tabIndex={tab === "review" ? 0 : -1}
           className={tab === "review" ? "active" : undefined}
-          onClick={() => setTab("review")}
+          onClick={() => onTabChanged("review")}
           onKeyDown={onTabKeyDown}
         >
           Нужно проверить <span>{reviewForms.length}</span>
@@ -1692,17 +1744,21 @@ function AttentionView({
 
 function CommunicationsView({
   communications,
+  tab,
+  onTabChanged,
+  selectedApplicationId,
+  onSelectedApplicationChanged,
   onChanged,
   onToast,
 }: {
   communications: Communications;
+  tab: CommunicationsTab;
+  onTabChanged: (tab: CommunicationsTab) => void;
+  selectedApplicationId: number | null;
+  onSelectedApplicationChanged: (applicationId: number | null) => void;
   onChanged: (communications: Communications) => void;
   onToast: (toast: Toast) => void;
 }) {
-  const [tab, setTab] = useState<"messages" | "invitations">("messages");
-  const [selectedApplicationId, setSelectedApplicationId] = useState<number | null>(
-    communications.conversations[0]?.application_id ?? null,
-  );
   const [draft, setDraft] = useState("");
   const [replyMode, setReplyMode] = useState<"manual" | "ai">("manual");
   const [busy, setBusy] = useState(false);
@@ -1716,10 +1772,19 @@ function CommunicationsView({
   );
 
   useEffect(() => {
-    if (!selectedApplicationId && communications.conversations[0]) {
-      setSelectedApplicationId(communications.conversations[0].application_id);
+    const selectionExists = communications.conversations.some(
+      (conversation) => conversation.application_id === selectedApplicationId,
+    );
+    if (!selectionExists) {
+      onSelectedApplicationChanged(
+        communications.conversations[0]?.application_id ?? null,
+      );
     }
-  }, [communications.conversations, selectedApplicationId]);
+  }, [
+    communications.conversations,
+    onSelectedApplicationChanged,
+    selectedApplicationId,
+  ]);
 
   useEffect(() => {
     setDraft(reply?.body ?? "");
@@ -1727,7 +1792,7 @@ function CommunicationsView({
   }, [reply?.body, reply?.id, selectedApplicationId]);
 
   async function selectConversation(conversation: Conversation): Promise<void> {
-    setSelectedApplicationId(conversation.application_id);
+    onSelectedApplicationChanged(conversation.application_id);
     if (!conversation.unread_count) return;
     try {
       onChanged(await markConversationRead(conversation.application_id));
@@ -1874,7 +1939,7 @@ function CommunicationsView({
             aria-selected={tab === "messages"}
             aria-controls="messages-panel"
             className={tab === "messages" ? "active" : undefined}
-            onClick={() => setTab("messages")}
+            onClick={() => onTabChanged("messages")}
           >
             Сообщения <span>{communications.unread_messages}</span>
           </button>
@@ -1885,7 +1950,7 @@ function CommunicationsView({
             aria-selected={tab === "invitations"}
             aria-controls="invitations-panel"
             className={tab === "invitations" ? "active" : undefined}
-            onClick={() => setTab("invitations")}
+            onClick={() => onTabChanged("invitations")}
           >
             Приглашения <span>{communications.unseen_invitations}</span>
           </button>
@@ -2001,7 +2066,7 @@ function CommunicationsView({
                         <textarea
                           id="reply-draft"
                           value={draft}
-                          rows={6}
+                          rows={4}
                           maxLength={5000}
                           placeholder="Введите ответ работодателю"
                           onChange={(event) => setDraft(event.target.value)}
@@ -2186,6 +2251,21 @@ function profileCategoryName(category: string): string {
   return profileCategoryNames[category] ?? category.replaceAll("_", " ");
 }
 
+function profileFactSource(fact: ProfileFact): string {
+  if (fact.source_type === "hh_live") return "Получено с hh.ru";
+  if (fact.source_type === "resume") return "Из импортированного резюме";
+  if (fact.source_reference?.startsWith("profile-fact:")) return "Исправлено вами";
+  return "Введено вами";
+}
+
+function profileFactUsage(fact: ProfileFact): string[] {
+  const values: string[] = [];
+  if (fact.allow_in_letters) values.push("письма");
+  if (fact.allow_in_forms) values.push("анкеты");
+  if (fact.allow_in_messages) values.push("сообщения");
+  return values;
+}
+
 function formatFileSize(value: number | null): string {
   if (value === null) return "Размер не указан";
   if (value < 1024 * 1024) return `${Math.max(1, Math.round(value / 1024))} КБ`;
@@ -2343,8 +2423,8 @@ function ProfileView({
             {profile.active_resume && (
               <p className="settings-warning">
                 <AlertTriangle size={18} aria-hidden="true" />
-                Ранее подтверждённые сведения сохранятся. После импорта проверьте список и
-                отклоните устаревшие данные вручную.
+                Новые формулировки появятся на проверке. Когда вы подтвердите новую
+                версию, предыдущая перестанет использоваться, но останется в истории.
               </p>
             )}
             <div className="settings-form-actions">
@@ -2399,29 +2479,47 @@ function ProfileView({
         ) : (
           <div className="calm-state">Все новые сведения проверены</div>
         )}
-        {(confirmedFacts.length > 0 || rejectedFacts.length > 0) && (
+        {confirmedFacts.length > 0 && (
+          <div className="profile-current-facts">
+            <div className="profile-subheading">
+              <div>
+                <h3>Действующие сведения</h3>
+                <p>Только эти версии могут использоваться в новых действиях Hugin.</p>
+              </div>
+              <span className="count-badge">
+                {plural(confirmedFacts.length, "сведение", "сведения", "сведений")}
+              </span>
+            </div>
+            <div className="profile-reviewed-grid">
+              {confirmedFacts.map((fact) => (
+                <ProfileFactEditor
+                  key={fact.id}
+                  fact={fact}
+                  permissionTemplate={fact}
+                  onProfileChanged={onProfileChanged}
+                  onToast={onToast}
+                />
+              ))}
+            </div>
+          </div>
+        )}
+        {rejectedFacts.length > 0 && (
           <details className="profile-history-details">
             <summary>
-              <span>
-                Проверено: {confirmedFacts.length} · отклонено: {rejectedFacts.length}
-              </span>
+              <span>История изменений · {rejectedFacts.length}</span>
               <ChevronDown size={18} aria-hidden="true" />
             </summary>
             <div className="profile-reviewed-grid">
-              {[...confirmedFacts, ...rejectedFacts].map((fact) => (
-                <article key={fact.id}>
-                  <div>
-                    <strong>{profileCategoryName(fact.category)}</strong>
-                    <span
-                      className={`status-pill ${
-                        fact.state === "CONFIRMED" ? "positive" : "muted"
-                      }`}
-                    >
-                      {fact.state === "CONFIRMED" ? "Подтверждено" : "Отклонено"}
-                    </span>
-                  </div>
-                  <p>{fact.content}</p>
-                </article>
+              {[...rejectedFacts].reverse().map((fact) => (
+                <ProfileFactEditor
+                  key={fact.id}
+                  fact={fact}
+                  permissionTemplate={confirmedFacts.find(
+                    (current) => current.category === fact.category,
+                  )}
+                  onProfileChanged={onProfileChanged}
+                  onToast={onToast}
+                />
               ))}
             </div>
           </details>
@@ -2577,6 +2675,226 @@ function ProfileFactReview({
           {busy === "reject" ? "Отклоняем…" : "Отклонить"}
         </button>
       </div>
+    </article>
+  );
+}
+
+function ProfileFactEditor({
+  fact,
+  permissionTemplate,
+  onProfileChanged,
+  onToast,
+}: {
+  fact: ProfileFact;
+  permissionTemplate?: ProfileFact;
+  onProfileChanged: (profile: Profile) => void;
+  onToast: (toast: Toast) => void;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [content, setContent] = useState(fact.content);
+  const [allowLetters, setAllowLetters] = useState(fact.allow_in_letters);
+  const [allowForms, setAllowForms] = useState(fact.allow_in_forms);
+  const [allowMessages, setAllowMessages] = useState(fact.allow_in_messages);
+  const [busy, setBusy] = useState<"save" | "reject" | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const usage = profileFactUsage(fact);
+
+  function beginEditing(): void {
+    const permissions = usage.length ? fact : permissionTemplate;
+    setContent(fact.content);
+    setAllowLetters(permissions?.allow_in_letters ?? false);
+    setAllowForms(permissions?.allow_in_forms ?? false);
+    setAllowMessages(permissions?.allow_in_messages ?? false);
+    setError(null);
+    setEditing(true);
+  }
+
+  function cancelEditing(): void {
+    setEditing(false);
+    setError(null);
+  }
+
+  async function save(): Promise<void> {
+    if (busy) return;
+    if (!content.trim()) {
+      setError("Текст сведения не может быть пустым");
+      return;
+    }
+    setBusy("save");
+    setError(null);
+    try {
+      onProfileChanged(
+        await correctProfileFact(fact.id, content.trim(), {
+          allow_in_letters: allowLetters,
+          allow_in_forms: allowForms,
+          allow_in_messages: allowMessages,
+        }),
+      );
+      setEditing(false);
+      onToast({
+        kind: "success",
+        message:
+          fact.state === "REJECTED"
+            ? "Исправленная версия стала действующей"
+            : "Сведение обновлено",
+      });
+    } catch (reason) {
+      setError(readableError(reason));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function reject(): Promise<void> {
+    if (
+      busy ||
+      !window.confirm(
+        `Перестать использовать «${profileCategoryName(fact.category)}» в новых действиях? История сохранится.`,
+      )
+    ) {
+      return;
+    }
+    setBusy("reject");
+    setError(null);
+    try {
+      onProfileChanged(await reviewProfileFact(fact.id, "reject"));
+      onToast({ kind: "success", message: "Сведение больше не используется" });
+    } catch (reason) {
+      setError(readableError(reason));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  return (
+    <article
+      className={
+        fact.state === "CONFIRMED"
+          ? "profile-reviewed-fact active"
+          : "profile-reviewed-fact archived"
+      }
+    >
+      <div className="profile-fact-heading">
+        <strong>{profileCategoryName(fact.category)}</strong>
+        <span
+          className={`status-pill ${
+            fact.state === "CONFIRMED" ? "positive" : "muted"
+          }`}
+        >
+          {fact.state === "CONFIRMED" ? "Действует" : "Не используется"}
+        </span>
+      </div>
+
+      {editing ? (
+        <>
+          <label className="profile-fact-edit-field">
+            <span>Формулировка</span>
+            <textarea
+              rows={Math.min(fact.category === "work_experience" ? 12 : 7, 14)}
+              maxLength={20_000}
+              value={content}
+              onChange={(event) => setContent(event.target.value)}
+            />
+          </label>
+          <fieldset>
+            <legend>Где Hugin может использовать эту версию</legend>
+            <div>
+              <label>
+                <input
+                  type="checkbox"
+                  checked={allowLetters}
+                  onChange={(event) => setAllowLetters(event.target.checked)}
+                />
+                <span>В письмах</span>
+              </label>
+              <label>
+                <input
+                  type="checkbox"
+                  checked={allowForms}
+                  onChange={(event) => setAllowForms(event.target.checked)}
+                />
+                <span>В анкетах</span>
+              </label>
+              <label>
+                <input
+                  type="checkbox"
+                  checked={allowMessages}
+                  onChange={(event) => setAllowMessages(event.target.checked)}
+                />
+                <span>В сообщениях</span>
+              </label>
+            </div>
+          </fieldset>
+          {!allowLetters && !allowForms && !allowMessages && (
+            <p className="profile-usage-warning">
+              Версия сохранится, но не будет автоматически подставляться.
+            </p>
+          )}
+          {error && (
+            <p className="settings-submit-error" role="alert">
+              {error}
+            </p>
+          )}
+          <div className="profile-review-actions">
+            <button
+              type="button"
+              className="primary-button"
+              disabled={busy !== null}
+              onClick={() => void save()}
+            >
+              {busy === "save" ? "Сохраняем…" : "Сохранить как действующее"}
+            </button>
+            <button
+              type="button"
+              className="secondary-button"
+              disabled={busy !== null}
+              onClick={cancelEditing}
+            >
+              Отменить
+            </button>
+          </div>
+        </>
+      ) : (
+        <>
+          <p className="profile-fact-content">{fact.content}</p>
+          <div className="profile-fact-meta">
+            <span>{profileFactSource(fact)}</span>
+            <span>изменено {formatDate(fact.updated_at, true)}</span>
+          </div>
+          <div className="profile-fact-usage" aria-label="Использование сведения">
+            {usage.length ? (
+              usage.map((place) => <span key={place}>{place}</span>)
+            ) : (
+              <span className="muted">нигде не используется</span>
+            )}
+          </div>
+          {error && (
+            <p className="settings-submit-error" role="alert">
+              {error}
+            </p>
+          )}
+          <div className="profile-review-actions">
+            <button
+              type="button"
+              className={fact.state === "CONFIRMED" ? "secondary-button" : "primary-button"}
+              disabled={busy !== null}
+              onClick={beginEditing}
+            >
+              {fact.state === "CONFIRMED" ? "Изменить" : "Исправить и вернуть"}
+            </button>
+            {fact.state === "CONFIRMED" && (
+              <button
+                type="button"
+                className="quiet-button"
+                disabled={busy !== null}
+                onClick={() => void reject()}
+              >
+                {busy === "reject" ? "Отключаем…" : "Не использовать"}
+              </button>
+            )}
+          </div>
+        </>
+      )}
     </article>
   );
 }
