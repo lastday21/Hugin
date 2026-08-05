@@ -8,8 +8,10 @@ import time
 import webbrowser
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager, suppress
+from dataclasses import dataclass
 from importlib import import_module
 from pathlib import Path
+from queue import Empty, Queue
 from typing import Protocol, cast
 from urllib.error import URLError
 from urllib.parse import urlsplit
@@ -42,7 +44,7 @@ from hugin.services.backups import BackupService
 from hugin.services.communications import CommunicationService, RecordingMessageSender
 from hugin.services.hh_login import HhLoginService, LoginStatus
 from hugin.services.recruiter_reply import RecruiterReplyService
-from hugin.services.screening_forms import ScreeningDraftService
+from hugin.services.screening_forms import ScreeningDraft, ScreeningDraftService
 from hugin.services.yandex_client import configured_yandex_ai_client
 from hugin.workers.applications import ApplicationWorker
 from hugin.workers.automation import AutomationWorker
@@ -108,6 +110,15 @@ def _is_safe_hh_url(value: str) -> bool:
     )
 
 
+type _FormReviewOutcome = dict[str, object] | Exception
+
+
+@dataclass(frozen=True, slots=True)
+class _FormReviewCommand:
+    draft: ScreeningDraft
+    response: Queue[_FormReviewOutcome]
+
+
 class DesktopBridge:
     def __init__(
         self,
@@ -122,15 +133,14 @@ class DesktopBridge:
         self._lock = browser_lock or threading.Lock()
         self._telegram_lock = threading.Lock()
         self._journal = journal or OperationJournal(settings.data_dir)
+        self._form_review_guard = threading.Lock()
+        self._form_review_thread: threading.Thread | None = None
+        self._form_review_commands: Queue[_FormReviewCommand | None] | None = None
 
     def open_form(self, vacancy_id: str) -> dict[str, object]:
-        def action() -> dict[str, object]:
-            with self._lock:
-                return self._open_form(vacancy_id.strip())
-
         return self._record_action(
             "screening_form.open",
-            action,
+            lambda: self._open_form(vacancy_id.strip()),
             vacancy_id=vacancy_id.strip(),
         )
 
@@ -429,6 +439,15 @@ class DesktopBridge:
         return self._result("READY", "Проверочное письмо отправлено.")
 
     def close(self) -> None:
+        with self._form_review_guard:
+            commands = self._form_review_commands
+            thread = self._form_review_thread
+            self._form_review_commands = None
+            self._form_review_thread = None
+        if commands is not None:
+            commands.put(None)
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=10)
         self._journal.record(
             "desktop",
             "bridge.lifecycle",
@@ -495,35 +514,122 @@ class DesktopBridge:
         finally:
             database.close()
 
-        with VisibleHhBrowser(
-            self._settings.browser_profile_dir(self._account_id),
-            self._settings.hh_login_url,
-            self._settings.hh_resumes_url,
-            self._settings.hh_search_url,
-            self._settings.hh_browser_timeout_ms,
-        ) as browser:
-            login = HhLoginService(WindowsCredentialStore()).authenticate(
-                self._account_id,
-                browser,
-            )
-            if not login.authenticated:
-                messages = {
-                    LoginStatus.CREDENTIALS_REQUIRED: "Сначала сохраните данные входа hh.ru",
-                    LoginStatus.CONFIRMATION_REQUIRED: "Введите код в открытом окне браузера",
-                    LoginStatus.CAPTCHA_REQUIRED: "Пройдите проверку в открытом окне браузера",
-                    LoginStatus.INVALID_CREDENTIALS: "hh.ru отклонил логин или пароль",
-                    LoginStatus.MANUAL_ACTION_REQUIRED: "Завершите вход в открытом окне браузера",
-                }
-                return self._result(login.status.value.upper(), messages[login.status])
+        return self._review_form(draft)
 
-            review = browser.open_screening_form(
-                draft.source_url,
-                expected_resume_hh_id=draft.resume_hh_id,
-                expected_resume_title=draft.resume_title,
-                expected_version_hash=draft.version_hash,
-                answers=draft.answers,
-                cover_letter=draft.cover_letter or "",
+    def _review_form(self, draft: ScreeningDraft) -> dict[str, object]:
+        response: Queue[_FormReviewOutcome] = Queue(maxsize=1)
+        command = _FormReviewCommand(draft, response)
+        with self._form_review_guard:
+            thread = self._form_review_thread
+            commands = self._form_review_commands
+            if thread is None or not thread.is_alive() or commands is None:
+                commands = Queue()
+                thread = threading.Thread(
+                    target=self._run_form_review_browser,
+                    args=(commands,),
+                    name="hugin-form-review",
+                    daemon=True,
+                )
+                self._form_review_commands = commands
+                self._form_review_thread = thread
+                commands.put(command)
+                thread.start()
+            else:
+                commands.put(command)
+        outcome = response.get()
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    def _run_form_review_browser(
+        self,
+        commands: Queue[_FormReviewCommand | None],
+    ) -> None:
+        current_thread = threading.current_thread()
+        try:
+            with (
+                self._lock,
+                VisibleHhBrowser(
+                    self._settings.browser_profile_dir(self._account_id),
+                    self._settings.hh_login_url,
+                    self._settings.hh_resumes_url,
+                    self._settings.hh_search_url,
+                    self._settings.hh_browser_timeout_ms,
+                ) as browser,
+            ):
+                while browser.is_open():
+                    try:
+                        command = commands.get(timeout=0.25)
+                    except Empty:
+                        continue
+                    if command is None:
+                        return
+                    if not browser.is_open():
+                        command.response.put(
+                            self._result(
+                                "UNAVAILABLE",
+                                "Окно hh.ru закрыто. Нажмите «Проверить ответы» ещё раз.",
+                            )
+                        )
+                        return
+                    try:
+                        result = self._prepare_form_review(command.draft, browser)
+                    except Exception as error:
+                        command.response.put(error)
+                        return
+                    command.response.put(result)
+        except Exception as error:
+            self._fail_pending_form_reviews(commands, error)
+        finally:
+            self._fail_pending_form_reviews(
+                commands,
+                RuntimeError("Окно hh.ru закрыто. Нажмите «Проверить ответы» ещё раз."),
             )
+            with self._form_review_guard:
+                if self._form_review_thread is current_thread:
+                    self._form_review_commands = None
+                    self._form_review_thread = None
+
+    @staticmethod
+    def _fail_pending_form_reviews(
+        commands: Queue[_FormReviewCommand | None],
+        error: Exception,
+    ) -> None:
+        while True:
+            try:
+                command = commands.get_nowait()
+            except Empty:
+                return
+            if command is not None:
+                command.response.put(error)
+
+    def _prepare_form_review(
+        self,
+        draft: ScreeningDraft,
+        browser: VisibleHhBrowser,
+    ) -> dict[str, object]:
+        login = HhLoginService(WindowsCredentialStore()).authenticate(
+            self._account_id,
+            browser,
+        )
+        if not login.authenticated:
+            messages = {
+                LoginStatus.CREDENTIALS_REQUIRED: "Сначала сохраните данные входа hh.ru",
+                LoginStatus.CONFIRMATION_REQUIRED: "Введите код в открытом окне браузера",
+                LoginStatus.CAPTCHA_REQUIRED: "Пройдите проверку в открытом окне браузера",
+                LoginStatus.INVALID_CREDENTIALS: "hh.ru отклонил логин или пароль",
+                LoginStatus.MANUAL_ACTION_REQUIRED: "Завершите вход в открытом окне браузера",
+            }
+            return self._result(login.status.value.upper(), messages[login.status])
+
+        review = browser.open_screening_form(
+            draft.source_url,
+            expected_resume_hh_id=draft.resume_hh_id,
+            expected_resume_title=draft.resume_title,
+            expected_version_hash=draft.version_hash,
+            answers=draft.answers,
+            cover_letter=draft.cover_letter or "",
+        )
         if review.status is HhFormReviewStatus.FORM_CHANGED and review.current_form is not None:
             database = create_database(self._settings)
             try:

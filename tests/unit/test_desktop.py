@@ -106,6 +106,9 @@ class FakeBrowser:
     def is_authenticated(self) -> bool:
         return True
 
+    def is_open(self) -> bool:
+        return not self.closed
+
     def open_screening_form(self, *_args: object, **_kwargs: object) -> HhFormReviewResult:
         return self.result
 
@@ -138,7 +141,7 @@ def prepare_bridge(
     return desktop.DesktopBridge(Settings(environment="test", data_dir=tmp_path))
 
 
-def test_bridge_opens_saved_form_without_submitting_and_closes_browser(
+def test_bridge_keeps_saved_form_open_without_submitting(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -154,10 +157,34 @@ def test_bridge_opens_saved_form_without_submitting_and_closes_browser(
         "skipped": 1,
     }
     assert second["status"] == "READY"
-    assert len(FakeBrowser.instances) == 2
+    assert len(FakeBrowser.instances) == 1
     assert all(browser.opened_login for browser in FakeBrowser.instances)
+    assert all(not browser.closed for browser in FakeBrowser.instances)
+    bridge.close()
     assert all(browser.closed for browser in FakeBrowser.instances)
     bridge.close()
+
+
+def test_bridge_restarts_browser_after_review_window_is_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    bridge = prepare_bridge(monkeypatch, tmp_path)
+
+    first = bridge.open_form("101")
+    first_browser = FakeBrowser.instances[0]
+    first_browser.closed = True
+
+    deadline = time.monotonic() + 2
+    while bridge._form_review_thread is not None and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    second = bridge.open_form("101")
+
+    assert first["status"] == "READY"
+    assert second["status"] == "READY"
+    assert len(FakeBrowser.instances) == 2
+    assert FakeBrowser.instances[1] is not first_browser
     bridge.close()
 
 
