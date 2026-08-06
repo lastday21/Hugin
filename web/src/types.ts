@@ -92,6 +92,29 @@ export interface QueueSettings {
   delay_max_seconds: number;
 }
 
+export interface ApprovedReplyTemplate {
+  key: string;
+  incoming_text: string;
+  response_text: string;
+  enabled: boolean;
+}
+
+export interface AutonomyPolicyValues {
+  auto_apply_stretch: boolean;
+  auto_submit_simple_forms: boolean;
+  auto_prepare_replies: boolean;
+  auto_send_approved_replies: boolean;
+  auto_reconcile_unknown: boolean;
+  reuse_confirmed_profile_facts: boolean;
+  mark_opened_invitations_seen: boolean;
+  mutable_fact_validity_days: number;
+  reply_templates: ApprovedReplyTemplate[];
+}
+
+export interface AutonomyPolicy extends AutonomyPolicyValues {
+  revision: number;
+}
+
 export interface ProfileResume {
   id: number;
   hh_id: string;
@@ -184,6 +207,11 @@ export interface FormQuestion {
   options: string[];
   answer: string | null;
   source: string | null;
+}
+
+export interface FormAnswerInput {
+  field_key: string;
+  answer: string;
 }
 
 export interface FormDraft {

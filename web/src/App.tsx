@@ -49,11 +49,13 @@ import {
   previewResume,
   reconcileApplication,
   reviewProfileFact,
+  saveFormAnswers,
   saveReplyDraft,
   saveProfileAnswer,
   resetAiPromptSettings,
   updateAiModelSettings,
   updateAiPromptSettings,
+  updateAutonomyPolicy,
   updateNotificationSettings,
   updateDirection,
   updateQueueSettings,
@@ -71,6 +73,9 @@ import type {
   AiModelSettings,
   AiPromptSettings,
   AiPromptValues,
+  ApprovedReplyTemplate,
+  AutonomyPolicy,
+  AutonomyPolicyValues,
   Communications,
   Conversation,
   Dashboard,
@@ -79,6 +84,7 @@ import type {
   DirectionSummary,
   EmploymentForm,
   FormDraft,
+  FormQuestion,
   NotificationSettings,
   Profile,
   ProfileFact,
@@ -108,6 +114,7 @@ type Toast = { kind: "success" | "error"; message: string };
 
 interface Workspace {
   dashboard: Dashboard;
+  autonomy: AutonomyPolicy;
   directionOptions: DirectionOptions;
   profile: Profile;
   queue: QueueItem[];
@@ -637,12 +644,25 @@ export default function App() {
                   forms={workspace.forms}
                   tab={attentionTab}
                   onTabChanged={setAttentionTab}
+                  onFormChanged={(form) =>
+                    setWorkspace((current) =>
+                      current
+                        ? {
+                            ...current,
+                            forms: current.forms.map((item) =>
+                              item.form_id === form.form_id ? form : item,
+                            ),
+                          }
+                        : current,
+                    )
+                  }
                   onToast={showToast}
                 />
               )}
               {view === "communications" && (
                 <CommunicationsView
                   communications={workspace.communications}
+                  autonomy={workspace.autonomy}
                   tab={communicationsTab}
                   onTabChanged={setCommunicationsTab}
                   selectedApplicationId={selectedConversationId}
@@ -658,6 +678,7 @@ export default function App() {
               {view === "profile" && (
                 <ProfileView
                   profile={workspace.profile}
+                  reuseConfirmedFacts={workspace.autonomy.reuse_confirmed_profile_facts}
                   onProfileChanged={applyProfile}
                   onToast={showToast}
                 />
@@ -665,6 +686,7 @@ export default function App() {
               {view === "settings" && (
                 <SettingsView
                   dashboard={workspace.dashboard}
+                  autonomy={workspace.autonomy}
                   directionOptions={workspace.directionOptions}
                   notificationSettings={workspace.communications.notification_settings}
                   aiModelSettings={workspace.communications.ai_model_settings}
@@ -673,6 +695,11 @@ export default function App() {
                   onToggleWidget={toggleWidget}
                   onResetWidgets={resetWidgets}
                   onSettingsSaved={applyQueueSettings}
+                  onAutonomySaved={(autonomy) =>
+                    setWorkspace((current) =>
+                      current ? { ...current, autonomy } : current,
+                    )
+                  }
                   onDirectionSaved={applyDirectionSettings}
                   onRefresh={() => void refresh(false)}
                   onNotificationsSaved={(communications) =>
@@ -1305,11 +1332,6 @@ function VacanciesView({
   }
 
   async function reconcile(item: QueueItem, status: "APPLIED" | "NOT_FOUND"): Promise<void> {
-    const message =
-      status === "APPLIED"
-        ? `Подтвердить, что отклик на вакансию «${item.title}» есть в истории hh.ru?`
-        : `Подтвердить, что отклика на вакансию «${item.title}» нет в истории hh.ru? Автоматического повтора не будет.`;
-    if (!window.confirm(message)) return;
     setReconcilingTask(item.task_id);
     try {
       await onReconcile(item.task_id, status);
@@ -1584,11 +1606,13 @@ function AttentionView({
   forms,
   tab,
   onTabChanged,
+  onFormChanged,
   onToast,
 }: {
   forms: FormDraft[];
   tab: AttentionTab;
   onTabChanged: (tab: AttentionTab) => void;
+  onFormChanged: (form: FormDraft) => void;
   onToast: (toast: Toast) => void;
 }) {
   const [busyForm, setBusyForm] = useState<number | null>(null);
@@ -1639,8 +1663,9 @@ function AttentionView({
       <div className="attention-intro">
         <FileQuestion size={22} aria-hidden="true" />
         <p>
-          Помощник уже подготовил доступные ответы. Проверьте только вопросы, где нужна
-          ваша информация.
+          Подтверждённые ответы подставляются автоматически. Безопасная простая анкета
+          отправится без дополнительных действий; здесь остаются только новые, изменившиеся
+          или важные вопросы.
         </p>
       </div>
       <div className="tabs" role="tablist" aria-label="Состояние анкет">
@@ -1720,9 +1745,20 @@ function AttentionView({
                         <strong>{question.question}</strong>
                         {question.is_required && <span className="required">Обязательный</span>}
                       </div>
-                      <p>{question.answer || "Ответ ещё не указан"}</p>
-                      {question.source && (
-                        <small>{sourceNames[question.source] ?? question.source}</small>
+                      {question.answer ? (
+                        <>
+                          <p>{question.answer}</p>
+                          {question.source && (
+                            <small>{sourceNames[question.source] ?? question.source}</small>
+                          )}
+                        </>
+                      ) : (
+                        <FormQuestionEditor
+                          formId={form.form_id}
+                          question={question}
+                          onFormChanged={onFormChanged}
+                          onToast={onToast}
+                        />
                       )}
                     </li>
                   ))}
@@ -1742,8 +1778,89 @@ function AttentionView({
   );
 }
 
+function FormQuestionEditor({
+  formId,
+  question,
+  onFormChanged,
+  onToast,
+}: {
+  formId: number;
+  question: FormQuestion;
+  onFormChanged: (form: FormDraft) => void;
+  onToast: (toast: Toast) => void;
+}) {
+  const [answer, setAnswer] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function save(): Promise<void> {
+    const value = answer.trim();
+    if (!value || saving) return;
+    setSaving(true);
+    setError(null);
+    try {
+      onFormChanged(
+        await saveFormAnswers(formId, [{ field_key: question.field_key, answer: value }]),
+      );
+      onToast({
+        kind: "success",
+        message: "Ответ сохранён. В следующий раз Hugin сможет подставить его сам",
+      });
+    } catch (reason) {
+      setError(readableError(reason));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className="form-answer-editor">
+      {question.options.length ? (
+        <select
+          value={answer}
+          aria-label={`Ответ на вопрос: ${question.question}`}
+          onChange={(event) => setAnswer(event.target.value)}
+        >
+          <option value="">Выберите ответ</option>
+          {question.options.map((option) => (
+            <option key={option} value={option}>
+              {option}
+            </option>
+          ))}
+        </select>
+      ) : (
+        <textarea
+          rows={2}
+          maxLength={4000}
+          value={answer}
+          aria-label={`Ответ на вопрос: ${question.question}`}
+          placeholder="Введите подтверждённый ответ"
+          onChange={(event) => setAnswer(event.target.value)}
+        />
+      )}
+      <div>
+        <span>Ответ сохранится в Hugin и будет доступен для следующих анкет.</span>
+        <button
+          type="button"
+          className="secondary-button"
+          disabled={!answer.trim() || saving}
+          onClick={() => void save()}
+        >
+          {saving ? "Сохраняем…" : "Сохранить ответ"}
+        </button>
+      </div>
+      {error && (
+        <p className="settings-submit-error" role="alert">
+          {error}
+        </p>
+      )}
+    </div>
+  );
+}
+
 function CommunicationsView({
   communications,
+  autonomy,
   tab,
   onTabChanged,
   selectedApplicationId,
@@ -1752,6 +1869,7 @@ function CommunicationsView({
   onToast,
 }: {
   communications: Communications;
+  autonomy: AutonomyPolicy;
   tab: CommunicationsTab;
   onTabChanged: (tab: CommunicationsTab) => void;
   selectedApplicationId: number | null;
@@ -1762,6 +1880,17 @@ function CommunicationsView({
   const [draft, setDraft] = useState("");
   const [replyMode, setReplyMode] = useState<"manual" | "ai">("manual");
   const [busy, setBusy] = useState(false);
+  const [autoPreparing, setAutoPreparing] = useState(false);
+  const [draftSaveState, setDraftSaveState] = useState<
+    "idle" | "saving" | "saved" | "error"
+  >("idle");
+  const selectedRef = useRef<number | null>(null);
+  const draftRef = useRef("");
+  const savedDraftRef = useRef("");
+  const draftSavingRef = useRef(false);
+  const automaticDraftAttemptsRef = useRef(new Set<string>());
+  const onChangedRef = useRef(onChanged);
+  const onToastRef = useRef(onToast);
   const selected =
     communications.conversations.find(
       (conversation) => conversation.application_id === selectedApplicationId,
@@ -1770,6 +1899,15 @@ function CommunicationsView({
   const hasIncoming = selected?.messages.some(
     (message) => message.direction === "INCOMING",
   );
+
+  useEffect(() => {
+    onChangedRef.current = onChanged;
+    onToastRef.current = onToast;
+  }, [onChanged, onToast]);
+
+  useEffect(() => {
+    draftRef.current = draft;
+  }, [draft]);
 
   useEffect(() => {
     const selectionExists = communications.conversations.some(
@@ -1787,11 +1925,143 @@ function CommunicationsView({
   ]);
 
   useEffect(() => {
-    setDraft(reply?.body ?? "");
-    setReplyMode("manual");
+    const applicationId = selected?.application_id ?? null;
+    const savedBody = reply?.body ?? "";
+    if (selectedRef.current !== applicationId) {
+      selectedRef.current = applicationId;
+      savedDraftRef.current = savedBody;
+      draftRef.current = savedBody;
+      setDraft(savedBody);
+      setDraftSaveState("idle");
+      setReplyMode("manual");
+      return;
+    }
+    if (draftRef.current.trim() === savedDraftRef.current.trim()) {
+      draftRef.current = savedBody;
+      setDraft(savedBody);
+    }
+    savedDraftRef.current = savedBody;
   }, [reply?.body, reply?.id, selectedApplicationId]);
 
+  useEffect(() => {
+    if (
+      !autonomy.auto_prepare_replies ||
+      !window.pywebview?.api ||
+      busy ||
+      autoPreparing
+    ) {
+      return;
+    }
+    const conversation = communications.conversations.find((item) => {
+      const latest = item.messages.at(-1);
+      return (
+        item.needs_reply &&
+        latest?.direction === "INCOMING" &&
+        !latestEditableReply(item)
+      );
+    });
+    const latestIncoming = conversation?.messages
+      .filter((message) => message.direction === "INCOMING")
+      .at(-1);
+    if (!conversation || !latestIncoming) return;
+    const attemptKey = `${conversation.application_id}:${latestIncoming.id}`;
+    if (automaticDraftAttemptsRef.current.has(attemptKey)) return;
+    automaticDraftAttemptsRef.current.add(attemptKey);
+    setAutoPreparing(true);
+    void window.pywebview.api
+      .generate_reply(conversation.application_id)
+      .then(async (result) => {
+        if (result.status !== "READY") throw new Error(result.message);
+        onChangedRef.current(await loadCommunications());
+        onToastRef.current({
+          kind: "success",
+          message: `Черновик для «${conversation.company}» подготовлен и сохранён`,
+        });
+      })
+      .catch((reason) => {
+        onToastRef.current({ kind: "error", message: readableError(reason) });
+      })
+      .finally(() => setAutoPreparing(false));
+  }, [
+    autoPreparing,
+    autonomy.auto_prepare_replies,
+    busy,
+    communications.conversations,
+  ]);
+
+  useEffect(() => {
+    const applicationId = selected?.application_id;
+    const value = draft.trim();
+    if (
+      !applicationId ||
+      !value ||
+      value === reply?.body ||
+      value === savedDraftRef.current ||
+      busy ||
+      autoPreparing ||
+      draftSaveState === "saving" ||
+      draftSaveState === "error"
+    ) {
+      return;
+    }
+    const timeout = window.setTimeout(() => {
+      if (draftSavingRef.current) return;
+      draftSavingRef.current = true;
+      setDraftSaveState("saving");
+      void saveReplyDraft(applicationId, value)
+        .then((updated) => {
+          savedDraftRef.current = value;
+          onChangedRef.current(updated);
+          setDraftSaveState("saved");
+        })
+        .catch((reason) => {
+          setDraftSaveState("error");
+          onToastRef.current({ kind: "error", message: readableError(reason) });
+        })
+        .finally(() => {
+          draftSavingRef.current = false;
+        });
+    }, 900);
+    return () => window.clearTimeout(timeout);
+  }, [
+    autoPreparing,
+    busy,
+    draft,
+    draftSaveState,
+    reply?.body,
+    selected?.application_id,
+  ]);
+
+  async function saveDraftNow(): Promise<boolean> {
+    const applicationId = selected?.application_id;
+    const value = draft.trim();
+    if (!applicationId || !value || value === reply?.body) return true;
+    if (draftSavingRef.current) return false;
+    draftSavingRef.current = true;
+    setDraftSaveState("saving");
+    try {
+      const updated = await saveReplyDraft(applicationId, value);
+      savedDraftRef.current = value;
+      onChanged(updated);
+      setDraftSaveState("saved");
+      return true;
+    } catch (reason) {
+      setDraftSaveState("error");
+      onToast({ kind: "error", message: readableError(reason) });
+      return false;
+    } finally {
+      draftSavingRef.current = false;
+    }
+  }
+
   async function selectConversation(conversation: Conversation): Promise<void> {
+    if (selected?.application_id !== conversation.application_id) {
+      if (draftSavingRef.current) {
+        onToast({ kind: "error", message: "Дождитесь сохранения текущего черновика" });
+        return;
+      }
+      if (!(await saveDraftNow())) return;
+    }
     onSelectedApplicationChanged(conversation.application_id);
     if (!conversation.unread_count) return;
     try {
@@ -1801,26 +2071,13 @@ function CommunicationsView({
     }
   }
 
-  async function saveDraft(): Promise<void> {
-    if (!selected || !draft.trim() || busy) return;
-    setBusy(true);
-    try {
-      onChanged(await saveReplyDraft(selected.application_id, draft.trim()));
-      onToast({ kind: "success", message: "Черновик ответа сохранён" });
-    } catch (reason) {
-      onToast({ kind: "error", message: readableError(reason) });
-    } finally {
-      setBusy(false);
-    }
-  }
-
   async function generateDraft(): Promise<void> {
     if (!selected || !hasIncoming || busy) return;
-    if (
-      draft.trim() &&
-      draft.trim() !== reply?.body &&
-      !window.confirm("Заменить несохранённый текст новым черновиком?")
-    ) {
+    if (draft.trim()) {
+      onToast({
+        kind: "error",
+        message: "Текущий текст сохранён: Hugin не будет заменять его автоматически",
+      });
       return;
     }
     if (!window.pywebview?.api) {
@@ -1851,14 +2108,7 @@ function CommunicationsView({
   }
 
   async function confirmDraft(): Promise<void> {
-    if (!reply?.content_hash || busy) return;
-    if (
-      !window.confirm(
-        "Отправить работодателю именно этот текст? После подтверждения Hugin нажмёт кнопку отправки на hh.ru один раз.",
-      )
-    ) {
-      return;
-    }
+    if (!reply?.content_hash || busy || draftSaveState === "saving") return;
     setBusy(true);
     try {
       if (reply.state !== "CONFIRMED") {
@@ -1913,7 +2163,11 @@ function CommunicationsView({
     invitationId: number,
     bookingUrl: string | null,
     sourceUrl: string,
+    alreadySeen: boolean,
   ): Promise<void> {
+    if (!alreadySeen && autonomy.mark_opened_invitations_seen) {
+      await seeInvitation(invitationId);
+    }
     if (!bookingUrl || !window.pywebview?.api) {
       await openCommunicationUrl(bookingUrl ?? sourceUrl);
       return;
@@ -1956,7 +2210,12 @@ function CommunicationsView({
           </button>
         </div>
         <p className="communications-note">
-          Ответ отправляется только после просмотра и явного подтверждения.
+          {autonomy.auto_prepare_replies
+            ? "Hugin сам готовит и сохраняет черновики. "
+            : "Автоматическая подготовка черновиков выключена. "}
+          Безопасные точные ответы могут отправляться автоматически только по
+          утверждённым вами шаблонам; новые договорённости, зарплата, даты, задания и
+          личные сведения всегда остаются на проверке.
         </p>
       </div>
 
@@ -2069,29 +2328,30 @@ function CommunicationsView({
                           rows={4}
                           maxLength={5000}
                           placeholder="Введите ответ работодателю"
-                          onChange={(event) => setDraft(event.target.value)}
+                          onChange={(event) => {
+                            setDraft(event.target.value);
+                            setDraftSaveState("idle");
+                          }}
+                          onBlur={() => void saveDraftNow()}
                         />
                         <div className="reply-actions">
                           <span>
-                            {reply?.state === "CONFIRMED"
-                              ? "Текст подтверждён и готов к отправке."
-                              : "Сохраните текст и проверьте его перед отправкой."}
+                            {draftSaveState === "saving"
+                              ? "Сохраняем изменения…"
+                              : draftSaveState === "error"
+                                ? "Не удалось сохранить изменения."
+                                : reply?.state === "CONFIRMED"
+                                  ? "Текст подтверждён и готов к отправке."
+                                  : draft.trim() && draft.trim() === reply?.body
+                                    ? "Черновик сохранён. Проверьте текст и отправьте одним действием."
+                                    : "Изменения сохраняются автоматически."}
                           </span>
-                          <button
-                            type="button"
-                            className="secondary-button"
-                            disabled={
-                              busy || !draft.trim() || draft.trim() === reply?.body
-                            }
-                            onClick={() => void saveDraft()}
-                          >
-                            Сохранить
-                          </button>
                           <button
                             type="button"
                             className="primary-button"
                             disabled={
                               busy ||
+                              draftSaveState === "saving" ||
                               !reply?.content_hash ||
                               draft.trim() !== reply.body
                             }
@@ -2106,24 +2366,29 @@ function CommunicationsView({
                     ) : (
                       <div className="reply-generation">
                         <div>
-                          <strong>Подготовить черновик по переписке</strong>
-                          <span>
-                            {hasIncoming
-                              ? "Нейросеть учтёт вакансию и только разрешённые вами подтверждённые сведения. Перед отправкой текст можно изменить."
+                            <strong>Подготовить черновик по переписке</strong>
+                            <span>
+                              {hasIncoming
+                              ? autoPreparing
+                                ? "Hugin уже готовит и сохранит черновик. Ваш текст он не перезапишет."
+                                : "Новый черновик готовится автоматически. Hugin использует только разрешённые подтверждённые сведения и не заменяет ваш текст."
                               : "Черновик можно будет подготовить после первого сообщения работодателя."}
-                          </span>
+                            </span>
                         </div>
                         <button
                           type="button"
                           className="primary-button"
-                          disabled={busy || !hasIncoming}
+                          disabled={busy || autoPreparing || !hasIncoming || !!draft.trim()}
                           onClick={() => void generateDraft()}
                         >
                           <Sparkles size={16} aria-hidden="true" />
                           {busy
+                            || autoPreparing
                             ? "Готовим…"
                             : hasIncoming
-                              ? "Подготовить черновик"
+                              ? draft.trim()
+                                ? "Черновик уже сохранён"
+                                : "Подготовить сейчас"
                               : "Пока нечего отвечать"}
                         </button>
                       </div>
@@ -2165,15 +2430,6 @@ function CommunicationsView({
                   )}
                 </div>
                 <div className="invitation-actions">
-                  {!invitation.seen_at && (
-                    <button
-                      type="button"
-                      className="secondary-button"
-                      onClick={() => void seeInvitation(invitation.id)}
-                    >
-                      Отметить просмотренным
-                    </button>
-                  )}
                   <span className={`status-pill ${stateTone(invitation.state)}`}>
                     {stateNames[invitation.state] ?? "Получено"}
                   </span>
@@ -2185,6 +2441,7 @@ function CommunicationsView({
                         invitation.id,
                         invitation.booking_url,
                         invitation.source_url,
+                        !!invitation.seen_at,
                       )
                     }
                   >
@@ -2274,10 +2531,12 @@ function formatFileSize(value: number | null): string {
 
 function ProfileView({
   profile,
+  reuseConfirmedFacts,
   onProfileChanged,
   onToast,
 }: {
   profile: Profile;
+  reuseConfirmedFacts: boolean;
   onProfileChanged: (profile: Profile) => void;
   onToast: (toast: Toast) => void;
 }) {
@@ -2285,6 +2544,11 @@ function ProfileView({
   const [preview, setPreview] = useState<ResumePreview | null>(null);
   const [previewing, setPreviewing] = useState(false);
   const [importing, setImporting] = useState(false);
+  const [batchConfirming, setBatchConfirming] = useState(false);
+  const [batchAllowLetters, setBatchAllowLetters] = useState(true);
+  const [batchAllowForms, setBatchAllowForms] = useState(true);
+  const [batchAllowMessages, setBatchAllowMessages] = useState(true);
+  const [batchError, setBatchError] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const pendingFacts = profile.facts.filter((fact) => fact.state === "PENDING");
   const confirmedFacts = profile.facts.filter((fact) => fact.state === "CONFIRMED");
@@ -2293,6 +2557,20 @@ function ProfileView({
   const dismissedQuestions = profile.questions.filter(
     (question) => question.state === "DISMISSED",
   );
+  const confirmedFactKeys = new Set(
+    confirmedFacts.map((fact) => `${fact.category}\u0000${fact.content}`),
+  );
+  const previewUnchangedFacts =
+    preview?.facts.filter((fact) =>
+      reuseConfirmedFacts &&
+      confirmedFactKeys.has(`${fact.category}\u0000${fact.content}`),
+    ) ?? [];
+  const previewNewFacts =
+    preview?.facts.filter(
+      (fact) =>
+        !reuseConfirmedFacts ||
+        !confirmedFactKeys.has(`${fact.category}\u0000${fact.content}`),
+    ) ?? [];
 
   async function chooseResume(file: File | undefined): Promise<void> {
     if (!file || previewing) return;
@@ -2317,11 +2595,49 @@ function ProfileView({
       const saved = await importResume(preview.token);
       onProfileChanged(saved);
       setPreview(null);
-      onToast({ kind: "success", message: "Резюме импортировано и ожидает проверки фактов" });
+      const pendingCount = saved.facts.filter((fact) => fact.state === "PENDING").length;
+      onToast({
+        kind: "success",
+        message: pendingCount
+          ? `Резюме импортировано: новых сведений для проверки — ${pendingCount}`
+          : "Резюме импортировано: подтверждённые сведения сохранились",
+      });
     } catch (reason) {
       setError(readableError(reason));
     } finally {
       setImporting(false);
+    }
+  }
+
+  async function confirmPendingFacts(): Promise<void> {
+    if (!pendingFacts.length || batchConfirming) return;
+    setBatchConfirming(true);
+    setBatchError(null);
+    let saved = profile;
+    let completed = 0;
+    try {
+      for (const fact of pendingFacts) {
+        saved = await reviewProfileFact(fact.id, "confirm", {
+          allow_in_letters: batchAllowLetters,
+          allow_in_forms: batchAllowForms,
+          allow_in_messages: batchAllowMessages,
+        });
+        completed += 1;
+      }
+      onProfileChanged(saved);
+      onToast({
+        kind: "success",
+        message: `${plural(completed, "сведение", "сведения", "сведений")} подтверждено`,
+      });
+    } catch (reason) {
+      if (completed) onProfileChanged(saved);
+      setBatchError(
+        completed
+          ? `Подтверждено ${completed} из ${pendingFacts.length}. ${readableError(reason)}`
+          : readableError(reason),
+      );
+    } finally {
+      setBatchConfirming(false);
     }
   }
 
@@ -2401,7 +2717,19 @@ function ProfileView({
               <span className="status-pill positive">Файл читается</span>
             </div>
             <div className="preview-counts">
-              <span>{plural(preview.facts.length, "сведение", "сведения", "сведений")}</span>
+              <span>
+                {plural(previewNewFacts.length, "новое сведение", "новых сведения", "новых сведений")}
+              </span>
+              {previewUnchangedFacts.length > 0 && (
+                <span>
+                  {plural(
+                    previewUnchangedFacts.length,
+                    "сведение сохранится",
+                    "сведения сохранятся",
+                    "сведений сохранятся",
+                  )}
+                </span>
+              )}
               <span>
                 {plural(preview.questions.length, "вопрос", "вопроса", "вопросов")} без ответа
               </span>
@@ -2412,10 +2740,16 @@ function ProfileView({
                 <ChevronDown size={18} aria-hidden="true" />
               </summary>
               <ul>
-                {preview.facts.map((fact, index) => (
+                {previewNewFacts.map((fact, index) => (
                   <li key={`${fact.category}-${index}`}>
                     <strong>{profileCategoryName(fact.category)}</strong>
                     <span>{fact.content}</span>
+                  </li>
+                ))}
+                {previewUnchangedFacts.map((fact, index) => (
+                  <li className="unchanged-preview-fact" key={`unchanged-${fact.category}-${index}`}>
+                    <strong>{profileCategoryName(fact.category)}</strong>
+                    <span>{fact.content} · уже подтверждено</span>
                   </li>
                 ))}
               </ul>
@@ -2423,8 +2757,9 @@ function ProfileView({
             {profile.active_resume && (
               <p className="settings-warning">
                 <AlertTriangle size={18} aria-hidden="true" />
-                Новые формулировки появятся на проверке. Когда вы подтвердите новую
-                версию, предыдущая перестанет использоваться, но останется в истории.
+                {reuseConfirmedFacts
+                  ? "Только новые и изменившиеся формулировки появятся на проверке. Неизменившиеся подтверждённые сведения и их разрешения сохранятся."
+                  : "После импорта все найденные сведения появятся на проверке, потому что повторное использование выключено."}
               </p>
             )}
             <div className="settings-form-actions">
@@ -2459,25 +2794,81 @@ function ProfileView({
           <div>
             <span className="eyebrow">Проверка</span>
             <h2 id="facts-title">Сведения из резюме</h2>
-            <p>Непроверенные сведения не используются в письмах, анкетах и сообщениях.</p>
+            <p>
+              {reuseConfirmedFacts
+                ? "Неизменившиеся подтверждённые сведения используются дальше. "
+                : "Повторное использование сведений выключено в настройках. "}
+              Новые можно подтвердить одним пакетом.
+            </p>
           </div>
           <span className={pendingFacts.length ? "count-badge warning" : "count-badge"}>
             {plural(pendingFacts.length, "ожидает", "ожидают", "ожидают")}
           </span>
         </div>
         {pendingFacts.length ? (
-          <div className="profile-fact-list">
-            {pendingFacts.map((fact) => (
-              <ProfileFactReview
-                key={fact.id}
-                fact={fact}
-                onProfileChanged={onProfileChanged}
-                onToast={onToast}
-              />
-            ))}
-          </div>
+          <>
+            <div className="profile-batch-review">
+              <div>
+                <strong>
+                  Подтвердить {plural(pendingFacts.length, "новое сведение", "новых сведения", "новых сведений")}
+                </strong>
+                <span>Выберите, где Hugin сможет использовать весь пакет.</span>
+              </div>
+              <fieldset disabled={batchConfirming}>
+                <legend className="visually-hidden">Области использования сведений</legend>
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={batchAllowLetters}
+                    onChange={(event) => setBatchAllowLetters(event.target.checked)}
+                  />
+                  <span>Письма</span>
+                </label>
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={batchAllowForms}
+                    onChange={(event) => setBatchAllowForms(event.target.checked)}
+                  />
+                  <span>Анкеты</span>
+                </label>
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={batchAllowMessages}
+                    onChange={(event) => setBatchAllowMessages(event.target.checked)}
+                  />
+                  <span>Сообщения</span>
+                </label>
+              </fieldset>
+              <button
+                type="button"
+                className="primary-button"
+                disabled={batchConfirming}
+                onClick={() => void confirmPendingFacts()}
+              >
+                {batchConfirming ? "Подтверждаем…" : "Подтвердить весь пакет"}
+              </button>
+            </div>
+            <div className="profile-fact-list">
+              {pendingFacts.map((fact) => (
+                <ProfileFactReview
+                  key={fact.id}
+                  fact={fact}
+                  disabled={batchConfirming}
+                  onProfileChanged={onProfileChanged}
+                  onToast={onToast}
+                />
+              ))}
+            </div>
+          </>
         ) : (
           <div className="calm-state">Все новые сведения проверены</div>
+        )}
+        {batchError && (
+          <p className="settings-submit-error" role="alert">
+            {batchError}
+          </p>
         )}
         {confirmedFacts.length > 0 && (
           <div className="profile-current-facts">
@@ -2531,7 +2922,10 @@ function ProfileView({
           <div>
             <span className="eyebrow">Частые вопросы</span>
             <h2 id="answers-title">Сохранённые ответы</h2>
-            <p>Ответ применяется только после вашего подтверждения.</p>
+            <p>
+              Подтверждённый ответ можно автоматически подставлять в безопасные простые
+              анкеты.
+            </p>
           </div>
           <span className={pendingQuestions.length ? "count-badge warning" : "count-badge"}>
             {plural(pendingQuestions.length, "без ответа", "без ответа", "без ответа")}
@@ -2575,10 +2969,12 @@ function ProfileView({
 
 function ProfileFactReview({
   fact,
+  disabled,
   onProfileChanged,
   onToast,
 }: {
   fact: ProfileFact;
+  disabled?: boolean;
   onProfileChanged: (profile: Profile) => void;
   onToast: (toast: Toast) => void;
 }) {
@@ -2589,7 +2985,7 @@ function ProfileFactReview({
   const [error, setError] = useState<string | null>(null);
 
   async function review(action: "confirm" | "reject"): Promise<void> {
-    if (busy) return;
+    if (busy || disabled) return;
     setBusy(action);
     setError(null);
     try {
@@ -2630,6 +3026,7 @@ function ProfileFactReview({
             <input
               type="checkbox"
               checked={allowLetters}
+              disabled={disabled || busy !== null}
               onChange={(event) => setAllowLetters(event.target.checked)}
             />
             <span>В письмах</span>
@@ -2638,6 +3035,7 @@ function ProfileFactReview({
             <input
               type="checkbox"
               checked={allowForms}
+              disabled={disabled || busy !== null}
               onChange={(event) => setAllowForms(event.target.checked)}
             />
             <span>В анкетах</span>
@@ -2646,6 +3044,7 @@ function ProfileFactReview({
             <input
               type="checkbox"
               checked={allowMessages}
+              disabled={disabled || busy !== null}
               onChange={(event) => setAllowMessages(event.target.checked)}
             />
             <span>В сообщениях</span>
@@ -2661,7 +3060,7 @@ function ProfileFactReview({
         <button
           type="button"
           className="primary-button"
-          disabled={busy !== null}
+          disabled={disabled || busy !== null}
           onClick={() => void review("confirm")}
         >
           {busy === "confirm" ? "Сохраняем…" : "Подтвердить"}
@@ -2669,7 +3068,7 @@ function ProfileFactReview({
         <button
           type="button"
           className="secondary-button"
-          disabled={busy !== null}
+          disabled={disabled || busy !== null}
           onClick={() => void review("reject")}
         >
           {busy === "reject" ? "Отклоняем…" : "Отклонить"}
@@ -2984,6 +3383,7 @@ function ProfileQuestionEditor({
 
 function SettingsView({
   dashboard,
+  autonomy,
   directionOptions,
   notificationSettings,
   aiModelSettings,
@@ -2992,12 +3392,14 @@ function SettingsView({
   onToggleWidget,
   onResetWidgets,
   onSettingsSaved,
+  onAutonomySaved,
   onDirectionSaved,
   onRefresh,
   onNotificationsSaved,
   onToast,
 }: {
   dashboard: Dashboard;
+  autonomy: AutonomyPolicy;
   directionOptions: DirectionOptions;
   notificationSettings: NotificationSettings;
   aiModelSettings: AiModelSettings;
@@ -3006,6 +3408,7 @@ function SettingsView({
   onToggleWidget: (widget: DashboardWidget) => void;
   onResetWidgets: () => void;
   onSettingsSaved: (settings: QueueSettings) => void;
+  onAutonomySaved: (autonomy: AutonomyPolicy) => void;
   onDirectionSaved: (direction: DirectionSummary) => void;
   onRefresh: () => void;
   onNotificationsSaved: (communications: Communications) => void;
@@ -3039,6 +3442,24 @@ function SettingsView({
         <QueueSettingsForm
           dashboard={dashboard}
           onSaved={onSettingsSaved}
+          onToast={onToast}
+        />
+      </section>
+
+      <section className="settings-card wide" aria-labelledby="autonomy-title">
+        <div className="section-heading">
+          <div>
+            <span className="eyebrow">Самостоятельная работа</span>
+            <h2 id="autonomy-title">Автономность</h2>
+            <p>
+              Разрешите Hugin выполнять безопасные повторяемые действия без лишних
+              подтверждений.
+            </p>
+          </div>
+        </div>
+        <AutonomySettingsForm
+          policy={autonomy}
+          onSaved={onAutonomySaved}
           onToast={onToast}
         />
       </section>
@@ -3113,6 +3534,369 @@ function SettingsView({
           onToast={onToast}
         />
       </section>
+    </div>
+  );
+}
+
+type AutonomyBooleanKey = Exclude<
+  keyof AutonomyPolicyValues,
+  "mutable_fact_validity_days" | "reply_templates"
+>;
+
+const autonomyOptions: {
+  key: AutonomyBooleanKey;
+  title: string;
+  description: string;
+}[] = [
+  {
+    key: "auto_apply_stretch",
+    title: "Откликаться на условно подходящие вакансии",
+    description:
+      "Hugin сначала обработает точные совпадения, затем вакансии без жёстких причин отказа.",
+  },
+  {
+    key: "auto_submit_simple_forms",
+    title: "Отправлять простые анкеты",
+    description:
+      "Только когда каждый обязательный ответ взят из подтверждённого профиля или сохранённого банка.",
+  },
+  {
+    key: "auto_prepare_replies",
+    title: "Готовить ответы работодателям",
+    description:
+      "Черновик создаётся после нового входящего сообщения и не заменяет написанный вами текст.",
+  },
+  {
+    key: "auto_send_approved_replies",
+    title: "Отправлять точные утверждённые ответы",
+    description:
+      "Автоматическая отправка разрешена только при точном совпадении сообщения с шаблоном ниже.",
+  },
+  {
+    key: "auto_reconcile_unknown",
+    title: "Самостоятельно сверять неопределённые результаты",
+    description:
+      "Hugin проверит историю hh.ru и продолжит остальные задачи, не повторяя спорное действие.",
+  },
+  {
+    key: "reuse_confirmed_profile_facts",
+    title: "Повторно использовать неизменившиеся сведения",
+    description:
+      "Уже подтверждённый неизменившийся факт сохраняет разрешённые области использования.",
+  },
+  {
+    key: "mark_opened_invitations_seen",
+    title: "Отмечать открытые приглашения просмотренными",
+    description:
+      "Открытие приглашения убирает счётчик, но не подтверждает встречу и не выбирает время.",
+  },
+];
+
+function autonomyPolicyValues(policy: AutonomyPolicy): AutonomyPolicyValues {
+  return {
+    auto_apply_stretch: policy.auto_apply_stretch,
+    auto_submit_simple_forms: policy.auto_submit_simple_forms,
+    auto_prepare_replies: policy.auto_prepare_replies,
+    auto_send_approved_replies: policy.auto_send_approved_replies,
+    auto_reconcile_unknown: policy.auto_reconcile_unknown,
+    reuse_confirmed_profile_facts: policy.reuse_confirmed_profile_facts,
+    mark_opened_invitations_seen: policy.mark_opened_invitations_seen,
+    mutable_fact_validity_days: policy.mutable_fact_validity_days,
+    reply_templates: policy.reply_templates.map((template) => ({ ...template })),
+  };
+}
+
+function AutonomySettingsForm({
+  policy,
+  onSaved,
+  onToast,
+}: {
+  policy: AutonomyPolicy;
+  onSaved: (policy: AutonomyPolicy) => void;
+  onToast: (toast: Toast) => void;
+}) {
+  const [values, setValues] = useState<AutonomyPolicyValues>(() =>
+    autonomyPolicyValues(policy),
+  );
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const baseline = autonomyPolicyValues(policy);
+  const dirty = JSON.stringify(values) !== JSON.stringify(baseline);
+  const normalizedIncoming = values.reply_templates.map((template) =>
+    template.incoming_text.trim().toLocaleLowerCase("ru-RU").replace(/\s+/g, " "),
+  );
+  const templatesComplete = values.reply_templates.every(
+    (template) =>
+      Boolean(template.incoming_text.trim()) && Boolean(template.response_text.trim()),
+  );
+  const templatesUnique =
+    new Set(normalizedIncoming).size === normalizedIncoming.length;
+  const mutableFactValidityValid =
+    Number.isInteger(values.mutable_fact_validity_days) &&
+    values.mutable_fact_validity_days >= 1 &&
+    values.mutable_fact_validity_days <= 365;
+
+  useEffect(() => {
+    setValues(autonomyPolicyValues(policy));
+    setError(null);
+  }, [policy.revision]);
+
+  function toggle(key: AutonomyBooleanKey, enabled: boolean): void {
+    setValues((current) => ({ ...current, [key]: enabled }));
+    setError(null);
+  }
+
+  function addTemplate(): void {
+    setValues((current) => ({
+      ...current,
+      reply_templates: [
+        ...current.reply_templates,
+        {
+          key: `reply-${Date.now().toString(36)}-${current.reply_templates.length + 1}`,
+          incoming_text: "",
+          response_text: "",
+          enabled: true,
+        },
+      ],
+    }));
+    setError(null);
+  }
+
+  function changeTemplate(
+    key: string,
+    change: Partial<ApprovedReplyTemplate>,
+  ): void {
+    setValues((current) => ({
+      ...current,
+      reply_templates: current.reply_templates.map((template) =>
+        template.key === key ? { ...template, ...change } : template,
+      ),
+    }));
+    setError(null);
+  }
+
+  function removeTemplate(key: string): void {
+    setValues((current) => ({
+      ...current,
+      reply_templates: current.reply_templates.filter(
+        (template) => template.key !== key,
+      ),
+    }));
+    setError(null);
+  }
+
+  async function save(): Promise<void> {
+    if (
+      !dirty ||
+      !templatesComplete ||
+      !templatesUnique ||
+      !mutableFactValidityValid ||
+      saving
+    ) {
+      return;
+    }
+    setSaving(true);
+    setError(null);
+    try {
+      const saved = await updateAutonomyPolicy({
+        ...values,
+        reply_templates: values.reply_templates.map((template) => ({
+          ...template,
+          incoming_text: template.incoming_text.trim(),
+          response_text: template.response_text.trim(),
+        })),
+      });
+      onSaved(saved);
+      onToast({ kind: "success", message: "Правила автономности сохранены" });
+    } catch (reason) {
+      setError(readableError(reason));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className="autonomy-settings">
+      <div className="autonomy-option-grid">
+        {autonomyOptions.map((option) => (
+          <label className="direction-active-control" key={option.key}>
+            <span className="check-control">
+              <input
+                type="checkbox"
+                checked={values[option.key]}
+                disabled={saving}
+                onChange={(event) => toggle(option.key, event.target.checked)}
+              />
+              <span aria-hidden="true" />
+            </span>
+            <span>
+              <strong>{option.title}</strong>
+              <small>{option.description}</small>
+            </span>
+          </label>
+        ))}
+      </div>
+
+      <label className="number-field">
+        <span>Срок актуальности изменяемых сведений</span>
+        <small>
+          После этого срока зарплату, дату выхода, формат работы, переезд и командировки
+          нужно подтвердить заново.
+        </small>
+        <div className="number-input">
+          <input
+            type="number"
+            min={1}
+            max={365}
+            step={1}
+            value={values.mutable_fact_validity_days}
+            disabled={saving}
+            onChange={(event) => {
+              const next = event.target.valueAsNumber;
+              if (!Number.isFinite(next)) return;
+              setValues((current) => ({
+                ...current,
+                mutable_fact_validity_days: next,
+              }));
+              setError(null);
+            }}
+          />
+          <span>дней</span>
+        </div>
+      </label>
+
+      <div className="approved-replies">
+        <div className="profile-subheading">
+          <div>
+            <h3>Точные утверждённые ответы</h3>
+            <p>
+              Регистр и лишние пробелы не учитываются, остальной текст должен совпасть.
+              Изменившееся сообщение останется на проверке.
+            </p>
+          </div>
+          <button
+            type="button"
+            className="secondary-button"
+            disabled={saving || values.reply_templates.length >= 50}
+            onClick={addTemplate}
+          >
+            Добавить ответ
+          </button>
+        </div>
+
+        {values.reply_templates.length ? (
+          <div className="approved-reply-list">
+            {values.reply_templates.map((template, index) => (
+              <article className="approved-reply-card" key={template.key}>
+                <div className="approved-reply-heading">
+                  <strong>Ответ {index + 1}</strong>
+                  <label className="inline-option">
+                    <input
+                      type="checkbox"
+                      checked={template.enabled}
+                      disabled={saving}
+                      onChange={(event) =>
+                        changeTemplate(template.key, { enabled: event.target.checked })
+                      }
+                    />
+                    <span>Разрешён</span>
+                  </label>
+                </div>
+                <label className="text-field">
+                  <span>Точное сообщение работодателя</span>
+                  <textarea
+                    rows={3}
+                    maxLength={2000}
+                    value={template.incoming_text}
+                    placeholder="Например: Предложение ещё актуально?"
+                    disabled={saving}
+                    onChange={(event) =>
+                      changeTemplate(template.key, {
+                        incoming_text: event.target.value,
+                      })
+                    }
+                  />
+                </label>
+                <label className="text-field">
+                  <span>Утверждённый ответ</span>
+                  <textarea
+                    rows={3}
+                    maxLength={5000}
+                    value={template.response_text}
+                    placeholder="Введите текст, который можно отправить без повторной проверки"
+                    disabled={saving}
+                    onChange={(event) =>
+                      changeTemplate(template.key, {
+                        response_text: event.target.value,
+                      })
+                    }
+                  />
+                </label>
+                <button
+                  type="button"
+                  className="quiet-button"
+                  disabled={saving}
+                  onClick={() => removeTemplate(template.key)}
+                >
+                  Удалить
+                </button>
+              </article>
+            ))}
+          </div>
+        ) : (
+          <p className="settings-note">
+            Утверждённых ответов пока нет. Новые содержательные сообщения будут только
+            готовиться как черновики.
+          </p>
+        )}
+      </div>
+
+      <p className="settings-warning autonomy-boundaries">
+        <AlertTriangle size={18} aria-hidden="true" />
+        Проверка «Я не робот», одноразовые коды, предупреждения аккаунта, документы,
+        платежи,
+        испытательные задания, переговоры о зарплате и новые договорённости всегда
+        требуют вашего решения.
+      </p>
+      {!templatesUnique && (
+        <p className="settings-submit-error" role="alert">
+          Один текст работодателя нельзя связать с несколькими ответами.
+        </p>
+      )}
+      {!templatesComplete && (
+        <p className="settings-submit-error" role="alert">
+          Заполните оба поля каждого утверждённого ответа или удалите пустую запись.
+        </p>
+      )}
+      {!mutableFactValidityValid && (
+        <p className="settings-submit-error" role="alert">
+          Срок актуальности должен быть от 1 до 365 дней.
+        </p>
+      )}
+      {error && (
+        <p className="settings-submit-error" role="alert">
+          {error}
+        </p>
+      )}
+      <div className="settings-form-actions">
+        <button
+          type="button"
+          className="primary-button"
+          disabled={
+            !dirty ||
+            !templatesComplete ||
+            !templatesUnique ||
+            !mutableFactValidityValid ||
+            saving
+          }
+          onClick={() => void save()}
+        >
+          {saving ? "Сохраняем…" : "Сохранить автономность"}
+        </button>
+        <span className="field-hint">
+          Изменения применятся к новым действиям после сохранения.
+        </span>
+      </div>
     </div>
   );
 }
@@ -3379,7 +4163,8 @@ function AiPromptSettingsForm({
         ))}
       </div>
       <p className="settings-note">
-        Правила точности и запрет отправки без подтверждения изменить нельзя.
+        Правила точности и ручные границы для важных действий изменить этими
+        инструкциями нельзя.
       </p>
       {error && (
         <p className="settings-submit-error" role="alert">

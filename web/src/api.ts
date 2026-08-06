@@ -1,10 +1,13 @@
 import type {
   AiPromptValues,
+  AutonomyPolicy,
+  AutonomyPolicyValues,
   Communications,
   Dashboard,
   DirectionOptions,
   DirectionSettings,
   DirectionSummary,
+  FormAnswerInput,
   FormDraft,
   Profile,
   QueueItem,
@@ -47,6 +50,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
 export async function loadWorkspace(): Promise<{
   dashboard: Dashboard;
+  autonomy: AutonomyPolicy;
   directionOptions: DirectionOptions;
   profile: Profile;
   queue: QueueItem[];
@@ -57,6 +61,7 @@ export async function loadWorkspace(): Promise<{
 }> {
   const [
     dashboard,
+    autonomy,
     directionOptions,
     profile,
     queue,
@@ -66,17 +71,19 @@ export async function loadWorkspace(): Promise<{
     communications,
   ] =
     await Promise.all([
-    request<Dashboard>(`/api/dashboard?account_id=${ACCOUNT_ID}`),
-    request<DirectionOptions>("/api/directions/options"),
-    request<Profile>(`/api/profile?account_id=${ACCOUNT_ID}`),
-    request<QueueItem[]>(`/api/queue?account_id=${ACCOUNT_ID}`),
-    request<FormDraft[]>(`/api/forms?account_id=${ACCOUNT_ID}`),
-    request<RejectedVacancy[]>(`/api/rejected?account_id=${ACCOUNT_ID}&limit=1000`),
-    request<SentApplication[]>(`/api/sent?account_id=${ACCOUNT_ID}&limit=1000`),
-    request<Communications>(`/api/communications?account_id=${ACCOUNT_ID}`),
-  ]);
+      request<Dashboard>(`/api/dashboard?account_id=${ACCOUNT_ID}`),
+      request<AutonomyPolicy>("/api/autonomy"),
+      request<DirectionOptions>("/api/directions/options"),
+      request<Profile>(`/api/profile?account_id=${ACCOUNT_ID}`),
+      request<QueueItem[]>(`/api/queue?account_id=${ACCOUNT_ID}`),
+      request<FormDraft[]>(`/api/forms?account_id=${ACCOUNT_ID}`),
+      request<RejectedVacancy[]>(`/api/rejected?account_id=${ACCOUNT_ID}&limit=1000`),
+      request<SentApplication[]>(`/api/sent?account_id=${ACCOUNT_ID}&limit=1000`),
+      request<Communications>(`/api/communications?account_id=${ACCOUNT_ID}`),
+    ]);
   return {
     dashboard,
+    autonomy,
     directionOptions,
     profile,
     queue,
@@ -140,6 +147,17 @@ export async function updateQueueSettings(
 ): Promise<QueueSettings> {
   const session = await request<{ key: string }>("/api/session");
   return request<QueueSettings>("/api/queue/settings", {
+    method: "PUT",
+    headers: { "X-Hugin-Session": session.key },
+    body: JSON.stringify(values),
+  });
+}
+
+export async function updateAutonomyPolicy(
+  values: AutonomyPolicyValues,
+): Promise<AutonomyPolicy> {
+  const session = await request<{ key: string }>("/api/session");
+  return request<AutonomyPolicy>("/api/autonomy", {
     method: "PUT",
     headers: { "X-Hugin-Session": session.key },
     body: JSON.stringify(values),
@@ -237,6 +255,21 @@ export async function dismissProfileQuestion(key: string): Promise<Profile> {
     {
       method: "POST",
       headers: { "X-Hugin-Session": session.key },
+    },
+  );
+}
+
+export async function saveFormAnswers(
+  formId: number,
+  answers: FormAnswerInput[],
+): Promise<FormDraft> {
+  const session = await request<{ key: string }>("/api/session");
+  return request<FormDraft>(
+    `/api/forms/${formId}/answers?account_id=${ACCOUNT_ID}`,
+    {
+      method: "POST",
+      headers: { "X-Hugin-Session": session.key },
+      body: JSON.stringify({ answers }),
     },
   );
 }
