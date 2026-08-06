@@ -235,6 +235,11 @@ def _read_live_resume(settings: Settings, account_id: int, resume_id: str) -> Hh
         settings.hh_resumes_url,
         settings.hh_search_url,
         settings.hh_browser_timeout_ms,
+        browser_source_ip=(
+            str(settings.hh_browser_source_ip)
+            if settings.hh_browser_source_ip is not None
+            else None
+        ),
     ) as browser:
         browser.open_login()
         if not browser.is_authenticated():

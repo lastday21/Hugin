@@ -23,6 +23,7 @@ from hugin.domain.communications import (
 )
 from hugin.domain.content import (
     InvitationState,
+    MessageDirection,
     NotificationChannel,
     RecruiterMessageState,
 )
@@ -33,6 +34,9 @@ from hugin.repositories import (
     ResumeRepository,
     VacancyRepository,
 )
+from hugin.repositories.communications import CommunicationRepository
+from hugin.services.autonomous_replies import AutonomousReplyService
+from hugin.services.autonomy import DEFAULT_AUTONOMY_POLICY, AutonomyPolicyService
 from hugin.services.communications import CommunicationService, RecordingMessageSender
 
 pytestmark = pytest.mark.integration
@@ -65,6 +69,7 @@ def create_application(
     return account.id, application.id
 
 
+@pytest.mark.empty_database
 def test_communications_migration_preserves_existing_rows(settings: Settings) -> None:
     upgrade_database(settings, "0012_automation_jobs")
     database = create_database(settings)
@@ -109,7 +114,7 @@ def test_communications_migration_preserves_existing_rows(settings: Settings) ->
         database.close()
 
     upgrade_database(settings)
-    assert current_revision(settings) == "0020_profile_fact_versions"
+    assert current_revision(settings) == "0022_system_recovery_state"
     check_database_schema(settings)
 
     migrated = create_database(settings)
@@ -376,7 +381,7 @@ def test_unknown_send_result_is_never_repeated(settings: Settings) -> None:
             service = CommunicationService(session, sender)
             draft = service.create_outgoing_draft(
                 application_id=application_id,
-                body="Подтверждённый ответ",
+                body="Подтверждённый ответ \n",
             )
             assert draft.content_hash is not None
 
@@ -404,5 +409,408 @@ def test_unknown_send_result_is_never_repeated(settings: Settings) -> None:
                     message_id=draft.id,
                     body="Нельзя менять до сверки результата",
                 )
+
+            reconciled, created = CommunicationRepository(session).save_synced_message(
+                application_id=application_id,
+                hh_id="hh-confirmed-outgoing",
+                direction=MessageDirection.OUTGOING,
+                body=draft.body.strip(),
+                occurred_at=now + timedelta(minutes=2),
+            )
+
+            assert created is False
+            assert reconciled.id == unknown.id
+            assert reconciled.state is RecruiterMessageState.SENT
+            assert reconciled.hh_id == "hh-confirmed-outgoing"
+    finally:
+        database.close()
+
+
+def test_unknown_outgoing_reconciliation_ignores_known_history(
+    settings: Settings,
+) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    now = datetime(2026, 7, 26, 10, 0, tzinfo=UTC)
+
+    try:
+        with database.sessions.begin() as session:
+            account_id, application_id = create_application(
+                session,
+                account_label="Старое исходящее",
+                vacancy_hh_id="communications-known-outgoing",
+            )
+            repository = CommunicationRepository(session)
+            old_message, old_created = repository.save_synced_message(
+                application_id=application_id,
+                hh_id="old-outgoing",
+                direction=MessageDirection.OUTGOING,
+                body="Одинаковый ответ",
+                occurred_at=now - timedelta(days=1),
+            )
+            assert old_created
+
+            service = CommunicationService(
+                session,
+                RecordingMessageSender(MessageSendOutcome.UNKNOWN_RESULT),
+            )
+            draft = service.create_outgoing_draft(
+                application_id=application_id,
+                body="Одинаковый ответ",
+            )
+            assert draft.content_hash is not None
+            unknown = service.confirm_and_send(
+                account_id=account_id,
+                message_id=draft.id,
+                content_version=draft.content_version,
+                content_hash=draft.content_hash,
+                now=now,
+            )
+            assert unknown.state is RecruiterMessageState.UNKNOWN_RESULT
+
+            known_again, created_again = repository.save_synced_message(
+                application_id=application_id,
+                hh_id="old-outgoing",
+                direction=MessageDirection.OUTGOING,
+                body="Одинаковый ответ",
+                occurred_at=now + timedelta(minutes=5),
+            )
+            still_unknown = repository.get_message(account_id, unknown.id)
+
+            assert not created_again
+            assert known_again.id == old_message.id
+            assert still_unknown.state is RecruiterMessageState.UNKNOWN_RESULT
+            assert still_unknown.hh_id is None
+
+            reconciled, reconciled_created = repository.save_synced_message(
+                application_id=application_id,
+                hh_id="new-outgoing",
+                direction=MessageDirection.OUTGOING,
+                body="Одинаковый ответ",
+                occurred_at=now + timedelta(minutes=6),
+            )
+
+            assert not reconciled_created
+            assert reconciled.id == unknown.id
+            assert reconciled.state is RecruiterMessageState.SENT
+            assert reconciled.hh_id == "new-outgoing"
+    finally:
+        database.close()
+
+
+@pytest.mark.parametrize(
+    ("body", "observed_at"),
+    (
+        ("Другой ответ", datetime(2026, 7, 26, 10, 5, tzinfo=UTC)),
+        ("Точный ответ", datetime(2026, 7, 26, 10, 31, tzinfo=UTC)),
+    ),
+)
+def test_unknown_outgoing_reconciliation_requires_exact_recent_message(
+    settings: Settings,
+    body: str,
+    observed_at: datetime,
+) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    now = datetime(2026, 7, 26, 10, 0, tzinfo=UTC)
+
+    try:
+        with database.sessions.begin() as session:
+            account_id, application_id = create_application(
+                session,
+                account_label=f"Сверка {body}",
+                vacancy_hh_id=f"communications-reconcile-{observed_at.minute}-{len(body)}",
+            )
+            service = CommunicationService(
+                session,
+                RecordingMessageSender(MessageSendOutcome.UNKNOWN_RESULT),
+            )
+            draft = service.create_outgoing_draft(
+                application_id=application_id,
+                body="Точный ответ",
+            )
+            assert draft.content_hash is not None
+            unknown = service.confirm_and_send(
+                account_id=account_id,
+                message_id=draft.id,
+                content_version=draft.content_version,
+                content_hash=draft.content_hash,
+                now=now,
+            )
+
+            synchronized, created = CommunicationRepository(session).save_synced_message(
+                application_id=application_id,
+                hh_id=f"unmatched-{observed_at.minute}",
+                direction=MessageDirection.OUTGOING,
+                body=body,
+                occurred_at=observed_at,
+            )
+            stored_unknown = CommunicationRepository(session).get_message(
+                account_id,
+                unknown.id,
+            )
+
+            assert created
+            assert synchronized.id != unknown.id
+            assert stored_unknown.state is RecruiterMessageState.UNKNOWN_RESULT
+            assert stored_unknown.hh_id is None
+    finally:
+        database.close()
+
+
+def test_exact_approved_safe_reply_is_prepared_for_automatic_send(
+    settings: Settings,
+) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+
+    try:
+        with database.sessions.begin() as session:
+            account_id, application_id = create_application(
+                session,
+                account_label="Утверждённый ответ",
+                vacancy_hh_id="communications-approved-reply",
+            )
+            incoming = CommunicationService(
+                session,
+                RecordingMessageSender(),
+            ).save_incoming(
+                application_id=application_id,
+                hh_id="incoming-approved",
+                body="Предложение ещё актуально?",
+            )
+            AutonomyPolicyService(session).update(
+                {
+                    **DEFAULT_AUTONOMY_POLICY,
+                    "reply_templates": [
+                        {
+                            "key": "interest",
+                            "incoming_text": "Предложение ещё актуально?",
+                            "response_text": "Здравствуйте! Да, готов обсудить детали.",
+                            "enabled": True,
+                        }
+                    ],
+                }
+            )
+
+            old_message_batch = AutonomousReplyService(session).prepare(
+                account_id=account_id,
+            )
+            assert old_message_batch.approved == ()
+
+            batch = AutonomousReplyService(session).prepare(
+                account_id=account_id,
+                incoming_message_ids=(incoming.id,),
+            )
+
+            assert len(batch.approved) == 1
+            outgoing = next(
+                message
+                for message in CommunicationService(
+                    session,
+                    RecordingMessageSender(),
+                ).messages(account_id)
+                if message.direction is MessageDirection.OUTGOING
+            )
+            assert outgoing.state is RecruiterMessageState.CONFIRMED
+            assert outgoing.auto_send_approved is True
+            assert outgoing.reply_template_key == "interest"
+            assert AutonomousReplyService(session).approved_for_send(
+                account_id=account_id,
+                message_id=outgoing.id,
+                content_version=outgoing.content_version,
+                content_hash=outgoing.content_hash or "",
+            )
+
+            pending_retry = AutonomousReplyService(session).prepare(account_id=account_id)
+            assert len(pending_retry.approved) == 1
+            assert pending_retry.approved[0].message_id == outgoing.id
+            assert (
+                len(
+                    tuple(
+                        message
+                        for message in CommunicationService(
+                            session,
+                            RecordingMessageSender(),
+                        ).messages(account_id)
+                        if message.direction is MessageDirection.OUTGOING
+                    )
+                )
+                == 1
+            )
+
+            failed = CommunicationService(
+                session,
+                RecordingMessageSender(MessageSendOutcome.FAILED),
+            ).send_confirmed(
+                account_id=account_id,
+                message_id=outgoing.id,
+                content_version=outgoing.content_version,
+                content_hash=outgoing.content_hash or "",
+            )
+            assert failed.state is RecruiterMessageState.FAILED
+
+            retry = AutonomousReplyService(session).prepare(account_id=account_id)
+            assert len(retry.approved) == 1
+            assert retry.approved[0].message_id == outgoing.id
+            assert (
+                CommunicationRepository(session).get_message(account_id, outgoing.id).state
+                is RecruiterMessageState.CONFIRMED
+            )
+            current_policy = AutonomyPolicyService(session).get()
+            AutonomyPolicyService(session).update(
+                {
+                    **current_policy.as_payload(),
+                    "auto_send_approved_replies": False,
+                }
+            )
+            assert not AutonomousReplyService(session).approved_for_send(
+                account_id=account_id,
+                message_id=outgoing.id,
+                content_version=outgoing.content_version,
+                content_hash=outgoing.content_hash or "",
+            )
+            AutonomyPolicyService(session).update(current_policy.as_payload())
+
+            unknown = CommunicationService(
+                session,
+                RecordingMessageSender(MessageSendOutcome.UNKNOWN_RESULT),
+            ).send_confirmed(
+                account_id=account_id,
+                message_id=outgoing.id,
+                content_version=outgoing.content_version,
+                content_hash=outgoing.content_hash or "",
+            )
+            assert unknown.state is RecruiterMessageState.UNKNOWN_RESULT
+            assert AutonomousReplyService(session).prepare(account_id=account_id).approved == ()
+            with pytest.raises(CommunicationStateError, match="Повтор разрешён"):
+                CommunicationService(
+                    session,
+                    RecordingMessageSender(),
+                ).confirm_outgoing_retry(
+                    account_id=account_id,
+                    message_id=outgoing.id,
+                    content_version=outgoing.content_version,
+                    content_hash=outgoing.content_hash or "",
+                )
+    finally:
+        database.close()
+
+
+@pytest.mark.parametrize(
+    ("suffix", "incoming_body", "response_body"),
+    (
+        (
+            "incoming",
+            "Какая зарплата вас устроит?",
+            "Предлагаю обсудить условия в переписке.",
+        ),
+        (
+            "response",
+            "Предложение ещё актуально?",
+            "Рассматриваю предложения от 150 000 рублей.",
+        ),
+        (
+            "time",
+            "Предложение ещё актуально?",
+            "Да, давайте созвонимся завтра в 15:00.",
+        ),
+        (
+            "url",
+            "Предложение ещё актуально?",
+            "Да, подробности здесь: https://example.com/profile",
+        ),
+        (
+            "english",
+            "Would you like to schedule an interview?",
+            "Yes, I am available.",
+        ),
+        (
+            "tomorrow",
+            "Давайте завтра?",
+            "Да, завтра удобно.",
+        ),
+        (
+            "weekday",
+            "Подойдёт понедельник?",
+            "Да, подойдёт.",
+        ),
+        (
+            "english-tomorrow",
+            "Are you free tomorrow?",
+            "Yes.",
+        ),
+        (
+            "currency-prefix",
+            "Предложение ещё актуально?",
+            "Ожидаю $2500.",
+        ),
+        (
+            "zoom",
+            "Can you join Zoom?",
+            "Yes.",
+        ),
+        (
+            "conversation",
+            "Хотели бы пообщаться о вакансии?",
+            "Да, предложение интересно.",
+        ),
+        (
+            "slot",
+            "Выберите удобный слот в календаре.",
+            "Хорошо.",
+        ),
+        (
+            "english-calendar",
+            "Please book a slot in my calendar.",
+            "Sure.",
+        ),
+    ),
+)
+def test_approved_reply_with_risky_content_stays_manual(
+    settings: Settings,
+    suffix: str,
+    incoming_body: str,
+    response_body: str,
+) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+
+    try:
+        with database.sessions.begin() as session:
+            account_id, application_id = create_application(
+                session,
+                account_label=f"Зарплата вручную {suffix}",
+                vacancy_hh_id=f"communications-salary-reply-{suffix}",
+            )
+            incoming = CommunicationService(
+                session,
+                RecordingMessageSender(),
+            ).save_incoming(
+                application_id=application_id,
+                hh_id=f"incoming-salary-{suffix}",
+                body=incoming_body,
+            )
+            AutonomyPolicyService(session).update(
+                {
+                    **DEFAULT_AUTONOMY_POLICY,
+                    "reply_templates": [
+                        {
+                            "key": "salary",
+                            "incoming_text": incoming_body,
+                            "response_text": response_body,
+                            "enabled": True,
+                        }
+                    ],
+                }
+            )
+
+            batch = AutonomousReplyService(session).prepare(
+                account_id=account_id,
+                incoming_message_ids=(incoming.id,),
+            )
+
+            assert batch.approved == ()
+            assert batch.skipped_manual == 1
     finally:
         database.close()

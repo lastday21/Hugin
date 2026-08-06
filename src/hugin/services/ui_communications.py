@@ -347,6 +347,7 @@ class UiCommunicationService:
         return message.state in {
             RecruiterMessageState.DRAFT,
             RecruiterMessageState.REVIEW_REQUIRED,
+            RecruiterMessageState.FAILED,
         }
 
     def _ai_prompt_settings(self) -> UiAiPromptSettings:

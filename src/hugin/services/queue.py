@@ -47,8 +47,6 @@ class QueueService:
         system = self._system.lock()
         if system.state is not SystemState.RUNNING:
             return None
-        if self._tasks.has_unknown_result():
-            return None
         if system.next_apply_at is not None and system.next_apply_at > selected_at:
             return None
         return self._tasks.claim_next(
@@ -99,8 +97,6 @@ class QueueService:
             raise ValueError(
                 "Нельзя включить очередь, пока выполняется управляемый поштучный отклик"
             )
-        if self._tasks.has_unknown_result():
-            raise ValueError("Сначала нужно сверить отклик, результат которого неизвестен")
         return self._system.transition(SystemState.RUNNING)
 
     def status(self) -> QueueStatus:

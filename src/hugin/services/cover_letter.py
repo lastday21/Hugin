@@ -42,7 +42,7 @@ from hugin.services.resume_improvement import ResumeBlockExtractor
 from hugin.services.vacancy_analysis import RULES_VERSION, RuleCategory
 
 PROMPT_PURPOSE = "cover_letter"
-PROMPT_VERSION = 26
+PROMPT_VERSION = 28
 INSTRUCTION_VERSION = CURRENT_COVER_LETTER_INSTRUCTION
 MANUAL_REVIEW_MODEL = "manual-review"
 MIN_LETTER_LENGTH = 350
@@ -94,6 +94,8 @@ _SERVICE_PREFIXES = (
 _TEMPLATE_PHRASES = (
     "меня заинтересовала вакансия",
     "заинтересовала вакансия",
+    "откликаюсь на вакансию",
+    "для задач позиции особенно подходит",
     "вижу, что",
     "в вашем описании",
     "уверен, что",
@@ -602,6 +604,12 @@ _EXPERIENCE_ITEM_CONTENT = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 _HISTORY_PREFIX = re.compile(r"^[^:]{0,100}\b(?:19|20)\d{2}\b[^:]*:\s*")
+_THIRD_PERSON_PRESENT = re.compile(
+    r"\b(?:автоматизирует|готовит|занимается|использует|настраивает|пишет|"
+    r"планирует|проверяет|применяет|работает|разрабатывает|руководит|собирает|"
+    r"создаёт|тестирует)\b",
+    re.IGNORECASE,
+)
 _CONSERVATIVE_FOCUS_TERMS = (
     ("FastAPI", re.compile(r"\bfastapi\b", re.IGNORECASE)),
     ("PostgreSQL", re.compile(r"\bpostgres(?:ql)?\b", re.IGNORECASE)),
@@ -2110,6 +2118,8 @@ def _conservative_cover_letter(
             item = item[:1].upper() + item[1:]
             if item[-1] not in ".!?":
                 item += "."
+            if _THIRD_PERSON_PRESENT.search(item):
+                continue
             focus = tuple(
                 label
                 for label, pattern in _CONSERVATIVE_FOCUS_TERMS
@@ -2125,42 +2135,21 @@ def _conservative_cover_letter(
     items.sort(key=lambda value: (-len(value[2]), value[0]))
     first = items[0]
     second = next((item for item in items[1:] if item[1] != first[1]), None)
-    focus_terms = first[2]
-    if focus_terms:
-        rendered_focus = _russian_join(focus_terms[:3])
-        focus_sentence = (
-            "Для задач позиции особенно подходит этот подтверждённый опыт "
-            f"с {rendered_focus}."
-        )
-    else:
-        focus_sentence = (
-            "Для задач позиции особенно подходит этот подтверждённый пример работы."
-        )
-
-    paragraphs = [f"{first[1]} {focus_sentence}"]
+    paragraphs = [first[1]]
     if second is not None:
         paragraphs.append(second[1])
+    example_label = "эти примеры" if second is not None else "этот пример"
     paragraphs.append(
-        "На собеседовании готов подробно разобрать первый пример и ответить "
-        "на вопросы по своей роли и указанным технологиям."
+        f"Готов на собеседовании подробно разобрать {example_label}: исходную задачу, "
+        "свои действия и границы ответственности, а также ответить на вопросы "
+        "по указанным технологиям."
     )
-    return (
-        f"Здравствуйте!\n\n{_vacancy_target_line(vacancy)}\n\n"
-        + "\n\n".join(paragraphs)
-    )
+    return "Здравствуйте!\n\n" + "\n\n".join(paragraphs)
 
 
 def _vacancy_target_line(vacancy: VacancyModel) -> str:
     vacancy_title = " ".join(vacancy.title.split()).replace("«", '"').replace("»", '"')
     return f"Откликаюсь на вакансию «{vacancy_title[:180].strip()}»."
-
-
-def _russian_join(values: tuple[str, ...]) -> str:
-    if len(values) == 1:
-        return values[0]
-    if len(values) == 2:
-        return f"{values[0]} и {values[1]}"
-    return f"{', '.join(values[:-1])} и {values[-1]}"
 
 
 def normalize_cover_letter(response: str) -> str:

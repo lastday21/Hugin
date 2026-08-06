@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import threading
 from collections.abc import Callable, Mapping
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 
 from hugin.core.settings import Settings
 from hugin.database import create_database, upgrade_database
@@ -14,17 +14,35 @@ from hugin.domain.automation import (
     AutomationJobState,
     AutomationJobStateError,
 )
+from hugin.domain.tasks import SystemState
+from hugin.domain.time import as_utc
+from hugin.repositories.tasks import SystemStateRepository
 from hugin.services.automation import AutomationSchedulerService
 
 type AutomationJobHandler = Callable[[AutomationJobRecord], AutomationJobResult]
+type AuthenticationRecovery = Callable[[], bool]
 
 DEFAULT_HEARTBEAT_SECONDS = 30.0
+DEFAULT_AUTHENTICATION_RECOVERY_INTERVAL_SECONDS = 60.0
+AUTHENTICATION_RECOVERY_STATES = frozenset(
+    {
+        SystemState.AUTH_REQUIRED,
+        SystemState.CAPTCHA_REQUIRED,
+    }
+)
 
 
 class AutomationJobBlocked(RuntimeError):
     def __init__(self, code: str, message: str) -> None:
         super().__init__(message)
         self.code = code.strip()[:64] or "AUTOMATION_BLOCKED"
+
+
+class AutomationJobRetry(RuntimeError):
+    def __init__(self, code: str, message: str, *, retry_after_seconds: int) -> None:
+        super().__init__(message)
+        self.code = code.strip()[:64] or "AUTOMATION_RETRY"
+        self.retry_after_seconds = max(1, min(retry_after_seconds, 86_400))
 
 
 class AutomationWorker:
@@ -36,6 +54,10 @@ class AutomationWorker:
         handlers: Mapping[AutomationJobKind, AutomationJobHandler] | None = None,
         poll_seconds: float = 2.0,
         heartbeat_seconds: float = DEFAULT_HEARTBEAT_SECONDS,
+        authentication_recovery: AuthenticationRecovery | None = None,
+        authentication_recovery_interval_seconds: float = (
+            DEFAULT_AUTHENTICATION_RECOVERY_INTERVAL_SECONDS
+        ),
         journal: OperationJournal | None = None,
     ) -> None:
         if account_id < 1:
@@ -44,11 +66,18 @@ class AutomationWorker:
             raise ValueError("Интервал проверки расписания должен быть положительным")
         if heartbeat_seconds <= 0:
             raise ValueError("Интервал пульса фонового задания должен быть положительным")
+        if authentication_recovery_interval_seconds <= 0:
+            raise ValueError("Интервал восстановления входа должен быть положительным")
         self._settings = settings
         self._account_id = account_id
         self._handlers = dict(handlers or {})
         self._poll_seconds = poll_seconds
         self._heartbeat_seconds = heartbeat_seconds
+        self._authentication_recovery = authentication_recovery
+        self._authentication_recovery_interval = timedelta(
+            seconds=authentication_recovery_interval_seconds
+        )
+        self._next_authentication_recovery_at: datetime | None = None
         self._journal = journal or OperationJournal(settings.data_dir)
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -108,10 +137,12 @@ class AutomationWorker:
                     ):
                         scheduler.unblock(configured_job.key, now)
                 scheduler.recover_stale(now)
+                system_state = SystemStateRepository(session).get().state
+            recovery_attempted = self._recover_authentication_if_due(system_state, now)
             with database.sessions.begin() as session:
                 job = AutomationSchedulerService(session).claim_due(now)
             if job is None:
-                return False
+                return recovery_attempted
 
             run = self._journal.start(
                 "automation",
@@ -146,6 +177,20 @@ class AutomationWorker:
                         now=now,
                     )
                 run.block(error_code=error.code, error_message=str(error))
+            except AutomationJobRetry as error:
+                with database.sessions.begin() as session:
+                    AutomationSchedulerService(session).fail(
+                        job.key,
+                        error_code=error.code,
+                        error_message=str(error),
+                        retry_after_seconds=error.retry_after_seconds,
+                        now=now,
+                    )
+                run.fail(
+                    error,
+                    error_code=error.code,
+                    retry_after_seconds=error.retry_after_seconds,
+                )
             except Exception as error:
                 with database.sessions.begin() as session:
                     AutomationSchedulerService(session).fail(
@@ -162,6 +207,46 @@ class AutomationWorker:
             return True
         finally:
             database.close()
+
+    def _recover_authentication_if_due(
+        self,
+        system_state: SystemState,
+        now: datetime | None,
+    ) -> bool:
+        if (
+            self._authentication_recovery is None
+            or system_state not in AUTHENTICATION_RECOVERY_STATES
+        ):
+            self._next_authentication_recovery_at = None
+            return False
+        selected_at = as_utc(now or datetime.now(UTC))
+        if (
+            self._next_authentication_recovery_at is not None
+            and selected_at < self._next_authentication_recovery_at
+        ):
+            return False
+
+        run = self._journal.start(
+            "automation",
+            "authentication.recovery",
+            account_id=self._account_id,
+            system_state=system_state.value,
+        )
+        try:
+            recovered = bool(self._authentication_recovery())
+        except Exception as error:
+            run.fail(error, system_state=system_state.value)
+        else:
+            if recovered:
+                run.succeed(recovered=True, system_state=system_state.value)
+            else:
+                run.block(recovered=False, system_state=system_state.value)
+        finally:
+            finished_at = selected_at if now is not None else datetime.now(UTC)
+            self._next_authentication_recovery_at = (
+                as_utc(finished_at) + self._authentication_recovery_interval
+            )
+        return True
 
     def _run_handler(
         self,

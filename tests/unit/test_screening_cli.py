@@ -81,6 +81,7 @@ class FakeSettings:
     hh_resumes_url = "https://hh.ru/applicant/resumes"
     hh_search_url = "https://hh.ru/search/vacancy"
     hh_browser_timeout_ms = 5_000
+    hh_browser_source_ip = None
 
     @staticmethod
     def browser_profile_dir(account_id: int) -> Path:
@@ -134,10 +135,16 @@ class FakeBrowser:
         filled_keys=("0:name:telegram",),
     )
     open_arguments: ClassVar[dict[str, object] | None] = None
+    browser_source_ips: ClassVar[list[str | None]] = []
     authenticated: ClassVar[bool] = True
 
-    def __init__(self, *args: object) -> None:
+    def __init__(
+        self,
+        *args: object,
+        browser_source_ip: str | None = None,
+    ) -> None:
         assert args
+        self.browser_source_ips.append(browser_source_ip)
 
     def __enter__(self) -> FakeBrowser:
         return self
@@ -165,6 +172,7 @@ def fake_dependencies(monkeypatch: pytest.MonkeyPatch) -> None:
         filled_keys=("0:name:telegram",),
     )
     FakeBrowser.open_arguments = None
+    FakeBrowser.browser_source_ips = []
     FakeBrowser.authenticated = True
     monkeypatch.setattr(screening_cli, "get_settings", FakeSettings)
     monkeypatch.setattr(screening_cli, "upgrade_database", lambda settings: None)
@@ -208,6 +216,7 @@ def test_open_refills_answers_and_waits_for_manual_submit(
         "answers": {"0:name:telegram": "@ivan"},
         "cover_letter": "Здравствуйте!",
     }
+    assert FakeBrowser.browser_source_ips == [None]
     assert "Hugin не нажимал кнопку отправки" in capsys.readouterr().out
     assert len(prompts) == 1
 

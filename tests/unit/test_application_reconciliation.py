@@ -108,6 +108,12 @@ def test_not_found_reconciliation_requires_review_before_retry(settings: Setting
     try:
         with database.sessions.begin() as session:
             application_id, task_id = create_unknown_task(session, "not-found")
+            account_id = ApplicationRepository(session).get(application_id).account_id
+            service = ApplicationAutomationService(session)
+            assert service.applied_since(
+                account_id,
+                datetime(2020, 1, 1, tzinfo=UTC),
+            ) == 1
 
             outcome = ApplicationReconciliationService(session).reconcile(
                 task_id,
@@ -121,6 +127,10 @@ def test_not_found_reconciliation_requires_review_before_retry(settings: Setting
             assert outcome.application.state is ApplicationState.APPLYING
             assert outcome.task.state is TaskState.REVIEW_REQUIRED
             assert outcome.task.last_error_code == "RECONCILED_NOT_FOUND"
+            assert service.applied_since(
+                account_id,
+                datetime(2020, 1, 1, tzinfo=UTC),
+            ) == 0
             assert QueueService(session).resume().state is SystemState.RUNNING
             event = ApplicationRepository(session).list_events(application_id)[-1]
             assert event.payload["reconciliation_status"] == "NOT_FOUND"
@@ -129,17 +139,18 @@ def test_not_found_reconciliation_requires_review_before_retry(settings: Setting
 
 
 @pytest.mark.parametrize(
-    ("status", "expected_system"),
+    ("status", "expected_system", "blocking"),
     [
-        (ReconciliationStatus.AUTH_REQUIRED, SystemState.AUTH_REQUIRED),
-        (ReconciliationStatus.CAPTCHA_REQUIRED, SystemState.CAPTCHA_REQUIRED),
-        (ReconciliationStatus.UNAVAILABLE, SystemState.PAUSED),
+        (ReconciliationStatus.AUTH_REQUIRED, SystemState.AUTH_REQUIRED, True),
+        (ReconciliationStatus.CAPTCHA_REQUIRED, SystemState.CAPTCHA_REQUIRED, True),
+        (ReconciliationStatus.UNAVAILABLE, SystemState.PAUSED, False),
     ],
 )
-def test_unresolved_reconciliation_keeps_unknown_result_blocking(
+def test_unresolved_reconciliation_quarantines_only_selected_application(
     settings: Settings,
     status: ReconciliationStatus,
     expected_system: SystemState,
+    blocking: bool,
 ) -> None:
     upgrade_database(settings)
     database = create_database(settings)
@@ -153,7 +164,7 @@ def test_unresolved_reconciliation_keeps_unknown_result_blocking(
                 ApplicationReconciliationResult(status),
             )
 
-            assert outcome.blocking
+            assert outcome.blocking is blocking
             assert outcome.application.state is ApplicationState.APPLYING
             assert outcome.task.state is TaskState.UNKNOWN_RESULT
             assert SystemStateRepository(session).get().state is expected_system
@@ -163,7 +174,6 @@ def test_unresolved_reconciliation_keeps_unknown_result_blocking(
 
             ApplicationAutomationService(session).resume_after_authentication()
             assert SystemStateRepository(session).get().state is SystemState.PAUSED
-            with pytest.raises(ValueError, match="неизвестен"):
-                QueueService(session).resume()
+            assert QueueService(session).resume().state is SystemState.RUNNING
     finally:
         database.close()

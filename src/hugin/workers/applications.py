@@ -14,6 +14,7 @@ from hugin.database import create_database, upgrade_database
 from hugin.database.models import CareerDirectionModel
 from hugin.diagnostics import OperationJournal, error_details
 from hugin.domain.hh import HhApplyResult, HhApplyStatus
+from hugin.domain.hh_sync import HhSyncBlockedError, HhSyncRetryableError
 from hugin.domain.time import as_utc, day_start_utc
 from hugin.services.ai_prompts import AiPromptSettingsService
 from hugin.services.application_automation import (
@@ -22,6 +23,7 @@ from hugin.services.application_automation import (
 )
 from hugin.services.cover_letter import CoverLetterService
 from hugin.services.hh_login import HhLoginService, LoginStatus
+from hugin.services.screening_forms import ScreeningDraftService, StoredScreeningSubmission
 from hugin.services.yandex_client import configured_yandex_ai_client
 
 type ApplicationJobHandler = Callable[[ApplyJob], HhApplyResult]
@@ -152,6 +154,24 @@ class ApplicationWorker:
         handler_error: Exception | None = None
         try:
             result = self._job_handler(job)
+        except HhSyncRetryableError as error:
+            handler_error = error
+            run.fail(error, result_status=HhApplyStatus.RETRYABLE_ERROR.value)
+            result = HhApplyResult(
+                HhApplyStatus.RETRYABLE_ERROR,
+                job.vacancy.source_url,
+                str(error),
+                retry_after_seconds=error.retry_after_seconds,
+            )
+        except HhSyncBlockedError as error:
+            handler_error = error
+            status = self._apply_status_for_blocked_code(error.code)
+            run.fail(error, result_status=status.value, error_code=error.code)
+            result = HhApplyResult(
+                status,
+                job.vacancy.source_url,
+                str(error),
+            )
         except Exception as error:
             handler_error = error
             run.fail(error, result_status=HhApplyStatus.UNKNOWN_RESULT.value)
@@ -216,6 +236,24 @@ class ApplicationWorker:
         handler_error: Exception | None = None
         try:
             result = self._form_preflight_handler(job)
+        except HhSyncRetryableError as error:
+            handler_error = error
+            run.fail(error, result_status=HhApplyStatus.RETRYABLE_ERROR.value)
+            result = HhApplyResult(
+                HhApplyStatus.RETRYABLE_ERROR,
+                job.vacancy.source_url,
+                str(error),
+                retry_after_seconds=error.retry_after_seconds,
+            )
+        except HhSyncBlockedError as error:
+            handler_error = error
+            status = self._apply_status_for_blocked_code(error.code)
+            run.fail(error, result_status=status.value, error_code=error.code)
+            result = HhApplyResult(
+                status,
+                job.vacancy.source_url,
+                str(error),
+            )
         except Exception as error:
             handler_error = error
             run.fail(error, result_status=HhApplyStatus.RETRYABLE_ERROR.value)
@@ -234,12 +272,19 @@ class ApplicationWorker:
             )
 
         finished_at = selected_at if now_is_fixed else datetime.now(UTC)
+        automatic_form_ready = False
         database = create_database(self._settings)
         try:
             with database.sessions.begin() as session:
                 service = ApplicationAutomationService(session)
                 if result.status is HhApplyStatus.MANUAL_REVIEW_REQUIRED:
                     service.release_form_preflight(job, now=finished_at)
+                elif result.status is HhApplyStatus.QUESTIONS_REQUIRED:
+                    automatic_form_ready = service.record_form_preflight(
+                        job,
+                        result,
+                        now=finished_at,
+                    )
                 else:
                     service.record_result(
                         job,
@@ -254,7 +299,7 @@ class ApplicationWorker:
         finally:
             database.close()
 
-        if result.status is not HhApplyStatus.MANUAL_REVIEW_REQUIRED:
+        if result.status is not HhApplyStatus.MANUAL_REVIEW_REQUIRED and not automatic_form_ready:
             if handler_error is None:
                 run.succeed(
                     result_status=result.status.value,
@@ -266,7 +311,7 @@ class ApplicationWorker:
 
         run.succeed(
             result_status="FORM_PREFLIGHT_PASSED",
-            questions=0,
+            questions=len(result.questions),
             warnings=len(result.warnings),
         )
         self._prepare_exact_letter(job, selected_at)
@@ -286,11 +331,12 @@ class ApplicationWorker:
                 )
                 if sent_today >= policy.daily_limit:
                     return None, False
+                include_stretch = service.stretch_automation_enabled()
                 return (
                     service.claim_next(
                         account_id=self._account_id,
                         require_cover_letter=True,
-                        include_stretch=False,
+                        include_stretch=include_stretch,
                     ),
                     True,
                 )
@@ -304,9 +350,10 @@ class ApplicationWorker:
                 service = ApplicationAutomationService(session)
                 if not service.applications_enabled():
                     return None
+                include_stretch = service.stretch_automation_enabled()
                 return service.claim_next_form_preflight(
                     account_id=self._account_id,
-                    include_stretch=False,
+                    include_stretch=include_stretch,
                     now=now,
                 )
         finally:
@@ -359,6 +406,7 @@ class ApplicationWorker:
                 )
                 if direction_name is None:
                     raise LookupError("Активное направление отклика не найдено")
+                include_stretch = automation.stretch_automation_enabled()
                 ai_settings = AiPromptSettingsService(session)
                 client = configured_yandex_ai_client(
                     self._settings,
@@ -374,7 +422,7 @@ class ApplicationWorker:
                     vacancy_hh_id=job.vacancy.hh_id,
                     application_id=job.application.id,
                     limit=1,
-                    include_stretch=False,
+                    include_stretch=include_stretch,
                 )
                 return result.generated + result.reused
         finally:
@@ -388,6 +436,11 @@ class ApplicationWorker:
             self._settings.hh_search_url,
             self._settings.hh_browser_timeout_ms,
             start_minimized=True,
+            browser_source_ip=(
+                str(self._settings.hh_browser_source_ip)
+                if self._settings.hh_browser_source_ip is not None
+                else None
+            ),
         ) as browser:
             login = HhLoginService(WindowsCredentialStore()).authenticate(
                 self._account_id,
@@ -409,6 +462,13 @@ class ApplicationWorker:
             )
 
     def _run_job(self, job: ApplyJob) -> HhApplyResult:
+        application = getattr(job, "application", None)
+        application_id = getattr(application, "id", None)
+        submission = (
+            self._auto_screening_submission(application_id)
+            if isinstance(application_id, int)
+            else None
+        )
         with VisibleHhBrowser(
             self._settings.browser_profile_dir(self._account_id),
             self._settings.hh_login_url,
@@ -416,6 +476,11 @@ class ApplicationWorker:
             self._settings.hh_search_url,
             self._settings.hh_browser_timeout_ms,
             start_minimized=True,
+            browser_source_ip=(
+                str(self._settings.hh_browser_source_ip)
+                if self._settings.hh_browser_source_ip is not None
+                else None
+            ),
         ) as browser:
             login = HhLoginService(WindowsCredentialStore()).authenticate(
                 self._account_id,
@@ -435,7 +500,11 @@ class ApplicationWorker:
                 expected_resume_title=job.resume.title,
                 cover_letter=job.cover_letter,
                 submit=True,
-                submit_guard=lambda: self._background_submission_is_allowed(job),
+                submit_guard=lambda: self._background_submission_is_allowed(
+                    job,
+                    submission,
+                ),
+                screening_submission=(submission.payload if submission is not None else None),
             )
 
     @staticmethod
@@ -444,24 +513,52 @@ class ApplicationWorker:
             LoginStatus.CREDENTIALS_REQUIRED: HhApplyStatus.AUTH_REQUIRED,
             LoginStatus.CONFIRMATION_REQUIRED: HhApplyStatus.AUTH_REQUIRED,
             LoginStatus.CAPTCHA_REQUIRED: HhApplyStatus.CAPTCHA_REQUIRED,
-            LoginStatus.INVALID_CREDENTIALS: HhApplyStatus.AUTH_REQUIRED,
+            LoginStatus.ACCOUNT_WARNING: HhApplyStatus.ACCOUNT_WARNING,
+            LoginStatus.INVALID_CREDENTIALS: HhApplyStatus.INVALID_CREDENTIALS,
             LoginStatus.MANUAL_ACTION_REQUIRED: HhApplyStatus.AUTH_REQUIRED,
         }
         return statuses[status]
 
-    def _background_submission_is_allowed(self, job: ApplyJob) -> bool:
+    @staticmethod
+    def _apply_status_for_blocked_code(code: str) -> HhApplyStatus:
+        statuses = {
+            "ACCOUNT_WARNING": HhApplyStatus.ACCOUNT_WARNING,
+            "CAPTCHA_REQUIRED": HhApplyStatus.CAPTCHA_REQUIRED,
+            "INVALID_CREDENTIALS": HhApplyStatus.INVALID_CREDENTIALS,
+        }
+        return statuses.get(code.strip().upper(), HhApplyStatus.AUTH_REQUIRED)
+
+    def _background_submission_is_allowed(
+        self,
+        job: ApplyJob,
+        submission: StoredScreeningSubmission | None = None,
+    ) -> bool:
         if job.cover_letter_id is None or job.cover_letter_sha256 is None:
             return False
         database = create_database(self._settings)
         try:
             with database.sessions.begin() as session:
-                return ApplicationAutomationService(session).background_submission_is_allowed(
+                allowed = ApplicationAutomationService(session).background_submission_is_allowed(
                     job.task.id,
                     letter_id=job.cover_letter_id,
                     letter_sha256=job.cover_letter_sha256,
                     resume_hh_id=job.resume.hh_id,
                     resume_title=job.resume.title,
                 )
+                if not allowed or submission is None:
+                    return allowed
+                return ScreeningDraftService(session).auto_submission_allowed(submission)
+        finally:
+            database.close()
+
+    def _auto_screening_submission(
+        self,
+        application_id: int,
+    ) -> StoredScreeningSubmission | None:
+        database = create_database(self._settings)
+        try:
+            with database.sessions.begin() as session:
+                return ScreeningDraftService(session).get_auto_submission(application_id)
         finally:
             database.close()
 

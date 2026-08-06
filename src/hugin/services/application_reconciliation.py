@@ -16,6 +16,7 @@ from hugin.domain.tasks import SystemState, TaskRecord, TaskState
 from hugin.domain.time import as_utc
 from hugin.repositories.applications import ApplicationRepository
 from hugin.repositories.tasks import QueueTaskRepository, SystemStateRepository
+from hugin.services.screening_forms import ScreeningDraftService
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,6 +28,7 @@ class ReconciliationOutcome:
 
 class ApplicationReconciliationService:
     def __init__(self, session: Session) -> None:
+        self._session = session
         self._applications = ApplicationRepository(session)
         self._tasks = QueueTaskRepository(session)
         self._system = SystemStateRepository(session)
@@ -69,10 +71,14 @@ class ApplicationReconciliationService:
                 },
             )
             task = self._tasks.transition(task.id, TaskState.COMPLETED)
+            ScreeningDraftService(self._session).mark_sent(
+                application.id,
+                sent_at=as_utc(result.checked_at),
+            )
             return ReconciliationOutcome(
                 application,
                 task,
-                blocking=self._tasks.has_unknown_result(),
+                blocking=False,
             )
 
         if result.status is ReconciliationStatus.NOT_FOUND:
@@ -84,7 +90,7 @@ class ApplicationReconciliationService:
             return ReconciliationOutcome(
                 application,
                 task,
-                blocking=self._tasks.has_unknown_result(),
+                blocking=False,
             )
 
         if result.status is ReconciliationStatus.AUTH_REQUIRED:
@@ -92,7 +98,15 @@ class ApplicationReconciliationService:
         elif result.status is ReconciliationStatus.CAPTCHA_REQUIRED:
             self._protect_system(SystemState.CAPTCHA_REQUIRED)
 
-        return ReconciliationOutcome(application, task, blocking=True)
+        return ReconciliationOutcome(
+            application,
+            task,
+            blocking=result.status
+            in {
+                ReconciliationStatus.AUTH_REQUIRED,
+                ReconciliationStatus.CAPTCHA_REQUIRED,
+            },
+        )
 
     def _protect_system(self, target: SystemState) -> None:
         current = self._system.get().state

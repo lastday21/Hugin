@@ -181,6 +181,47 @@ def test_unknown_result_requires_reconciliation_before_retry(settings: Settings)
         database.close()
 
 
+def test_unknown_result_does_not_stop_other_applications(settings: Settings) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    now = datetime(2026, 7, 18, 12, 0, tzinfo=UTC)
+
+    try:
+        with database.sessions.begin() as session:
+            uncertain_application_id = create_application(
+                session,
+                "unknown-first",
+                "resume-unknown-first",
+            )
+            next_application_id = create_application(
+                session,
+                "unknown-next",
+                "resume-unknown-next",
+            )
+            tasks = QueueTaskRepository(session)
+            uncertain = tasks.enqueue(uncertain_application_id, 80, now)
+            following = tasks.enqueue(next_application_id, 50, now)
+            SystemStateRepository(session).transition(SystemState.RUNNING)
+            queue = QueueService(session)
+
+            claimed = queue.claim_next(now)
+            assert claimed is not None
+            assert claimed.id == uncertain.id
+            tasks.transition(
+                claimed.id,
+                TaskState.UNKNOWN_RESULT,
+                error_code="UNKNOWN_RESULT",
+            )
+
+            next_claimed = queue.claim_next(now)
+            assert next_claimed is not None
+            assert next_claimed.id == following.id
+            assert tasks.get(uncertain.id).state is TaskState.UNKNOWN_RESULT
+            assert SystemStateRepository(session).get().state is SystemState.RUNNING
+    finally:
+        database.close()
+
+
 def test_queue_prefers_fresher_vacancy_before_rule_score(settings: Settings) -> None:
     upgrade_database(settings)
     database = create_database(settings)
@@ -278,6 +319,7 @@ def test_running_task_is_recovered_without_automatic_retry(settings: Settings) -
             application_id = create_application(session, "interrupted", "resume-1")
             repository = QueueTaskRepository(session)
             task = repository.enqueue(application_id, 50, now)
+            SystemStateRepository(session).transition(SystemState.RUNNING)
             assert repository.claim_next(now) is not None
 
             recovered_count = ApplicationAutomationService(session).recover_interrupted()
@@ -286,7 +328,7 @@ def test_running_task_is_recovered_without_automatic_retry(settings: Settings) -
             assert recovered_count == 1
             assert recovered.state is TaskState.UNKNOWN_RESULT
             assert recovered.last_error_code == "INTERRUPTED_DURING_APPLY"
-            assert SystemStateRepository(session).get().state is SystemState.PAUSED
+            assert SystemStateRepository(session).get().state is SystemState.RUNNING
             assert repository.claim_next(now + timedelta(hours=1)) is None
             event = ApplicationRepository(session).list_events(application_id)[-1]
             assert event.event_type is ApplicationEventType.UNKNOWN_RESULT

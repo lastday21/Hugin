@@ -6,8 +6,23 @@ import pytest
 
 from hugin.core.settings import Settings
 from hugin.database import create_database, upgrade_database
-from hugin.domain import AutomationJobKind, AutomationJobState, SystemState
-from hugin.repositories import AccountRepository, DirectionRepository, SystemStateRepository
+from hugin.domain import (
+    AutomationJobKind,
+    AutomationJobState,
+    SystemState,
+    TaskState,
+    VacancyData,
+)
+from hugin.repositories import (
+    AccountRepository,
+    ApplicationRepository,
+    DirectionRepository,
+    QueueTaskRepository,
+    ResumeRepository,
+    SystemStateRepository,
+    VacancyRepository,
+)
+from hugin.services.application_automation import ApplicationAutomationService
 from hugin.services.automation import AutomationSchedulerService
 
 pytestmark = pytest.mark.integration
@@ -121,6 +136,29 @@ def test_scheduler_limits_failure_backoff(settings: Settings) -> None:
                 assert failed.last_error_message == "Временная ошибка сети"
 
             current += timedelta(minutes=delay_minutes)
+    finally:
+        database.close()
+
+
+def test_scheduler_respects_explicit_retry_delay(settings: Settings) -> None:
+    account_id, _query_id = seed_search_query(settings)
+    database = create_database(settings)
+    current = datetime(2026, 7, 26, 9, 0, tzinfo=UTC)
+
+    try:
+        with database.sessions.begin() as session:
+            AutomationSchedulerService(session).ensure_account_jobs(account_id, current)
+            claimed = AutomationSchedulerService(session).claim_due(current)
+            assert claimed is not None
+            failed = AutomationSchedulerService(session).fail(
+                claimed.key,
+                error_code="HH_RATE_LIMITED",
+                error_message="hh.ru временно ограничил обращения",
+                retry_after_seconds=180,
+                now=current,
+            )
+
+        assert failed.next_run_at == current + timedelta(seconds=180)
     finally:
         database.close()
 
@@ -270,6 +308,83 @@ def test_protective_system_state_stops_all_background_jobs(
             jobs = {job.key: job for job in scheduler.list_for_account(account_id)}
             assert jobs[messages.key].state is AutomationJobState.BLOCKED
             assert jobs[statuses.key].state is AutomationJobState.WAITING
+    finally:
+        database.close()
+
+
+def test_authentication_restores_the_previous_queue_mode(settings: Settings) -> None:
+    account_id, _query_id = seed_search_query(settings)
+    database = create_database(settings)
+    now = datetime(2026, 7, 26, 12, 45, tzinfo=UTC)
+
+    try:
+        with database.sessions.begin() as session:
+            scheduler = AutomationSchedulerService(session)
+            messages, _statuses = scheduler.ensure_account_jobs(account_id, now)
+            state = SystemStateRepository(session)
+            state.transition(SystemState.RUNNING)
+            scheduler.block(
+                messages.key,
+                error_code="CAPTCHA_REQUIRED",
+                error_message="Требуется проверка",
+                now=now,
+            )
+
+            assert state.get().state is SystemState.CAPTCHA_REQUIRED
+            ApplicationAutomationService(session).resume_after_authentication()
+            assert state.get().state is SystemState.RUNNING
+
+            state.transition(SystemState.PAUSED)
+            state.transition(SystemState.AUTH_REQUIRED)
+            ApplicationAutomationService(session).resume_after_authentication()
+            assert state.get().state is SystemState.PAUSED
+    finally:
+        database.close()
+
+
+def test_unknown_result_accelerates_status_reconciliation(settings: Settings) -> None:
+    account_id, _query_id = seed_search_query(settings)
+    database = create_database(settings)
+    now = datetime(2026, 7, 26, 12, 50, tzinfo=UTC)
+
+    try:
+        with database.sessions.begin() as session:
+            scheduler = AutomationSchedulerService(session)
+            messages, statuses = scheduler.ensure_account_jobs(account_id, now)
+            scheduler.disable(messages.key, now)
+
+            resume = ResumeRepository(session).upsert(
+                account_id,
+                "unknown-reconciliation-resume",
+                "Python backend",
+            )
+            vacancy = VacancyRepository(session).upsert(
+                VacancyData(
+                    "unknown-reconciliation-vacancy",
+                    "Python backend",
+                    "https://hh.ru/vacancy/unknown-reconciliation-vacancy",
+                )
+            )
+            application = ApplicationRepository(session).create_apply_intent(
+                account_id,
+                vacancy.id,
+                resume.id,
+            )
+            tasks = QueueTaskRepository(session)
+            task = tasks.enqueue(application.id, 50, now)
+            assert tasks.claim_exact(task.id, now) is not None
+            tasks.transition(
+                task.id,
+                TaskState.UNKNOWN_RESULT,
+                error_code="UNKNOWN_RESULT",
+            )
+
+            claimed = scheduler.claim_due(now)
+            assert claimed is not None
+            assert claimed.key == statuses.key
+            completed = scheduler.complete(claimed.key, now=now)
+
+            assert completed.next_run_at == now + timedelta(minutes=1)
     finally:
         database.close()
 

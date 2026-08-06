@@ -119,6 +119,7 @@ line-ending = "lf"
 [tool.pytest.ini_options]
 addopts = "-ra --strict-config --strict-markers"
 markers = [
+    "empty_database: проверки миграций с исходно пустой базой",
     "integration: проверки с настоящими местными зависимостями",
 ]
 testpaths = ["tests"]

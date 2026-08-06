@@ -12,6 +12,13 @@ class HhSyncBlockedError(RuntimeError):
         self.code = code
 
 
+class HhSyncRetryableError(RuntimeError):
+    def __init__(self, code: str, message: str, *, retry_after_seconds: int) -> None:
+        super().__init__(message)
+        self.code = code.strip()[:64] or "HH_TEMPORARY_LIMIT"
+        self.retry_after_seconds = max(1, retry_after_seconds)
+
+
 class HhNegotiationStatus(StrEnum):
     APPLIED = "APPLIED"
     VIEWED = "VIEWED"

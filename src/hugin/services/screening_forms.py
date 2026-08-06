@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import re
 from dataclasses import dataclass
+from datetime import UTC, date, datetime, timedelta
 from typing import cast
 
 from sqlalchemy import delete, select
@@ -10,6 +12,7 @@ from sqlalchemy.orm import Session
 from hugin.database.models import (
     AnswerTemplateModel,
     ApplicationModel,
+    ApplicationTaskModel,
     CandidateProfileModel,
     CoverLetterModel,
     ResumeModel,
@@ -19,6 +22,7 @@ from hugin.database.models import (
     VacancyModel,
     VerifiedFactModel,
 )
+from hugin.domain.applications import ApplicationState
 from hugin.domain.content import (
     AnswerSource,
     ConfirmationState,
@@ -26,8 +30,18 @@ from hugin.domain.content import (
     ScreeningFormState,
     cover_letter_instruction_version,
 )
-from hugin.domain.hh import HhScreeningField, HhScreeningForm, screening_form_hash
+from hugin.domain.hh import (
+    HhScreeningField,
+    HhScreeningForm,
+    HhScreeningSubmission,
+    screening_form_hash,
+)
+from hugin.domain.tasks import TaskState
+from hugin.domain.time import as_utc
+from hugin.domain.vacancies import VacancyAvailability
+from hugin.repositories.tasks import FORM_PREFLIGHT_PASSED, QueueTaskRepository
 from hugin.services.ai_prompts import AiPromptSettingsService
+from hugin.services.autonomy import AutonomyPolicy, AutonomyPolicyService
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,6 +88,14 @@ class _ResolvedAnswer:
     text: str
     source: AnswerSource
     verified_fact_id: int | None
+    confirmed: bool
+
+
+@dataclass(frozen=True, slots=True)
+class StoredScreeningSubmission:
+    form_id: int
+    application_id: int
+    payload: HhScreeningSubmission
 
 
 QUESTION_KEYS: tuple[tuple[str, tuple[re.Pattern[str], ...]], ...] = (
@@ -120,12 +142,80 @@ FACT_PATTERNS: tuple[tuple[str, tuple[re.Pattern[str], ...]], ...] = (
     ("citizenship", (re.compile(r"гражданств", re.IGNORECASE),)),
     ("employment", (re.compile(r"занятост", re.IGNORECASE),)),
     ("work_format", (re.compile(r"формат.*работ", re.IGNORECASE),)),
+    (
+        "experience",
+        (
+            re.compile(r"(?:опыт|стаж).*(?:работ|лет|год|месяц)", re.IGNORECASE),
+            re.compile(r"сколько.*(?:лет|год|месяц).*(?:опыт|работ)", re.IGNORECASE),
+        ),
+    ),
+    (
+        "technology",
+        (
+            re.compile(
+                r"(?:знаком|владе|работал|работали|опыт).*(?:python|django|fastapi|"
+                r"flask|sql|postgres|redis|docker|git|linux|api)",
+                re.IGNORECASE,
+            ),
+        ),
+    ),
+    (
+        "portfolio",
+        (re.compile(r"портфолио|ссылк.*(?:профил|проект|работ)", re.IGNORECASE),),
+    ),
 )
 
 DANGEROUS_QUESTION = re.compile(
-    r"паспорт|банк|кар[тт]ы|код\s+(?:из|подтверждения)|смс|sms|оплат|"
-    r"установ.*программ|испытательн|тестов.*задан",
+    r"паспорт|банк|банковск|карт[аы]|снилс|\bинн\b|полис|удостоверен|"
+    r"код\s+(?:из|подтверждения)|смс|sms|оплат|перевод.*денег|"
+    r"документ|биометр|медицин|здоров|диагноз|судим|"
+    r"установ.*программ|испытательн|"
+    r"\bтест(?:ы|а|е|ом|у|ами|ах|ов)?\b|\bтестов\w*\b|\bтестирован\w*\b|"
+    r"домашн[\s\S]{0,80}(?:задан|работ|проект|тест)|"
+    r"(?:прой(?:д|т)|проход|выполн|сдела|реши)[\s\S]{0,120}(?:\bтест\w*|задан)|"
+    r"видео",
     re.IGNORECASE,
+)
+
+SERIOUS_QUESTION = re.compile(
+    r"почему|мотивац|расскаж|опиш|приведите.*пример|задач|решени|"
+    r"алгоритм|архитектур|проектир|код|достижен|конфликт|"
+    r"сильн.*сторон|слаб.*сторон|причин.*(?:поиск|увольнен)|"
+    r"руковод|ожидани.*работодател|эссе|развернут|развёрнут",
+    re.IGNORECASE,
+)
+
+SERIOUS_OBLIGATION = re.compile(
+    r"оформ.*(?:ип|самозан)|штраф|неустой|материальн.*ответствен|"
+    r"обязует|обязательств|удержан|платн.*обучен|обучен.*за.*счет",
+    re.IGNORECASE,
+)
+
+SUPPORTED_AUTOMATIC_FIELD_TYPES = frozenset(
+    {
+        "checkbox",
+        "date",
+        "email",
+        "number",
+        "radio",
+        "select",
+        "tel",
+        "text",
+        "textarea",
+        "url",
+    }
+)
+
+MUTABLE_FACT_CATEGORIES = frozenset(
+    {
+        "available_from",
+        "business_trips",
+        "employment",
+        "relocation",
+        "salary_expectation",
+        "work_format",
+        "work_schedule",
+    }
 )
 
 
@@ -137,17 +227,25 @@ class ScreeningDraftService:
         self,
         application_id: int,
         form: HhScreeningForm,
+        *,
+        force_review: bool = False,
     ) -> ScreeningDraft:
         application = self._session.get(ApplicationModel, application_id)
         if application is None:
             raise LookupError("Отклик не найден")
+        policy = AutonomyPolicyService(self._session).get()
+        confirmed_at = datetime.now(UTC)
         self._session.execute(
             delete(ScreeningFormModel).where(ScreeningFormModel.application_id == application_id)
         )
         stored = ScreeningFormModel(
             application_id=application_id,
             version_hash=screening_form_hash(form),
-            requires_confirmation=True,
+            requires_confirmation=(
+                force_review
+                or not self._simple_structure(form)
+                or not policy.auto_submit_simple_forms
+            ),
             state=ScreeningFormState.DRAFT,
         )
         self._session.add(stored)
@@ -158,9 +256,10 @@ class ScreeningDraftService:
                 CandidateProfileModel.account_id == application.account_id
             )
         )
-        templates = self._templates(profile.id) if profile is not None else ()
-        facts = self._facts(profile.id) if profile is not None else ()
+        templates = self._templates(profile.id, application) if profile is not None else ()
+        facts = self._facts(profile.id, application) if profile is not None else ()
         required_missing = False
+        has_unconfirmed_answer = False
         for position, field in enumerate(form.fields):
             question = ScreeningQuestionModel(
                 form_id=stored.id,
@@ -178,23 +277,37 @@ class ScreeningDraftService:
             )
             self._session.add(question)
             self._session.flush()
-            resolved = self._resolve(field, templates, facts)
+            resolved = self._resolve(
+                field,
+                templates,
+                facts,
+                policy=policy,
+                now=confirmed_at,
+            )
             if field.is_required and resolved is None:
                 required_missing = True
+            if resolved is not None and not resolved.confirmed:
+                has_unconfirmed_answer = True
             self._session.add(
                 ScreeningAnswerModel(
                     question_id=question.id,
                     answer_text=resolved.text if resolved is not None else None,
                     source=resolved.source if resolved is not None else None,
                     verified_fact_id=(resolved.verified_fact_id if resolved is not None else None),
+                    is_confirmed=resolved.confirmed if resolved is not None else False,
+                    confirmed_at=(
+                        confirmed_at if resolved is not None and resolved.confirmed else None
+                    ),
                 )
             )
 
-        stored.state = (
-            ScreeningFormState.INPUT_REQUIRED
-            if required_missing
-            else ScreeningFormState.REVIEW_REQUIRED
-        )
+        if required_missing:
+            stored.state = ScreeningFormState.INPUT_REQUIRED
+        elif stored.requires_confirmation or has_unconfirmed_answer:
+            stored.state = ScreeningFormState.REVIEW_REQUIRED
+        else:
+            stored.state = ScreeningFormState.CONFIRMED
+            stored.confirmed_at = confirmed_at
         self._session.flush()
         return self._draft(stored)
 
@@ -260,6 +373,249 @@ class ScreeningDraftService:
         form.state = ScreeningFormState.INVALIDATED
         self._session.flush()
 
+    def save_confirmed_answers(
+        self,
+        account_id: int,
+        form_id: int,
+        answers: dict[str, str],
+    ) -> ScreeningDraft:
+        if not answers:
+            raise ValueError("Укажите хотя бы один ответ")
+        if len(answers) > 100:
+            raise ValueError("За один раз можно сохранить не более 100 ответов")
+        form = self._form_for_account(account_id, form_id)
+        if form.state in {ScreeningFormState.INVALIDATED, ScreeningFormState.SENT}:
+            raise ValueError("Эта версия анкеты уже недоступна для изменения")
+        application = self._session.get(ApplicationModel, form.application_id)
+        if application is None:
+            raise RuntimeError("Отклик анкеты отсутствует")
+        rows = tuple(
+            self._session.execute(
+                select(ScreeningQuestionModel, ScreeningAnswerModel)
+                .join(
+                    ScreeningAnswerModel,
+                    ScreeningAnswerModel.question_id == ScreeningQuestionModel.id,
+                )
+                .where(ScreeningQuestionModel.form_id == form.id)
+                .order_by(ScreeningQuestionModel.position, ScreeningQuestionModel.id)
+            )
+        )
+        by_key = {question.field_key: (question, answer) for question, answer in rows}
+        unknown = sorted(set(answers) - set(by_key))
+        if unknown:
+            raise ValueError(f"В текущей анкете нет поля «{unknown[0]}»")
+
+        selected_at = datetime.now(UTC)
+        for field_key, raw_value in answers.items():
+            question, answer = by_key[field_key]
+            field = self._stored_field(question)
+            if self._prohibited(field):
+                raise ValueError(
+                    f"Поле «{question.question_text}» нужно заполнить непосредственно на hh.ru"
+                )
+            value = raw_value.strip()
+            if len(value) > 4000:
+                raise ValueError("Ответ слишком длинный")
+            compatible = self._compatible_answer(field, value)
+            if compatible is None:
+                raise ValueError(
+                    f"Ответ для поля «{question.question_text}» не соответствует формату"
+                )
+            fact = self._save_answer_template(
+                application,
+                question.question_text,
+                compatible,
+            )
+            answer.answer_text = compatible
+            answer.source = AnswerSource.USER
+            answer.verified_fact_id = fact.id
+            answer.is_confirmed = True
+            answer.confirmed_at = selected_at
+
+        required_missing = any(
+            question.is_required
+            and (
+                answer.answer_text is None
+                or not answer.answer_text.strip()
+                or not answer.is_confirmed
+            )
+            for question, answer in rows
+        )
+        has_unconfirmed_answer = any(
+            answer.answer_text is not None
+            and answer.answer_text.strip()
+            and not answer.is_confirmed
+            for _question, answer in rows
+        )
+        if required_missing:
+            form.state = ScreeningFormState.INPUT_REQUIRED
+            form.confirmed_at = None
+        elif form.requires_confirmation or has_unconfirmed_answer:
+            form.state = ScreeningFormState.REVIEW_REQUIRED
+            form.confirmed_at = None
+            self._move_task_to_review(form.application_id)
+        else:
+            form.state = ScreeningFormState.CONFIRMED
+            form.confirmed_at = selected_at
+            self._resume_task(form.application_id, selected_at)
+        self._session.flush()
+        return self._draft(form)
+
+    def get_auto_submission(
+        self,
+        application_id: int,
+    ) -> StoredScreeningSubmission | None:
+        policy = AutonomyPolicyService(self._session).get()
+        if not policy.auto_submit_simple_forms:
+            return None
+        form = self._session.scalar(
+            select(ScreeningFormModel)
+            .where(
+                ScreeningFormModel.application_id == application_id,
+                ScreeningFormModel.state == ScreeningFormState.CONFIRMED,
+                ScreeningFormModel.requires_confirmation.is_(False),
+            )
+            .order_by(ScreeningFormModel.updated_at.desc(), ScreeningFormModel.id.desc())
+            .limit(1)
+        )
+        if form is None:
+            return None
+        application = self._session.get(ApplicationModel, application_id)
+        if application is None or application.state is not ApplicationState.APPLYING:
+            return None
+        resume = self._session.get(ResumeModel, application.resume_id)
+        vacancy = self._session.get(VacancyModel, application.vacancy_id)
+        if (
+            resume is None
+            or not resume.is_active
+            or vacancy is None
+            or vacancy.availability is not VacancyAvailability.ACTIVE
+        ):
+            return None
+        rows = tuple(
+            self._session.execute(
+                select(ScreeningQuestionModel, ScreeningAnswerModel)
+                .join(
+                    ScreeningAnswerModel,
+                    ScreeningAnswerModel.question_id == ScreeningQuestionModel.id,
+                )
+                .where(ScreeningQuestionModel.form_id == form.id)
+                .order_by(ScreeningQuestionModel.position, ScreeningQuestionModel.id)
+            )
+        )
+        if not rows or any(
+            question.is_required
+            and (
+                answer.answer_text is None
+                or not answer.answer_text.strip()
+                or not answer.is_confirmed
+            )
+            for question, answer in rows
+        ):
+            return None
+        if not self._answers_still_allowed(form.id, application, policy):
+            return None
+        confirmed_answers = tuple(
+            (question.field_key, answer.answer_text.strip())
+            for question, answer in rows
+            if answer.answer_text is not None and answer.answer_text.strip() and answer.is_confirmed
+        )
+        return StoredScreeningSubmission(
+            form_id=form.id,
+            application_id=application_id,
+            payload=HhScreeningSubmission(form.version_hash, confirmed_answers),
+        )
+
+    def auto_submission_allowed(
+        self,
+        submission: StoredScreeningSubmission,
+    ) -> bool:
+        policy = AutonomyPolicyService(self._session).get()
+        if not policy.auto_submit_simple_forms:
+            return False
+        current = self.get_auto_submission(submission.application_id)
+        if current is None:
+            return False
+        if current.form_id != submission.form_id or current.payload != submission.payload:
+            return False
+        application = self._session.get(ApplicationModel, submission.application_id)
+        if application is None:
+            return False
+        return self._answers_still_allowed(current.form_id, application, policy)
+
+    def _answers_still_allowed(
+        self,
+        form_id: int,
+        application: ApplicationModel,
+        policy: AutonomyPolicy,
+    ) -> bool:
+        selected_at = datetime.now(UTC)
+        rows = tuple(
+            self._session.execute(
+                select(
+                    ScreeningAnswerModel,
+                    VerifiedFactModel,
+                    ScreeningQuestionModel,
+                )
+                .join(
+                    ScreeningQuestionModel,
+                    ScreeningQuestionModel.id == ScreeningAnswerModel.question_id,
+                )
+                .outerjoin(
+                    VerifiedFactModel,
+                    VerifiedFactModel.id == ScreeningAnswerModel.verified_fact_id,
+                )
+                .where(
+                    ScreeningQuestionModel.form_id == form_id,
+                    ScreeningAnswerModel.is_confirmed.is_(True),
+                    ScreeningAnswerModel.answer_text.is_not(None),
+                )
+            )
+        )
+        return all(
+            fact is not None
+            and fact.state is ConfirmationState.CONFIRMED
+            and fact.allow_in_forms
+            and (fact.resume_id is None or fact.resume_id == application.resume_id)
+            and (fact.direction_id is None or fact.direction_id == application.direction_id)
+            and answer.answer_text is not None
+            and answer.answer_text.strip() == fact.content.strip()
+            and self._fact_is_current(
+                fact,
+                question.question_text,
+                policy,
+                now=selected_at,
+            )
+            for answer, fact, question in rows
+        )
+
+    def mark_sent(
+        self,
+        application_id: int,
+        *,
+        version_hash: str | None = None,
+        sent_at: datetime | None = None,
+    ) -> None:
+        statement = select(ScreeningFormModel).where(
+            ScreeningFormModel.application_id == application_id,
+            ScreeningFormModel.state.not_in(
+                (ScreeningFormState.INVALIDATED, ScreeningFormState.SENT)
+            ),
+        )
+        if version_hash is not None:
+            statement = statement.where(ScreeningFormModel.version_hash == version_hash)
+        form = self._session.scalar(
+            statement.order_by(
+                ScreeningFormModel.updated_at.desc(),
+                ScreeningFormModel.id.desc(),
+            ).limit(1)
+        )
+        if form is None:
+            return
+        form.state = ScreeningFormState.SENT
+        form.confirmed_at = sent_at or datetime.now(UTC)
+        self._session.flush()
+
     def _draft(self, form: ScreeningFormModel) -> ScreeningDraft:
         application = self._session.get(ApplicationModel, form.application_id)
         if application is None:
@@ -321,6 +677,7 @@ class ScreeningDraftService:
     def _templates(
         self,
         profile_id: int,
+        application: ApplicationModel,
     ) -> tuple[tuple[AnswerTemplateModel, VerifiedFactModel | None], ...]:
         rows = self._session.execute(
             select(AnswerTemplateModel, VerifiedFactModel)
@@ -331,12 +688,30 @@ class ScreeningDraftService:
             .where(
                 AnswerTemplateModel.profile_id == profile_id,
                 AnswerTemplateModel.is_active.is_(True),
+                (
+                    (VerifiedFactModel.id.is_(None))
+                    | (
+                        (VerifiedFactModel.resume_id.is_(None))
+                        | (VerifiedFactModel.resume_id == application.resume_id)
+                    )
+                ),
+                (
+                    (VerifiedFactModel.id.is_(None))
+                    | (
+                        (VerifiedFactModel.direction_id.is_(None))
+                        | (VerifiedFactModel.direction_id == application.direction_id)
+                    )
+                ),
             )
             .order_by(AnswerTemplateModel.id)
         )
         return tuple((template, cast(VerifiedFactModel | None, fact)) for template, fact in rows)
 
-    def _facts(self, profile_id: int) -> tuple[VerifiedFactModel, ...]:
+    def _facts(
+        self,
+        profile_id: int,
+        application: ApplicationModel,
+    ) -> tuple[VerifiedFactModel, ...]:
         return tuple(
             self._session.scalars(
                 select(VerifiedFactModel)
@@ -344,6 +719,14 @@ class ScreeningDraftService:
                     VerifiedFactModel.profile_id == profile_id,
                     VerifiedFactModel.state == ConfirmationState.CONFIRMED,
                     VerifiedFactModel.allow_in_forms.is_(True),
+                    (
+                        (VerifiedFactModel.resume_id.is_(None))
+                        | (VerifiedFactModel.resume_id == application.resume_id)
+                    ),
+                    (
+                        (VerifiedFactModel.direction_id.is_(None))
+                        | (VerifiedFactModel.direction_id == application.direction_id)
+                    ),
                 )
                 .order_by(VerifiedFactModel.id)
             )
@@ -354,6 +737,9 @@ class ScreeningDraftService:
         field: HhScreeningField,
         templates: tuple[tuple[AnswerTemplateModel, VerifiedFactModel | None], ...],
         facts: tuple[VerifiedFactModel, ...],
+        *,
+        policy: AutonomyPolicy,
+        now: datetime,
     ) -> _ResolvedAnswer | None:
         if (
             field.has_attachment
@@ -362,24 +748,25 @@ class ScreeningDraftService:
             or DANGEROUS_QUESTION.search(field.question)
         ):
             return None
-        question_key = self._question_key(field.question)
         normalized_question = self._normalize(field.question)
         for template, fact in templates:
-            fact_allowed = fact is None or (
+            fact_allowed = fact is not None and (
                 fact.state == ConfirmationState.CONFIRMED and fact.allow_in_forms
+                and self._fact_is_current(
+                    fact,
+                    field.question,
+                    policy,
+                    now=now,
+                )
             )
-            if not fact_allowed:
-                continue
-            if (
-                self._normalize(template.question_pattern) == normalized_question
-                or template.key == question_key
-            ):
+            if self._normalize(template.question_pattern) == normalized_question:
                 answer = self._compatible_answer(field, template.answer_text)
                 if answer is not None:
                     return _ResolvedAnswer(
                         answer,
                         AnswerSource.BANK,
                         template.verified_fact_id,
+                        fact_allowed,
                     )
 
         category = self._fact_category(field.question)
@@ -390,25 +777,245 @@ class ScreeningDraftService:
                 continue
             answer = self._compatible_answer(field, fact.content)
             if answer is not None:
-                return _ResolvedAnswer(answer, AnswerSource.PROFILE, fact.id)
+                return _ResolvedAnswer(
+                    answer,
+                    AnswerSource.PROFILE,
+                    fact.id,
+                    self._fact_is_current(
+                        fact,
+                        field.question,
+                        policy,
+                        now=now,
+                    ),
+                )
         return None
+
+    @classmethod
+    def _fact_is_current(
+        cls,
+        fact: VerifiedFactModel,
+        question: str,
+        policy: AutonomyPolicy,
+        *,
+        now: datetime,
+    ) -> bool:
+        categories = {
+            fact.category,
+            cls._question_key(question),
+            cls._fact_category(question),
+        }
+        if MUTABLE_FACT_CATEGORIES.isdisjoint(categories):
+            return True
+        if fact.actual_at is None:
+            return False
+        threshold = as_utc(now) - timedelta(days=policy.mutable_fact_validity_days)
+        return as_utc(fact.actual_at) >= threshold
+
+    def _form_for_account(self, account_id: int, form_id: int) -> ScreeningFormModel:
+        form = self._session.scalar(
+            select(ScreeningFormModel)
+            .join(ApplicationModel, ApplicationModel.id == ScreeningFormModel.application_id)
+            .where(
+                ScreeningFormModel.id == form_id,
+                ApplicationModel.account_id == account_id,
+            )
+        )
+        if form is None:
+            raise LookupError("Черновик анкеты не найден")
+        return form
+
+    def _save_answer_template(
+        self,
+        application: ApplicationModel,
+        question: str,
+        answer: str,
+    ) -> VerifiedFactModel:
+        profile = self._session.scalar(
+            select(CandidateProfileModel).where(
+                CandidateProfileModel.account_id == application.account_id
+            )
+        )
+        if profile is None:
+            raise LookupError("Профиль кандидата не найден; сначала импортируйте резюме")
+        digest = hashlib.sha256(self._normalize(question).encode("utf-8")).hexdigest()[:24]
+        scope = f"{application.direction_id or 0}:{application.resume_id}"
+        key = f"screening:{scope}:{digest}"
+        category = (
+            self._question_key(question)
+            or self._fact_category(question)
+            or "screening_answer"
+        )
+        fact = self._session.scalar(
+            select(VerifiedFactModel).where(
+                VerifiedFactModel.profile_id == profile.id,
+                VerifiedFactModel.source_reference == key,
+            )
+        )
+        if fact is None:
+            fact = VerifiedFactModel(
+                profile_id=profile.id,
+                category=category,
+                source_type="user",
+                source_reference=key,
+                resume_id=application.resume_id,
+                direction_id=application.direction_id,
+            )
+            self._session.add(fact)
+        fact.category = category
+        fact.content = answer
+        fact.actual_at = datetime.now(UTC)
+        fact.state = ConfirmationState.CONFIRMED
+        fact.allow_in_forms = True
+        self._session.flush()
+
+        template = self._session.scalar(
+            select(AnswerTemplateModel).where(
+                AnswerTemplateModel.profile_id == profile.id,
+                AnswerTemplateModel.key == key,
+            )
+        )
+        if template is None:
+            template = AnswerTemplateModel(profile_id=profile.id, key=key)
+            self._session.add(template)
+        template.question_pattern = question
+        template.answer_text = answer
+        template.verified_fact_id = fact.id
+        template.is_active = True
+        self._session.flush()
+        return fact
+
+    def _resume_task(self, application_id: int, selected_at: datetime) -> None:
+        task = self._session.scalar(
+            select(ApplicationTaskModel).where(
+                ApplicationTaskModel.application_id == application_id
+            )
+        )
+        if task is None:
+            return
+        tasks = QueueTaskRepository(self._session)
+        if task.state is TaskState.INPUT_REQUIRED:
+            tasks.transition(
+                task.id,
+                TaskState.REVIEW_REQUIRED,
+                error_code="FORM_ANSWERS_CONFIRMED",
+            )
+            task = self._session.get(ApplicationTaskModel, task.id)
+            if task is None:
+                return
+        if task.state is TaskState.REVIEW_REQUIRED:
+            tasks.transition(
+                task.id,
+                TaskState.RETRY_SCHEDULED,
+                scheduled_at=selected_at,
+                error_code=FORM_PREFLIGHT_PASSED,
+            )
+
+    def _move_task_to_review(self, application_id: int) -> None:
+        task = self._session.scalar(
+            select(ApplicationTaskModel).where(
+                ApplicationTaskModel.application_id == application_id
+            )
+        )
+        if task is None or task.state is not TaskState.INPUT_REQUIRED:
+            return
+        QueueTaskRepository(self._session).transition(
+            task.id,
+            TaskState.REVIEW_REQUIRED,
+            error_code="FORM_ANSWERS_CONFIRMED",
+        )
+
+    @classmethod
+    def _simple_structure(cls, form: HhScreeningForm) -> bool:
+        return (
+            bool(form.fields)
+            and not form.warnings
+            and all(cls._simple_field(field) for field in form.fields)
+        )
+
+    @classmethod
+    def _simple_field(cls, field: HhScreeningField) -> bool:
+        if cls._prohibited(field):
+            return False
+        if field.field_type.casefold() not in SUPPORTED_AUTOMATIC_FIELD_TYPES:
+            return False
+        if SERIOUS_QUESTION.search(field.question) or SERIOUS_OBLIGATION.search(field.question):
+            return False
+        return (
+            cls._question_key(field.question) is not None
+            or cls._fact_category(field.question) is not None
+        )
+
+    @staticmethod
+    def _prohibited(field: HhScreeningField) -> bool:
+        return bool(
+            field.has_attachment
+            or field.has_external_action
+            or field.has_test_assignment
+            or DANGEROUS_QUESTION.search(field.question)
+            or SERIOUS_OBLIGATION.search(field.question)
+        )
+
+    @staticmethod
+    def _stored_field(question: ScreeningQuestionModel) -> HhScreeningField:
+        return HhScreeningField(
+            key=question.field_key,
+            question=question.question_text,
+            field_type=question.field_type,
+            is_required=question.is_required,
+            options=tuple(question.options),
+            max_length=question.max_length,
+            format_hint=question.format_hint or "",
+            has_attachment=question.has_attachment,
+            has_external_action=question.has_external_action,
+            has_test_assignment=question.has_test_assignment,
+        )
 
     @staticmethod
     def _compatible_answer(field: HhScreeningField, value: str) -> str | None:
         answer = value.strip()
         if not answer or (field.max_length is not None and len(answer) > field.max_length):
             return None
-        if not field.options:
-            return answer
-        normalized = ScreeningDraftService._normalize(answer)
-        return next(
-            (
-                option
-                for option in field.options
-                if ScreeningDraftService._normalize(option) == normalized
-            ),
-            None,
-        )
+        field_type = field.field_type.casefold()
+        if field_type == "checkbox":
+            normalized = ScreeningDraftService._normalize(answer)
+            if normalized in {"да", "true", "1", "согласен"}:
+                return "Да"
+            if normalized in {"нет", "false", "0", "не согласен"}:
+                return "Нет"
+            return None
+        if field.options:
+            normalized = ScreeningDraftService._normalize(answer)
+            return next(
+                (
+                    option
+                    for option in field.options
+                    if ScreeningDraftService._normalize(option) == normalized
+                ),
+                None,
+            )
+        if (
+            field_type == "email"
+            and re.fullmatch(
+                r"[^@\s]+@[^@\s]+\.[^@\s]+",
+                answer,
+            )
+            is None
+        ):
+            return None
+        if field_type == "tel":
+            digits = re.sub(r"\D", "", answer)
+            if not 7 <= len(digits) <= 15 or re.fullmatch(r"[\d\s()+-]+", answer) is None:
+                return None
+        if field_type == "url" and re.fullmatch(r"https?://\S+", answer) is None:
+            return None
+        if field_type == "number" and re.fullmatch(r"[+-]?\d+(?:[.,]\d+)?", answer) is None:
+            return None
+        if field_type == "date":
+            try:
+                date.fromisoformat(answer)
+            except ValueError:
+                return None
+        return answer
 
     @staticmethod
     def _question_key(question: str) -> str | None:

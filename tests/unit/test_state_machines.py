@@ -28,6 +28,8 @@ def test_valid_state_transitions() -> None:
     ensure_system_transition(SystemState.RUNNING, SystemState.CAPTCHA_REQUIRED)
     ensure_system_transition(SystemState.PAUSED, SystemState.AUTH_REQUIRED)
     ensure_system_transition(SystemState.AUTH_REQUIRED, SystemState.PAUSED)
+    ensure_system_transition(SystemState.AUTH_REQUIRED, SystemState.CAPTCHA_REQUIRED)
+    ensure_system_transition(SystemState.CAPTCHA_REQUIRED, SystemState.ACCOUNT_WARNING)
 
 
 @pytest.mark.parametrize(

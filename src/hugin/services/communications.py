@@ -100,12 +100,21 @@ class CommunicationService:
         *,
         application_id: int,
         body: str,
+        auto_send_approved: bool = False,
+        reply_template_key: str | None = None,
     ) -> RecruiterMessageRecord:
         exact_body = self._body(body)
+        selected_template_key = reply_template_key.strip() if reply_template_key else None
+        if selected_template_key is not None and len(selected_template_key) > 64:
+            raise ValueError("Ключ утверждённого ответа длиннее 64 символов")
+        if auto_send_approved and not selected_template_key:
+            raise ValueError("Для автоматической отправки нужен ключ утверждённого ответа")
         return self._repository.create_outgoing_draft(
             application_id=self._positive_id(application_id),
             body=exact_body,
             content_hash=self.content_hash(exact_body),
+            auto_send_approved=auto_send_approved,
+            reply_template_key=selected_template_key,
         )
 
     def edit_outgoing_draft(
@@ -137,6 +146,38 @@ class CommunicationService:
             message_id=self._positive_id(message_id),
             content_version=self._positive_id(content_version),
             content_hash=self._hash(content_hash),
+            confirmed_at=self._now(confirmed_at),
+        )
+
+    def confirm_outgoing_retry(
+        self,
+        *,
+        account_id: int,
+        message_id: int,
+        content_version: int,
+        content_hash: str,
+        confirmed_at: datetime | None = None,
+    ) -> RecruiterMessageRecord:
+        selected_account_id = self._positive_id(account_id)
+        selected_message_id = self._positive_id(message_id)
+        selected_version = self._positive_id(content_version)
+        selected_hash = self._hash(content_hash)
+        message = self._repository.lock_message_for_send(
+            selected_account_id,
+            selected_message_id,
+        )
+        self._require_exact_version(message, selected_version, selected_hash)
+        if message.state is RecruiterMessageState.CONFIRMED:
+            return message
+        if message.state is not RecruiterMessageState.FAILED:
+            raise CommunicationStateError(
+                "Повтор разрешён только для подтверждённого ответа или явной ошибки отправки"
+            )
+        return self._repository.confirm_outgoing_draft(
+            account_id=selected_account_id,
+            message_id=selected_message_id,
+            content_version=selected_version,
+            content_hash=selected_hash,
             confirmed_at=self._now(confirmed_at),
         )
 

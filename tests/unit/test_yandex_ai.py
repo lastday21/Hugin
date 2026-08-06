@@ -65,6 +65,64 @@ def test_yandex_client_streams_private_completion(monkeypatch: pytest.MonkeyPatc
     assert body["messages"][1]["content"] == "Пользовательский запрос"
 
 
+def test_yandex_client_uses_selected_source_address(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    opened: list[tuple[urllib.request.Request, int]] = []
+    handlers: list[urllib.request.BaseHandler] = []
+
+    class FakeOpener:
+        def open(
+            self,
+            request: urllib.request.Request,
+            *,
+            timeout: int,
+        ) -> FakeResponse:
+            opened.append((request, timeout))
+            return FakeResponse(
+                [b'data: {"choices":[{"message":{"content":"ok"}}]}\n']
+            )
+
+    def build_opener(
+        *selected_handlers: urllib.request.BaseHandler,
+    ) -> FakeOpener:
+        handlers.extend(selected_handlers)
+        return FakeOpener()
+
+    monkeypatch.setattr(urllib.request, "build_opener", build_opener)
+    client = YandexAIClient(
+        "key",
+        "folder",
+        connect_ip="158.160.54.160",
+        source_ip="192.168.0.18",
+    )
+
+    assert client.complete("system", "user") == "ok"
+    assert any(
+        type(handler).__name__ == "_SourceAddressHTTPSHandler"
+        for handler in handlers
+    )
+    assert opened[0][1] == 120
+
+
+def test_yandex_client_rejects_invalid_source_address() -> None:
+    with pytest.raises(ValueError):
+        YandexAIClient("key", "folder", source_ip="not-an-ip")
+    with pytest.raises(ValueError):
+        YandexAIClient(
+            "key",
+            "folder",
+            connect_ip="not-an-ip",
+            source_ip="192.168.0.18",
+        )
+    with pytest.raises(ValueError, match="исходящий"):
+        YandexAIClient(
+            "key",
+            "folder",
+            connect_ip="158.160.54.160",
+        )
+
+
 def test_yandex_client_journals_call_and_reported_tokens(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

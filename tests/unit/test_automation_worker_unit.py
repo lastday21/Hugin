@@ -6,6 +6,7 @@ from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -18,7 +19,12 @@ from hugin.domain import (
     AutomationJobState,
     AutomationJobStateError,
 )
-from hugin.workers.automation import AutomationJobBlocked, AutomationWorker
+from hugin.domain.tasks import SystemState
+from hugin.workers.automation import (
+    AutomationJobBlocked,
+    AutomationJobRetry,
+    AutomationWorker,
+)
 
 
 def make_job(kind: AutomationJobKind = AutomationJobKind.MESSAGES) -> AutomationJobRecord:
@@ -71,6 +77,7 @@ class FakeScheduler:
         self.heartbeat_seen = threading.Event()
         self.blocked: list[tuple[str, str, str, datetime | None]] = []
         self.failed: list[tuple[str, str, str, datetime | None]] = []
+        self.retry_delays: list[int | None] = []
         self.completed: list[tuple[str, AutomationJobResult, datetime | None]] = []
 
     def ensure_configured_jobs(
@@ -113,9 +120,11 @@ class FakeScheduler:
         *,
         error_code: str,
         error_message: str,
+        retry_after_seconds: int | None = None,
         now: datetime | None = None,
     ) -> None:
         self.failed.append((job_key, error_code, error_message, now))
+        self.retry_delays.append(retry_after_seconds)
 
     def complete(
         self,
@@ -129,6 +138,8 @@ class FakeScheduler:
 def patch_worker_storage(
     monkeypatch: pytest.MonkeyPatch,
     scheduler: FakeScheduler,
+    *,
+    system_state: SystemState = SystemState.RUNNING,
 ) -> FakeDatabase:
     database = FakeDatabase()
 
@@ -138,8 +149,20 @@ def patch_worker_storage(
     def create_scheduler(_session: object) -> FakeScheduler:
         return scheduler
 
+    class FakeSystemStateRepository:
+        def __init__(self, _session: object) -> None:
+            pass
+
+        def get(self) -> SimpleNamespace:
+            return SimpleNamespace(state=system_state)
+
     monkeypatch.setattr(worker_module, "create_database", create_database)
     monkeypatch.setattr(worker_module, "AutomationSchedulerService", create_scheduler)
+    monkeypatch.setattr(
+        worker_module,
+        "SystemStateRepository",
+        FakeSystemStateRepository,
+    )
     return database
 
 
@@ -242,13 +265,24 @@ def test_connected_handler_unblocks_previous_missing_source(
 
 
 @pytest.mark.parametrize(
-    ("account_id", "poll_seconds", "heartbeat_seconds"),
-    [(0, 2.0, 30.0), (1, 0.0, 30.0), (1, 2.0, 0.0)],
+    (
+        "account_id",
+        "poll_seconds",
+        "heartbeat_seconds",
+        "authentication_recovery_interval_seconds",
+    ),
+    [
+        (0, 2.0, 30.0, 60.0),
+        (1, 0.0, 30.0, 60.0),
+        (1, 2.0, 0.0, 60.0),
+        (1, 2.0, 30.0, 0.0),
+    ],
 )
 def test_worker_rejects_invalid_settings(
     account_id: int,
     poll_seconds: float,
     heartbeat_seconds: float,
+    authentication_recovery_interval_seconds: float,
 ) -> None:
     with pytest.raises(ValueError):
         AutomationWorker(
@@ -256,6 +290,9 @@ def test_worker_rejects_invalid_settings(
             account_id=account_id,
             poll_seconds=poll_seconds,
             heartbeat_seconds=heartbeat_seconds,
+            authentication_recovery_interval_seconds=(
+                authentication_recovery_interval_seconds
+            ),
         )
 
 
@@ -270,6 +307,62 @@ def test_worker_returns_false_when_no_job_is_due(
     assert scheduler.configured == [(1, now)]
     assert scheduler.recovered == [now]
     assert database.closed
+
+
+@pytest.mark.parametrize(
+    "system_state",
+    [SystemState.AUTH_REQUIRED, SystemState.CAPTCHA_REQUIRED],
+)
+def test_worker_retries_authentication_on_a_bounded_interval(
+    monkeypatch: pytest.MonkeyPatch,
+    system_state: SystemState,
+) -> None:
+    now = datetime(2026, 8, 6, 8, 0, tzinfo=UTC)
+    scheduler = FakeScheduler(None)
+    patch_worker_storage(monkeypatch, scheduler, system_state=system_state)
+    attempts: list[SystemState] = []
+
+    def recover() -> bool:
+        attempts.append(system_state)
+        return False
+
+    worker = AutomationWorker(
+        Settings(environment="test"),
+        authentication_recovery=recover,
+        authentication_recovery_interval_seconds=60,
+    )
+
+    assert worker.run_once(now)
+    assert not worker.run_once(now.replace(second=30))
+    assert worker.run_once(now.replace(minute=1))
+
+    assert attempts == [system_state, system_state]
+
+
+def test_worker_does_not_recover_account_warning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime(2026, 8, 6, 8, 0, tzinfo=UTC)
+    scheduler = FakeScheduler(None)
+    patch_worker_storage(
+        monkeypatch,
+        scheduler,
+        system_state=SystemState.ACCOUNT_WARNING,
+    )
+    attempts = 0
+
+    def recover() -> bool:
+        nonlocal attempts
+        attempts += 1
+        return True
+
+    worker = AutomationWorker(
+        Settings(environment="test"),
+        authentication_recovery=recover,
+    )
+
+    assert not worker.run_once(now)
+    assert attempts == 0
 
 
 def test_worker_blocks_job_when_handler_reports_required_action(
@@ -323,6 +416,35 @@ def test_worker_records_unexpected_handler_exception(
     assert scheduler.failed[0][0] == job.key
     assert scheduler.failed[0][1] == "SilentFailure"
     assert scheduler.failed[0][2]
+
+
+def test_worker_schedules_explicit_retry_delay(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 7, 26, 8, 0, tzinfo=UTC)
+    job = make_job()
+    scheduler = FakeScheduler(job)
+    patch_worker_storage(monkeypatch, scheduler)
+
+    def retry(_job: AutomationJobRecord) -> AutomationJobResult:
+        raise AutomationJobRetry(
+            "HH_RATE_LIMITED",
+            "hh.ru временно ограничил обращения",
+            retry_after_seconds=180,
+        )
+
+    worker = AutomationWorker(
+        Settings(environment="test", data_dir=tmp_path),
+        handlers={AutomationJobKind.MESSAGES: retry},
+    )
+
+    assert worker.run_once(now)
+    assert scheduler.failed == [
+        (job.key, "HH_RATE_LIMITED", "hh.ru временно ограничил обращения", now)
+    ]
+    assert scheduler.retry_delays == [180]
+    assert not scheduler.blocked
     assert scheduler.failed[0][3] == now
     assert not scheduler.blocked
     assert not scheduler.completed
@@ -370,6 +492,13 @@ def test_worker_updates_heartbeat_from_a_separate_database(
 
     monkeypatch.setattr(worker_module, "create_database", create_database)
     monkeypatch.setattr(worker_module, "AutomationSchedulerService", create_scheduler)
+    monkeypatch.setattr(
+        worker_module,
+        "SystemStateRepository",
+        lambda _session: SimpleNamespace(
+            get=lambda: SimpleNamespace(state=SystemState.RUNNING)
+        ),
+    )
 
     def complete(_job: AutomationJobRecord) -> AutomationJobResult:
         assert scheduler.heartbeat_seen.wait(1.0)

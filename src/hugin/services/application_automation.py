@@ -22,8 +22,10 @@ from hugin.domain.applications import (
     ApplicationState,
     EventPayload,
 )
+from hugin.domain.automation import AutomationJobKind
 from hugin.domain.content import (
     CoverLetterState,
+    ScreeningFormState,
     cover_letter_instruction_version,
 )
 from hugin.domain.directions import (
@@ -38,6 +40,7 @@ from hugin.domain.tasks import ApplicationPolicyRecord, SystemState, TaskRecord,
 from hugin.domain.time import as_utc
 from hugin.domain.vacancies import VacancyAvailability, VacancyRecord
 from hugin.repositories.applications import ApplicationRepository
+from hugin.repositories.automation import AutomationJobRepository
 from hugin.repositories.directions import (
     AccountRepository,
     DirectionRepository,
@@ -51,9 +54,10 @@ from hugin.repositories.tasks import (
 )
 from hugin.repositories.vacancies import VacancyRepository
 from hugin.services.ai_prompts import AiPromptSettingsService
+from hugin.services.autonomy import AutonomyPolicyService
 from hugin.services.cover_letter import CoverLetterService
 from hugin.services.queue import QueueService
-from hugin.services.screening_forms import ScreeningDraftService
+from hugin.services.screening_forms import ScreeningDraft, ScreeningDraftService
 from hugin.services.vacancy_analysis import RULES_VERSION, RuleCategory
 
 SUPERVISED_MIN_INTERVAL = timedelta(seconds=60)
@@ -271,8 +275,6 @@ class ApplicationAutomationService:
         if self._system.supervised_lease_active():
             return 0
         recovered = self._tasks.recover_running()
-        if any(task.state is TaskState.UNKNOWN_RESULT for task in recovered):
-            self._transition_system(SystemState.PAUSED)
         return len(recovered)
 
     def recover_expired_supervised(self, now: datetime | None = None) -> int:
@@ -283,8 +285,6 @@ class ApplicationAutomationService:
             recovery="supervised_lease_expired",
             now=selected_at,
         )
-        if any(task.state is TaskState.UNKNOWN_RESULT for task in recovered):
-            self._transition_system(SystemState.PAUSED)
         return len(recovered)
 
     def policy(self, timezone_name: str | None = None) -> ApplicationPolicyRecord:
@@ -296,6 +296,9 @@ class ApplicationAutomationService:
             and not self._system.supervised_lease_active()
         )
 
+    def stretch_automation_enabled(self) -> bool:
+        return AutonomyPolicyService(self._session).get().auto_apply_stretch
+
     def acquire_supervised_lease(
         self,
         token: str,
@@ -303,8 +306,6 @@ class ApplicationAutomationService:
         ttl: timedelta = timedelta(minutes=15),
     ) -> datetime:
         self._system.lock()
-        if self._tasks.has_unknown_result():
-            raise RuntimeError("Сначала нужно сверить отклик, результат которого неизвестен")
         running_task = self._session.scalar(
             select(ApplicationTaskModel.id)
             .where(ApplicationTaskModel.state == TaskState.RUNNING)
@@ -335,9 +336,7 @@ class ApplicationAutomationService:
     ) -> bool:
         selected_at = as_utc(now or datetime.now(UTC))
         system = self._system.lock()
-        if self._tasks.has_unknown_result() or not self._system.supervised_lease_is_valid(
-            token, now=selected_at
-        ):
+        if not self._system.supervised_lease_is_valid(token, now=selected_at):
             return False
         instruction_version = cover_letter_instruction_version(
             AiPromptSettingsService(self._session).get().cover_letter
@@ -430,14 +429,15 @@ class ApplicationAutomationService:
     ) -> bool:
         selected_at = as_utc(now or datetime.now(UTC))
         system = self._system.lock()
-        if (
-            system.state is not SystemState.RUNNING
-            or self._tasks.has_unknown_result()
-            or self._system.supervised_lease_active(selected_at)
+        if system.state is not SystemState.RUNNING or self._system.supervised_lease_active(
+            selected_at
         ):
             return False
         if system.next_apply_at is not None and as_utc(system.next_apply_at) > selected_at:
             return False
+        allowed_categories = [RuleCategory.MATCH.value]
+        if self.stretch_automation_enabled():
+            allowed_categories.append(RuleCategory.STRETCH.value)
         instruction_version = cover_letter_instruction_version(
             AiPromptSettingsService(self._session).get().cover_letter
         )
@@ -465,8 +465,9 @@ class ApplicationAutomationService:
                 VacancyModel.availability == VacancyAvailability.ACTIVE,
                 DirectionVacancyModel.state == VacancyState.QUEUED,
                 DirectionVacancyModel.rules_version == RULES_VERSION,
-                DirectionVacancyModel.rules_details["category"].as_string()
-                == RuleCategory.MATCH.value,
+                DirectionVacancyModel.rules_details["category"]
+                .as_string()
+                .in_(allowed_categories),
                 CoverLetterModel.id == letter_id,
                 CoverLetterModel.state == CoverLetterState.READY,
                 CoverLetterModel.text.is_not(None),
@@ -517,8 +518,6 @@ class ApplicationAutomationService:
         if not 1 <= session_limit <= 20:
             raise ValueError("Предел управляемого сеанса должен быть от 1 до 20")
         selected_at = as_utc(now or datetime.now(UTC))
-        if self._tasks.has_unknown_result():
-            raise RuntimeError("Сначала нужно сверить отклик, результат которого неизвестен")
         if not self._system.supervised_lease_is_valid(lease_token, now=selected_at):
             raise RuntimeError(
                 "Управляемый сеанс не активен или срок его аренды истёк"  # noqa: RUF001
@@ -811,7 +810,6 @@ class ApplicationAutomationService:
         system = self._system.lock()
         if (
             system.state is not SystemState.RUNNING
-            or self._tasks.has_unknown_result()
             or self._system.supervised_lease_active(selected_at)
             or (system.next_apply_at is not None and as_utc(system.next_apply_at) > selected_at)
         ):
@@ -869,8 +867,6 @@ class ApplicationAutomationService:
             raise RuntimeError(
                 "Перед управляемой проверкой формы поставьте отправку откликов на паузу"
             )
-        if self._tasks.has_unknown_result():
-            raise RuntimeError("Сначала нужно сверить отклик, результат которого неизвестен")
         if self._system.supervised_lease_active(selected_at):
             raise RuntimeError("Другой управляемый сеанс ещё не завершён")
 
@@ -981,10 +977,54 @@ class ApplicationAutomationService:
         return self._applications.count_applied_since(account_id, since)
 
     def resume_after_authentication(self) -> None:
-        current = self._system.get().state
-        if current not in {SystemState.AUTH_REQUIRED, SystemState.CAPTCHA_REQUIRED}:
-            return
-        self._system.transition(SystemState.PAUSED)
+        self._system.resume_after_authentication()
+
+    def record_form_preflight(
+        self,
+        job: ApplyJob,
+        result: HhApplyResult,
+        *,
+        now: datetime | None = None,
+    ) -> bool:
+        if result.status is not HhApplyStatus.QUESTIONS_REQUIRED:
+            raise ValueError("Результат не содержит анкету работодателя")
+        task = self._tasks.get(job.task.id)
+        if (
+            task.state is not TaskState.RUNNING
+            or task.last_error_code != FORM_PREFLIGHT_RUNNING
+            or task.application_id != job.application.id
+        ):
+            raise RuntimeError("Предварительная проверка формы уже завершена")
+        selected_at = as_utc(now or datetime.now(UTC))
+        draft = self._capture_screening_form(job, result)
+        payload: EventPayload = {
+            "hh_status": result.status.value,
+            "confirmation": result.confirmation[:1000],
+            "final_url": result.final_url[:1000],
+            "question_count": len(draft.questions),
+            "answered_count": len(draft.answers),
+            "screening_form_state": draft.state.value,
+        }
+        if draft.state is ScreeningFormState.CONFIRMED:
+            self._tasks.transition(
+                job.task.id,
+                TaskState.RETRY_SCHEDULED,
+                scheduled_at=selected_at,
+                error_code=FORM_PREFLIGHT_PASSED,
+                event_payload=payload,
+            )
+            return True
+        self._tasks.transition(
+            job.task.id,
+            (
+                TaskState.INPUT_REQUIRED
+                if draft.state is ScreeningFormState.INPUT_REQUIRED
+                else TaskState.REVIEW_REQUIRED
+            ),
+            error_code=result.status.value,
+            event_payload=payload,
+        )
+        return False
 
     def record_result(
         self,
@@ -1007,6 +1047,8 @@ class ApplicationAutomationService:
             payload["source"] = "hh.ru"
         if result.retry_after_seconds is not None:
             payload["retry_after_seconds"] = result.retry_after_seconds
+        if result.screening_form_version_hash is not None:
+            payload["screening_form_version_hash"] = result.screening_form_version_hash
         if result.status in {HhApplyStatus.APPLIED, HhApplyStatus.ALREADY_APPLIED}:
             current_application = self._applications.get(job.application.id)
             current_task = self._tasks.get(job.task.id)
@@ -1047,6 +1089,11 @@ class ApplicationAutomationService:
                         job.cover_letter_id,
                         selected_at,
                     )
+                ScreeningDraftService(self._session).mark_sent(
+                    job.application.id,
+                    version_hash=result.screening_form_version_hash,
+                    sent_at=selected_at,
+                )
                 sent = result.status is HhApplyStatus.APPLIED
                 next_apply_at = (
                     selected_at + apply_delay if sent and apply_delay is not None else None
@@ -1069,6 +1116,11 @@ class ApplicationAutomationService:
                     job.cover_letter_id,
                     selected_at,
                 )
+            ScreeningDraftService(self._session).mark_sent(
+                job.application.id,
+                version_hash=result.screening_form_version_hash,
+                sent_at=selected_at,
+            )
             self._tasks.transition(job.task.id, TaskState.COMPLETED)
             sent = result.status is HhApplyStatus.APPLIED
             next_apply_at = selected_at + apply_delay if sent and apply_delay is not None else None
@@ -1081,28 +1133,47 @@ class ApplicationAutomationService:
             )
 
         if result.status is HhApplyStatus.QUESTIONS_REQUIRED:
-            draft_service = ScreeningDraftService(self._session)
-            draft = (
-                draft_service.capture(job.application.id, result.screening_form)
-                if result.screening_form is not None
-                else draft_service.capture_questions(job.application.id, result.questions)
-            )
+            draft = self._capture_screening_form(job, result)
             payload["question_count"] = len(draft.questions)
             payload["answered_count"] = len(draft.answers)
             payload["screening_form_state"] = draft.state.value
             self._tasks.transition(
                 job.task.id,
-                TaskState.INPUT_REQUIRED,
+                (
+                    TaskState.RETRY_SCHEDULED
+                    if draft.state is ScreeningFormState.CONFIRMED
+                    else TaskState.INPUT_REQUIRED
+                    if draft.state is ScreeningFormState.INPUT_REQUIRED
+                    else TaskState.REVIEW_REQUIRED
+                ),
+                scheduled_at=selected_at,
                 error_code=result.status.value,
                 event_payload=payload,
             )
             return RecordedApplyResult(blocking=False, sent=False)
 
         if result.status is HhApplyStatus.MANUAL_REVIEW_REQUIRED:
+            if result.screening_form is not None:
+                draft = ScreeningDraftService(self._session).capture(
+                    job.application.id,
+                    result.screening_form,
+                    force_review=True,
+                )
+                payload["question_count"] = len(draft.questions)
+                payload["answered_count"] = len(draft.answers)
+                payload["screening_form_state"] = draft.state.value
+                self._tasks.transition(
+                    job.task.id,
+                    TaskState.REVIEW_REQUIRED,
+                    error_code=result.status.value,
+                    event_payload=payload,
+                )
+                return RecordedApplyResult(blocking=False, sent=False)
             self._tasks.transition(
                 job.task.id,
                 TaskState.REVIEW_REQUIRED,
                 error_code=result.status.value,
+                event_payload=payload,
             )
             return RecordedApplyResult(blocking=False, sent=False)
 
@@ -1138,11 +1209,17 @@ class ApplicationAutomationService:
                 error_code=result.status.value,
                 event_payload=payload,
             )
-            self._transition_system(SystemState.PAUSED)
-            return RecordedApplyResult(blocking=True, sent=False)
+            if AutonomyPolicyService(self._session).get().auto_reconcile_unknown:
+                AutomationJobRepository(self._session).schedule_soon(
+                    kind=AutomationJobKind.STATUSES,
+                    account_id=job.application.account_id,
+                    run_at=selected_at + timedelta(seconds=30),
+                )
+            return RecordedApplyResult(blocking=False, sent=False)
 
         system_states = {
             HhApplyStatus.AUTH_REQUIRED: SystemState.AUTH_REQUIRED,
+            HhApplyStatus.INVALID_CREDENTIALS: SystemState.AUTH_REQUIRED,
             HhApplyStatus.CAPTCHA_REQUIRED: SystemState.CAPTCHA_REQUIRED,
             HhApplyStatus.ACCOUNT_WARNING: SystemState.ACCOUNT_WARNING,
             HhApplyStatus.RESUME_MISMATCH: SystemState.PAUSED,
@@ -1177,6 +1254,18 @@ class ApplicationAutomationService:
                 and result.retry_after_seconds is not None
                 else None
             ),
+        )
+
+    def _capture_screening_form(
+        self,
+        job: ApplyJob,
+        result: HhApplyResult,
+    ) -> ScreeningDraft:
+        draft_service = ScreeningDraftService(self._session)
+        return (
+            draft_service.capture(job.application.id, result.screening_form)
+            if result.screening_form is not None
+            else draft_service.capture_questions(job.application.id, result.questions)
         )
 
     def release_after_preview(

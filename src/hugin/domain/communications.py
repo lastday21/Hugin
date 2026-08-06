@@ -34,6 +34,8 @@ class RecruiterMessageRecord:
     confirmed_at: datetime | None
     sent_at: datetime | None
     received_at: datetime | None
+    auto_send_approved: bool
+    reply_template_key: str | None
     created_at: datetime
 
 

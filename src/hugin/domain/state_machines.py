@@ -64,8 +64,21 @@ SYSTEM_TRANSITIONS: dict[SystemState, frozenset[SystemState]] = {
             SystemState.ACCOUNT_WARNING,
         }
     ),
-    SystemState.AUTH_REQUIRED: frozenset({SystemState.RUNNING, SystemState.PAUSED}),
-    SystemState.CAPTCHA_REQUIRED: frozenset({SystemState.RUNNING, SystemState.PAUSED}),
+    SystemState.AUTH_REQUIRED: frozenset(
+        {
+            SystemState.RUNNING,
+            SystemState.PAUSED,
+            SystemState.CAPTCHA_REQUIRED,
+            SystemState.ACCOUNT_WARNING,
+        }
+    ),
+    SystemState.CAPTCHA_REQUIRED: frozenset(
+        {
+            SystemState.RUNNING,
+            SystemState.PAUSED,
+            SystemState.ACCOUNT_WARNING,
+        }
+    ),
     SystemState.ACCOUNT_WARNING: frozenset({SystemState.RUNNING, SystemState.PAUSED}),
 }
 

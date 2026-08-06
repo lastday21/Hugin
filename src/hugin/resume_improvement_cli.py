@@ -154,6 +154,16 @@ def _client(
         reasoning_effort=reasoning_effort,
         journal=OperationJournal(settings.data_dir),
         operation=operation,
+        connect_ip=(
+            str(settings.yandex_ai_host_ip)
+            if settings.yandex_ai_host_ip is not None
+            else None
+        ),
+        source_ip=(
+            str(settings.yandex_ai_source_ip)
+            if settings.yandex_ai_source_ip is not None
+            else None
+        ),
     )
 
 

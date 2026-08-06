@@ -57,6 +57,7 @@ from hugin.domain.hh import (
     HhResumeDetails,
     HhScreeningField,
     HhScreeningForm,
+    HhScreeningSubmission,
     screening_form_hash,
 )
 from hugin.domain.resumes import (
@@ -127,6 +128,7 @@ __all__ = [
     "HhResumeDetails",
     "HhScreeningField",
     "HhScreeningForm",
+    "HhScreeningSubmission",
     "IncidentSeverity",
     "IncidentState",
     "InvalidStateTransitionError",

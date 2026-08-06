@@ -15,6 +15,7 @@ from hugin.database.models import (
     VerifiedFactModel,
 )
 from hugin.domain.content import ConfirmationState, ProfileQuestionState
+from hugin.domain.resumes import ParsedResumeProfile, ResumeFactCandidate
 from hugin.repositories import AccountRepository, ResumeRepository
 from hugin.services.resume_profile import (
     ProfileFactService,
@@ -89,6 +90,7 @@ def test_resume_import_is_idempotent_and_questions_are_reusable(
             assert confirmed is not None
             assert confirmed.state is ConfirmationState.CONFIRMED
             assert confirmed.allow_in_letters
+            assert confirmed.actual_at is not None
             fact_service.reject(account.id, first_fact.id)
             rejected = session.get(VerifiedFactModel, first_fact.id)
             assert rejected is not None
@@ -121,6 +123,9 @@ def test_resume_import_is_idempotent_and_questions_are_reusable(
             assert answer is not None
             assert answer.answer_text == "от 180 000 рублей после вычета налогов"
             assert answer.verified_fact_id is not None
+            answer_fact = session.get(VerifiedFactModel, answer.verified_fact_id)
+            assert answer_fact is not None
+            assert answer_fact.actual_at is not None
             assert question is not None
             assert question.state is ProfileQuestionState.ANSWERED
 
@@ -218,6 +223,7 @@ def test_profile_fact_confirmation_and_correction_keep_one_active_version(
             assert corrected.allow_in_letters
             assert corrected.allow_in_forms
             assert not corrected.allow_in_messages
+            assert corrected.actual_at is not None
             assert replacement.state is ConfirmationState.REJECTED
             assert not replacement.allow_in_letters
 
@@ -243,5 +249,122 @@ def test_profile_fact_confirmation_and_correction_keep_one_active_version(
                 service.correct(account.id, corrected.id, "   ")
             with pytest.raises(ValueError, match="повреждённые символы"):
                 service.correct(account.id, corrected.id, "???")
+    finally:
+        database.close()
+
+
+def test_confirmed_fact_is_not_inherited_between_resumes(
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    local_settings = settings.model_copy(update={"data_dir": tmp_path / "data"})
+    source = tmp_path / "Резюме ИТ.docx"
+    write_resume(source)
+    upgrade_database(local_settings)
+    database = create_database(local_settings)
+
+    try:
+        with database.sessions.begin() as session:
+            account = AccountRepository(session).create("Иван", "account-two-resumes")
+            first_resume = ResumeRepository(session).upsert(
+                account.id,
+                "resume-first",
+                "Python-разработчик",
+            )
+            second_resume = ResumeRepository(session).upsert(
+                account.id,
+                "resume-second",
+                "Инженер по данным",
+            )
+            profile_data = ParsedResumeProfile(
+                display_name="Иван",
+                title="Python-разработчик",
+                facts=(
+                    ResumeFactCandidate(
+                        category="work_experience",
+                        content="Более двух лет практической разработки на Python",
+                        source_reference="section:work_experience",
+                    ),
+                ),
+                missing_questions=(),
+            )
+            first_import = ResumeImportService(session, local_settings.data_dir)
+            monkeypatch.setattr(
+                first_import._extractor,
+                "extract",
+                lambda _document: profile_data,
+            )
+            first_import.import_file(
+                account.id,
+                source,
+                hh_resume_id=first_resume.hh_id,
+            )
+            first_fact = session.scalar(
+                select(VerifiedFactModel).where(
+                    VerifiedFactModel.resume_id == first_resume.id,
+                )
+            )
+            assert first_fact is not None
+            ProfileFactService(session).confirm(
+                account.id,
+                first_fact.id,
+                allow_in_letters=True,
+                allow_in_forms=True,
+                allow_in_messages=True,
+            )
+            profile = session.scalar(select(CandidateProfileModel))
+            assert profile is not None
+            common_fact = VerifiedFactModel(
+                profile_id=profile.id,
+                category=first_fact.category,
+                content=first_fact.content,
+                source_type="user",
+                source_reference="profile",
+                state=ConfirmationState.CONFIRMED,
+                allow_in_letters=True,
+                allow_in_forms=True,
+                allow_in_messages=True,
+            )
+            session.add(common_fact)
+            session.flush()
+
+            second_profile_data = ParsedResumeProfile(
+                display_name="Иван",
+                title="Инженер по данным",
+                facts=profile_data.facts,
+                missing_questions=(),
+            )
+            second_import = ResumeImportService(session, local_settings.data_dir)
+            monkeypatch.setattr(
+                second_import._extractor,
+                "extract",
+                lambda _document: second_profile_data,
+            )
+            result = second_import.import_file(
+                account.id,
+                source,
+                hh_resume_id=second_resume.hh_id,
+            )
+            second_fact = session.scalar(
+                select(VerifiedFactModel).where(
+                    VerifiedFactModel.resume_id == second_resume.id,
+                )
+            )
+
+            assert result.facts_pending == 1
+            assert second_fact is not None
+            assert second_fact.state is ConfirmationState.PENDING
+            assert not second_fact.allow_in_letters
+            assert not second_fact.allow_in_forms
+            assert not second_fact.allow_in_messages
+            assert first_fact.state is ConfirmationState.CONFIRMED
+            assert first_fact.allow_in_letters
+            assert first_fact.allow_in_forms
+            assert first_fact.allow_in_messages
+            assert common_fact.state is ConfirmationState.CONFIRMED
+            assert common_fact.allow_in_letters
+            assert common_fact.allow_in_forms
+            assert common_fact.allow_in_messages
     finally:
         database.close()

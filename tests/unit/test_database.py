@@ -3,10 +3,10 @@ from __future__ import annotations
 import pytest
 from sqlalchemy import inspect, select, text
 
+import hugin.database.cli as cli
 from hugin.core.settings import Settings
 from hugin.database import (
     check_database_schema,
-    cli,
     create_database,
     current_revision,
     downgrade_database,
@@ -16,7 +16,7 @@ from hugin.database.models import CandidateProfileModel, VerifiedFactModel
 from hugin.domain.content import ConfirmationState
 from hugin.repositories import AccountRepository, ResumeRepository
 
-pytestmark = pytest.mark.integration
+pytestmark = [pytest.mark.integration, pytest.mark.empty_database]
 
 
 def test_database_uses_postgresql(settings: Settings) -> None:
@@ -45,7 +45,7 @@ def test_migration_reaches_baseline(settings: Settings) -> None:
         database.close()
 
     upgrade_database(settings)
-    assert current_revision(settings) == "0020_profile_fact_versions"
+    assert current_revision(settings) == "0022_system_recovery_state"
     check_database_schema(settings)
 
     downgrade_database(settings)
@@ -61,9 +61,39 @@ def test_database_cli_manages_schema(
 
     assert cli.main(["upgrade"]) == 0
     assert cli.main(["current"]) == 0
-    assert capsys.readouterr().out.strip() == "0020_profile_fact_versions"
+    assert capsys.readouterr().out.strip() == "0022_system_recovery_state"
     assert cli.main(["check"]) == 0
     assert cli.main(["downgrade"]) == 0
+
+
+@pytest.mark.parametrize("legacy_state", ("AUTH_REQUIRED", "CAPTCHA_REQUIRED"))
+def test_recovery_state_migration_keeps_legacy_authentication_pause(
+    settings: Settings,
+    legacy_state: str,
+) -> None:
+    upgrade_database(settings, "0021_autonomy_policy")
+    database = create_database(settings)
+    try:
+        with database.engine.begin() as connection:
+            connection.execute(
+                text("UPDATE system_state SET state = :state WHERE id = 1"),
+                {"state": legacy_state},
+            )
+    finally:
+        database.close()
+
+    upgrade_database(settings)
+    migrated = create_database(settings)
+    try:
+        with migrated.engine.connect() as connection:
+            state, recovery_state = connection.execute(
+                text("SELECT state, recovery_state FROM system_state WHERE id = 1")
+            ).one()
+
+        assert state == legacy_state
+        assert recovery_state == "PAUSED"
+    finally:
+        migrated.close()
 
 
 def test_safe_defaults_migration_pauses_existing_queue(settings: Settings) -> None:
@@ -266,6 +296,6 @@ def test_direction_migration_preserves_existing_application(settings: Settings) 
             ).one()
 
         assert row == ("Imported data", "legacy-resume", "APPLYING")
-        assert current_revision(settings) == "0020_profile_fact_versions"
+        assert current_revision(settings) == "0022_system_recovery_state"
     finally:
         migrated.close()

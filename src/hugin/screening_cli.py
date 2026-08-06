@@ -16,6 +16,7 @@ LOGIN_MESSAGES = {
     LoginStatus.CREDENTIALS_REQUIRED: "Сначала сохраните данные командой hugin-hh save.",
     LoginStatus.CONFIRMATION_REQUIRED: "Введите одноразовый код в открытом окне.",
     LoginStatus.CAPTCHA_REQUIRED: "Пройдите проверку в открытом окне.",
+    LoginStatus.ACCOUNT_WARNING: "hh.ru показал предупреждение безопасности аккаунта.",
     LoginStatus.INVALID_CREDENTIALS: "hh.ru отклонил логин или пароль.",
     LoginStatus.MANUAL_ACTION_REQUIRED: "Завершите вход в открытом окне.",
 }
@@ -67,6 +68,11 @@ def run(argv: Sequence[str] | None = None) -> int:
         settings.hh_resumes_url,
         settings.hh_search_url,
         settings.hh_browser_timeout_ms,
+        browser_source_ip=(
+            str(settings.hh_browser_source_ip)
+            if settings.hh_browser_source_ip is not None
+            else None
+        ),
     )
     with browser:
         login = HhLoginService(WindowsCredentialStore()).authenticate(

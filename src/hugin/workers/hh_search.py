@@ -45,6 +45,11 @@ class HhSearchJobHandler:
                 self._settings.hh_search_url,
                 self._settings.hh_browser_timeout_ms,
                 start_minimized=True,
+                browser_source_ip=(
+                    str(self._settings.hh_browser_source_ip)
+                    if self._settings.hh_browser_source_ip is not None
+                    else None
+                ),
             ) as browser,
         ):
             login = HhLoginService(WindowsCredentialStore()).authenticate(
@@ -68,6 +73,7 @@ class HhSearchJobHandler:
             LoginStatus.CREDENTIALS_REQUIRED: "Сначала сохраните данные входа hh.ru",
             LoginStatus.CONFIRMATION_REQUIRED: "Введите код в открытом окне браузера",
             LoginStatus.CAPTCHA_REQUIRED: "Пройдите проверку hh.ru в открытом окне",
+            LoginStatus.ACCOUNT_WARNING: "hh.ru показал предупреждение безопасности аккаунта",
             LoginStatus.INVALID_CREDENTIALS: "hh.ru отклонил логин или пароль",
             LoginStatus.MANUAL_ACTION_REQUIRED: "Завершите вход в открытом окне браузера",
             LoginStatus.AUTHENTICATED: "Вход в hh.ru выполнен",

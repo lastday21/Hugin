@@ -89,9 +89,14 @@ class FakeBrowser:
     )
     instances: ClassVar[list[FakeBrowser]] = []
 
-    def __init__(self, *_args: object) -> None:
+    def __init__(
+        self,
+        *_args: object,
+        browser_source_ip: str | None = None,
+    ) -> None:
         self.closed = False
         self.opened_login = False
+        self.browser_source_ip = browser_source_ip
         self.instances.append(self)
 
     def __enter__(self) -> FakeBrowser:
@@ -160,6 +165,13 @@ def test_bridge_keeps_saved_form_open_without_submitting(
     assert len(FakeBrowser.instances) == 1
     assert all(browser.opened_login for browser in FakeBrowser.instances)
     assert all(not browser.closed for browser in FakeBrowser.instances)
+    configured_source = Settings(
+        environment="test",
+        data_dir=tmp_path,
+    ).hh_browser_source_ip
+    assert FakeBrowser.instances[0].browser_source_ip == (
+        str(configured_source) if configured_source is not None else None
+    )
     bridge.close()
     assert all(browser.closed for browser in FakeBrowser.instances)
     bridge.close()

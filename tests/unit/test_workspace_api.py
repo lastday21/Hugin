@@ -383,6 +383,28 @@ def test_workspace_endpoints_return_real_data_and_protect_changes(settings: Sett
         assert request(app, "POST", "/api/queue/pause").status_code == 403
         session_key = request(app, "GET", "/api/session").json()["key"]
         headers = {"X-Hugin-Session": session_key}
+        saved_form = request(
+            app,
+            "POST",
+            (f"/api/forms/{forms.json()[0]['form_id']}/answers?account_id={account_id}"),
+            headers=headers,
+            json={
+                "answers": [
+                    {
+                        "field_key": "motivation",
+                        "answer": "Хочу решать задачи серверной разработки.",
+                    }
+                ]
+            },
+        )
+        assert saved_form.status_code == 200
+        assert saved_form.json()["state"] == "REVIEW_REQUIRED"
+        assert saved_form.json()["questions"][0]["source"] == "USER"
+        assert (
+            saved_form.json()["questions"][0]["answer"]
+            == "Хочу решать задачи серверной разработки."
+        )
+
         paused = request(app, "POST", "/api/queue/pause", headers=headers)
         assert paused.status_code == 200
         assert paused.json()["state"] == "PAUSED"
@@ -668,6 +690,56 @@ def test_workspace_endpoints_return_real_data_and_protect_changes(settings: Sett
         )
         assert invalid_delay.status_code == 422
         assert "не может быть меньше" in invalid_delay.json()["detail"]
+
+        autonomy = request(app, "GET", "/api/autonomy")
+        assert autonomy.status_code == 200
+        assert autonomy.json()["mutable_fact_validity_days"] == 30
+        autonomy_values = {
+            key: value for key, value in autonomy.json().items() if key != "revision"
+        }
+        autonomy_values["mutable_fact_validity_days"] = 45
+        autonomy_values["reply_templates"] = [
+            {
+                "key": "interest",
+                "incoming_text": "Предложение ещё актуально?",
+                "response_text": "Здравствуйте! Да, готов обсудить детали.",
+                "enabled": True,
+            }
+        ]
+        assert (
+            request(
+                app,
+                "PUT",
+                "/api/autonomy",
+                json=autonomy_values,
+            ).status_code
+            == 403
+        )
+        saved_autonomy = request(
+            app,
+            "PUT",
+            "/api/autonomy",
+            headers=headers,
+            json=autonomy_values,
+        )
+        assert saved_autonomy.status_code == 200, saved_autonomy.text
+        assert saved_autonomy.json()["revision"] == autonomy.json()["revision"] + 1
+        assert saved_autonomy.json()["mutable_fact_validity_days"] == 45
+        assert saved_autonomy.json()["reply_templates"] == autonomy_values["reply_templates"]
+        invalid_autonomy = {
+            **autonomy_values,
+            "mutable_fact_validity_days": 0,
+        }
+        assert (
+            request(
+                app,
+                "PUT",
+                "/api/autonomy",
+                headers=headers,
+                json=invalid_autonomy,
+            ).status_code
+            == 422
+        )
     finally:
         app.state.database.close()
 

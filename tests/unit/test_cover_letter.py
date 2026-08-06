@@ -317,7 +317,7 @@ def test_user_confirmed_work_fact_uses_conservative_letter_without_model(
             assert letter.state is CoverLetterState.READY
             assert "планировал задачи" in (letter.text or "")
             assert "самостоятельно разработал SmartPVD" in (letter.text or "")
-            assert "На собеседовании готов подробно разобрать" in (letter.text or "")
+            assert "Готов на собеседовании подробно разобрать" in (letter.text or "")
 
             second_vacancy = VacancyRepository(session).upsert(
                 VacancyData(
@@ -368,7 +368,7 @@ def test_user_confirmed_work_fact_uses_conservative_letter_without_model(
             )
             assert second_letter is not None
             assert second_letter.state is CoverLetterState.READY
-            assert "Backend-разработчик Python" in (second_letter.text or "")
+            assert "Backend-разработчик Python" not in (second_letter.text or "")
     finally:
         database.close()
 
@@ -2093,6 +2093,10 @@ def test_conservative_letter_uses_only_separate_confirmed_items() -> None:
                 '<experience_item type="ROLE" label="Опыт работы">\n'
                 "Декабрь 2022 — июнь 2025: Газпромнефть; применял Python к "
                 "производственным данным и самостоятельно разработал SmartPVD.\n"
+                "</experience_item>\n"
+                '<experience_item type="ROLE" label="Опыт работы">\n'
+                "Март 2026 — настоящее время: текущая работа; автоматизирует "
+                "подготовку данных и отчётных материалов в Excel.\n"
                 "</experience_item>"
             ),
             "user",
@@ -2101,8 +2105,11 @@ def test_conservative_letter_uses_only_separate_confirmed_items() -> None:
 
     text = _conservative_cover_letter(vacancy, facts)
 
-    assert f"Откликаюсь на вакансию «{vacancy.title}»." in text
+    assert vacancy.title not in text
+    assert "Откликаюсь на вакансию" not in text
+    assert "Для задач позиции" not in text
     assert "Газпромнефть" not in text
+    assert "автоматизирует" not in text
     assert "асинхрон" not in text.casefold()
     assert "высоконагруж" not in text.casefold()
     assert "В проекте CartCase занимался серверной разработкой:" in text

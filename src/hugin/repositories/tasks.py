@@ -33,6 +33,11 @@ from hugin.domain.time import as_utc
 from hugin.domain.vacancies import VacancyAvailability
 
 READY_STATES = (TaskState.PENDING, TaskState.RETRY_SCHEDULED)
+ELIGIBILITY_CHECKED_STATES = (
+    *READY_STATES,
+    TaskState.REVIEW_REQUIRED,
+    TaskState.INPUT_REQUIRED,
+)
 FORM_PREFLIGHT_RUNNING = "FORM_PREFLIGHT_RUNNING"
 FORM_PREFLIGHT_INTERRUPTED = "FORM_PREFLIGHT_INTERRUPTED"
 FORM_PREFLIGHT_PASSED = "FORM_PREFLIGHT_PASSED"
@@ -321,7 +326,7 @@ class QueueTaskRepository:
                 )
                 .where(
                     ApplicationModel.direction_id == direction_id,
-                    ApplicationTaskModel.state.in_(READY_STATES),
+                    ApplicationTaskModel.state.in_(ELIGIBILITY_CHECKED_STATES),
                     or_(
                         *rules_ineligible,
                         VacancyModel.duplicate_of_id.is_not(None),
@@ -497,7 +502,41 @@ class SystemStateRepository:
             raise ValueError(
                 "Нельзя включить очередь, пока выполняется управляемый поштучный отклик"
             )
+        if (
+            model.state in {SystemState.RUNNING, SystemState.PAUSED}
+            and target
+            in {
+                SystemState.AUTH_REQUIRED,
+                SystemState.CAPTCHA_REQUIRED,
+                SystemState.ACCOUNT_WARNING,
+            }
+        ):
+            model.recovery_state = model.state
+        elif target in {SystemState.RUNNING, SystemState.PAUSED}:
+            model.recovery_state = None
         model.state = target
+        self._session.flush()
+        return _system_record(model)
+
+    def resume_after_authentication(self) -> SystemStateRecord:
+        model = self._session.scalar(
+            select(SystemStateModel)
+            .where(SystemStateModel.id == 1)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if model is None:
+            raise SystemStateNotFoundError
+        if model.state not in {SystemState.AUTH_REQUIRED, SystemState.CAPTCHA_REQUIRED}:
+            return _system_record(model)
+        target = (
+            model.recovery_state
+            if model.recovery_state in {SystemState.RUNNING, SystemState.PAUSED}
+            else SystemState.RUNNING
+        )
+        ensure_system_transition(model.state, target)
+        model.state = target
+        model.recovery_state = None
         self._session.flush()
         return _system_record(model)
 

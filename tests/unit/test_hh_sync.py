@@ -25,6 +25,7 @@ from hugin.repositories import (
     VacancyRepository,
 )
 from hugin.repositories.communications import CommunicationRepository
+from hugin.services.application_automation import ApplicationAutomationService
 from hugin.services.hh_sync import HhSynchronizationService
 
 pytestmark = pytest.mark.integration
@@ -209,11 +210,12 @@ def test_hh_statuses_and_messages_are_synchronized_idempotently(
                     body="Спасибо, подтверждаю.",
                 ),
             )
-            first_sync = service.synchronize_messages(
+            first_sync_details = service.synchronize_messages_with_new_ids(
                 account_id=account.id,
                 messages=messages,
                 checked_at=checked_at,
             )
+            first_sync = first_sync_details.metrics
             second_sync = service.synchronize_messages(
                 account_id=account.id,
                 messages=messages,
@@ -223,6 +225,7 @@ def test_hh_statuses_and_messages_are_synchronized_idempotently(
             assert first_sync["incoming"] == 1
             assert first_sync["outgoing"] == 1
             assert first_sync["attention"] == 1
+            assert len(first_sync_details.new_incoming_message_ids) == 1
             assert second_sync["created"] == 0
 
             communication = CommunicationRepository(session)
@@ -251,6 +254,156 @@ def test_hh_statuses_and_messages_are_synchronized_idempotently(
             )
             assert status_after_message["invitations"] == 0
             assert len(communication.list_invitations_for_account(account.id)) == 2
+    finally:
+        database.close()
+
+
+def test_status_sync_reconciles_unknown_application_automatically(
+    settings: Settings,
+) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    try:
+        with database.sessions.begin() as session:
+            account = AccountRepository(session).create("Сверка неизвестного результата")
+            resume = ResumeRepository(session).upsert(
+                account.id,
+                "unknown-sync-resume",
+                "Python backend",
+            )
+            vacancy = VacancyRepository(session).upsert(
+                VacancyData(
+                    hh_id="unknown-sync-vacancy",
+                    title="Python-разработчик",
+                    source_url="https://hh.ru/vacancy/unknown-sync-vacancy",
+                )
+            )
+            application = ApplicationRepository(session).create_apply_intent(
+                account.id,
+                vacancy.id,
+                resume.id,
+            )
+            tasks = QueueTaskRepository(session)
+            task = tasks.enqueue(application.id, 80)
+            assert tasks.claim_exact(task.id) is not None
+            tasks.transition(
+                task.id,
+                TaskState.UNKNOWN_RESULT,
+                error_code="UNKNOWN_RESULT",
+            )
+
+            HhSynchronizationService(session).synchronize_statuses(
+                account_id=account.id,
+                statuses=(
+                    HhNegotiationData(
+                        vacancy.hh_id,
+                        HhNegotiationStatus.APPLIED,
+                        "Не просмотрен",
+                        True,
+                    ),
+                ),
+            )
+
+            assert (
+                ApplicationRepository(session).get(application.id).state is ApplicationState.APPLIED
+            )
+            assert tasks.get(task.id).state is TaskState.COMPLETED
+            events = ApplicationRepository(session).list_events(application.id)
+            assert events[-1].payload["source"] == "hugin_reconciliation"
+            service = ApplicationAutomationService(session)
+            assert (
+                service.applied_since(
+                    account.id,
+                    datetime(2026, 1, 1, tzinfo=UTC),
+                )
+                == 1
+            )
+
+            HhSynchronizationService(session).synchronize_statuses(
+                account_id=account.id,
+                statuses=(
+                    HhNegotiationData(
+                        vacancy.hh_id,
+                        HhNegotiationStatus.APPLIED,
+                        "Не просмотрен",
+                        True,
+                    ),
+                ),
+            )
+            assert (
+                service.applied_since(
+                    account.id,
+                    datetime(2026, 1, 1, tzinfo=UTC),
+                )
+                == 1
+            )
+    finally:
+        database.close()
+
+
+def test_status_sync_leaves_unknown_application_for_manual_review_when_resume_is_ambiguous(
+    settings: Settings,
+) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    try:
+        with database.sessions.begin() as session:
+            account = AccountRepository(session).create("Неоднозначная сверка")
+            first_resume = ResumeRepository(session).upsert(
+                account.id,
+                "ambiguous-sync-resume-1",
+                "Python backend",
+            )
+            second_resume = ResumeRepository(session).upsert(
+                account.id,
+                "ambiguous-sync-resume-2",
+                "Python-разработчик",
+            )
+            vacancy = VacancyRepository(session).upsert(
+                VacancyData(
+                    hh_id="ambiguous-sync-vacancy",
+                    title="Python-разработчик",
+                    source_url="https://hh.ru/vacancy/ambiguous-sync-vacancy",
+                )
+            )
+            applications = ApplicationRepository(session)
+            first_application = applications.create_apply_intent(
+                account.id,
+                vacancy.id,
+                first_resume.id,
+            )
+            unknown_application = applications.create_apply_intent(
+                account.id,
+                vacancy.id,
+                second_resume.id,
+            )
+            tasks = QueueTaskRepository(session)
+            task = tasks.enqueue(unknown_application.id, 80)
+            assert tasks.claim_exact(task.id) is not None
+            tasks.transition(
+                task.id,
+                TaskState.UNKNOWN_RESULT,
+                error_code="UNKNOWN_RESULT",
+            )
+            event_count = len(applications.list_events(unknown_application.id))
+
+            result = HhSynchronizationService(session).synchronize_statuses(
+                account_id=account.id,
+                statuses=(
+                    HhNegotiationData(
+                        vacancy.hh_id,
+                        HhNegotiationStatus.APPLIED,
+                        "Не просмотрен",
+                        True,
+                    ),
+                ),
+            )
+
+            assert result["matched"] == 0
+            assert applications.get(first_application.id).state is ApplicationState.APPLYING
+            assert applications.get(unknown_application.id).state is ApplicationState.APPLYING
+            assert tasks.get(task.id).state is TaskState.UNKNOWN_RESULT
+            assert len(applications.list_events(unknown_application.id)) == event_count
     finally:
         database.close()
 

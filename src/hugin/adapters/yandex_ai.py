@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import http.client
 import json
+import socket
+import ssl
 import urllib.error
 import urllib.request
+from ipaddress import IPv4Address
+from typing import Any
 
 from hugin.diagnostics import OperationJournal
 
@@ -11,6 +16,65 @@ REASONING_EFFORTS = frozenset({"low", "medium", "high"})
 
 class YandexAIError(RuntimeError):
     pass
+
+
+class _BoundHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(
+        self,
+        host: str,
+        *,
+        connect_ip: str,
+        source_address: tuple[str, int],
+        **kwargs: Any,
+    ) -> None:
+        context = ssl.create_default_context()
+        super().__init__(
+            host,
+            source_address=source_address,
+            context=context,
+            **kwargs,
+        )
+        self._connect_ip = connect_ip
+        self._hugin_source_address = source_address
+        self._hugin_context = context
+
+    def connect(self) -> None:
+        self.sock = socket.create_connection(
+            (self._connect_ip, self.port),
+            self.timeout,
+            self._hugin_source_address,
+        )
+        self.sock = self._hugin_context.wrap_socket(
+            self.sock,
+            server_hostname=self.host,
+        )
+
+
+class _SourceAddressHTTPSHandler(urllib.request.HTTPSHandler):
+    def __init__(self, source_ip: str, connect_ip: str | None = None) -> None:
+        super().__init__()
+        self._source_address = (str(IPv4Address(source_ip)), 0)
+        self._connect_ip = str(IPv4Address(connect_ip)) if connect_ip else None
+
+    def https_open(self, request: urllib.request.Request) -> Any:
+        def connection(
+            host: str,
+            **kwargs: Any,
+        ) -> http.client.HTTPSConnection:
+            if self._connect_ip is not None:
+                return _BoundHTTPSConnection(
+                    host,
+                    connect_ip=self._connect_ip,
+                    source_address=self._source_address,
+                    **kwargs,
+                )
+            return http.client.HTTPSConnection(
+                host,
+                source_address=self._source_address,
+                **kwargs,
+            )
+
+        return self.do_open(connection, request)
 
 
 class YandexAIClient:
@@ -25,6 +89,8 @@ class YandexAIClient:
         reasoning_effort: str = "high",
         journal: OperationJournal | None = None,
         operation: str = "unspecified",
+        connect_ip: str | None = None,
+        source_ip: str | None = None,
     ) -> None:
         self._api_key = api_key.strip()
         self._folder_id = folder_id.strip()
@@ -35,6 +101,16 @@ class YandexAIClient:
         self._reasoning_effort = reasoning_effort.strip()
         self._journal = journal
         self._operation = operation.strip() or "unspecified"
+        self._opener = (
+            urllib.request.build_opener(
+                urllib.request.ProxyHandler({}),
+                _SourceAddressHTTPSHandler(source_ip, connect_ip),
+            )
+            if source_ip
+            else None
+        )
+        if connect_ip and not source_ip:
+            raise ValueError("Для прямого адреса YandexGPT нужен исходящий сетевой адрес")
         if not self._api_key:
             raise ValueError("Не указан ключ Yandex AI Studio")
         if not self._folder_id:
@@ -92,7 +168,12 @@ class YandexAIClient:
             else None
         )
         try:
-            with urllib.request.urlopen(request, timeout=self._timeout_seconds) as response:
+            open_request = (
+                self._opener.open
+                if self._opener is not None
+                else urllib.request.urlopen
+            )
+            with open_request(request, timeout=self._timeout_seconds) as response:
                 for raw_line in response:
                     line = raw_line.decode("utf-8", errors="replace").strip()
                     if not line.startswith("data:"):

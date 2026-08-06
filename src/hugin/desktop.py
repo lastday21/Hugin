@@ -266,6 +266,11 @@ class DesktopBridge:
                 self._settings.hh_resumes_url,
                 self._settings.hh_search_url,
                 self._settings.hh_browser_timeout_ms,
+                browser_source_ip=(
+                    str(self._settings.hh_browser_source_ip)
+                    if self._settings.hh_browser_source_ip is not None
+                    else None
+                ),
             ) as browser,
         ):
             login = HhLoginService(WindowsCredentialStore()).authenticate(
@@ -555,6 +560,11 @@ class DesktopBridge:
                     self._settings.hh_resumes_url,
                     self._settings.hh_search_url,
                     self._settings.hh_browser_timeout_ms,
+                    browser_source_ip=(
+                        str(self._settings.hh_browser_source_ip)
+                        if self._settings.hh_browser_source_ip is not None
+                        else None
+                    ),
                 ) as browser,
             ):
                 while browser.is_open():
@@ -617,6 +627,7 @@ class DesktopBridge:
                 LoginStatus.CREDENTIALS_REQUIRED: "Сначала сохраните данные входа hh.ru",
                 LoginStatus.CONFIRMATION_REQUIRED: "Введите код в открытом окне браузера",
                 LoginStatus.CAPTCHA_REQUIRED: "Пройдите проверку в открытом окне браузера",
+                LoginStatus.ACCOUNT_WARNING: "hh.ru показал предупреждение безопасности аккаунта",
                 LoginStatus.INVALID_CREDENTIALS: "hh.ru отклонил логин или пароль",
                 LoginStatus.MANUAL_ACTION_REQUIRED: "Завершите вход в открытом окне браузера",
             }
@@ -828,6 +839,7 @@ def main() -> None:
             AutomationJobKind.MESSAGES: messages_handler,
             AutomationJobKind.STATUSES: statuses_handler,
         },
+        authentication_recovery=messages_handler.recover_authentication,
         journal=journal,
     )
     application_worker = ApplicationWorker(

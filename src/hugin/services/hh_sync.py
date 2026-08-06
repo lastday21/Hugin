@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from hugin.database.models import ApplicationModel, VacancyModel
+from hugin.database.models import ApplicationModel, ApplicationTaskModel, VacancyModel
 from hugin.domain.applications import ApplicationState, EventPayload
 from hugin.domain.automation import AutomationJobResult
 from hugin.domain.content import MessageDirection
@@ -20,6 +21,7 @@ from hugin.domain.tasks import TaskState
 from hugin.repositories.applications import ApplicationRepository
 from hugin.repositories.communications import CommunicationRepository
 from hugin.repositories.tasks import QueueTaskRepository
+from hugin.services.screening_forms import ScreeningDraftService
 
 _INTERVIEW_TITLE = "Приглашение на собеседование"
 _NEGATED_ATTENTION_PATTERNS: tuple[re.Pattern[str], ...] = (
@@ -60,6 +62,12 @@ _ATTENTION_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
 _HTTPS_URL = re.compile(r"https://[^\s<>\"]+", re.I)
 
 
+@dataclass(frozen=True, slots=True)
+class MessageSynchronizationResult:
+    metrics: AutomationJobResult
+    new_incoming_message_ids: tuple[int, ...]
+
+
 class HhSynchronizationService:
     def __init__(self, session: Session) -> None:
         self._session = session
@@ -79,24 +87,31 @@ class HhSynchronizationService:
     ) -> AutomationJobResult:
         selected_at = checked_at or datetime.now(UTC)
         applications = self._application_map(account_id)
+        manual_reconciliation = self._ambiguous_unknown_result_vacancies(account_id)
         updated = 0
         invitations = 0
         matched: set[str] = set()
 
         for item in statuses:
             application = applications.get(item.vacancy_id)
-            if application is None:
+            if application is None or item.vacancy_id in manual_reconciliation:
                 continue
             matched.add(item.vacancy_id)
             target = ApplicationState(item.status.value)
             current = self._applications.get(application.id)
+            task = self._tasks.get_by_application_id(application.id)
+            event_source = (
+                "hugin_reconciliation"
+                if task is not None and task.state is TaskState.UNKNOWN_RESULT
+                else "hh.ru"
+            )
             if current.state is ApplicationState.APPLYING:
                 current = self._applications.transition_state(
                     current.id,
                     ApplicationState.APPLIED,
                     {
                         "hh_status": HhNegotiationStatus.APPLIED.value,
-                        "source": "hh.ru",
+                        "source": event_source,
                         "status_label": item.status_label[:255],
                     },
                 )
@@ -112,6 +127,10 @@ class HhSynchronizationService:
                     },
                 )
                 updated += 1
+            ScreeningDraftService(self._session).mark_sent(
+                current.id,
+                sent_at=selected_at,
+            )
             self._close_obsolete_task(current.id, item)
             if item.status is HhNegotiationStatus.INVITED:
                 if self._communications.has_open_message_invitation(
@@ -178,6 +197,19 @@ class HhSynchronizationService:
         messages: tuple[HhChatMessageData, ...],
         checked_at: datetime | None = None,
     ) -> AutomationJobResult:
+        return self.synchronize_messages_with_new_ids(
+            account_id=account_id,
+            messages=messages,
+            checked_at=checked_at,
+        ).metrics
+
+    def synchronize_messages_with_new_ids(
+        self,
+        *,
+        account_id: int,
+        messages: tuple[HhChatMessageData, ...],
+        checked_at: datetime | None = None,
+    ) -> MessageSynchronizationResult:
         selected_at = checked_at or datetime.now(UTC)
         applications = self._application_map(account_id)
         created = 0
@@ -185,13 +217,14 @@ class HhSynchronizationService:
         outgoing = 0
         attention = 0
         matched: set[str] = set()
+        new_incoming_message_ids: list[int] = []
 
         for item in messages:
             application = applications.get(item.vacancy_id)
             if application is None:
                 continue
             matched.add(item.vacancy_id)
-            _record, is_new = self._communications.save_synced_message(
+            record, is_new = self._communications.save_synced_message(
                 application_id=application.id,
                 hh_id=item.hh_id,
                 direction=item.direction,
@@ -206,6 +239,7 @@ class HhSynchronizationService:
                 continue
             if is_new:
                 incoming += 1
+                new_incoming_message_ids.append(record.id)
             attention_title = self._attention_title(item.body)
             if attention_title is None:
                 continue
@@ -223,15 +257,18 @@ class HhSynchronizationService:
             if is_new:
                 attention += 1
 
-        return {
-            "tracked": len(applications),
-            "received": len(messages),
-            "matched": len(matched),
-            "created": created,
-            "incoming": incoming,
-            "outgoing": outgoing,
-            "attention": attention,
-        }
+        return MessageSynchronizationResult(
+            metrics={
+                "tracked": len(applications),
+                "received": len(messages),
+                "matched": len(matched),
+                "created": created,
+                "incoming": incoming,
+                "outgoing": outgoing,
+                "attention": attention,
+            },
+            new_incoming_message_ids=tuple(new_incoming_message_ids),
+        )
 
     def _application_map(self, account_id: int) -> dict[str, ApplicationModel]:
         if account_id < 1:
@@ -246,6 +283,33 @@ class HhSynchronizationService:
         for application, vacancy_hh_id in rows:
             applications.setdefault(vacancy_hh_id, application)
         return applications
+
+    def _ambiguous_unknown_result_vacancies(self, account_id: int) -> frozenset[str]:
+        rows = self._session.execute(
+            select(
+                VacancyModel.hh_id,
+                ApplicationModel.resume_id,
+                ApplicationTaskModel.state,
+            )
+            .join(ApplicationModel, ApplicationModel.vacancy_id == VacancyModel.id)
+            .outerjoin(
+                ApplicationTaskModel,
+                ApplicationTaskModel.application_id == ApplicationModel.id,
+            )
+            .where(ApplicationModel.account_id == account_id)
+            .order_by(ApplicationModel.id.desc())
+        )
+        resumes_by_vacancy: dict[str, set[int]] = {}
+        has_unknown_result: set[str] = set()
+        for vacancy_hh_id, resume_id, task_state in rows:
+            resumes_by_vacancy.setdefault(vacancy_hh_id, set()).add(resume_id)
+            if task_state is TaskState.UNKNOWN_RESULT:
+                has_unknown_result.add(vacancy_hh_id)
+        return frozenset(
+            vacancy_hh_id
+            for vacancy_hh_id in has_unknown_result
+            if len(resumes_by_vacancy[vacancy_hh_id]) > 1
+        )
 
     @staticmethod
     def _attention_title(body: str) -> str | None:

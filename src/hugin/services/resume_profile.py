@@ -30,6 +30,7 @@ from hugin.domain.resumes import (
     ResumeFactCandidate,
     ResumeImportResult,
 )
+from hugin.services.autonomy import AutonomyPolicyService
 
 
 @dataclass(frozen=True, slots=True)
@@ -420,6 +421,23 @@ class ResumeImportService:
         )
         desired = {(fact.category, fact.content): fact for fact in profile_data.facts}
         existing_keys = {(fact.category, fact.content) for fact in existing}
+        reuse_confirmed = AutonomyPolicyService(
+            self._session
+        ).get().reuse_confirmed_profile_facts
+        confirmed_by_content = (
+            {
+                (fact.category, self._normalized_fact_content(fact.content)): fact
+                for fact in self._session.scalars(
+                    select(VerifiedFactModel).where(
+                        VerifiedFactModel.profile_id == profile_id,
+                        VerifiedFactModel.resume_id == resume_id,
+                        VerifiedFactModel.state == ConfirmationState.CONFIRMED,
+                    )
+                )
+            }
+            if reuse_confirmed
+            else {}
+        )
 
         for fact in existing:
             if (
@@ -431,17 +449,35 @@ class ResumeImportService:
         for key, candidate in desired.items():
             if key in existing_keys:
                 continue
-            self._session.add(
-                VerifiedFactModel(
-                    profile_id=profile_id,
-                    category=candidate.category,
-                    content=candidate.content,
-                    source_type="resume",
-                    source_reference=f"{stored_path}#{candidate.source_reference}",
-                    resume_id=resume_id,
-                    state=ConfirmationState.PENDING,
+            inherited = confirmed_by_content.get(
+                (
+                    candidate.category,
+                    self._normalized_fact_content(candidate.content),
                 )
             )
+            model = VerifiedFactModel(
+                profile_id=profile_id,
+                category=candidate.category,
+                content=candidate.content,
+                source_type="resume",
+                source_reference=f"{stored_path}#{candidate.source_reference}",
+                resume_id=resume_id,
+                state=(
+                    ConfirmationState.CONFIRMED
+                    if inherited is not None
+                    else ConfirmationState.PENDING
+                ),
+                actual_at=inherited.actual_at if inherited is not None else None,
+                allow_in_letters=inherited.allow_in_letters if inherited is not None else False,
+                allow_in_forms=inherited.allow_in_forms if inherited is not None else False,
+                allow_in_messages=inherited.allow_in_messages if inherited is not None else False,
+            )
+            self._session.add(model)
+            if inherited is not None:
+                inherited.state = ConfirmationState.REJECTED
+                inherited.allow_in_letters = False
+                inherited.allow_in_forms = False
+                inherited.allow_in_messages = False
         self._session.flush()
         return (
             self._session.scalar(
@@ -454,6 +490,10 @@ class ResumeImportService:
             )
             or 0
         )
+
+    @staticmethod
+    def _normalized_fact_content(value: str) -> str:
+        return " ".join(value.casefold().replace("\u00a0", " ").split())
 
     def _synchronize_questions(
         self,
@@ -536,9 +576,11 @@ class ProfileQuestionService:
                 source_reference=source_reference,
             )
             self._session.add(fact)
+        answered_at = datetime.now(UTC)
         fact.content = value
         fact.state = ConfirmationState.CONFIRMED
         fact.allow_in_forms = True
+        fact.actual_at = answered_at
         self._session.flush()
 
         template = self._session.scalar(
@@ -557,7 +599,7 @@ class ProfileQuestionService:
 
         question.answer_text = value
         question.state = ProfileQuestionState.ANSWERED
-        question.answered_at = datetime.now(UTC)
+        question.answered_at = answered_at
         self._session.flush()
 
     def dismiss(self, account_id: int, key: str) -> None:
@@ -695,6 +737,7 @@ class ProfileFactService:
         fact.allow_in_letters = allow_in_letters
         fact.allow_in_forms = allow_in_forms
         fact.allow_in_messages = allow_in_messages
+        fact.actual_at = datetime.now(UTC)
 
     @classmethod
     def _validated_content(cls, content: str) -> str:

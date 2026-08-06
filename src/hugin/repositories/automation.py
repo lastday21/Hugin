@@ -111,6 +111,24 @@ class AutomationJobRepository:
         )
         return tuple(_job_record(model) for model in models)
 
+    def schedule_soon(
+        self,
+        *,
+        kind: AutomationJobKind,
+        account_id: int,
+        run_at: datetime,
+    ) -> AutomationJobRecord | None:
+        scheduled_at = as_utc(run_at)
+        job_key = automation_job_key(kind, account_id)
+        model = self._session.get(AutomationJobModel, job_key)
+        if model is None or model.state not in CLAIMABLE_STATES:
+            return None
+        if model.next_run_at is None or as_utc(model.next_run_at) > scheduled_at:
+            model.next_run_at = scheduled_at
+            model.updated_at = datetime.now(UTC)
+            self._session.flush()
+        return _job_record(model)
+
     def claim_due(
         self,
         now: datetime | None = None,

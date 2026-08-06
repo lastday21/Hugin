@@ -228,6 +228,14 @@ def test_search_handler_runs_cycle_after_successful_login(
     assert browsers[0].exited
     assert login_calls == [(1, browsers[0])]
     assert cycle.calls == [(1, 7, browsers[0])]
-    assert browsers[0].arguments[0] == Settings(environment="test").browser_profile_dir(1)
-    assert browsers[0].arguments[-1] == Settings(environment="test").hh_browser_timeout_ms
-    assert browsers[0].keyword_arguments == {"start_minimized": True}
+    settings = Settings(environment="test")
+    assert browsers[0].arguments[0] == settings.browser_profile_dir(1)
+    assert browsers[0].arguments[-1] == settings.hh_browser_timeout_ms
+    assert browsers[0].keyword_arguments == {
+        "start_minimized": True,
+        "browser_source_ip": (
+            str(settings.hh_browser_source_ip)
+            if settings.hh_browser_source_ip is not None
+            else None
+        ),
+    }

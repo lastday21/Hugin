@@ -2,12 +2,13 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session
 
 from hugin.database.models import (
     ApplicationEventModel,
     ApplicationModel,
+    ApplicationTaskModel,
     CareerDirectionModel,
     ResumeModel,
 )
@@ -21,6 +22,7 @@ from hugin.domain.applications import (
     EventPayload,
 )
 from hugin.domain.state_machines import ensure_application_transition
+from hugin.domain.tasks import TaskState
 from hugin.domain.time import as_utc
 
 
@@ -146,20 +148,33 @@ class ApplicationRepository:
     def count_applied_since(self, account_id: int, since: datetime) -> int:
         return (
             self._session.scalar(
-                select(func.count())
+                select(func.count(func.distinct(ApplicationEventModel.application_id)))
                 .select_from(ApplicationEventModel)
                 .join(ApplicationModel)
+                .outerjoin(
+                    ApplicationTaskModel,
+                    ApplicationTaskModel.application_id == ApplicationModel.id,
+                )
                 .where(
                     ApplicationModel.account_id == account_id,
-                    ApplicationEventModel.event_type == ApplicationEventType.APPLIED,
                     ApplicationEventModel.created_at >= since,
-                    ApplicationEventModel.payload["hh_status"].as_string()
-                    == ApplicationState.APPLIED.value,
-                    func.coalesce(
-                        ApplicationEventModel.payload["source"].as_string(),
-                        "",
-                    )
-                    != "hh.ru",
+                    or_(
+                        and_(
+                            ApplicationEventModel.event_type == ApplicationEventType.APPLIED,
+                            ApplicationEventModel.payload["hh_status"].as_string()
+                            == ApplicationState.APPLIED.value,
+                            func.coalesce(
+                                ApplicationEventModel.payload["source"].as_string(),
+                                "",
+                            )
+                            != "hh.ru",
+                        ),
+                        and_(
+                            ApplicationEventModel.event_type
+                            == ApplicationEventType.UNKNOWN_RESULT,
+                            ApplicationTaskModel.state == TaskState.UNKNOWN_RESULT,
+                        ),
+                    ),
                 )
             )
             or 0

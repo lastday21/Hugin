@@ -24,13 +24,14 @@ from hugin.domain.content import AnswerSource
 from hugin.domain.directions import EmploymentForm, SearchRegion, WorkFormat
 from hugin.services.application_reconciliation import ApplicationReconciliationService
 from hugin.services.automation import AutomationSchedulerService
+from hugin.services.autonomy import AutonomyPolicy, AutonomyPolicyService
 from hugin.services.career_directions import (
     COMMON_REGIONS,
     RUSSIA_REGION,
     CareerDirectionService,
 )
 from hugin.services.queue import QueueService
-from hugin.services.screening_forms import ScreeningDraftService
+from hugin.services.screening_forms import ScreeningDraft, ScreeningDraftService
 from hugin.services.ui_workspace import UiWorkspaceService
 
 
@@ -196,6 +197,19 @@ class FormDraftResponse(BaseModel):
     questions: tuple[FormQuestionResponse, ...]
 
 
+class FormAnswerUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    field_key: str = Field(min_length=1, max_length=255)
+    answer: str = Field(min_length=1, max_length=4000)
+
+
+class FormAnswersUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    answers: tuple[FormAnswerUpdate, ...] = Field(min_length=1, max_length=100)
+
+
 class VacancyQuestionResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -268,6 +282,33 @@ class QueueSettingsResponse(BaseModel):
     daily_limit: int
     delay_min_seconds: int
     delay_max_seconds: int
+
+
+class ApprovedReplyTemplateUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    key: str = Field(min_length=1, max_length=64)
+    incoming_text: str = Field(min_length=1, max_length=2_000)
+    response_text: str = Field(min_length=1, max_length=5_000)
+    enabled: bool = True
+
+
+class AutonomyPolicyUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    auto_apply_stretch: bool
+    auto_submit_simple_forms: bool
+    auto_prepare_replies: bool
+    auto_send_approved_replies: bool
+    auto_reconcile_unknown: bool
+    reuse_confirmed_profile_facts: bool
+    mark_opened_invitations_seen: bool
+    mutable_fact_validity_days: int = Field(ge=1, le=365, strict=True)
+    reply_templates: tuple[ApprovedReplyTemplateUpdate, ...] = Field(max_length=50)
+
+
+class AutonomyPolicyResponse(AutonomyPolicyUpdate):
+    revision: int
 
 
 class SessionResponse(BaseModel):
@@ -419,23 +460,46 @@ def forms(
     account_id: int = Query(default=1, ge=1),
 ) -> tuple[FormDraftResponse, ...]:
     drafts = ScreeningDraftService(session).list_pending(account_id)
-    return tuple(
-        FormDraftResponse(
-            form_id=draft.form_id,
-            application_id=draft.application_id,
-            vacancy_id=draft.vacancy_id,
-            vacancy_title=draft.vacancy_title,
-            company=draft.company,
-            source_url=draft.source_url,
-            resume_title=draft.resume_title,
-            state=draft.state.value,
-            answered_count=len(draft.answers),
-            unanswered_count=draft.unanswered_count,
-            questions=tuple(
-                FormQuestionResponse(**asdict(question)) for question in draft.questions
-            ),
+    return tuple(_form_response(draft) for draft in drafts)
+
+
+@router.post("/forms/{form_id}/answers", response_model=FormDraftResponse)
+def save_form_answers(
+    form_id: int,
+    values: FormAnswersUpdate,
+    session: WriteSession,
+    _guard: SessionGuard,
+    account_id: int = Query(default=1, ge=1),
+) -> FormDraftResponse:
+    answer_map = {item.field_key: item.answer for item in values.answers}
+    if len(answer_map) != len(values.answers):
+        raise HTTPException(status_code=422, detail="Ответы содержат повторяющиеся поля")
+    try:
+        draft = ScreeningDraftService(session).save_confirmed_answers(
+            account_id,
+            form_id,
+            answer_map,
         )
-        for draft in drafts
+    except LookupError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    return _form_response(draft)
+
+
+def _form_response(draft: ScreeningDraft) -> FormDraftResponse:
+    return FormDraftResponse(
+        form_id=draft.form_id,
+        application_id=draft.application_id,
+        vacancy_id=draft.vacancy_id,
+        vacancy_title=draft.vacancy_title,
+        company=draft.company,
+        source_url=draft.source_url,
+        resume_title=draft.resume_title,
+        state=draft.state.value,
+        answered_count=len(draft.answers),
+        unanswered_count=draft.unanswered_count,
+        questions=tuple(FormQuestionResponse(**asdict(question)) for question in draft.questions),
     )
 
 
@@ -585,6 +649,52 @@ def update_queue_settings(
         daily_limit=saved.daily_limit,
         delay_min_seconds=saved.delay_min_seconds,
         delay_max_seconds=saved.delay_max_seconds,
+    )
+
+
+@router.get("/autonomy", response_model=AutonomyPolicyResponse)
+def autonomy_policy(session: ReadSession) -> AutonomyPolicyResponse:
+    try:
+        return _autonomy_response(AutonomyPolicyService(session).get())
+    except (LookupError, ValueError) as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+
+
+@router.put("/autonomy", response_model=AutonomyPolicyResponse)
+def update_autonomy_policy(
+    values: AutonomyPolicyUpdate,
+    session: WriteSession,
+    _guard: SessionGuard,
+) -> AutonomyPolicyResponse:
+    try:
+        saved = AutonomyPolicyService(session).update(values.model_dump(mode="json"))
+    except LookupError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    return _autonomy_response(saved)
+
+
+def _autonomy_response(policy: AutonomyPolicy) -> AutonomyPolicyResponse:
+    return AutonomyPolicyResponse(
+        revision=policy.revision,
+        auto_apply_stretch=policy.auto_apply_stretch,
+        auto_submit_simple_forms=policy.auto_submit_simple_forms,
+        auto_prepare_replies=policy.auto_prepare_replies,
+        auto_send_approved_replies=policy.auto_send_approved_replies,
+        auto_reconcile_unknown=policy.auto_reconcile_unknown,
+        reuse_confirmed_profile_facts=policy.reuse_confirmed_profile_facts,
+        mark_opened_invitations_seen=policy.mark_opened_invitations_seen,
+        mutable_fact_validity_days=policy.mutable_fact_validity_days,
+        reply_templates=tuple(
+            ApprovedReplyTemplateUpdate(
+                key=template.key,
+                incoming_text=template.incoming_text,
+                response_text=template.response_text,
+                enabled=template.enabled,
+            )
+            for template in policy.reply_templates
+        ),
     )
 
 

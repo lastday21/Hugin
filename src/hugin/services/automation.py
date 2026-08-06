@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from hugin.database.models import (
+    ApplicationModel,
     ApplicationSettingsModel,
+    ApplicationTaskModel,
     CareerDirectionModel,
     DirectionSearchQueryModel,
     HhAccountModel,
@@ -18,9 +20,11 @@ from hugin.domain.automation import (
     AutomationJobResult,
     AutomationJobState,
 )
-from hugin.domain.tasks import SystemState
+from hugin.domain.tasks import SystemState, TaskState
 from hugin.domain.time import as_utc
 from hugin.repositories.automation import AutomationJobRepository
+from hugin.repositories.tasks import SystemStateRepository
+from hugin.services.autonomy import AutonomyPolicyService
 
 STALE_RUNNING_AFTER = timedelta(minutes=5)
 FAILURE_RETRY_DELAYS = (
@@ -32,6 +36,12 @@ RESOURCE_SAVING_SEARCH_INTERVAL_MINUTES = 240
 RESOURCE_SAVING_MESSAGE_INTERVAL_MINUTES = 15
 RESOURCE_SAVING_STATUS_INTERVAL_MINUTES = 60
 RESOURCE_SAVING_SEARCH_STAGGER = timedelta(minutes=5)
+UNKNOWN_RECONCILIATION_FAST_WINDOW = timedelta(minutes=2)
+UNKNOWN_RECONCILIATION_MEDIUM_WINDOW = timedelta(minutes=15)
+UNKNOWN_RECONCILIATION_SLOW_WINDOW = timedelta(hours=1)
+UNKNOWN_RECONCILIATION_FAST_DELAY = timedelta(minutes=1)
+UNKNOWN_RECONCILIATION_MEDIUM_DELAY = timedelta(minutes=3)
+UNKNOWN_RECONCILIATION_SLOW_DELAY = timedelta(minutes=10)
 PROTECTIVE_SYSTEM_STATES = frozenset(
     {
         SystemState.AUTH_REQUIRED,
@@ -202,7 +212,9 @@ class AutomationSchedulerService:
         result: AutomationJobResult | None = None,
         now: datetime | None = None,
     ) -> AutomationJobRecord:
-        completed = self._jobs.complete(job_key, result, self._now(now))
+        finished_at = self._now(now)
+        completed = self._jobs.complete(job_key, result, finished_at)
+        completed = self._schedule_unknown_reconciliation(completed, finished_at)
         return self._disable_finished_search_if_paused(completed, now)
 
     def fail(
@@ -211,11 +223,16 @@ class AutomationSchedulerService:
         *,
         error_code: str,
         error_message: str,
+        retry_after_seconds: int | None = None,
         now: datetime | None = None,
     ) -> AutomationJobRecord:
         failed_at = self._now(now)
         current = self._jobs.get(job_key)
-        delay = self._retry_delay(current.consecutive_failures + 1)
+        delay = (
+            timedelta(seconds=max(1, min(retry_after_seconds, 86_400)))
+            if retry_after_seconds is not None
+            else self._retry_delay(current.consecutive_failures + 1)
+        )
         failed = self._jobs.fail(
             job_key,
             retry_at=failed_at + delay,
@@ -380,13 +397,50 @@ class AutomationSchedulerService:
         target = PROTECTIVE_ERROR_STATES.get(error_code.strip().upper())
         if target is None:
             return
-        system = self._session.get(SystemStateModel, 1)
-        if system is not None and system.state in {
-            SystemState.RUNNING,
-            SystemState.PAUSED,
-        }:
-            system.state = target
-            self._session.flush()
+        system = SystemStateRepository(self._session)
+        current = system.get()
+        if current.state in {SystemState.RUNNING, SystemState.PAUSED}:
+            system.transition(target)
+
+    def _schedule_unknown_reconciliation(
+        self,
+        completed: AutomationJobRecord,
+        finished_at: datetime,
+    ) -> AutomationJobRecord:
+        if completed.kind is not AutomationJobKind.STATUSES:
+            return completed
+        if not AutonomyPolicyService(self._session).get().auto_reconcile_unknown:
+            return completed
+        oldest_unknown = self._session.scalar(
+            select(func.min(ApplicationTaskModel.updated_at))
+            .join(
+                ApplicationModel,
+                ApplicationModel.id == ApplicationTaskModel.application_id,
+            )
+            .where(
+                ApplicationModel.account_id == completed.account_id,
+                ApplicationTaskModel.state == TaskState.UNKNOWN_RESULT,
+            )
+        )
+        if oldest_unknown is None:
+            return completed
+        age = max(finished_at - as_utc(oldest_unknown), timedelta(0))
+        if age < UNKNOWN_RECONCILIATION_FAST_WINDOW:
+            delay = UNKNOWN_RECONCILIATION_FAST_DELAY
+        elif age < UNKNOWN_RECONCILIATION_MEDIUM_WINDOW:
+            delay = UNKNOWN_RECONCILIATION_MEDIUM_DELAY
+        elif age < UNKNOWN_RECONCILIATION_SLOW_WINDOW:
+            delay = UNKNOWN_RECONCILIATION_SLOW_DELAY
+        else:
+            return completed
+        return (
+            self._jobs.schedule_soon(
+                kind=completed.kind,
+                account_id=completed.account_id,
+                run_at=finished_at + delay,
+            )
+            or completed
+        )
 
     @staticmethod
     def _retry_delay(failure_number: int) -> timedelta:

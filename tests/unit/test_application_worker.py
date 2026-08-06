@@ -11,9 +11,11 @@ import pytest
 
 import hugin.workers.applications as applications
 from hugin.core.settings import Settings
-from hugin.domain.hh import HhApplyResult, HhApplyStatus
+from hugin.domain.hh import HhApplyResult, HhApplyStatus, HhScreeningSubmission
+from hugin.domain.hh_sync import HhSyncBlockedError, HhSyncRetryableError
 from hugin.services.application_automation import ApplyJob
 from hugin.services.hh_login import LoginResult, LoginStatus
+from hugin.services.screening_forms import StoredScreeningSubmission
 
 
 class FakeSessions:
@@ -42,6 +44,8 @@ class FakeApplicationService:
     expired_recovery_checks: ClassVar[list[datetime]] = []
     submission_checks: ClassVar[list[dict[str, object]]] = []
     released_preflights: ClassVar[list[tuple[ApplyJob, datetime]]] = []
+    recorded_preflights: ClassVar[list[tuple[ApplyJob, HhApplyResult, datetime]]] = []
+    automatic_form_ready: ClassVar[bool] = False
     day_starts: ClassVar[list[datetime]] = []
 
     def __init__(self, _session: object) -> None:
@@ -66,6 +70,9 @@ class FakeApplicationService:
     def applications_enabled(self) -> bool:
         return self.enabled
 
+    def stretch_automation_enabled(self) -> bool:
+        return True
+
     def applied_since(self, _account_id: int, since: datetime) -> int:
         type(self).day_starts.append(since)
         return self.sent_today
@@ -82,7 +89,7 @@ class FakeApplicationService:
         assert kwargs == {
             "account_id": 1,
             "require_cover_letter": True,
-            "include_stretch": False,
+            "include_stretch": True,
         }
         selected = type(self).job
         type(self).job = None
@@ -91,7 +98,7 @@ class FakeApplicationService:
     def claim_next_form_preflight(self, **kwargs: object) -> object | None:
         assert set(kwargs) == {"account_id", "include_stretch", "now"}
         assert kwargs["account_id"] == 1
-        assert kwargs["include_stretch"] is False
+        assert kwargs["include_stretch"] is True
         assert isinstance(kwargs["now"], datetime)
         selected = type(self).preflight_job
         type(self).preflight_job = None
@@ -99,6 +106,16 @@ class FakeApplicationService:
 
     def release_form_preflight(self, job: ApplyJob, *, now: datetime) -> None:
         type(self).released_preflights.append((job, now))
+
+    def record_form_preflight(
+        self,
+        job: ApplyJob,
+        result: HhApplyResult,
+        *,
+        now: datetime,
+    ) -> bool:
+        type(self).recorded_preflights.append((job, result, now))
+        return type(self).automatic_form_ready
 
     def record_result(
         self,
@@ -147,6 +164,8 @@ def setup_function() -> None:
     FakeApplicationService.expired_recovery_checks = []
     FakeApplicationService.submission_checks = []
     FakeApplicationService.released_preflights = []
+    FakeApplicationService.recorded_preflights = []
+    FakeApplicationService.automatic_form_ready = False
     FakeApplicationService.day_starts = []
 
 
@@ -324,6 +343,48 @@ def test_worker_marks_exception_after_claim_as_unknown(
     assert delay is None
 
 
+def test_worker_retries_login_timeout_without_marking_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    job = fake_job()
+    FakeApplicationService.job = job
+
+    def fail_before_vacancy(_job: ApplyJob) -> HhApplyResult:
+        raise HhSyncRetryableError(
+            "HH_NETWORK_TIMEOUT",
+            "Страница входа hh.ru временно недоступна",
+            retry_after_seconds=60,
+        )
+
+    worker = prepare_worker(monkeypatch, tmp_path, job_handler=fail_before_vacancy)
+
+    assert worker.run_once(datetime(2026, 7, 27, 10, 0, tzinfo=UTC))
+    _, result, delay, _ = FakeApplicationService.recorded[0]
+    assert result.status is HhApplyStatus.RETRYABLE_ERROR
+    assert result.retry_after_seconds == 60
+    assert delay is None
+
+
+def test_worker_promotes_account_warning_before_application(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    job = fake_job()
+    FakeApplicationService.job = job
+
+    def fail_before_vacancy(_job: ApplyJob) -> HhApplyResult:
+        raise HhSyncBlockedError(
+            "ACCOUNT_WARNING",
+            "hh.ru показал предупреждение безопасности",
+        )
+
+    worker = prepare_worker(monkeypatch, tmp_path, job_handler=fail_before_vacancy)
+
+    assert worker.run_once(datetime(2026, 7, 27, 10, 0, tzinfo=UTC))
+    assert FakeApplicationService.recorded[0][1].status is HhApplyStatus.ACCOUNT_WARNING
+
+
 def test_clean_form_is_checked_before_exact_letter_and_sent_only_next_cycle(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -391,7 +452,39 @@ def test_form_with_questions_is_recorded_without_model_call(
 
     assert worker.run_once(datetime(2026, 7, 27, 10, 0, tzinfo=UTC))
     assert FakeApplicationService.released_preflights == []
-    assert FakeApplicationService.recorded[0][1].status is HhApplyStatus.QUESTIONS_REQUIRED
+    assert (
+        FakeApplicationService.recorded_preflights[0][1].status is HhApplyStatus.QUESTIONS_REQUIRED
+    )
+    assert FakeApplicationService.recorded == []
+
+
+def test_safe_form_preflight_prepares_letter_for_automatic_submission(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    job = fake_job()
+    FakeApplicationService.preflight_job = job
+    FakeApplicationService.automatic_form_ready = True
+    prepared: list[ApplyJob] = []
+
+    def prepare_letter(selected: ApplyJob) -> int:
+        prepared.append(selected)
+        return 1
+
+    worker = prepare_worker(
+        monkeypatch,
+        tmp_path,
+        form_preflight_handler=lambda selected: HhApplyResult(
+            HhApplyStatus.QUESTIONS_REQUIRED,
+            selected.vacancy.source_url,
+            questions=("Укажите Telegram",),
+        ),
+        letter_preparer=prepare_letter,
+    )
+
+    assert worker.run_once(datetime(2026, 7, 27, 10, 0, tzinfo=UTC))
+    assert prepared == [job]
+    assert FakeApplicationService.recorded_preflights[0][0] is job
 
 
 def test_form_preflight_exception_is_retryable_not_unknown(
@@ -474,9 +567,11 @@ def test_worker_runs_authenticated_browser_job(
             cover_letter: str,
             submit: bool,
             submit_guard: object,
+            screening_submission: object,
         ) -> HhApplyResult:
             assert submit
             assert callable(submit_guard)
+            assert screening_submission is None
             assert submit_guard()
             calls.append((source_url, expected_resume_hh_id, expected_resume_title, cover_letter))
             return HhApplyResult(HhApplyStatus.APPLIED, source_url)
@@ -514,6 +609,107 @@ def test_worker_runs_authenticated_browser_job(
             "Здравствуйте!",
         )
     ]
+    assert FakeApplicationService.submission_checks == [
+        {
+            "task_id": 10,
+            "letter_id": 20,
+            "letter_sha256": "letter-sha",
+            "resume_hh_id": "resume-1",
+            "resume_title": "Python backend",
+        }
+    ]
+
+
+def test_worker_submits_safe_screening_form_after_final_recheck(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    payload = HhScreeningSubmission(
+        "a" * 64,
+        (("name:telegram", "@timur"),),
+    )
+    submission = StoredScreeningSubmission(
+        form_id=7,
+        application_id=11,
+        payload=payload,
+    )
+    screening_checks: list[StoredScreeningSubmission] = []
+
+    class FakeScreeningDraftService:
+        def __init__(self, _session: object) -> None:
+            pass
+
+        def auto_submission_allowed(
+            self,
+            checked_submission: StoredScreeningSubmission,
+        ) -> bool:
+            screening_checks.append(checked_submission)
+            return True
+
+    class FakeBrowser:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def __enter__(self) -> FakeBrowser:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            pass
+
+        def apply_to_vacancy(
+            self,
+            source_url: str,
+            *,
+            expected_resume_hh_id: str,
+            expected_resume_title: str,
+            cover_letter: str,
+            submit: bool,
+            submit_guard: object,
+            screening_submission: object,
+        ) -> HhApplyResult:
+            assert source_url == "https://hh.ru/vacancy/101"
+            assert expected_resume_hh_id == "resume-1"
+            assert expected_resume_title == "Python backend"
+            assert cover_letter == "Здравствуйте!"
+            assert submit
+            assert screening_submission == payload
+            assert callable(submit_guard)
+            assert submit_guard()
+            return HhApplyResult(HhApplyStatus.APPLIED, source_url)
+
+    class FakeLoginService:
+        def __init__(self, _store: object) -> None:
+            pass
+
+        def authenticate(self, _account_id: int, _browser: object) -> LoginResult:
+            return LoginResult(LoginStatus.AUTHENTICATED)
+
+    monkeypatch.setattr(applications, "VisibleHhBrowser", FakeBrowser)
+    monkeypatch.setattr(applications, "HhLoginService", FakeLoginService)
+    monkeypatch.setattr(applications, "ScreeningDraftService", FakeScreeningDraftService)
+    worker = prepare_worker(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        worker,
+        "_auto_screening_submission",
+        lambda application_id: submission if application_id == 11 else None,
+    )
+    job = cast(
+        ApplyJob,
+        SimpleNamespace(
+            task=SimpleNamespace(id=10),
+            application=SimpleNamespace(id=11),
+            vacancy=SimpleNamespace(source_url="https://hh.ru/vacancy/101"),
+            resume=SimpleNamespace(hh_id="resume-1", title="Python backend"),
+            cover_letter="Здравствуйте!",
+            cover_letter_id=20,
+            cover_letter_sha256="letter-sha",
+        ),
+    )
+
+    result = worker._run_job(job)
+
+    assert result.status is HhApplyStatus.APPLIED
+    assert screening_checks == [submission]
     assert FakeApplicationService.submission_checks == [
         {
             "task_id": 10,
@@ -590,8 +786,17 @@ def test_worker_checks_form_without_letter_or_submission(
     ]
 
 
+@pytest.mark.parametrize(
+    ("login_status", "apply_status"),
+    (
+        (LoginStatus.CAPTCHA_REQUIRED, HhApplyStatus.CAPTCHA_REQUIRED),
+        (LoginStatus.INVALID_CREDENTIALS, HhApplyStatus.INVALID_CREDENTIALS),
+    ),
+)
 def test_worker_maps_incomplete_login_without_applying(
     monkeypatch: pytest.MonkeyPatch,
+    login_status: LoginStatus,
+    apply_status: HhApplyStatus,
 ) -> None:
     class FakeBrowser:
         def __init__(self, *_args: object, **_kwargs: object) -> None:
@@ -608,7 +813,7 @@ def test_worker_maps_incomplete_login_without_applying(
             pass
 
         def authenticate(self, _account_id: int, _browser: object) -> LoginResult:
-            return LoginResult(LoginStatus.CAPTCHA_REQUIRED)
+            return LoginResult(login_status)
 
     monkeypatch.setattr(applications, "VisibleHhBrowser", FakeBrowser)
     monkeypatch.setattr(applications, "HhLoginService", FakeLoginService)
@@ -627,7 +832,7 @@ def test_worker_maps_incomplete_login_without_applying(
 
     result = worker._run_job(job)
 
-    assert result.status is HhApplyStatus.CAPTCHA_REQUIRED
+    assert result.status is apply_status
 
 
 def test_worker_prepares_one_letter_for_active_direction(
@@ -659,7 +864,7 @@ def test_worker_prepares_one_letter_for_active_direction(
                 "vacancy_hh_id": "101",
                 "application_id": 11,
                 "limit": 1,
-                "include_stretch": False,
+                "include_stretch": True,
             }
             return SimpleNamespace(generated=1, reused=0)
 
@@ -668,6 +873,9 @@ def test_worker_prepares_one_letter_for_active_direction(
             pass
 
         def applications_enabled(self) -> bool:
+            return True
+
+        def stretch_automation_enabled(self) -> bool:
             return True
 
     monkeypatch.setattr(applications, "create_database", lambda _settings: LetterDatabase())

@@ -64,12 +64,15 @@ class FakeBrowser:
         resumes_url: str,
         search_url: str,
         timeout_ms: int,
+        *,
+        browser_source_ip: str | None = None,
     ) -> None:
         self.profile_dir = profile_dir
         self.login_url = login_url
         self.resumes_url = resumes_url
         self.search_url = search_url
         self.timeout_ms = timeout_ms
+        self.browser_source_ip = browser_source_ip
         self.opened = False
         self.details_read: list[str] = []
         self.applications: list[tuple[str, str, str]] = []
@@ -238,6 +241,13 @@ def test_login_reuses_authenticated_profile(
     assert FakeBrowser.created is not None
     assert FakeBrowser.created.opened
     assert FakeBrowser.created.profile_dir == tmp_path / "browser-profiles" / "account-2"
+    configured_source = Settings(
+        environment="test",
+        data_dir=tmp_path,
+    ).hh_browser_source_ip
+    assert FakeBrowser.created.browser_source_ip == (
+        str(configured_source) if configured_source is not None else None
+    )
 
 
 def test_manual_confirmation_can_finish_in_open_browser(

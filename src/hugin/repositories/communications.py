@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import cast
 
 from sqlalchemy import or_, select, update
@@ -42,6 +42,7 @@ _NON_RETRYABLE_NOTIFICATION_ERRORS = frozenset(
         "TELEGRAM_NOT_CONFIGURED",
     }
 )
+_UNKNOWN_OUTGOING_RECONCILIATION_WINDOW = timedelta(minutes=30)
 
 
 def _optional_utc(value: datetime | None) -> datetime | None:
@@ -62,6 +63,8 @@ def _message_record(model: RecruiterMessageModel) -> RecruiterMessageRecord:
         confirmed_at=_optional_utc(model.confirmed_at),
         sent_at=_optional_utc(model.sent_at),
         received_at=_optional_utc(model.received_at),
+        auto_send_approved=model.auto_send_approved,
+        reply_template_key=model.reply_template_key,
         created_at=as_utc(model.created_at),
     )
 
@@ -174,7 +177,31 @@ class CommunicationRepository:
     ) -> tuple[RecruiterMessageRecord, bool]:
         self._require_application(application_id)
         selected_at = as_utc(occurred_at)
+        existing = self._session.scalar(
+            select(RecruiterMessageModel)
+            .where(
+                RecruiterMessageModel.application_id == application_id,
+                RecruiterMessageModel.hh_id == hh_id,
+            )
+            .with_for_update()
+        )
+        if existing is not None:
+            if existing.direction is not direction or existing.body != body:
+                raise CommunicationStateError(
+                    "Идентификатор сообщения hh.ru уже связан с другим содержимым"
+                )
+            return _message_record(existing), False
+
         incoming = direction is MessageDirection.INCOMING
+        if not incoming:
+            reconciled = self._reconcile_unknown_outgoing(
+                application_id=application_id,
+                hh_id=hh_id,
+                body=body,
+                sent_at=selected_at,
+            )
+            if reconciled is not None:
+                return reconciled, False
         statement = (
             insert(RecruiterMessageModel)
             .values(
@@ -233,6 +260,8 @@ class CommunicationRepository:
         application_id: int,
         body: str,
         content_hash: str,
+        auto_send_approved: bool = False,
+        reply_template_key: str | None = None,
     ) -> RecruiterMessageRecord:
         self._require_application(application_id)
         model = RecruiterMessageModel(
@@ -242,8 +271,48 @@ class CommunicationRepository:
             content_hash=content_hash,
             version=1,
             state=RecruiterMessageState.REVIEW_REQUIRED,
+            auto_send_approved=auto_send_approved,
+            reply_template_key=reply_template_key,
         )
         self._session.add(model)
+        self._session.flush()
+        return _message_record(model)
+
+    def _reconcile_unknown_outgoing(
+        self,
+        *,
+        application_id: int,
+        hh_id: str,
+        body: str,
+        sent_at: datetime,
+    ) -> RecruiterMessageRecord | None:
+        selected_at = as_utc(sent_at)
+        unknown = tuple(
+            self._session.scalars(
+                select(RecruiterMessageModel)
+                .where(
+                    RecruiterMessageModel.application_id == application_id,
+                    RecruiterMessageModel.direction == MessageDirection.OUTGOING,
+                    RecruiterMessageModel.state == RecruiterMessageState.UNKNOWN_RESULT,
+                    RecruiterMessageModel.hh_id.is_(None),
+                    RecruiterMessageModel.confirmed_at.is_not(None),
+                    RecruiterMessageModel.confirmed_at <= selected_at,
+                    RecruiterMessageModel.confirmed_at
+                    >= selected_at - _UNKNOWN_OUTGOING_RECONCILIATION_WINDOW,
+                )
+                .with_for_update()
+            )
+        )
+        candidates = tuple(model for model in unknown if model.body == body)
+        if not candidates:
+            stripped = body.strip()
+            candidates = tuple(model for model in unknown if model.body.strip() == stripped)
+        if len(candidates) != 1:
+            return None
+        model = candidates[0]
+        model.hh_id = hh_id
+        model.state = RecruiterMessageState.SENT
+        model.sent_at = selected_at
         self._session.flush()
         return _message_record(model)
 
@@ -296,6 +365,7 @@ class CommunicationRepository:
         if model.state not in {
             RecruiterMessageState.DRAFT,
             RecruiterMessageState.REVIEW_REQUIRED,
+            RecruiterMessageState.FAILED,
         }:
             raise CommunicationStateError("Черновик нельзя подтвердить в текущем состоянии")
         model.state = RecruiterMessageState.CONFIRMED

@@ -52,6 +52,7 @@ from hugin.repositories.tasks import (
 from hugin.services.ai_prompts import DEFAULT_AI_PROMPTS
 from hugin.services.application_automation import ApplicationAutomationService
 from hugin.services.application_reconciliation import ApplicationReconciliationService
+from hugin.services.autonomy import AutonomyPolicyService
 from hugin.services.cover_letter import MANUAL_REVIEW_MODEL, CoverLetterService
 from hugin.services.hh_sync import HhSynchronizationService
 from hugin.services.queue import QueueService
@@ -435,16 +436,20 @@ def test_automation_prepares_claims_and_records_results(settings: Settings) -> N
                 uncertain_job,
                 HhApplyResult(HhApplyStatus.UNKNOWN_RESULT, uncertain_vacancy.source_url),
             )
-            assert uncertain.blocking
+            assert not uncertain.blocking
             assert (
                 QueueTaskRepository(session).get(uncertain_job.task.id).state
                 is TaskState.UNKNOWN_RESULT
             )
-            assert SystemStateRepository(session).get().state is SystemState.PAUSED
+            assert SystemStateRepository(session).get().state is SystemState.RUNNING
             unknown_event = ApplicationRepository(session).list_events(
                 uncertain_job.application.id
             )[-1]
             assert unknown_event.payload["final_url"] == uncertain_vacancy.source_url
+            assert service.applied_since(
+                account.id,
+                datetime(2026, 1, 1, tzinfo=UTC),
+            ) == 2
 
             confirmed = ApplicationReconciliationService(session).reconcile(
                 uncertain_job.task.id,
@@ -462,9 +467,11 @@ def test_automation_prepares_claims_and_records_results(settings: Settings) -> N
             assert (
                 QueueTaskRepository(session).get(uncertain_job.task.id).state is TaskState.COMPLETED
             )
-            assert SystemStateRepository(session).get().state is SystemState.PAUSED
-            QueueService(session).resume()
             assert SystemStateRepository(session).get().state is SystemState.RUNNING
+            assert service.applied_since(
+                account.id,
+                datetime(2026, 1, 1, tzinfo=UTC),
+            ) == 2
 
             closed_vacancy = vacancies.upsert(
                 VacancyData("400", "Closed Python role", "https://hh.ru/vacancy/400")
@@ -536,12 +543,14 @@ def test_automation_prepares_claims_and_records_results(settings: Settings) -> N
             assert auth_required.blocking
             assert SystemStateRepository(session).get().state is SystemState.AUTH_REQUIRED
             service.resume_after_authentication()
-            assert SystemStateRepository(session).get().state is SystemState.PAUSED
+            assert SystemStateRepository(session).get().state is SystemState.RUNNING
     finally:
         database.close()
 
 
-def test_retry_after_schedules_task_and_all_new_applications(settings: Settings) -> None:
+def test_retry_after_schedules_next_run_and_account_warning_blocks_queue(
+    settings: Settings,
+) -> None:
     upgrade_database(settings)
     database = create_database(settings)
     now = datetime.now(UTC) - timedelta(seconds=1)
@@ -590,6 +599,47 @@ def test_retry_after_schedules_task_and_all_new_applications(settings: Settings)
             assert recorded.next_apply_at == expected
             assert QueueTaskRepository(session).get(job.task.id).scheduled_at == expected
             assert SystemStateRepository(session).get().next_apply_at == expected
+
+            SystemStateRepository(session).set_next_apply_at(None)
+            warning_vacancy = VacancyRepository(session).upsert(
+                VacancyData(
+                    "account-warning",
+                    "Python",
+                    "https://hh.ru/vacancy/account-warning",
+                )
+            )
+            directions.track_vacancy(direction.id, warning_vacancy.id)
+            directions.apply_rules(
+                direction.id,
+                warning_vacancy.id,
+                state=VacancyState.QUEUED,
+                score=40,
+                details={"category": "MATCH", "accepted": True},
+                rules_version=RULES_VERSION,
+            )
+            warning_application = ApplicationRepository(session).create_apply_intent(
+                account.id,
+                warning_vacancy.id,
+                resume.id,
+                direction.id,
+            )
+            QueueTaskRepository(session).enqueue(warning_application.id, 40, now)
+            warning_job = service.claim_next(direction.id)
+            assert warning_job is not None
+            warning = service.record_result(
+                warning_job,
+                HhApplyResult(
+                    HhApplyStatus.ACCOUNT_WARNING,
+                    warning_vacancy.source_url,
+                ),
+                now=now,
+            )
+
+            assert warning.blocking
+            assert (
+                SystemStateRepository(session).get().state
+                is SystemState.ACCOUNT_WARNING
+            )
     finally:
         database.close()
 
@@ -667,6 +717,74 @@ def test_rule_change_skips_and_can_restore_pending_task(settings: Settings) -> N
 
             assert restored.created == 1
             assert QueueTaskRepository(session).get(task.id).state is TaskState.PENDING
+    finally:
+        database.close()
+
+
+@pytest.mark.parametrize(
+    "task_state",
+    (TaskState.REVIEW_REQUIRED, TaskState.INPUT_REQUIRED),
+)
+def test_rule_change_skips_actionable_task_waiting_for_user(
+    settings: Settings,
+    task_state: TaskState,
+) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    try:
+        with database.sessions.begin() as session:
+            account = AccountRepository(session).create(
+                "Иван",
+                f"rules-waiting-{task_state.value}",
+            )
+            resume = ResumeRepository(session).upsert(
+                account.id,
+                f"resume-{task_state.value}",
+                "Python",
+            )
+            directions = DirectionRepository(session)
+            direction = directions.create(account.id, "Python backend")
+            directions.attach_resume(direction.id, resume.id)
+            vacancy = VacancyRepository(session).upsert(
+                VacancyData(
+                    f"rules-{task_state.value}",
+                    "Python backend",
+                    f"https://hh.ru/vacancy/rules-{task_state.value}",
+                )
+            )
+            directions.track_vacancy(direction.id, vacancy.id)
+            directions.apply_rules(
+                direction.id,
+                vacancy.id,
+                state=VacancyState.FILTERED_OUT,
+                score=0,
+                details={"category": "REJECTED", "accepted": False},
+                rules_version=RULES_VERSION,
+            )
+            application = ApplicationRepository(session).create_apply_intent(
+                account.id,
+                vacancy.id,
+                resume.id,
+                direction.id,
+            )
+            tasks = QueueTaskRepository(session)
+            task = tasks.enqueue(application.id, 50)
+            if task_state is TaskState.INPUT_REQUIRED:
+                tasks.transition(task.id, TaskState.RUNNING)
+            tasks.transition(task.id, task_state)
+
+            skipped = tasks.skip_ineligible(
+                direction.id,
+                rules_version=RULES_VERSION,
+                allowed_categories=frozenset(
+                    {RuleCategory.MATCH.value, RuleCategory.STRETCH.value}
+                ),
+            )
+
+            assert skipped == 1
+            stored = tasks.get(task.id)
+            assert stored.state is TaskState.SKIPPED
+            assert stored.last_error_code == "VACANCY_RULES_CHANGED"
     finally:
         database.close()
 
@@ -1012,6 +1130,20 @@ def test_background_claim_and_submit_guard_require_the_same_current_letter(
             tracking.rules_details = {"category": "STRETCH", "accepted": True}
             letter.context_hash = CoverLetterService(session).current_context_hash(application.id)
             session.flush()
+            assert service.background_submission_is_allowed(
+                task.id,
+                letter_id=letter.id,
+                letter_sha256=job.cover_letter_sha256,
+                resume_hh_id=resume.hh_id,
+                resume_title=resume.title,
+            )
+            autonomy = AutonomyPolicyService(session)
+            autonomy.update(
+                {
+                    **autonomy.get().as_payload(),
+                    "auto_apply_stretch": False,
+                }
+            )
             assert not service.background_submission_is_allowed(
                 task.id,
                 letter_id=letter.id,
@@ -1153,13 +1285,28 @@ def test_supervised_claim_requires_exact_letter_and_excludes_worker(
                 )
             )
             session.flush()
+            session_limit_application_ids = [application.id]
+            for index in range(1, 20):
+                counted_vacancy = VacancyRepository(session).upsert(
+                    VacancyData(
+                        f"supervised-counted-{index}",
+                        "Python backend",
+                        f"https://hh.ru/vacancy/supervised-counted-{index}",
+                    )
+                )
+                counted_application = ApplicationRepository(session).create_apply_intent(
+                    account.id,
+                    counted_vacancy.id,
+                    resume.id,
+                )
+                session_limit_application_ids.append(counted_application.id)
             session.add_all(
                 ApplicationEventModel(
-                    application_id=application.id,
+                    application_id=application_id,
                     event_type=ApplicationEventType.APPLIED,
                     payload={"hh_status": "APPLIED"},
                 )
-                for _ in range(20)
+                for application_id in session_limit_application_ids
             )
             session.flush()
             assert service.last_confirmed_application_at(account.id) is not None
@@ -1182,7 +1329,9 @@ def test_supervised_claim_requires_exact_letter_and_excludes_worker(
                 )
             session.execute(
                 delete(ApplicationEventModel).where(
-                    ApplicationEventModel.application_id == application.id
+                    ApplicationEventModel.application_id.in_(
+                        session_limit_application_ids
+                    )
                 )
             )
             session.flush()
@@ -1385,8 +1534,8 @@ def test_supervised_claim_requires_exact_letter_and_excludes_worker(
                 TaskState.UNKNOWN_RESULT,
                 error_code="UNKNOWN_RESULT",
             )
-            with pytest.raises(RuntimeError, match="результат которого неизвестен"):
-                service.acquire_supervised_lease("lease-after-unknown")
+            service.acquire_supervised_lease("lease-after-unknown")
+            assert service.supervised_lease_is_valid("lease-after-unknown")
     finally:
         database.close()
 

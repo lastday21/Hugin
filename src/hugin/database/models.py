@@ -540,7 +540,13 @@ class ApplicationTaskModel(Base):
 
 class SystemStateModel(Base):
     __tablename__ = "system_state"
-    __table_args__ = (CheckConstraint("id = 1", name="ck_system_state_singleton"),)
+    __table_args__ = (
+        CheckConstraint("id = 1", name="ck_system_state_singleton"),
+        CheckConstraint(
+            "recovery_state IS NULL OR recovery_state IN ('RUNNING', 'PAUSED')",
+            name="ck_system_state_recovery_state",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True, default=1)
     state: Mapped[SystemState] = mapped_column(
@@ -554,6 +560,16 @@ class SystemStateModel(Base):
         ),
         default=SystemState.PAUSED,
         nullable=False,
+    )
+    recovery_state: Mapped[SystemState | None] = mapped_column(
+        Enum(
+            SystemState,
+            name="system_recovery_state_value",
+            native_enum=False,
+            create_constraint=False,
+            length=24,
+            values_callable=enum_values,
+        )
     )
     next_apply_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     supervised_lease_token: Mapped[str | None] = mapped_column(String(64), index=True)
@@ -1017,6 +1033,8 @@ class RecruiterMessageModel(Base):
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     received_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     read_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    auto_send_approved: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    reply_template_key: Mapped[str | None] = mapped_column(String(64))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
     )
@@ -1194,6 +1212,10 @@ class ApplicationSettingsModel(Base):
             "AND backups_retention_days >= 1",
             name="ck_application_settings_retention",
         ),
+        CheckConstraint(
+            "autonomy_policy_version >= 1",
+            name="ck_application_settings_autonomy_policy_version",
+        ),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True, default=1)
@@ -1218,6 +1240,12 @@ class ApplicationSettingsModel(Base):
         default=dict,
         nullable=False,
     )
+    autonomy_policy: Mapped[ConfigPayload] = mapped_column(
+        JSONB,
+        default=dict,
+        nullable=False,
+    )
+    autonomy_policy_version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
     diagnostics_retention_days: Mapped[int] = mapped_column(Integer, default=30, nullable=False)
     logs_retention_days: Mapped[int] = mapped_column(Integer, default=90, nullable=False)
     backups_retention_days: Mapped[int] = mapped_column(Integer, default=30, nullable=False)
