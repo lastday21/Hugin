@@ -53,6 +53,8 @@ from hugin.workers.hh_search import HhSearchJobHandler
 from hugin.workers.hh_sync import HhSyncJobHandler
 from hugin.workers.notifications import NotificationWorker
 
+APP_ICON = Path(__file__).with_name("assets") / "hugin.ico"
+
 
 class WebviewWindow(Protocol):
     def destroy(self) -> None: ...
@@ -77,7 +79,7 @@ class WebviewModule(Protocol):
         background_color: str,
     ) -> WebviewWindow: ...
 
-    def start(self, *, debug: bool = False) -> None: ...
+    def start(self, *, debug: bool = False, icon: str | None = None) -> None: ...
 
 
 class WindowsUser32(Protocol):
@@ -883,7 +885,7 @@ def main() -> None:
     starting.succeed(workers=len(started_workers))
     session = journal.start("desktop", "application.session")
     try:
-        webview.start(debug=False)
+        webview.start(debug=False, icon=str(APP_ICON))
     except Exception as error:
         session.fail(error)
         raise

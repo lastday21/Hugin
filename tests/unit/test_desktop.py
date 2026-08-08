@@ -914,8 +914,8 @@ def test_main_starts_window_and_always_closes_bridge(
             created.append((args, kwargs))
             return object()
 
-        def start(self, *, debug: bool = False) -> None:
-            events.append(("start", debug))
+        def start(self, *, debug: bool = False, icon: str | None = None) -> None:
+            events.append(("start", debug, icon))
 
     class FakeBridge:
         def __init__(self, selected: Settings, **_kwargs: object) -> None:
@@ -945,9 +945,10 @@ def test_main_starts_window_and_always_closes_bridge(
 
     desktop.main()
 
+    assert desktop.APP_ICON.is_file()
     assert events[0] == "services"
     assert events[-6:] == [
-        ("start", False),
+        ("start", False, str(desktop.APP_ICON)),
         "close",
         "worker-stop",
         "worker-stop",
