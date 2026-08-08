@@ -854,7 +854,12 @@ def test_worker_prepares_one_letter_for_active_direction(
             pass
 
     class FakeLetterService:
-        def __init__(self, _session: object, _client: object) -> None:
+        def __init__(
+            self,
+            _session: object,
+            _client: object,
+            _router_client: object,
+        ) -> None:
             pass
 
         def prepare(self, **values: object) -> SimpleNamespace:
@@ -892,7 +897,8 @@ def test_worker_prepares_one_letter_for_active_direction(
         applications,
         "configured_yandex_ai_client",
         lambda _settings, *, model, reasoning_effort, operation: {
-            ("selected-model", "high", "cover_letter"): object()
+            ("selected-model", "high", "cover_letter"): object(),
+            ("deepseek-v4-flash/latest", "low", "cover_letter_routing"): object(),
         }[(model, reasoning_effort, operation)],
     )
 

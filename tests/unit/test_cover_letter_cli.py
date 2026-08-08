@@ -112,8 +112,14 @@ def test_prepare_creates_letters_without_browser_or_hh_submission(
             return SimpleNamespace(created=3, existing=4)
 
     class FakeLetters:
-        def __init__(self, _session: object, client: object | None = None) -> None:
+        def __init__(
+            self,
+            _session: object,
+            client: object | None = None,
+            router_client: object | None = None,
+        ) -> None:
             assert client is not None
+            assert router_client is not None
 
         def prepare(self, **kwargs: object) -> CoverLetterPreparationResult:
             assert kwargs == {
@@ -145,7 +151,8 @@ def test_prepare_creates_letters_without_browser_or_hh_submission(
         cover_letter_cli,
         "_client",
         lambda _settings, _store, *, model, reasoning_effort, operation: {
-            ("selected-model", "high", "cover_letter"): object()
+            ("selected-model", "high", "cover_letter"): object(),
+            ("deepseek-v4-flash/latest", "low", "cover_letter_routing"): object(),
         }[(model, reasoning_effort, operation)],
     )
     monkeypatch.setattr(cover_letter_cli, "ApplicationAutomationService", FakeAutomation)

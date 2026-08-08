@@ -157,6 +157,16 @@ def run(argv: Sequence[str] | None = None) -> int:
                     print(f"Вакансия: {vacancy.title} (№ {vacancy.hh_id})")
                     print(f"Идентификатор письма: {letter.id}")
                     print(f"Состояние: {letter.state.value}")
+                    print(f"Способ подготовки: {letter.generation_mode.value}")
+                    print(f"Модель текста: {letter.model_name}")
+                    if letter.reused_from_id is not None:
+                        print(f"Исходное письмо: № {letter.reused_from_id}")
+                    if letter.router_model_name:
+                        print(f"Модель отбора: {letter.router_model_name}")
+                    if letter.router_confidence is not None:
+                        print(f"Уверенность отбора: {letter.router_confidence:.2f}")
+                    if letter.router_reason:
+                        print(f"Причина решения: {letter.router_reason}")
                     if letter.text:
                         digest = hashlib.sha256(letter.text.encode("utf-8")).hexdigest()
                         print(f"SHA256 письма: {digest}")
@@ -226,12 +236,19 @@ def run(argv: Sequence[str] | None = None) -> int:
                     reasoning_effort=ai_settings.get_reasoning_effort(),
                     operation="cover_letter",
                 )
+                router_client = _client(
+                    settings,
+                    store,
+                    model=settings.yandex_ai_router_model,
+                    reasoning_effort=settings.yandex_ai_router_reasoning_effort,
+                    operation="cover_letter_routing",
+                )
                 queued = ApplicationAutomationService(session).prepare_for_account_id(
                     account_id=arguments.account_id,
                     direction_name=arguments.direction,
                     include_stretch=not arguments.exclude_stretch,
                 )
-                result = CoverLetterService(session, client).prepare(
+                result = CoverLetterService(session, client, router_client).prepare(
                     account_id=arguments.account_id,
                     direction_name=arguments.direction,
                     limit=arguments.limit,
@@ -244,7 +261,8 @@ def run(argv: Sequence[str] | None = None) -> int:
         print(f"Новых заданий в очереди: {queued.created}. Ранее созданных: {queued.existing}.")
         labels = {
             "generated": "создано",
-            "reused": "переиспользовано для связанной публикации",
+            "adapted": "исправлено лёгкой моделью",
+            "reused": "выбрано готовое письмо",
             "existing": "уже готово",
             "failed": "ошибка",
             "blocked": "пропущено без нового обращения к модели",

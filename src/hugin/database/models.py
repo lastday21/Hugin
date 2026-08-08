@@ -31,6 +31,7 @@ from hugin.domain.content import (
     AnswerSource,
     CompanyRuleType,
     ConfirmationState,
+    CoverLetterGenerationMode,
     CoverLetterState,
     DeliveryState,
     IncidentSeverity,
@@ -781,6 +782,11 @@ class CoverLetterModel(Base):
             "instruction_version",
             name="uq_cover_letters_application_instruction",
         ),
+        CheckConstraint(
+            "router_confidence IS NULL OR "
+            "(router_confidence >= 0 AND router_confidence <= 1)",
+            name="ck_cover_letters_router_confidence",
+        ),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -802,6 +808,21 @@ class CoverLetterModel(Base):
     reused_from_id: Mapped[int | None] = mapped_column(
         ForeignKey("cover_letters.id", ondelete="SET NULL"), index=True
     )
+    generation_mode: Mapped[CoverLetterGenerationMode] = mapped_column(
+        Enum(
+            CoverLetterGenerationMode,
+            name="cover_letter_generation_mode",
+            native_enum=False,
+            create_constraint=True,
+            length=24,
+            values_callable=enum_values,
+        ),
+        default=CoverLetterGenerationMode.MODEL_NEW,
+        nullable=False,
+    )
+    router_model_name: Mapped[str | None] = mapped_column(String(128))
+    router_confidence: Mapped[float | None] = mapped_column(Float)
+    router_reason: Mapped[str | None] = mapped_column(String(512))
     text: Mapped[str | None] = mapped_column(Text)
     instruction_version: Mapped[str] = mapped_column(String(64), nullable=False)
     model_name: Mapped[str] = mapped_column(String(128), nullable=False)

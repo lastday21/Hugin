@@ -82,6 +82,28 @@ def test_communications_migration_preserves_existing_rows(settings: Settings) ->
             )
 
         with database.engine.begin() as connection:
+            application = connection.execute(
+                text(
+                    "SELECT vacancy_id, resume_id, direction_id "
+                    "FROM applications WHERE id = :application_id"
+                ),
+                {"application_id": application_id},
+            ).one()
+            connection.execute(
+                text(
+                    "INSERT INTO cover_letters "
+                    "(application_id, vacancy_id, direction_id, resume_id, text, "
+                    "instruction_version, model_name, state) "
+                    "VALUES (:application_id, :vacancy_id, :direction_id, :resume_id, "
+                    "'Старое письмо', 'legacy-instruction', 'legacy-model', 'SENT')"
+                ),
+                {
+                    "application_id": application_id,
+                    "vacancy_id": application.vacancy_id,
+                    "direction_id": application.direction_id,
+                    "resume_id": application.resume_id,
+                },
+            )
             connection.execute(
                 text(
                     "INSERT INTO recruiter_messages "
@@ -114,7 +136,7 @@ def test_communications_migration_preserves_existing_rows(settings: Settings) ->
         database.close()
 
     upgrade_database(settings)
-    assert current_revision(settings) == "0022_system_recovery_state"
+    assert current_revision(settings) == "0023_cover_letter_routing"
     check_database_schema(settings)
 
     migrated = create_database(settings)
@@ -137,6 +159,12 @@ def test_communications_migration_preserves_existing_rows(settings: Settings) ->
             column["name"]
             for column in inspect(migrated.engine).get_columns("application_settings")
         }
+        assert {
+            "generation_mode",
+            "router_model_name",
+            "router_confidence",
+            "router_reason",
+        } <= {column["name"] for column in inspect(migrated.engine).get_columns("cover_letters")}
 
         with migrated.engine.begin() as connection:
             message = connection.execute(
@@ -147,6 +175,12 @@ def test_communications_migration_preserves_existing_rows(settings: Settings) ->
             ).one()
             notification_key = connection.execute(
                 text("SELECT deduplication_key FROM notifications")
+            ).scalar_one()
+            generation_mode = connection.execute(
+                text(
+                    "SELECT generation_mode FROM cover_letters "
+                    "WHERE instruction_version = 'legacy-instruction'"
+                )
             ).scalar_one()
             connection.execute(
                 text(
@@ -160,6 +194,7 @@ def test_communications_migration_preserves_existing_rows(settings: Settings) ->
 
         assert message == (None, None, 1)
         assert notification_key.startswith("legacy:")
+        assert generation_mode == "LEGACY"
     finally:
         migrated.close()
 

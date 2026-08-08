@@ -38,6 +38,15 @@ class CoverLetterState(StrEnum):
     SENT = "SENT"
 
 
+class CoverLetterGenerationMode(StrEnum):
+    LEGACY = "LEGACY"
+    MODEL_NEW = "MODEL_NEW"
+    ROUTED_REUSE = "ROUTED_REUSE"
+    LIGHT_EDIT = "LIGHT_EDIT"
+    DUPLICATE_REUSE = "DUPLICATE_REUSE"
+    MANUAL = "MANUAL"
+
+
 class ScreeningFormState(StrEnum):
     DRAFT = "DRAFT"
     REVIEW_REQUIRED = "REVIEW_REQUIRED"

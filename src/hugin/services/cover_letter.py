@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from html import escape
 from typing import Protocol
 
-from sqlalchemy import case, delete, func, select
+from sqlalchemy import case, delete, func, or_, select
 from sqlalchemy.orm import Session
 
 from hugin.adapters.yandex_ai import YandexAIError
@@ -30,6 +30,7 @@ from hugin.domain.applications import ApplicationState
 from hugin.domain.content import (
     CURRENT_COVER_LETTER_INSTRUCTION,
     ConfirmationState,
+    CoverLetterGenerationMode,
     CoverLetterState,
     cover_letter_instruction_version,
 )
@@ -38,6 +39,15 @@ from hugin.domain.tasks import TaskState
 from hugin.domain.vacancies import VacancyAvailability
 from hugin.repositories.tasks import QueueTaskRepository
 from hugin.services.ai_prompts import AiPromptSettingsService, with_user_prompt
+from hugin.services.cover_letter_routing import (
+    ROUTER_SYSTEM_PROMPT,
+    RoutingCandidate,
+    RoutingDecision,
+    RoutingDecisionKind,
+    RoutingResponseError,
+    build_routing_prompt,
+    parse_routing_decision,
+)
 from hugin.services.resume_improvement import ResumeBlockExtractor
 from hugin.services.vacancy_analysis import RULES_VERSION, RuleCategory
 
@@ -315,7 +325,6 @@ _DISTINCTIVE_RELEVANCE_TERMS = (_STRONG_RELEVANCE_TERMS - {"python"}) | {
     "typescript",
 }
 _COMMON_STACK_PERSONALIZATION_TERMS = {"python", "fastapi", "postgresql"}
-_PYTHON_ROLE = re.compile(r"\bpython\b", re.IGNORECASE)
 _DATA_ROLE_TITLE = re.compile(
     r"\b(?:data[- ]?инженер\w*|data engineer\w*|etl|"
     r"sql[- ]?разработчик\w*|разработчик\w*\s+sql|sql developer\w*)\b",
@@ -369,6 +378,10 @@ _SIMILARITY_STOP_WORDS = _GENERIC_RELEVANCE_TERMS | {
 }
 _MAX_SELECTED_FACTS = 2
 _MAX_SIMILAR_LETTERS = 100
+_MAX_ROUTING_CANDIDATES = 5
+_USE_CONFIDENCE_THRESHOLD = 0.9
+_EDIT_CONFIDENCE_THRESHOLD = 0.75
+_MIN_EDIT_SIMILARITY = 0.45
 _NEAR_DUPLICATE_SIMILARITY = 0.75
 _HIGH_DUPLICATE_SIMILARITY = 0.92
 _CONTEXTUAL_DETAILS = (
@@ -586,44 +599,12 @@ _PERMANENT_PREPARATION_FAILURES = frozenset(
 _AUTO_RETRY_FAILURE_PREFIX = "COVER_LETTER_RETRY_FAILED:"
 _AUTO_RETRY_ERROR_CODE = "COVER_LETTER_RETRY_FAILED"
 _MAX_VALIDATION_CORRECTION_ATTEMPTS = 3
-_FACTUAL_RISK_CODES = frozenset(
-    {
-        "UNCONFIRMED_CLAIM",
-        "UNCONFIRMED_SPECIALIST_TERM",
-        "UNCONFIRMED_TECHNOLOGY_EXPERIENCE",
-    }
-)
 _ACTION_LINE = re.compile(
     r"\b(?:разработ|реализ|настро|интегр|автоматиз|созда|поддерж|проектир|тестир|"
     r"оптимиз|анализир|внедр)",
     re.IGNORECASE,
 )
 _EMPLOYER_LINE = re.compile(r"^(?:ООО|АО|ПАО|ЗАО|ИП)\b", re.IGNORECASE)
-_EXPERIENCE_ITEM_CONTENT = re.compile(
-    r"<experience_item\b[^>]*>\s*(.*?)\s*</experience_item>",
-    re.IGNORECASE | re.DOTALL,
-)
-_HISTORY_PREFIX = re.compile(r"^[^:]{0,100}\b(?:19|20)\d{2}\b[^:]*:\s*")
-_THIRD_PERSON_PRESENT = re.compile(
-    r"\b(?:автоматизирует|готовит|занимается|использует|настраивает|пишет|"
-    r"планирует|проверяет|применяет|работает|разрабатывает|руководит|собирает|"
-    r"создаёт|тестирует)\b",
-    re.IGNORECASE,
-)
-_CONSERVATIVE_FOCUS_TERMS = (
-    ("FastAPI", re.compile(r"\bfastapi\b", re.IGNORECASE)),
-    ("PostgreSQL", re.compile(r"\bpostgres(?:ql)?\b", re.IGNORECASE)),
-    ("Redis", re.compile(r"\bredis\b", re.IGNORECASE)),
-    ("Python", re.compile(r"\bpython\b", re.IGNORECASE)),
-    ("SQL", re.compile(r"(?<![A-Za-z])sql(?![A-Za-z])", re.IGNORECASE)),
-    ("YT", re.compile(r"(?<![A-Za-z])yt(?![A-Za-z])", re.IGNORECASE)),
-    ("YQL", re.compile(r"(?<![A-Za-z])yql(?![A-Za-z])", re.IGNORECASE)),
-    ("Yandex DataLens", re.compile(r"\b(?:yandex\s+)?datalens\b", re.IGNORECASE)),
-    ("pandas", re.compile(r"\bpandas\b", re.IGNORECASE)),
-    ("NumPy", re.compile(r"\bnumpy\b", re.IGNORECASE)),
-    ("Excel", re.compile(r"\bexcel\b", re.IGNORECASE)),
-    ("VBA", re.compile(r"\bvba\b", re.IGNORECASE)),
-)
 _STOP_WORDS = {
     "для",
     "или",
@@ -779,14 +760,31 @@ class _Candidate:
     direction_vacancy: DirectionVacancyModel
 
 
+@dataclass(frozen=True, slots=True)
+class _StoredRoutingCandidate:
+    letter: CoverLetterModel
+    vacancy: VacancyModel
+    public: RoutingCandidate
+
+
+@dataclass(frozen=True, slots=True)
+class _RoutingAttempt:
+    item: CoverLetterPreparationItem | None = None
+    model_name: str | None = None
+    confidence: float | None = None
+    reason: str | None = None
+
+
 class CoverLetterService:
     def __init__(
         self,
         session: Session,
         model: CoverLetterTextModel | None = None,
+        router_model: CoverLetterTextModel | None = None,
     ) -> None:
         self._session = session
         self._model = model
+        self._router_model = router_model
 
     def prepare(
         self,
@@ -850,7 +848,7 @@ class CoverLetterService:
                 break
         prepared_items = tuple(items)
         return CoverLetterPreparationResult(
-            generated=sum(item.action == "generated" for item in prepared_items),
+            generated=sum(item.action in ("generated", "adapted") for item in prepared_items),
             reused=sum(item.action == "reused" for item in prepared_items),
             already_ready=already_ready,
             failed=sum(item.action == "failed" for item in prepared_items),
@@ -1017,7 +1015,12 @@ class CoverLetterService:
         letter.context_hash = self.current_context_hash(application.id)
         letter.model_name = MANUAL_REVIEW_MODEL
         letter.prompt_version_id = None
-        self._save_ready(letter, normalized, tuple(fact.id for fact in used_facts))
+        self._save_ready(
+            letter,
+            normalized,
+            tuple(fact.id for fact in used_facts),
+            generation_mode=CoverLetterGenerationMode.MANUAL,
+        )
         task = QueueTaskRepository(self._session).get_by_application_id(application.id)
         if task is not None and task.state is TaskState.REVIEW_REQUIRED:
             QueueTaskRepository(self._session).transition(
@@ -1248,8 +1251,22 @@ class CoverLetterService:
             and letter.state is CoverLetterState.READY
             and letter.text
             and letter.context_hash == context_hash
-            and letter.model_name == model.model_name
             and letter.prompt_version_id == prompt_version.id
+            and (
+                letter.generation_mode is not CoverLetterGenerationMode.LEGACY
+                or letter.model_name == MANUAL_REVIEW_MODEL
+            )
+            and (
+                letter.model_name == model.model_name
+                or letter.model_name == MANUAL_REVIEW_MODEL
+                or letter.generation_mode
+                in (
+                    CoverLetterGenerationMode.ROUTED_REUSE,
+                    CoverLetterGenerationMode.LIGHT_EDIT,
+                    CoverLetterGenerationMode.DUPLICATE_REUSE,
+                    CoverLetterGenerationMode.MANUAL,
+                )
+            )
         ):
             try:
                 validate_cover_letter(letter.text, candidate.vacancy, facts)
@@ -1295,60 +1312,34 @@ class CoverLetterService:
                 "failed",
                 str(error),
             )
-        source = self._duplicate_source(candidate, instruction_version, prompt_version.id)
+        source = self._duplicate_source(candidate, instruction_version)
         if source is not None and source.text:
-            source_fact_ids = tuple(
-                self._session.scalars(
-                    select(CoverLetterFactModel.fact_id).where(
-                        CoverLetterFactModel.cover_letter_id == source.id
-                    )
-                )
-            )
-            self._save_ready(
-                letter,
-                source.text,
-                source_fact_ids,
-                reused_from_id=source.id,
-            )
-            return self._item(candidate, CoverLetterState.READY, "reused")
-
-        if any(
-            fact.category in _EXPERIENCE_FACT_CATEGORIES and fact.source_type == "user"
-            for fact in facts
-        ):
-            conservative_text = ""
             try:
-                conservative_text = _conservative_cover_letter(candidate.vacancy, facts)
-                conservative_facts = validate_cover_letter(
-                    conservative_text,
-                    candidate.vacancy,
-                    facts,
-                )
-            except CoverLetterValidationError as error:
-                error.rejected_text = error.rejected_text or conservative_text
-                if error.rejected_text:
-                    self._record_rejection(letter, error)
-                failure_reason = f"{_AUTO_RETRY_FAILURE_PREFIX}{error.code}"
-                self._save_failed(letter, failure_reason)
-                self._mark_preparation_blocked(candidate.application.id, failure_reason)
-                return self._item(
-                    candidate,
-                    CoverLetterState.FAILED,
-                    "failed",
-                    f"Письмо из подтверждённых сведений не прошло проверку: {error}",
-                )
+                duplicate_facts = validate_cover_letter(source.text, candidate.vacancy, facts)
+            except CoverLetterValidationError:
+                pass
             else:
                 self._save_ready(
                     letter,
-                    conservative_text,
-                    tuple(fact.id for fact in conservative_facts),
+                    source.text,
+                    tuple(fact.id for fact in duplicate_facts),
+                    reused_from_id=source.id,
+                    generation_mode=CoverLetterGenerationMode.DUPLICATE_REUSE,
+                    model_name=source.model_name,
                 )
-                return self._item(
-                    candidate,
-                    CoverLetterState.READY,
-                    "generated",
-                    "Сформировано только из подтверждённых пользователем сведений",
-                )
+                return self._item(candidate, CoverLetterState.READY, "reused")
+
+        routing = self._route_existing_letter(
+            candidate,
+            letter,
+            facts,
+            instruction_version,
+        )
+        if routing.item is not None:
+            return routing.item
+        letter.router_model_name = routing.model_name
+        letter.router_confidence = routing.confidence
+        letter.router_reason = routing.reason[:512] if routing.reason else None
 
         validation_errors: list[CoverLetterValidationError] = []
         try:
@@ -1418,34 +1409,15 @@ class CoverLetterService:
                 "YandexGPT не вернул допустимый текст",
             )
 
-        if any(error.code in _FACTUAL_RISK_CODES for error in validation_errors):
-            conservative_text = ""
-            try:
-                conservative_text = _conservative_cover_letter(candidate.vacancy, facts)
-                conservative_facts = validate_cover_letter(
-                    conservative_text,
-                    candidate.vacancy,
-                    facts,
-                )
-            except CoverLetterValidationError as fallback_error:
-                fallback_error.rejected_text = fallback_error.rejected_text or conservative_text
-                self._record_rejection(letter, fallback_error)
-                error_codes = "->".join(
-                    [*(error.code for error in validation_errors), fallback_error.code]
-                )
-                failure_reason = f"{_AUTO_RETRY_FAILURE_PREFIX}{error_codes}"
-                self._save_failed(letter, failure_reason)
-                self._mark_preparation_blocked(candidate.application.id, failure_reason)
-                return self._item(
-                    candidate,
-                    CoverLetterState.FAILED,
-                    "failed",
-                    f"Осторожный вариант не прошёл проверку: {fallback_error}",
-                )
-            text = conservative_text
-            used_facts = conservative_facts
-
-        self._save_ready(letter, text, tuple(fact.id for fact in used_facts))
+        self._save_ready(
+            letter,
+            text,
+            tuple(fact.id for fact in used_facts),
+            generation_mode=CoverLetterGenerationMode.MODEL_NEW,
+            router_model_name=routing.model_name,
+            router_confidence=routing.confidence,
+            router_reason=routing.reason,
+        )
         reason = (
             "Исправлено после локальной проверки: "
             + " → ".join(str(error) for error in validation_errors)
@@ -1478,6 +1450,243 @@ class CoverLetterService:
                 rejected_text=text,
             )
         return text, used_facts
+
+    def _route_existing_letter(
+        self,
+        candidate: _Candidate,
+        letter: CoverLetterModel,
+        facts: tuple[_SelectedFact, ...],
+        instruction_version: str,
+    ) -> _RoutingAttempt:
+        router = self._router_model
+        if router is None:
+            return _RoutingAttempt()
+        stored_candidates = self._routing_candidates(candidate, instruction_version)
+        if not stored_candidates:
+            return _RoutingAttempt()
+        public_candidates = tuple(item.public for item in stored_candidates)
+        try:
+            response = router.complete(
+                ROUTER_SYSTEM_PROMPT,
+                build_routing_prompt(
+                    candidate.vacancy,
+                    tuple(fact.content for fact in facts),
+                    public_candidates,
+                ),
+            )
+            decision = parse_routing_decision(
+                response,
+                frozenset(item.letter_id for item in public_candidates),
+            )
+        except (RoutingResponseError, YandexAIError) as error:
+            return _RoutingAttempt(
+                model_name=router.model_name,
+                reason=f"Отбор готового письма не сработал: {error}"[:512],
+            )
+        selected = next(
+            (item for item in stored_candidates if item.letter.id == decision.candidate_id),
+            None,
+        )
+        metadata = _RoutingAttempt(
+            model_name=router.model_name,
+            confidence=decision.confidence,
+            reason=decision.reason,
+        )
+        if decision.kind is RoutingDecisionKind.NEW:
+            return metadata
+        if selected is None or selected.letter.text is None:
+            return _RoutingAttempt(
+                model_name=router.model_name,
+                confidence=decision.confidence,
+                reason="Выбранное лёгкой моделью письмо больше недоступно",
+            )
+        if decision.kind is RoutingDecisionKind.USE:
+            if decision.confidence < _USE_CONFIDENCE_THRESHOLD:
+                return _RoutingAttempt(
+                    model_name=router.model_name,
+                    confidence=decision.confidence,
+                    reason="Уверенности недостаточно для использования письма без изменений",
+                )
+            try:
+                used_facts = validate_cover_letter(
+                    selected.letter.text,
+                    candidate.vacancy,
+                    facts,
+                )
+            except CoverLetterValidationError as error:
+                return _RoutingAttempt(
+                    model_name=router.model_name,
+                    confidence=decision.confidence,
+                    reason=f"Выбранное письмо не прошло проверку: {error}"[:512],
+                )
+            self._save_ready(
+                letter,
+                selected.letter.text,
+                tuple(fact.id for fact in used_facts),
+                reused_from_id=selected.letter.id,
+                generation_mode=CoverLetterGenerationMode.ROUTED_REUSE,
+                model_name=selected.letter.model_name,
+                router_model_name=router.model_name,
+                router_confidence=decision.confidence,
+                router_reason=decision.reason,
+            )
+            return _RoutingAttempt(
+                item=self._item(
+                    candidate,
+                    CoverLetterState.READY,
+                    "reused",
+                    f"Выбрано письмо № {selected.letter.id}: {decision.reason}",
+                ),
+                model_name=router.model_name,
+                confidence=decision.confidence,
+                reason=decision.reason,
+            )
+        return self._apply_light_edit(
+            candidate,
+            letter,
+            facts,
+            selected,
+            decision,
+            router,
+        )
+
+    def _apply_light_edit(
+        self,
+        candidate: _Candidate,
+        letter: CoverLetterModel,
+        facts: tuple[_SelectedFact, ...],
+        selected: _StoredRoutingCandidate,
+        decision: RoutingDecision,
+        router: CoverLetterTextModel,
+    ) -> _RoutingAttempt:
+        if decision.confidence < _EDIT_CONFIDENCE_THRESHOLD:
+            return _RoutingAttempt(
+                model_name=router.model_name,
+                confidence=decision.confidence,
+                reason="Уверенности недостаточно для правки готового письма",
+            )
+        assert decision.text is not None
+        assert selected.letter.text is not None
+        edited_text = normalize_cover_letter(decision.text)
+        similarity = _letter_similarity(edited_text, selected.letter.text)
+        if edited_text == selected.letter.text or similarity < _MIN_EDIT_SIMILARITY:
+            return _RoutingAttempt(
+                model_name=router.model_name,
+                confidence=decision.confidence,
+                reason="Лёгкая модель не внесла ограниченную правку в выбранное письмо",
+            )
+        try:
+            used_facts = validate_cover_letter(
+                edited_text,
+                candidate.vacancy,
+                facts,
+            )
+        except CoverLetterValidationError as error:
+            return _RoutingAttempt(
+                model_name=router.model_name,
+                confidence=decision.confidence,
+                reason=f"Правка лёгкой модели не прошла проверку: {error}"[:512],
+            )
+        self._save_ready(
+            letter,
+            edited_text,
+            tuple(fact.id for fact in used_facts),
+            reused_from_id=selected.letter.id,
+            generation_mode=CoverLetterGenerationMode.LIGHT_EDIT,
+            model_name=router.model_name,
+            router_model_name=router.model_name,
+            router_confidence=decision.confidence,
+            router_reason=decision.reason,
+        )
+        return _RoutingAttempt(
+            item=self._item(
+                candidate,
+                CoverLetterState.READY,
+                "adapted",
+                f"Исправлено письмо № {selected.letter.id}: {decision.reason}",
+            ),
+            model_name=router.model_name,
+            confidence=decision.confidence,
+            reason=decision.reason,
+        )
+
+    def _routing_candidates(
+        self,
+        candidate: _Candidate,
+        instruction_version: str,
+    ) -> tuple[_StoredRoutingCandidate, ...]:
+        rows = tuple(
+            self._session.execute(
+                select(CoverLetterModel, VacancyModel)
+                .join(
+                    ApplicationModel,
+                    ApplicationModel.id == CoverLetterModel.application_id,
+                )
+                .join(VacancyModel, VacancyModel.id == CoverLetterModel.vacancy_id)
+                .where(
+                    ApplicationModel.account_id == candidate.application.account_id,
+                    ApplicationModel.resume_id == candidate.application.resume_id,
+                    ApplicationModel.id != candidate.application.id,
+                    CoverLetterModel.instruction_version == instruction_version,
+                    CoverLetterModel.text.is_not(None),
+                    or_(
+                        CoverLetterModel.state == CoverLetterState.SENT,
+                        (
+                            (CoverLetterModel.state == CoverLetterState.READY)
+                            & (CoverLetterModel.model_name == MANUAL_REVIEW_MODEL)
+                        ),
+                    ),
+                )
+                .order_by(CoverLetterModel.id.desc())
+                .limit(_MAX_SIMILAR_LETTERS)
+            )
+        )
+        text_counts = Counter(letter.text for letter, _vacancy in rows if letter.text)
+        target_focus = _vacancy_focus_tokens(candidate.vacancy) - _GENERIC_RELEVANCE_TERMS
+        target_title = _tokens(candidate.vacancy.title) - _RELEVANCE_STOP_WORDS
+        ranked: list[_StoredRoutingCandidate] = []
+        for source_letter, source_vacancy in rows:
+            if not source_letter.text:
+                continue
+            if (
+                source_letter.generation_mode is CoverLetterGenerationMode.LEGACY
+                and source_letter.reused_from_id is None
+                and text_counts[source_letter.text] > 1
+            ):
+                continue
+            source_focus = _vacancy_focus_tokens(source_vacancy) - _GENERIC_RELEVANCE_TERMS
+            source_title = _tokens(source_vacancy.title) - _RELEVANCE_STOP_WORDS
+            letter_focus = _matching_tokens(target_focus, _tokens(source_letter.text))
+            focus_similarity = _set_similarity(target_focus, source_focus)
+            title_similarity = _set_similarity(target_title, source_title)
+            distinctive = letter_focus & _DISTINCTIVE_RELEVANCE_TERMS
+            if not distinctive and len(letter_focus) < 2 and focus_similarity < 0.25:
+                continue
+            score = (
+                0.55 * focus_similarity
+                + 0.2 * title_similarity
+                + 0.08 * min(len(letter_focus), 3)
+                + 0.06 * min(len(distinctive), 3)
+            )
+            public = RoutingCandidate(
+                letter_id=source_letter.id,
+                vacancy_title=source_vacancy.title,
+                employer_name=source_vacancy.employer_name or "Компания не указана",
+                text=source_letter.text,
+                score=score,
+            )
+            ranked.append(_StoredRoutingCandidate(source_letter, source_vacancy, public))
+        ranked.sort(key=lambda item: (-item.public.score, -item.letter.id))
+        selected: list[_StoredRoutingCandidate] = []
+        seen_texts: set[str] = set()
+        for item in ranked:
+            if item.public.text in seen_texts:
+                continue
+            seen_texts.add(item.public.text)
+            selected.append(item)
+            if len(selected) == _MAX_ROUTING_CANDIDATES:
+                break
+        return tuple(selected)
 
     def _direction(self, account_id: int, name: str) -> CareerDirectionModel:
         direction = self._session.scalar(
@@ -1735,6 +1944,10 @@ class CoverLetterService:
         letter.text = None
         letter.failure_reason = None
         letter.reused_from_id = None
+        letter.generation_mode = CoverLetterGenerationMode.MODEL_NEW
+        letter.router_model_name = None
+        letter.router_confidence = None
+        letter.router_reason = None
         self._session.flush()
         return letter
 
@@ -1742,9 +1955,7 @@ class CoverLetterService:
         self,
         candidate: _Candidate,
         instruction_version: str,
-        prompt_version_id: int,
     ) -> CoverLetterModel | None:
-        model = self._require_model()
         canonical_id = candidate.vacancy.duplicate_of_id
         if canonical_id is None:
             return None
@@ -1756,9 +1967,13 @@ class CoverLetterService:
                 ApplicationModel.vacancy_id == canonical_id,
                 ApplicationModel.resume_id == candidate.resume.id,
                 CoverLetterModel.instruction_version == instruction_version,
-                CoverLetterModel.prompt_version_id == prompt_version_id,
-                CoverLetterModel.model_name == model.model_name,
-                CoverLetterModel.state.in_((CoverLetterState.READY, CoverLetterState.SENT)),
+                or_(
+                    CoverLetterModel.state == CoverLetterState.SENT,
+                    (
+                        (CoverLetterModel.state == CoverLetterState.READY)
+                        & (CoverLetterModel.model_name == MANUAL_REVIEW_MODEL)
+                    ),
+                ),
                 CoverLetterModel.text.is_not(None),
             )
             .order_by(CoverLetterModel.id.desc())
@@ -1767,6 +1982,8 @@ class CoverLetterService:
     def _has_current_origin(self, letter: CoverLetterModel) -> bool:
         if letter.model_name == MANUAL_REVIEW_MODEL:
             return letter.prompt_version_id is None
+        if letter.generation_mode is CoverLetterGenerationMode.LEGACY:
+            return False
         if letter.prompt_version_id is None:
             return False
         prompt_version = self._session.get(PromptVersionModel, letter.prompt_version_id)
@@ -1868,12 +2085,23 @@ class CoverLetterService:
         fact_ids: tuple[int, ...],
         *,
         reused_from_id: int | None = None,
+        generation_mode: CoverLetterGenerationMode = CoverLetterGenerationMode.MODEL_NEW,
+        model_name: str | None = None,
+        router_model_name: str | None = None,
+        router_confidence: float | None = None,
+        router_reason: str | None = None,
     ) -> None:
         self._replace_fact_links(letter.id, fact_ids)
         letter.text = text
         letter.state = CoverLetterState.READY
         letter.failure_reason = None
         letter.reused_from_id = reused_from_id
+        letter.generation_mode = generation_mode
+        if model_name is not None:
+            letter.model_name = model_name
+        letter.router_model_name = router_model_name
+        letter.router_confidence = router_confidence
+        letter.router_reason = router_reason[:512] if router_reason else None
         self._session.flush()
 
     def _record_rejection(
@@ -1923,6 +2151,7 @@ class CoverLetterService:
         letter.state = CoverLetterState.FAILED
         letter.failure_reason = reason[:512]
         letter.reused_from_id = None
+        letter.generation_mode = CoverLetterGenerationMode.MODEL_NEW
         self._session.flush()
 
     def _mark_preparation_blocked(self, application_id: int, reason: str) -> None:
@@ -2076,75 +2305,6 @@ def build_cover_letter_prompt(
 </confirmed_facts>
 
 Верни только текст письма."""
-
-
-def _conservative_cover_letter(
-    vacancy: VacancyModel,
-    facts: tuple[_SelectedFact, ...],
-) -> str:
-    vacancy_text = _vacancy_text(vacancy)
-    items: list[tuple[int, str, tuple[str, ...]]] = []
-    for fact in facts:
-        if fact.category not in _EXPERIENCE_FACT_CATEGORIES:
-            continue
-        raw_items = _EXPERIENCE_ITEM_CONTENT.findall(fact.content)
-        if not raw_items:
-            raw_items = [line for line in fact.content.splitlines() if line.strip()]
-        for index, raw_item in enumerate(raw_items):
-            item = " ".join(raw_item.split())
-            item = _HISTORY_PREFIX.sub("", item)
-            if ";" in item:
-                context, action = item.split(";", 1)
-                if "проект" in context.casefold():
-                    project_context = re.sub(
-                        r"^проект\s+",
-                        "",
-                        context.strip(),
-                        flags=re.IGNORECASE,
-                    )
-                    project_name, separator, project_role = project_context.partition(",")
-                    if separator and project_role.strip().casefold() == "серверная разработка":
-                        item = (
-                            f"В проекте {project_name.strip()} занимался серверной "
-                            f"разработкой: {action.strip()}"
-                        )
-                    else:
-                        item = f"В проекте {project_context}: {action.strip()}"
-                else:
-                    item = action
-            item = item.strip(" ;")
-            if not item:
-                continue
-            item = item[:1].upper() + item[1:]
-            if item[-1] not in ".!?":
-                item += "."
-            if _THIRD_PERSON_PRESENT.search(item):
-                continue
-            focus = tuple(
-                label
-                for label, pattern in _CONSERVATIVE_FOCUS_TERMS
-                if pattern.search(item) is not None and pattern.search(vacancy_text) is not None
-            )
-            items.append((index, item, focus))
-    if not items:
-        raise CoverLetterValidationError(
-            "NO_RELEVANT_EVIDENCE",
-            "Для осторожного письма не найден подтверждённый пример работы",
-        )
-
-    items.sort(key=lambda value: (-len(value[2]), value[0]))
-    first = items[0]
-    second = next((item for item in items[1:] if item[1] != first[1]), None)
-    paragraphs = [first[1]]
-    if second is not None:
-        paragraphs.append(second[1])
-    example_label = "эти примеры" if second is not None else "этот пример"
-    paragraphs.append(
-        f"Готов на собеседовании подробно разобрать {example_label}: исходную задачу, "
-        "свои действия и границы ответственности, а также ответить на вопросы "
-        "по указанным технологиям."
-    )
-    return "Здравствуйте!\n\n" + "\n\n".join(paragraphs)
 
 
 def _vacancy_target_line(vacancy: VacancyModel) -> str:
@@ -2580,25 +2740,8 @@ def _has_distinctive_vacancy_accent(
             specific_vacancy_focus,
             fact_tokens,
         )
-        if _matching_tokens(confirmed_specific_focus, letter_tokens):
-            return True
-        if any(fact.source_type == "user" for fact in facts):
-            return (
-                bool(letter_focus & _DISTINCTIVE_RELEVANCE_TERMS)
-                or len(letter_focus) >= 2
-                or (
-                    _PYTHON_ROLE.search(vacancy.title) is not None
-                    and _PYTHON_ROLE.search(text) is not None
-                )
-            )
-        return False
-    if bool(letter_focus & _DISTINCTIVE_RELEVANCE_TERMS) or len(letter_focus) >= 2:
-        return True
-    return (
-        any(fact.source_type == "user" for fact in facts)
-        and _PYTHON_ROLE.search(vacancy.title) is not None
-        and _PYTHON_ROLE.search(text) is not None
-    )
+        return bool(_matching_tokens(confirmed_specific_focus, letter_tokens))
+    return bool(letter_focus & _DISTINCTIVE_RELEVANCE_TERMS) or len(letter_focus) >= 2
 
 
 def _relevant_excerpt(
@@ -2659,15 +2802,15 @@ def _work_experience_excerpt(
         structure = ResumeBlockExtractor().extract(f"Опыт работы\n{content.strip()}\nОбразование")
     except ValueError:
         candidates = [
-            (
-                (vacancy_tokens & _tokens(line)) - _RELEVANCE_STOP_WORDS,
-                index,
                 (
-                    '<experience_item type="ROLE" label="Опыт работы">\n'
-                    f"{line}\n"
-                    "</experience_item>"
-                ),
-            )
+                    (vacancy_tokens & _tokens(line)) - _RELEVANCE_STOP_WORDS,
+                    index,
+                    (
+                        '<experience_item type="ROLE" label="Опыт работы">\n'
+                        f"{line}\n"
+                        "</experience_item>"
+                    ),
+                )
             for index, line in enumerate(content.splitlines())
             if line.strip()
         ]
@@ -2797,12 +2940,6 @@ def _ensure_relevant_evidence(
     if _DATA_ROLE_TITLE.search(vacancy.title) and _matching_tokens(
         _DATA_ROLE_FOCUS_TERMS,
         narrative_tokens,
-    ):
-        return
-    if (
-        any(fact.source_type == "user" for fact in narrative_facts)
-        and _PYTHON_ROLE.search(vacancy.title) is not None
-        and _PYTHON_ROLE.search("\n".join(fact.content for fact in narrative_facts)) is not None
     ):
         return
     raise CoverLetterValidationError(

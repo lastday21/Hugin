@@ -414,9 +414,15 @@ class ApplicationWorker:
                     reasoning_effort=ai_settings.get_reasoning_effort(),
                     operation="cover_letter",
                 )
+                router_client = configured_yandex_ai_client(
+                    self._settings,
+                    model=self._settings.yandex_ai_router_model,
+                    reasoning_effort=self._settings.yandex_ai_router_reasoning_effort,
+                    operation="cover_letter_routing",
+                )
                 if not automation.applications_enabled():
                     return 0
-                result = CoverLetterService(session, client).prepare(
+                result = CoverLetterService(session, client, router_client).prepare(
                     account_id=job.application.account_id,
                     direction_name=direction_name,
                     vacancy_hh_id=job.vacancy.hh_id,

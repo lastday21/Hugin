@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -14,11 +15,16 @@ from hugin.database.models import (
     CoverLetterFactModel,
     CoverLetterModel,
     CoverLetterRejectionModel,
+    DirectionVacancyModel,
     ResumeModel,
     VacancyModel,
     VerifiedFactModel,
 )
-from hugin.domain.content import ConfirmationState, CoverLetterState
+from hugin.domain.content import (
+    ConfirmationState,
+    CoverLetterGenerationMode,
+    CoverLetterState,
+)
 from hugin.domain.directions import VacancyState
 from hugin.domain.hh import HhApplyResult, HhApplyStatus
 from hugin.domain.tasks import SystemState, TaskState
@@ -38,7 +44,6 @@ from hugin.services.cover_letter import (
     MAX_LETTER_LENGTH,
     CoverLetterService,
     CoverLetterValidationError,
-    _conservative_cover_letter,
     _ensure_relevant_evidence,
     _letter_similarity,
     _relevant_excerpt,
@@ -89,6 +94,18 @@ def _letter_with_template_phrase() -> str:
         "прикладную логику и интеграции, проверял обработку ошибок и изменения перед выпуском. "
         "При доработке сервисов отделял прикладную логику от доступа к данным.\n\n"
         "Буду рад подробнее рассказать о выполненных проектах и обсудить задачи команды."
+    )
+
+
+def _alternative_letter() -> str:
+    return (
+        "Здравствуйте!\n\n"
+        "При разработке серверных приложений на Python работал с FastAPI и PostgreSQL. "
+        "Отдельное внимание уделял автоматическим проверкам: подготавливал проверяемые "
+        "сценарии для прикладной логики и обработки ошибок, чтобы изменения можно было "
+        "оценить до выпуска. Такой подход использовал при развитии серверной части и "
+        "связанных с ней интеграций.\n\n"
+        "Готов рассказать, как организовывал проверки и работу с данными в серверном приложении."
     )
 
 
@@ -191,6 +208,56 @@ def _prepare_data(
     return account.id, direction.id, resume.id, tuple(item.id for item in stored)
 
 
+def _prepare_routing_target(
+    session: object,
+) -> tuple[int, int, CoverLetterModel, str]:
+    account_id, direction_id, _, _ = _prepare_data(session)
+    source_writer = FakeModel([_letter()])
+    source_writer.model_name = "strong-writer"
+    CoverLetterService(session, source_writer).prepare(  # type: ignore[arg-type]
+        account_id=account_id,
+        direction_name="Python backend",
+    )
+    source_letter = session.scalar(select(CoverLetterModel))  # type: ignore[attr-defined]
+    assert source_letter is not None
+    source_letter.state = CoverLetterState.SENT
+    source_letter.sent_at = datetime(2026, 8, 8, tzinfo=UTC)
+
+    vacancy = VacancyRepository(session).upsert(  # type: ignore[arg-type]
+        VacancyData(
+            hh_id="letter-routing-target",
+            title="Backend-разработчик Python",
+            source_url="https://hh.ru/vacancy/letter-routing-target",
+            employer_name="Новая компания",
+            description="Разработка серверных сервисов и интеграций на Python.",
+            responsibilities="Развивать серверную часть и интеграции.",
+            required_qualifications="Python, FastAPI, PostgreSQL.",
+            key_skills=("Python", "FastAPI", "PostgreSQL"),
+            details_fetched_at=datetime(2026, 8, 8, tzinfo=UTC),
+        )
+    )
+    directions = DirectionRepository(session)  # type: ignore[arg-type]
+    directions.track_vacancy(direction_id, vacancy.id)
+    directions.apply_rules(
+        direction_id,
+        vacancy.id,
+        state=VacancyState.ANALYZED,
+        score=88,
+        details={
+            "category": "MATCH",
+            "accepted": True,
+            "reasons": ["совпадают FastAPI, PostgreSQL и задачи интеграции"],
+        },
+        rules_version=RULES_VERSION,
+    )
+    ApplicationAutomationService(session).prepare_for_account_id(  # type: ignore[arg-type]
+        account_id=account_id,
+        direction_name="Python backend",
+        include_stretch=True,
+    )
+    return account_id, direction_id, source_letter, vacancy.hh_id
+
+
 def test_yandex_letter_uses_only_confirmed_facts_and_is_saved(settings: Settings) -> None:
     upgrade_database(settings)
     database = create_database(settings)
@@ -278,15 +345,15 @@ def test_yandex_letter_uses_only_confirmed_facts_and_is_saved(settings: Settings
         database.close()
 
 
-def test_user_confirmed_work_fact_uses_conservative_letter_without_model(
+def test_user_confirmed_work_fact_uses_writer_without_approved_candidate(
     settings: Settings,
 ) -> None:
     upgrade_database(settings)
     database = create_database(settings)
-    model = FakeModel([])
+    model = FakeModel([_letter()])
     try:
         with database.sessions.begin() as session:
-            account_id, direction_id, _, _ = _prepare_data(session)
+            account_id, _, _, _ = _prepare_data(session)
             fact = session.scalar(
                 select(VerifiedFactModel).where(
                     VerifiedFactModel.category == "work_experience",
@@ -295,13 +362,6 @@ def test_user_confirmed_work_fact_uses_conservative_letter_without_model(
             )
             assert fact is not None
             fact.source_type = "user"
-            fact.content = (
-                "Январь 2026 — август 2026: проект CartCase; руководил серверной "
-                "разработкой, планировал задачи, проверял изменения и разрабатывал "
-                "сервис на FastAPI и PostgreSQL.\n"
-                "Декабрь 2022 — июнь 2025: производственный проект; применял Python "
-                "к производственным данным и самостоятельно разработал SmartPVD."
-            )
             session.flush()
 
             result = CoverLetterService(session, model).prepare(
@@ -311,64 +371,309 @@ def test_user_confirmed_work_fact_uses_conservative_letter_without_model(
 
             assert result.generated == 1
             assert result.failed == 0
-            assert model.prompts == []
+            assert len(model.prompts) == 1
             letter = session.scalar(select(CoverLetterModel))
             assert letter is not None
             assert letter.state is CoverLetterState.READY
-            assert "планировал задачи" in (letter.text or "")
-            assert "самостоятельно разработал SmartPVD" in (letter.text or "")
-            assert "Готов на собеседовании подробно разобрать" in (letter.text or "")
+            assert letter.text == _letter()
+            assert letter.generation_mode is CoverLetterGenerationMode.MODEL_NEW
+    finally:
+        database.close()
 
-            second_vacancy = VacancyRepository(session).upsert(
-                VacancyData(
-                    hh_id="letter-second-user-fact",
-                    title="Backend-разработчик Python",
-                    source_url="https://hh.ru/vacancy/letter-second-user-fact",
-                    employer_name="Другая компания",
-                    description="Разработка сервисов на Python, FastAPI и PostgreSQL.",
-                    responsibilities="Развивать серверную часть.",
-                    required_qualifications="Python, FastAPI, PostgreSQL.",
-                    key_skills=("Python", "FastAPI", "PostgreSQL"),
-                    details_fetched_at=datetime(2026, 7, 24, tzinfo=UTC),
+
+def test_legacy_ready_letter_is_rebuilt_before_sending(settings: Settings) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    try:
+        with database.sessions.begin() as session:
+            account_id, _, _, _ = _prepare_data(session)
+            original_writer = FakeModel([_letter()])
+            CoverLetterService(session, original_writer).prepare(
+                account_id=account_id,
+                direction_name="Python backend",
+            )
+            letter = session.scalar(select(CoverLetterModel))
+            assert letter is not None
+            letter.generation_mode = CoverLetterGenerationMode.LEGACY
+            session.flush()
+            with pytest.raises(ValueError, match="устаревшей версией"):
+                CoverLetterService(session).validate_for_submission(
+                    application_id=letter.application_id,
+                    letter_id=letter.id,
+                )
+
+            replacement_writer = FakeModel([_alternative_letter()])
+            result = CoverLetterService(session, replacement_writer).prepare(
+                account_id=account_id,
+                direction_name="Python backend",
+            )
+
+            assert result.generated == 1
+            assert result.already_ready == 0
+            assert len(replacement_writer.prompts) == 1
+            assert letter.text == _alternative_letter()
+            assert letter.generation_mode is CoverLetterGenerationMode.MODEL_NEW
+    finally:
+        database.close()
+
+
+def test_related_publication_reuses_sent_letter_without_models(settings: Settings) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    try:
+        with database.sessions.begin() as session:
+            account_id, direction_id, resume_id, vacancy_ids = _prepare_data(
+                session,
+                with_duplicate=True,
+            )
+            source_writer = FakeModel([_letter()])
+            source_writer.model_name = "old-writer"
+            CoverLetterService(session, source_writer).prepare(
+                account_id=account_id,
+                direction_name="Python backend",
+                vacancy_hh_id="letter-1",
+            )
+            source = session.scalar(select(CoverLetterModel))
+            assert source is not None
+            source.state = CoverLetterState.SENT
+
+            target_application = ApplicationRepository(session).create_apply_intent(
+                account_id,
+                vacancy_ids[1],
+                resume_id,
+                direction_id,
+            )
+            QueueTaskRepository(session).enqueue(target_application.id, 85)
+            tracked = session.scalar(
+                select(DirectionVacancyModel).where(
+                    DirectionVacancyModel.direction_id == direction_id,
+                    DirectionVacancyModel.vacancy_id == vacancy_ids[1],
                 )
             )
-            directions = DirectionRepository(session)
-            directions.track_vacancy(direction_id, second_vacancy.id)
-            directions.apply_rules(
-                direction_id,
-                second_vacancy.id,
-                state=VacancyState.ANALYZED,
-                score=85,
-                details={
-                    "category": "MATCH",
-                    "accepted": True,
-                    "reasons": ["совпадают Python, FastAPI и PostgreSQL"],
-                },
-                rules_version=RULES_VERSION,
-            )
-            ApplicationAutomationService(session).prepare_for_account_id(
+            assert tracked is not None
+            tracked.state = VacancyState.QUEUED
+            session.flush()
+
+            unused_writer = FakeModel([])
+            unused_writer.model_name = "new-writer"
+            result = CoverLetterService(session, unused_writer).prepare(
                 account_id=account_id,
                 direction_name="Python backend",
-                include_stretch=True,
+                vacancy_hh_id="letter-2",
             )
 
-            second_result = CoverLetterService(session, model).prepare(
+            assert result.reused == 1
+            assert unused_writer.prompts == []
+            target = session.scalar(
+                select(CoverLetterModel).where(CoverLetterModel.id != source.id)
+            )
+            assert target is not None
+            assert target.text == source.text
+            assert target.reused_from_id == source.id
+            assert target.model_name == "old-writer"
+            assert target.generation_mode is CoverLetterGenerationMode.DUPLICATE_REUSE
+    finally:
+        database.close()
+
+
+def test_light_router_reuses_approved_letter_for_another_vacancy(
+    settings: Settings,
+) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    try:
+        with database.sessions.begin() as session:
+            account_id, _, source, vacancy_hh_id = _prepare_routing_target(session)
+            writer = FakeModel([])
+            writer.model_name = "strong-writer"
+            router = FakeModel(
+                [
+                    json.dumps(
+                        {
+                            "decision": "USE",
+                            "candidate_id": source.id,
+                            "confidence": 0.96,
+                            "reason": "Письмо раскрывает серверную разработку и интеграции",
+                            "text": None,
+                        },
+                        ensure_ascii=False,
+                    )
+                ]
+            )
+            router.model_name = "light-router"
+
+            result = CoverLetterService(session, writer, router).prepare(
                 account_id=account_id,
                 direction_name="Python backend",
-                vacancy_hh_id="letter-second-user-fact",
+                vacancy_hh_id=vacancy_hh_id,
             )
 
-            assert second_result.generated == 1
-            assert second_result.failed == 0
-            assert model.prompts == []
-            second_letter = session.scalar(
-                select(CoverLetterModel)
-                .join(VacancyModel, VacancyModel.id == CoverLetterModel.vacancy_id)
-                .where(VacancyModel.hh_id == "letter-second-user-fact")
+            assert result.reused == 1
+            assert writer.prompts == []
+            assert len(router.prompts) == 1
+            target = session.scalar(
+                select(CoverLetterModel).where(CoverLetterModel.id != source.id)
             )
-            assert second_letter is not None
-            assert second_letter.state is CoverLetterState.READY
-            assert "Backend-разработчик Python" not in (second_letter.text or "")
+            assert target is not None
+            assert target.text == source.text
+            assert target.reused_from_id == source.id
+            assert target.generation_mode is CoverLetterGenerationMode.ROUTED_REUSE
+            assert target.model_name == "strong-writer"
+            assert target.router_model_name == "light-router"
+            assert target.router_confidence == pytest.approx(0.96)
+    finally:
+        database.close()
+
+
+def test_light_router_can_make_limited_valid_edit(
+    settings: Settings,
+) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    try:
+        with database.sessions.begin() as session:
+            account_id, _, source, vacancy_hh_id = _prepare_routing_target(session)
+            assert source.text is not None
+            edited = source.text.replace(
+                "Буду рад подробнее обсудить задачи серверной части",
+                "Буду рад подробнее обсудить развитие серверной части и интеграций",
+            )
+            writer = FakeModel([])
+            writer.model_name = "strong-writer"
+            router = FakeModel(
+                [
+                    json.dumps(
+                        {
+                            "decision": "EDIT",
+                            "candidate_id": source.id,
+                            "confidence": 0.88,
+                            "reason": "Нужно точнее связать концовку с интеграциями",
+                            "text": edited,
+                        },
+                        ensure_ascii=False,
+                    )
+                ]
+            )
+            router.model_name = "light-router"
+
+            result = CoverLetterService(session, writer, router).prepare(
+                account_id=account_id,
+                direction_name="Python backend",
+                vacancy_hh_id=vacancy_hh_id,
+            )
+
+            assert result.generated == 1
+            assert result.items[0].action == "adapted"
+            assert writer.prompts == []
+            target = session.scalar(
+                select(CoverLetterModel).where(CoverLetterModel.id != source.id)
+            )
+            assert target is not None
+            assert target.text == edited
+            assert target.reused_from_id == source.id
+            assert target.generation_mode is CoverLetterGenerationMode.LIGHT_EDIT
+            assert target.model_name == "light-router"
+    finally:
+        database.close()
+
+
+def test_light_router_new_decision_calls_strong_writer(
+    settings: Settings,
+) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    try:
+        with database.sessions.begin() as session:
+            account_id, _, source, vacancy_hh_id = _prepare_routing_target(session)
+            writer = FakeModel([_alternative_letter()])
+            writer.model_name = "strong-writer"
+            router = FakeModel(
+                [
+                    json.dumps(
+                        {
+                            "decision": "NEW",
+                            "candidate_id": None,
+                            "confidence": 0.93,
+                            "reason": "Прежнее письмо не раскрывает отличительную задачу",
+                            "text": None,
+                        },
+                        ensure_ascii=False,
+                    )
+                ]
+            )
+            router.model_name = "light-router"
+
+            result = CoverLetterService(session, writer, router).prepare(
+                account_id=account_id,
+                direction_name="Python backend",
+                vacancy_hh_id=vacancy_hh_id,
+            )
+
+            assert result.generated == 1
+            assert len(writer.prompts) == 1
+            assert len(router.prompts) == 1
+            target = session.scalar(
+                select(CoverLetterModel).where(CoverLetterModel.id != source.id)
+            )
+            assert target is not None
+            assert target.generation_mode is CoverLetterGenerationMode.MODEL_NEW
+            assert target.reused_from_id is None
+            assert target.model_name == "strong-writer"
+            assert target.router_model_name == "light-router"
+            assert target.router_confidence == pytest.approx(0.93)
+    finally:
+        database.close()
+
+
+def test_invalid_light_edit_falls_back_to_strong_writer(
+    settings: Settings,
+) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    try:
+        with database.sessions.begin() as session:
+            account_id, _, source, vacancy_hh_id = _prepare_routing_target(session)
+            writer = FakeModel([_alternative_letter()])
+            writer.model_name = "strong-writer"
+            router = FakeModel(
+                [
+                    json.dumps(
+                        {
+                            "decision": "EDIT",
+                            "candidate_id": source.id,
+                            "confidence": 0.91,
+                            "reason": "Предлагаю полностью заменить прежнее письмо",
+                            "text": (
+                                "Здравствуйте!\n\nРаботал с Kubernetes и Kafka.\n\n"
+                                "Готов обсудить задачи."
+                            ),
+                        },
+                        ensure_ascii=False,
+                    )
+                ]
+            )
+            router.model_name = "light-router"
+
+            result = CoverLetterService(session, writer, router).prepare(
+                account_id=account_id,
+                direction_name="Python backend",
+                vacancy_hh_id=vacancy_hh_id,
+            )
+
+            assert result.generated == 1
+            assert len(writer.prompts) == 1
+            target = session.scalar(
+                select(CoverLetterModel).where(CoverLetterModel.id != source.id)
+            )
+            assert target is not None
+            assert target.text == _alternative_letter()
+            assert target.generation_mode is CoverLetterGenerationMode.MODEL_NEW
+            assert target.model_name == "strong-writer"
+            assert target.router_model_name == "light-router"
+            assert target.router_confidence == pytest.approx(0.91)
+            assert target.router_reason == (
+                "Лёгкая модель не внесла ограниченную правку в выбранное письмо"
+            )
     finally:
         database.close()
 
@@ -2074,48 +2379,6 @@ def test_compact_work_history_keeps_each_line_as_separate_source() -> None:
     assert "FastAPI" in excerpt
     assert "PostgreSQL и Redis" in excerpt
     assert "Яндекс Крауд" not in excerpt
-
-
-def test_conservative_letter_uses_only_separate_confirmed_items() -> None:
-    vacancy = _vacancy()
-    vacancy.title = "Python-разработчик AI/LLM"
-    vacancy.description = "Доработка Python-сервисов для обработки данных."
-    facts = (
-        _SelectedFact(
-                1,
-                "work_experience",
-                (
-                    '<experience_item type="ROLE" label="Опыт работы">\n'
-                    "Январь 2026 — август 2026: проект CartCase, серверная разработка; "
-                    "руководил работой серверной команды, планировал задачи, проверял "
-                    "изменения и разрабатывал сервис на FastAPI, PostgreSQL и Redis.\n"
-                "</experience_item>\n"
-                '<experience_item type="ROLE" label="Опыт работы">\n'
-                "Декабрь 2022 — июнь 2025: Газпромнефть; применял Python к "
-                "производственным данным и самостоятельно разработал SmartPVD.\n"
-                "</experience_item>\n"
-                '<experience_item type="ROLE" label="Опыт работы">\n'
-                "Март 2026 — настоящее время: текущая работа; автоматизирует "
-                "подготовку данных и отчётных материалов в Excel.\n"
-                "</experience_item>"
-            ),
-            "user",
-        ),
-    )
-
-    text = _conservative_cover_letter(vacancy, facts)
-
-    assert vacancy.title not in text
-    assert "Откликаюсь на вакансию" not in text
-    assert "Для задач позиции" not in text
-    assert "Газпромнефть" not in text
-    assert "автоматизирует" not in text
-    assert "асинхрон" not in text.casefold()
-    assert "высоконагруж" not in text.casefold()
-    assert "В проекте CartCase занимался серверной разработкой:" in text
-    assert "планировал задачи" in text
-    assert "самостоятельно разработал SmartPVD" in text
-    validate_cover_letter(text, vacancy, facts)
 
 
 def test_work_experience_context_prefers_new_llm_evidence_over_repeated_python() -> None:

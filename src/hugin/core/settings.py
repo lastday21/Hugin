@@ -65,6 +65,8 @@ class Settings(BaseSettings):
     yandex_ai_api_key: SecretStr = SecretStr("")
     yandex_ai_folder_id: str = ""
     yandex_ai_model: str = "aliceai-llm/latest"
+    yandex_ai_router_model: str = "deepseek-v4-flash/latest"
+    yandex_ai_router_reasoning_effort: Literal["low", "medium", "high"] = "low"
     yandex_ai_base_url: str = "https://ai.api.cloud.yandex.net/v1"
     yandex_ai_host_ip: IPv4Address | None = None
     yandex_ai_source_ip: IPv4Address | None = None
