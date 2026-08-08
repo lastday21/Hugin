@@ -11,6 +11,7 @@ from hugin.api.app import create_app
 from hugin.core.settings import Settings
 from hugin.database import create_database, upgrade_database
 from hugin.database.models import ApplicationModel, ApplicationSettingsModel
+from hugin.domain.applications import ApplicationState
 from hugin.domain.communications import (
     CommunicationNotFoundError,
     CommunicationStateError,
@@ -514,5 +515,42 @@ def test_ui_communications_reports_missing_settings_and_account(
                     email_enabled=False,
                     events=(),
                 )
+    finally:
+        database.close()
+
+
+def test_ui_marks_only_actionable_incoming_message_as_needing_reply(
+    settings: Settings,
+) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    try:
+        with database.sessions.begin() as session:
+            account_id, application_id = create_application(
+                session,
+                account_label="Признак ответа",
+                vacancy_hh_id="communications-ui-reply-filter",
+            )
+            communications = CommunicationService(session, RecordingMessageSender())
+            communications.save_incoming(
+                application_id=application_id,
+                hh_id="incoming-ui-refusal",
+                body="К сожалению, сейчас мы не готовы пригласить вас дальше.",
+            )
+            service = UiCommunicationService(session)
+            assert service.get(account_id).conversations[0].needs_reply is False
+
+            communications.save_incoming(
+                application_id=application_id,
+                hh_id="incoming-ui-question",
+                body="Расскажите, пожалуйста, как вы применяли Celery.",
+            )
+            assert service.get(account_id).conversations[0].needs_reply is True
+
+            application = session.get(ApplicationModel, application_id)
+            assert application is not None
+            application.state = ApplicationState.REJECTED
+            session.flush()
+            assert service.get(account_id).conversations[0].needs_reply is False
     finally:
         database.close()

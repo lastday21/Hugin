@@ -1,8 +1,5 @@
-# ruff: noqa: RUF001
-
 from __future__ import annotations
 
-import re
 from collections.abc import Callable, Collection
 from dataclasses import dataclass
 
@@ -16,6 +13,7 @@ from hugin.database.models import (
     RecruiterMessageModel,
     VacancyModel,
 )
+from hugin.domain.applications import ApplicationState
 from hugin.domain.communications import CommunicationStateError
 from hugin.domain.content import (
     InvitationState,
@@ -25,43 +23,11 @@ from hugin.domain.content import (
 from hugin.services.autonomy import AutonomyPolicyService
 from hugin.services.communications import CommunicationService, RecordingMessageSender
 from hugin.services.recruiter_reply import RecruiterReplyService, RecruiterReplyTextModel
+from hugin.services.recruiter_reply_policy import (
+    RecruiterReplyDisposition,
+    classify_recruiter_reply,
+)
 
-_MANUAL_REPLY_PATTERN = re.compile(
-    r"\b(?:"
-    r"зарплат\w*|оклад\w*|доход\w*|рубл\w*|"
-    r"переезд\w*|командиров\w*|"
-    r"собеседован\w*|интервью\w*|встреч\w*|созвон\w*|"
-    r"пообщ\w*|поговор\w*|разговор\w*|слот\w*|календар\w*|брон\w*|"
-    r"дат\w*|врем\w*|час\w*|график\w*|удобн\w*|"
-    r"сегодня|завтра|послезавтра|"
-    r"понедельник\w*|вторник\w*|сред\w*|четверг\w*|"
-    r"пятниц\w*|суббот\w*|воскрес\w*|"
-    r"январ\w*|феврал\w*|март\w*|апрел\w*|ма[йяе]\w*|июн\w*|"
-    r"июл\w*|август\w*|сентябр\w*|октябр\w*|ноябр\w*|декабр\w*|"
-    r"тестов\w*|задани\w*|"
-    r"документ\w*|паспорт\w*|банк\w*|карт\w*|код\w*|"
-    r"оплат\w*|ссылк\w*|файл\w*|договор\w*|оффер\w*|"
-    r"zoom|skype|teams|google\s+meet|telegram|whatsapp|"
-    r"salary|compensation|relocation|travel|trip|"
-    r"interview|meeting|call|schedule|date|time|slot|calendar|book|"
-    r"today|tomorrow|tonight|monday|tuesday|wednesday|thursday|"
-    r"friday|saturday|sunday|weekday|weekend|"
-    r"morning|afternoon|evening|noon|available|free|join|"
-    r"test|assignment|document|passport|bank|card|code|"
-    r"payment|link|file|contract|offer"
-    r")\b",
-    re.I,
-)
-_MANUAL_REPLY_STRUCTURE = re.compile(
-    r"https?://|www\.|"
-    r"\b[\w.+-]+@[\w.-]+\.[a-zа-я]{2,}\b|"
-    r"\b\d{1,2}:\d{2}\b|"
-    r"\b\d{1,2}[./-]\d{1,2}(?:[./-]\d{2,4})?\b|"
-    r"(?:\+?\d[\d\s()/-]{7,}\d)|"
-    r"(?:[₽$€£]\s*\d|\d[\d\s.,]*\s*[₽$€£])|"
-    r"\b\d[\d\s.,]*\s*(?:руб\w*|rub|usd|eur|доллар\w*|евро)\b",
-    re.I,
-)
 _BLOCKING_INVITATION_TITLES = (
     "Приглашение на собеседование",
     "Задание от работодателя",
@@ -127,10 +93,10 @@ class AutonomousReplyService:
                 )
             )
         )
-        source_urls: dict[int, str] = {
-            application_id: source_url
-            for application_id, source_url in self._session.execute(
-                select(ApplicationModel.id, VacancyModel.source_url)
+        application_details: dict[int, tuple[str, ApplicationState]] = {
+            application_id: (source_url, state)
+            for application_id, source_url, state in self._session.execute(
+                select(ApplicationModel.id, VacancyModel.source_url, ApplicationModel.state)
                 .join(VacancyModel, VacancyModel.id == ApplicationModel.vacancy_id)
                 .where(
                     ApplicationModel.account_id == account_id,
@@ -167,9 +133,20 @@ class AutonomousReplyService:
                 None,
             )
             template = policy.matching_reply_template(incoming.body)
-            manual = application_id in blocked_applications or _requires_manual_reply(
+            details = application_details.get(application_id)
+            if details is None:
+                continue
+            source_url, application_state = details
+            disposition = classify_recruiter_reply(
+                application_state,
                 incoming.body,
                 template.response_text if template is not None else "",
+            )
+            if disposition is RecruiterReplyDisposition.NO_REPLY:
+                continue
+            manual = (
+                application_id in blocked_applications
+                or disposition is RecruiterReplyDisposition.MANUAL
             )
             if outgoing is not None and outgoing.id > incoming.id:
                 if (
@@ -184,7 +161,6 @@ class AutonomousReplyService:
                     and outgoing.body == template.response_text
                     and policy.auto_send_approved_replies
                     and not manual
-                    and application_id in source_urls
                     and outgoing.content_hash is not None
                 ):
                     confirmed = communications.confirm_outgoing_retry(
@@ -197,7 +173,7 @@ class AutonomousReplyService:
                         ApprovedReplyToSend(
                             message_id=confirmed.id,
                             application_id=application_id,
-                            source_url=source_urls[application_id],
+                            source_url=source_url,
                             content_hash=confirmed.content_hash or "",
                             content_version=confirmed.content_version,
                         )
@@ -209,7 +185,6 @@ class AutonomousReplyService:
                 template is not None
                 and policy.auto_send_approved_replies
                 and not manual
-                and application_id in source_urls
             ):
                 draft = communications.create_outgoing_draft(
                     application_id=application_id,
@@ -227,7 +202,7 @@ class AutonomousReplyService:
                     ApprovedReplyToSend(
                         message_id=confirmed.id,
                         application_id=application_id,
-                        source_url=source_urls[application_id],
+                        source_url=source_url,
                         content_hash=confirmed.content_hash or "",
                         content_version=confirmed.content_version,
                     )
@@ -235,6 +210,7 @@ class AutonomousReplyService:
                 continue
             if manual:
                 skipped_manual += 1
+                continue
             if not policy.auto_prepare_replies or model_factory is None:
                 continue
             try:
@@ -311,11 +287,16 @@ class AutonomousReplyService:
         if incoming is None or message.id <= incoming.id or latest_outgoing_id != message.id:
             return False
         template = policy.matching_reply_template(incoming.body)
+        disposition = classify_recruiter_reply(
+            application.state,
+            incoming.body,
+            template.response_text if template is not None else "",
+        )
         if (
             template is None
             or template.key != message.reply_template_key
             or template.response_text != message.body
-            or _requires_manual_reply(incoming.body, template.response_text)
+            or disposition is not RecruiterReplyDisposition.AUTOMATIC_DRAFT
         ):
             return False
         blocking_invitation = self._session.scalar(
@@ -328,12 +309,3 @@ class AutonomousReplyService:
             .limit(1)
         )
         return blocking_invitation is None
-
-
-def _requires_manual_reply(*texts: str) -> bool:
-    return any(
-        _MANUAL_REPLY_PATTERN.search(text) is not None
-        or _MANUAL_REPLY_STRUCTURE.search(text) is not None
-        for text in texts
-        if text
-    )

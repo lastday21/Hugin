@@ -27,6 +27,10 @@ from hugin.domain.content import (
 )
 from hugin.services.ai_prompts import AiPromptSettingsService, with_user_prompt
 from hugin.services.communications import CommunicationService, RecordingMessageSender
+from hugin.services.recruiter_reply_policy import (
+    RecruiterReplyDisposition,
+    classify_recruiter_reply,
+)
 
 MAX_REPLY_LENGTH = 5000
 MAX_MESSAGES = 20
@@ -80,10 +84,23 @@ class RecruiterReplyService:
                 .order_by(RecruiterMessageModel.created_at, RecruiterMessageModel.id)
             )
         )
-        if not any(message.direction is MessageDirection.INCOMING for message in messages):
+        latest_incoming = next(
+            (
+                message
+                for message in reversed(messages)
+                if message.direction is MessageDirection.INCOMING
+            ),
+            None,
+        )
+        if latest_incoming is None:
             raise CommunicationStateError(
                 "Сначала дождитесь сообщения работодателя или напишите ответ самостоятельно"
             )
+        if (
+            classify_recruiter_reply(application.state, latest_incoming.body)
+            is RecruiterReplyDisposition.NO_REPLY
+        ):
+            raise CommunicationStateError("На последнее сообщение работодателя отвечать не нужно")
         communications = CommunicationService(self._session, RecordingMessageSender())
         outgoing = next(
             (

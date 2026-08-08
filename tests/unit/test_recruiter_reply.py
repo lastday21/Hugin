@@ -159,6 +159,19 @@ def test_reply_generation_rejects_missing_context_unknown_result_and_bad_text(
             communications.save_incoming(
                 application_id=application_id,
                 hh_id="incoming-error",
+                body="К сожалению, сейчас мы не готовы пригласить вас дальше.",
+            )
+            refusal_model = FakeReplyModel()
+            with pytest.raises(CommunicationStateError, match="отвечать не нужно"):
+                RecruiterReplyService(session, refusal_model).generate(
+                    account_id=account_id,
+                    application_id=application_id,
+                )
+            assert refusal_model.prompts == []
+
+            communications.save_incoming(
+                application_id=application_id,
+                hh_id="incoming-question",
                 body="Когда готовы начать?",
             )
             empty = RecruiterReplyService(session, FakeReplyModel("  "))

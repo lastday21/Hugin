@@ -27,6 +27,10 @@ from hugin.services.ai_prompts import (
     AiPromptSettingsService,
     AiReasoningOption,
 )
+from hugin.services.recruiter_reply_policy import (
+    RecruiterReplyDisposition,
+    classify_recruiter_reply,
+)
 
 WINDOWS_NOTIFICATION_EVENTS = (
     "NEW_MESSAGE",
@@ -173,7 +177,7 @@ class UiCommunicationService:
                     company=vacancy.employer_name or "Компания не указана",
                     source_url=vacancy.source_url,
                     unread_count=unread_count,
-                    needs_reply=self._needs_reply(latest),
+                    needs_reply=self._needs_reply(application, latest),
                     messages=messages,
                 )
             )
@@ -341,9 +345,15 @@ class UiCommunicationService:
         )
 
     @staticmethod
-    def _needs_reply(message: RecruiterMessageModel) -> bool:
+    def _needs_reply(
+        application: ApplicationModel,
+        message: RecruiterMessageModel,
+    ) -> bool:
         if message.direction is MessageDirection.INCOMING:
-            return True
+            return (
+                classify_recruiter_reply(application.state, message.body)
+                is not RecruiterReplyDisposition.NO_REPLY
+            )
         return message.state in {
             RecruiterMessageState.DRAFT,
             RecruiterMessageState.REVIEW_REQUIRED,

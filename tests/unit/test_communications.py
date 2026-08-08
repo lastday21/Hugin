@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from typing import Never
 
 import pytest
 from sqlalchemy import inspect, text
@@ -847,5 +848,60 @@ def test_approved_reply_with_risky_content_stays_manual(
 
             assert batch.approved == ()
             assert batch.skipped_manual == 1
+    finally:
+        database.close()
+
+
+@pytest.mark.parametrize(
+    ("incoming_body", "expected_manual"),
+    (
+        (
+            "К сожалению, сейчас мы не готовы пригласить вас на следующий этап.",
+            0,
+        ),
+        ("Какие у вас зарплатные ожидания?", 1),
+    ),
+)
+def test_automatic_reply_filter_does_not_construct_model_for_skipped_messages(
+    settings: Settings,
+    incoming_body: str,
+    expected_manual: int,
+) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    factory_calls = 0
+
+    def model_factory() -> Never:
+        nonlocal factory_calls
+        factory_calls += 1
+        raise AssertionError("Модель не должна вызываться")
+
+    try:
+        with database.sessions.begin() as session:
+            account_id, application_id = create_application(
+                session,
+                account_label="Фильтр ответов",
+                vacancy_hh_id=f"reply-filter-{expected_manual}",
+            )
+            incoming = CommunicationService(
+                session,
+                RecordingMessageSender(),
+            ).save_incoming(
+                application_id=application_id,
+                hh_id=f"incoming-filter-{expected_manual}",
+                body=incoming_body,
+            )
+
+            batch = AutonomousReplyService(session).prepare(
+                account_id=account_id,
+                model_factory=model_factory,
+                incoming_message_ids=(incoming.id,),
+            )
+
+            assert batch.approved == ()
+            assert batch.drafts_created == 0
+            assert batch.skipped_manual == expected_manual
+            assert batch.failed == 0
+            assert factory_calls == 0
     finally:
         database.close()

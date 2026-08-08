@@ -1880,7 +1880,6 @@ function CommunicationsView({
   const [draft, setDraft] = useState("");
   const [replyMode, setReplyMode] = useState<"manual" | "ai">("manual");
   const [busy, setBusy] = useState(false);
-  const [autoPreparing, setAutoPreparing] = useState(false);
   const [draftSaveState, setDraftSaveState] = useState<
     "idle" | "saving" | "saved" | "error"
   >("idle");
@@ -1888,7 +1887,6 @@ function CommunicationsView({
   const draftRef = useRef("");
   const savedDraftRef = useRef("");
   const draftSavingRef = useRef(false);
-  const automaticDraftAttemptsRef = useRef(new Set<string>());
   const onChangedRef = useRef(onChanged);
   const onToastRef = useRef(onToast);
   const selected =
@@ -1944,52 +1942,6 @@ function CommunicationsView({
   }, [reply?.body, reply?.id, selectedApplicationId]);
 
   useEffect(() => {
-    if (
-      !autonomy.auto_prepare_replies ||
-      !window.pywebview?.api ||
-      busy ||
-      autoPreparing
-    ) {
-      return;
-    }
-    const conversation = communications.conversations.find((item) => {
-      const latest = item.messages.at(-1);
-      return (
-        item.needs_reply &&
-        latest?.direction === "INCOMING" &&
-        !latestEditableReply(item)
-      );
-    });
-    const latestIncoming = conversation?.messages
-      .filter((message) => message.direction === "INCOMING")
-      .at(-1);
-    if (!conversation || !latestIncoming) return;
-    const attemptKey = `${conversation.application_id}:${latestIncoming.id}`;
-    if (automaticDraftAttemptsRef.current.has(attemptKey)) return;
-    automaticDraftAttemptsRef.current.add(attemptKey);
-    setAutoPreparing(true);
-    void window.pywebview.api
-      .generate_reply(conversation.application_id)
-      .then(async (result) => {
-        if (result.status !== "READY") throw new Error(result.message);
-        onChangedRef.current(await loadCommunications());
-        onToastRef.current({
-          kind: "success",
-          message: `Черновик для «${conversation.company}» подготовлен и сохранён`,
-        });
-      })
-      .catch((reason) => {
-        onToastRef.current({ kind: "error", message: readableError(reason) });
-      })
-      .finally(() => setAutoPreparing(false));
-  }, [
-    autoPreparing,
-    autonomy.auto_prepare_replies,
-    busy,
-    communications.conversations,
-  ]);
-
-  useEffect(() => {
     const applicationId = selected?.application_id;
     const value = draft.trim();
     if (
@@ -1998,7 +1950,6 @@ function CommunicationsView({
       value === reply?.body ||
       value === savedDraftRef.current ||
       busy ||
-      autoPreparing ||
       draftSaveState === "saving" ||
       draftSaveState === "error"
     ) {
@@ -2024,7 +1975,6 @@ function CommunicationsView({
     }, 900);
     return () => window.clearTimeout(timeout);
   }, [
-    autoPreparing,
     busy,
     draft,
     draftSaveState,
@@ -2211,7 +2161,7 @@ function CommunicationsView({
         </div>
         <p className="communications-note">
           {autonomy.auto_prepare_replies
-            ? "Hugin сам готовит и сохраняет черновики. "
+            ? "Hugin готовит черновики только для новых сообщений, на которые действительно нужен ответ. "
             : "Автоматическая подготовка черновиков выключена. "}
           Безопасные точные ответы могут отправляться автоматически только по
           утверждённым вами шаблонам; новые договорённости, зарплата, даты, задания и
@@ -2369,24 +2319,25 @@ function CommunicationsView({
                             <strong>Подготовить черновик по переписке</strong>
                             <span>
                               {hasIncoming
-                              ? autoPreparing
-                                ? "Hugin уже готовит и сохранит черновик. Ваш текст он не перезапишет."
-                                : "Новый черновик готовится автоматически. Hugin использует только разрешённые подтверждённые сведения и не заменяет ваш текст."
+                              ? selected.needs_reply
+                                ? "Hugin использует только разрешённые подтверждённые сведения и не заменяет ваш текст."
+                                : "Последнее сообщение не требует ответа. При отказах и служебных уведомлениях нейросеть не вызывается."
                               : "Черновик можно будет подготовить после первого сообщения работодателя."}
                             </span>
                         </div>
                         <button
                           type="button"
                           className="primary-button"
-                          disabled={busy || autoPreparing || !hasIncoming || !!draft.trim()}
+                          disabled={busy || !hasIncoming || !selected.needs_reply || !!draft.trim()}
                           onClick={() => void generateDraft()}
                         >
                           <Sparkles size={16} aria-hidden="true" />
                           {busy
-                            || autoPreparing
                             ? "Готовим…"
                             : hasIncoming
-                              ? draft.trim()
+                              ? !selected.needs_reply
+                                ? "Ответ не требуется"
+                                : draft.trim()
                                 ? "Черновик уже сохранён"
                                 : "Подготовить сейчас"
                               : "Пока нечего отвечать"}
