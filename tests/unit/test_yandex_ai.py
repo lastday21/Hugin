@@ -19,6 +19,7 @@ from hugin.diagnostics import OperationJournal
 class FakeResponse:
     def __init__(self, lines: list[bytes]) -> None:
         self._lines = lines
+        self.fp: object | None = None
 
     def __enter__(self) -> Self:
         return self
