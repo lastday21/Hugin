@@ -413,7 +413,6 @@ class DirectionRepository:
         models = self._session.scalars(
             select(DirectionSearchQueryModel).where(
                 DirectionSearchQueryModel.direction_id == direction_id,
-                DirectionSearchQueryModel.area == "",
             )
         )
         for model in models:

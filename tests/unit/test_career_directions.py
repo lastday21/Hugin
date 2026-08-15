@@ -17,6 +17,7 @@ from hugin.domain.vacancies import VacancyData
 from hugin.repositories.directions import AccountRepository, ResumeRepository
 from hugin.services.career_directions import (
     DEFAULT_DIRECTION_QUERIES,
+    PREFERRED_LOCAL_REGIONS,
     CareerDirectionService,
 )
 from hugin.services.job_search import JobSearchSyncService
@@ -115,8 +116,18 @@ def test_direction_settings_use_active_resume_and_build_city_searches(
                 ),
             )
             assert synchronized.resume == resume
-            assert session.scalar(select(func.count()).select_from(DirectionSearchQueryModel)) == 6
+            assert session.scalar(
+                select(func.count()).select_from(DirectionSearchQueryModel)
+            ) == len(DEFAULT_DIRECTION_QUERIES[DirectionScope.IT_ADJACENT])
             assert session.scalar(select(func.count()).select_from(VacancyDiscoveryModel)) == 1
+            legacy_query = DirectionSearchQueryModel(
+                direction_id=configured.direction.id,
+                query="legacy Python",
+                area="113",
+                filters={"order_by": "publication_time"},
+            )
+            session.add(legacy_query)
+            session.flush()
 
             updated = CareerDirectionService(session).update(
                 account_id=account.id,
@@ -143,6 +154,36 @@ def test_direction_settings_use_active_resume_and_build_city_searches(
             assert updated.desired_salary == 230_000
             assert updated.remote_all_russia is True
             assert updated.queries[0].schedule_minutes == 90
+            session.refresh(legacy_query)
+            assert legacy_query.is_active is False
+
+            backend = CareerDirectionService(session).configure(
+                account_id=account.id,
+                direction_name="Python backend",
+                queries=("Python backend разработчик",),
+                regions=(
+                    SearchRegion("99", "Уфа"),
+                    SearchRegion("3", "Екатеринбург"),
+                    SearchRegion("2", "Санкт-Петербург"),
+                    SearchRegion("88", "Казань"),
+                ),
+                work_formats=(WorkFormat.REMOTE, WorkFormat.ON_SITE, WorkFormat.HYBRID),
+                employment_forms=(EmploymentForm.FULL,),
+                remote_all_russia=True,
+            )
+            backend_tasks = CareerDirectionService(session).build_search_tasks(
+                account.id,
+                backend.direction.name,
+            )
+            assert backend.queries[0].regions == PREFERRED_LOCAL_REGIONS
+            assert [(task.area, task.region_name) for task in backend_tasks] == [
+                ("2", "Санкт-Петербург"),
+                ("88", "Казань"),
+                ("3", "Екатеринбург"),
+                ("99", "Уфа"),
+                ("113", "Россия — удалённо"),
+            ]
+            assert backend_tasks[0].filters["search_field"] == "name"
     finally:
         database.close()
 

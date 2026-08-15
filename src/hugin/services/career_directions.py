@@ -25,19 +25,33 @@ from hugin.repositories.directions import (
 )
 
 RUSSIA_REGION = SearchRegion("113", "Россия")
+PREFERRED_LOCAL_REGIONS = (
+    SearchRegion("2", "Санкт-Петербург"),
+    SearchRegion("88", "Казань"),
+    SearchRegion("3", "Екатеринбург"),
+    SearchRegion("99", "Уфа"),
+)
 
 DEFAULT_DIRECTION_QUERIES = {
     DirectionScope.PYTHON_BACKEND: (
+        "Python разработчик",
+        "Python Developer",
         "Python backend разработчик",
         "Backend разработчик Python",
+        "FastAPI разработчик",
+        "Junior Python разработчик",
+        "Python API разработчик",
     ),
     DirectionScope.IT_ADJACENT: (
-        "Fullstack разработчик Python",
-        "Инженер автоматизации Python",
         "Разработчик интеграций Python API",
+        "Разработчик автоматизации Python",
+        "Разработчик внутренних инструментов Python",
+        "Разработчик сервисов обработки данных Python",
         "Инженер по автотестам Python",
         "LLM RAG разработчик Python",
         "ETL разработчик Python",
+        "Инфраструктурная автоматизация Python Docker Linux",
+        "Fullstack разработчик Python backend",
     ),
 }
 
@@ -164,6 +178,8 @@ class CareerDirectionService:
         self._directions.attach_resume(direction.id, resume.id)
 
         filters: dict[str, object] = {"order_by": "publication_time"}
+        if actual_scope is DirectionScope.PYTHON_BACKEND:
+            filters["search_field"] = "name"
         if normalized_employment:
             filters["employment_form"] = [value.value for value in normalized_employment]
         if actual_minimum is not None:
@@ -381,7 +397,14 @@ class CareerDirectionService:
 
     @staticmethod
     def _unique_regions(regions: tuple[SearchRegion, ...]) -> tuple[SearchRegion, ...]:
-        return tuple({region.area: region for region in regions}.values())
+        unique = {region.area: region for region in regions}
+        if PREFERRED_LOCAL_REGIONS[0].area not in unique:
+            return tuple(unique.values())
+        preferred_areas = tuple(region.area for region in PREFERRED_LOCAL_REGIONS)
+        return (
+            *(unique[area] for area in preferred_areas if area in unique),
+            *(region for area, region in unique.items() if area not in preferred_areas),
+        )
 
     @staticmethod
     def _work_formats(

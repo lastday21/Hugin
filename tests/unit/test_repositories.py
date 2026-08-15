@@ -351,12 +351,72 @@ def test_detail_refresh_prioritizes_ready_tasks_and_skips_finished_work(
             assert [vacancy.hh_id for vacancy in pending] == [
                 "ready-never",
                 "ready-old",
-                "old-unassigned",
                 "new-unassigned",
+                "old-unassigned",
             ]
             assert finished_id not in {vacancy.id for vacancy in pending}
             assert old_unassigned_id in {vacancy.id for vacancy in pending}
             assert new_unassigned_id in {vacancy.id for vacancy in pending}
+    finally:
+        database.close()
+
+
+def test_detail_refresh_prioritizes_new_unfetched_vacancies_after_ready_tasks(
+    settings: Settings,
+) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    now = datetime.now(UTC)
+
+    try:
+        with database.sessions.begin() as session:
+            account = AccountRepository(session).create("Main account")
+            resume = ResumeRepository(session).upsert(account.id, "resume-refresh", "Developer")
+            direction = DirectionRepository(session).create(account.id, "Backend")
+            vacancies = VacancyRepository(session)
+            directions = DirectionRepository(session)
+
+            def add_vacancy(hh_id: str, *, created_at: datetime) -> int:
+                vacancy = vacancies.upsert(
+                    VacancyData(
+                        hh_id=hh_id,
+                        title="Python developer",
+                        source_url=f"https://hh.ru/vacancy/{hh_id}",
+                    )
+                )
+                directions.track_vacancy(direction.id, vacancy.id)
+                model = session.get(VacancyModel, vacancy.id)
+                assert model is not None
+                model.created_at = created_at
+                session.flush()
+                return vacancy.id
+
+            ready_id = add_vacancy("ready", created_at=now - timedelta(days=5))
+            add_vacancy("old-unfetched", created_at=now - timedelta(days=4))
+            add_vacancy("new-unfetched", created_at=now)
+
+            application = ApplicationRepository(session).create_apply_intent(
+                account.id,
+                ready_id,
+                resume.id,
+                direction.id,
+            )
+            session.add(
+                ApplicationTaskModel(
+                    application_id=application.id,
+                    state=TaskState.PENDING,
+                    priority_score=80,
+                )
+            )
+            session.flush()
+
+            pending = vacancies.list_pending_for_direction(direction.id, limit=10)
+
+            assert [vacancy.hh_id for vacancy in pending] == [
+                "ready",
+                "new-unfetched",
+                "old-unfetched",
+            ]
     finally:
         database.close()
 

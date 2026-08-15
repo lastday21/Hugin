@@ -381,13 +381,15 @@ class VacancyRepository:
             )
         )
         ready_priority = case((ready_task_exists, 0), else_=1)
-        never_fetched_ready_priority = case(
+        never_fetched_priority = case(
+            (VacancyModel.details_fetched_at.is_(None), 0),
+            else_=1,
+        )
+        never_fetched_recency = case(
             (
-                ready_task_exists & VacancyModel.details_fetched_at.is_(None),
-                0,
+                VacancyModel.details_fetched_at.is_(None),
+                VacancyModel.created_at,
             ),
-            (ready_task_exists, 1),
-            else_=2,
         )
         due_at = case(
             (ready_task_exists, VacancyModel.details_fetched_at),
@@ -410,7 +412,8 @@ class VacancyRepository:
             )
             .order_by(
                 ready_priority,
-                never_fetched_ready_priority,
+                never_fetched_priority,
+                never_fetched_recency.desc().nulls_last(),
                 due_at.asc().nulls_first(),
                 VacancyModel.created_at,
                 VacancyModel.id,

@@ -26,7 +26,7 @@ from hugin.repositories.vacancies import VacancyRepository
 from hugin.services.career_directions import CareerDirectionService
 from hugin.services.vacancy_duplicates import VacancyDuplicateDetector
 
-RULES_VERSION = "python_it_v35"
+RULES_VERSION = "python_it_v41"
 MAX_VACANCY_AGE = timedelta(days=30)
 
 
@@ -655,10 +655,24 @@ class PythonBackendRules:
         if self._external_application_form_pattern.search(description):
             stretch_reasons.append("работодатель требует внешнюю форму; нужна ручная проверка")
         if vacancy.has_test_assignment:
-            reasons.append(
-                "работодатель указал испытательное задание; это не блокирует отклик"
-            )
+            reasons.append("работодатель указал испытательное задание; это не блокирует отклик")
         destination = VacancyRoleRouter.classify(vacancy)
+        has_development_title = any(
+            marker in title
+            for marker in (
+                "разработ",
+                "developer",
+                "программист",
+                "software engineer",
+            )
+        )
+        if (
+            not rejected
+            and self.scope is DirectionScope.PYTHON_BACKEND
+            and destination is None
+            and not has_development_title
+        ):
+            rejected.append("название вакансии не относится к Python backend-разработке")
         if not rejected and destination is not None and destination is not self.scope:
             return RuleEvaluation(
                 score=0,
@@ -757,13 +771,15 @@ class PythonBackendRules:
                 "уровень Middle/Senior указан как риск, а не самостоятельный запрет"
             )
         if self._more_than_six_years(experience):
-            rejected.append("hh.ru указывает требуемый опыт более 6 лет")
+            reasons.append(
+                "hh.ru указывает требуемый опыт более 6 лет; это снижает приоритет, "
+                "но само по себе не блокирует отклик"
+            )
         if minimum_required_experience is None and self._four_plus_experience_pattern.search(
             " ".join((requirements, description))
         ):
-            stretch_reasons.append(
-                "требование от четырёх лет требует дополнительной проверки, "
-                "но само по себе не блокирует"
+            reasons.append(
+                "требование от четырёх лет снижает приоритет, но само по себе не блокирует отклик"
             )
 
         has_development = any(marker in complete_text for marker in self._development_markers)
@@ -797,8 +813,19 @@ class PythonBackendRules:
                 rejected.append(reason)
                 break
         other_stack = self._primary_other_stack(title)
-        if other_stack is not None and "python" not in title:
+        if other_stack is not None and (
+            "python" not in title
+            or (
+                self.scope is DirectionScope.PYTHON_BACKEND
+                and not any(marker in title for marker in VacancyRoleRouter._backend_markers)
+            )
+        ):
             rejected.append(f"другой основной стек в названии: {other_stack}")
+        elif other_stack is not None and self.scope is DirectionScope.PYTHON_BACKEND:
+            stretch_reasons.append(
+                f"в названии вместе с Python указан другой основной стек: {other_stack}; "
+                "требуется ручная проверка"
+            )
         mandatory_other_stack = self._mandatory_other_stack(" ".join((requirements, description)))
         if mandatory_other_stack is not None:
             rejected.append(f"другой обязательный основной стек: {mandatory_other_stack}")
@@ -849,6 +876,10 @@ class PythonBackendRules:
             rejected.append("офис или гибрид находится вне выбранных регионов")
         if self._salary_below_threshold(vacancy, context):
             rejected.append("верхняя граница зарплаты ниже установленного порога")
+        elif self._salary_below_desired(vacancy, context):
+            stretch_reasons.append(
+                "верхняя граница зарплаты ниже желаемой; требуется ручная проверка"
+            )
 
         format_score = self._work_format_score(vacancy, context)
         if format_score is not None:
@@ -1736,6 +1767,17 @@ class PythonBackendRules:
         return vacancy.salary_to < threshold
 
     @staticmethod
+    def _salary_below_desired(vacancy: VacancyData, context: RuleContext) -> bool:
+        target = context.desired_salary
+        if (
+            target is None
+            or vacancy.salary_to is None
+            or vacancy.salary_currency not in {None, "RUR", "RUB"}
+        ):
+            return False
+        return vacancy.salary_to < target
+
+    @staticmethod
     def _salary_score(vacancy: VacancyData, context: RuleContext) -> float | None:
         target = context.desired_salary or context.minimum_salary
         offered = vacancy.salary_to or vacancy.salary_from
@@ -1750,15 +1792,12 @@ class PythonBackendRules:
             return None
         work_format = _normalize_rule_text(vacancy.work_format)
         if "удал" in work_format or "remote" in work_format:
-            return 100
+            return 95
         vacancy_region = _normalize_rule_text(vacancy.region)
-        return (
-            100
-            if any(
-                _normalize_rule_text(region.name) in vacancy_region for region in context.regions
-            )
-            else 20
-        )
+        for index, region in enumerate(context.regions):
+            if _normalize_rule_text(region.name) in vacancy_region:
+                return 100 if index == 0 else 95
+        return 20
 
     @staticmethod
     def _freshness_score(published_at: datetime | None) -> float | None:
@@ -1990,6 +2029,11 @@ class VacancyAnalysisService:
                 if tracked.state is VacancyState.QUEUED
                 else VacancyState.ANALYZED
             )
+            experience_priority = tracked.rules_details.get("experience_priority")
+            if not isinstance(experience_priority, int | float):
+                experience_priority = (
+                    rules._experience_score(_normalize_rule_text(vacancy.experience)) or 80
+                )
             self._directions.apply_rules(
                 direction.id,
                 stored.id,
@@ -1999,6 +2043,7 @@ class VacancyAnalysisService:
                     **tracked.rules_details,
                     "category": RuleCategory.MATCH.value,
                     "accepted": True,
+                    "experience_priority": experience_priority,
                 },
                 rules_version=RULES_VERSION,
             )
@@ -2057,6 +2102,22 @@ class VacancyAnalysisService:
                     }
                     for component in evaluation.components
                 ],
+                "location_priority": next(
+                    (
+                        component.score
+                        for component in evaluation.components
+                        if component.name == "region"
+                    ),
+                    None,
+                ),
+                "experience_priority": next(
+                    (
+                        component.score
+                        for component in evaluation.components
+                        if component.name == "experience"
+                    ),
+                    80,
+                ),
                 "soft_boundary": rules.soft_boundary,
                 "duplicate_of_id": stored.duplicate_of_id,
                 "target_scope": (

@@ -17,8 +17,8 @@ from hugin.services.vacancy_analysis import (
 )
 
 
-def test_rules_version_is_python_it_v35() -> None:
-    assert RULES_VERSION == "python_it_v35"
+def test_rules_version_is_python_it_v41() -> None:
+    assert RULES_VERSION == "python_it_v41"
 
 
 @pytest.mark.parametrize(
@@ -130,7 +130,7 @@ def test_rules_accept_junior_python_backend_with_explanation() -> None:
     assert "Python указан в названии" in result.reasons
 
 
-def test_three_to_six_years_lowers_priority_without_blocking_non_senior_role() -> None:
+def test_three_to_six_years_lowers_priority_without_manual_review() -> None:
     result = PythonBackendRules().evaluate(
         VacancyData(
             "5",
@@ -760,7 +760,7 @@ def test_marketplace_experience_request_does_not_block_application() -> None:
     assert not any("ручн" in reason for reason in result.reasons)
 
 
-def test_multilanguage_backend_gaps_do_not_block_application() -> None:
+def test_multilanguage_backend_requires_manual_review() -> None:
     vacancy = VacancyData(
         "135721455",
         "Middle Backend Developer / Backend-разработчик (Go / Python)",
@@ -776,7 +776,8 @@ def test_multilanguage_backend_gaps_do_not_block_application() -> None:
 
     result = PythonBackendRules().evaluate(vacancy, RuleContext(skills=("Python",)))
 
-    assert result.category is RuleCategory.MATCH
+    assert result.category is RuleCategory.STRETCH
+    assert any("вместе с Python" in reason for reason in result.reasons)
     assert any("Go" in reason for reason in result.reasons)
     assert any("Node.js" in reason for reason in result.reasons)
     assert any("микросервисная архитектура" in reason for reason in result.reasons)
@@ -1471,7 +1472,7 @@ def test_automation_is_routed_from_python_backend_to_it() -> None:
     assert result.accepted
 
 
-def test_more_than_six_years_hh_experience_is_rejected() -> None:
+def test_more_than_six_years_hh_experience_lowers_priority_without_blocking() -> None:
     result = PythonBackendRules().evaluate(
         VacancyData(
             "more-than-six",
@@ -1482,7 +1483,11 @@ def test_more_than_six_years_hh_experience_is_rejected() -> None:
         )
     )
 
-    assert result.category is RuleCategory.REJECTED
+    assert result.category is RuleCategory.MATCH
+    experience = next(
+        component for component in result.components if component.name == "experience"
+    )
+    assert experience.score == 55
     assert any("более 6 лет" in reason for reason in result.reasons)
 
 
@@ -1495,7 +1500,7 @@ def test_more_than_six_years_hh_experience_is_rejected() -> None:
         "Backend development experience: 4+ years.",
     ],
 )
-def test_four_plus_year_requirement_does_not_block_application(
+def test_four_plus_year_requirement_does_not_require_manual_review(
     required_qualifications: str,
 ) -> None:
     result = PythonBackendRules().evaluate(
@@ -1546,7 +1551,7 @@ def test_mandatory_two_plus_years_of_development_is_stretch(
         "Python development experience: 3+ years.",
     ],
 )
-def test_mandatory_three_plus_years_of_development_does_not_block_application(
+def test_mandatory_three_plus_years_of_development_does_not_require_manual_review(
     required_qualifications: str,
 ) -> None:
     result = PythonBackendRules().evaluate(
@@ -1725,7 +1730,7 @@ def test_salary_maximum_below_explicit_minimum_is_rejected() -> None:
     assert any("зарплаты" in reason for reason in result.reasons)
 
 
-def test_salary_maximum_below_desired_salary_is_only_a_soft_score() -> None:
+def test_salary_maximum_below_desired_salary_requires_manual_review() -> None:
     result = PythonBackendRules().evaluate(
         VacancyData(
             "below-desired-salary",
@@ -1742,9 +1747,9 @@ def test_salary_maximum_below_desired_salary_is_only_a_soft_score() -> None:
     salary_component = next(
         component for component in result.components if component.name == "salary"
     )
-    assert result.category is RuleCategory.MATCH
+    assert result.category is RuleCategory.STRETCH
     assert salary_component.score < 100
-    assert not any("ниже установленного порога" in reason for reason in result.reasons)
+    assert any("ниже желаемой" in reason for reason in result.reasons)
 
 
 def test_mandatory_frontend_stack_missing_from_profile_does_not_block() -> None:
@@ -1859,7 +1864,7 @@ def test_founding_ai_engineer_gaps_do_not_add_a_hard_rejection() -> None:
     assert any("роль первого инженера" in reason for reason in result.reasons)
 
 
-def test_sbermed_qa_with_three_to_six_years_requires_manual_review() -> None:
+def test_sbermed_qa_with_three_to_six_years_is_stretch_only_for_specialization() -> None:
     result = AdjacentItRules().evaluate(
         VacancyData(
             "sbermed-qa-live-pattern",
@@ -1874,6 +1879,7 @@ def test_sbermed_qa_with_three_to_six_years_requires_manual_review() -> None:
 
     assert result.category is RuleCategory.STRETCH
     assert any("диапазон опыта hh.ru" in reason for reason in result.reasons)
+    assert any("отдельная специализация" in reason for reason in result.reasons)
 
 
 def test_one_unverified_specialist_requirement_does_not_block() -> None:
@@ -2026,6 +2032,42 @@ def test_office_in_selected_region_does_not_depend_on_resume_city() -> None:
     )
 
     assert result.category is RuleCategory.MATCH
+
+
+def test_selected_region_order_prioritizes_saint_petersburg_only() -> None:
+    context = RuleContext(
+        regions=(
+            SearchRegion("2", "Санкт-Петербург"),
+            SearchRegion("88", "Казань"),
+            SearchRegion("3", "Екатеринбург"),
+            SearchRegion("99", "Уфа"),
+        ),
+    )
+
+    def evaluate(region: str, work_format: str) -> tuple[float, float]:
+        result = PythonBackendRules().evaluate(
+            VacancyData(
+                f"region-priority-{region}",
+                "Python backend разработчик",
+                "https://hh.ru/vacancy/region-priority",
+                description="Разработка API на Python и FastAPI.",
+                work_format=work_format,
+                region=region,
+            ),
+            context,
+        )
+        region_component = next(
+            component for component in result.components if component.name == "region"
+        )
+        assert result.category is RuleCategory.MATCH
+        return result.score, region_component.score
+
+    spb_score, spb_region_score = evaluate("Санкт-Петербург", "Офис")
+    remote_score, remote_region_score = evaluate("Москва", "Удалённо")
+    kazan_score, kazan_region_score = evaluate("Казань", "Гибрид")
+
+    assert (spb_region_score, remote_region_score, kazan_region_score) == (100, 95, 95)
+    assert spb_score > remote_score == kazan_score
 
 
 @pytest.mark.parametrize(
@@ -2372,7 +2414,7 @@ def test_mandatory_primary_1c_stack_is_rejected() -> None:
     assert any("1С" in reason for reason in result.reasons)
 
 
-def test_mixed_go_and_python_backend_title_is_not_rejected_as_other_stack() -> None:
+def test_mixed_go_and_python_backend_title_requires_manual_review() -> None:
     result = PythonBackendRules().evaluate(
         VacancyData(
             "mixed-stack",
@@ -2384,4 +2426,5 @@ def test_mixed_go_and_python_backend_title_is_not_rejected_as_other_stack() -> N
         RuleContext(skills=("Python, FastAPI, PostgreSQL",)),
     )
 
-    assert result.category is RuleCategory.MATCH
+    assert result.category is RuleCategory.STRETCH
+    assert any("вместе с Python" in reason for reason in result.reasons)

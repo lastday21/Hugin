@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import and_, func, or_, select, update
+from sqlalchemy import and_, case, func, or_, select, update
 from sqlalchemy.orm import Session
 
 from hugin.database.models import (
@@ -10,6 +10,7 @@ from hugin.database.models import (
     ApplicationModel,
     ApplicationSettingsModel,
     ApplicationTaskModel,
+    CareerDirectionModel,
     CoverLetterModel,
     DirectionVacancyModel,
     SystemStateModel,
@@ -17,7 +18,7 @@ from hugin.database.models import (
 )
 from hugin.domain.applications import ApplicationEventType, ApplicationState, EventPayload
 from hugin.domain.content import CURRENT_COVER_LETTER_INSTRUCTION, CoverLetterState
-from hugin.domain.directions import VacancyState
+from hugin.domain.directions import DirectionScope, VacancyState
 from hugin.domain.state_machines import ensure_system_transition, ensure_task_transition
 from hugin.domain.tasks import (
     ApplicationPolicyRecord,
@@ -138,18 +139,46 @@ class QueueTaskRepository:
                 "Нельзя одновременно требовать и исключать готовое сопроводительное письмо"
             )
         selected_at = as_utc(now or datetime.now(UTC))
+        direction_priority = case(
+            (
+                CareerDirectionModel.scoring_config["role_scope"].as_string()
+                == DirectionScope.PYTHON_BACKEND.value,
+                0,
+            ),
+            else_=1,
+        )
+        location_priority = DirectionVacancyModel.rules_details["location_priority"].as_float()
+        experience_priority = DirectionVacancyModel.rules_details["experience_priority"].as_float()
         statement = (
             select(ApplicationTaskModel.id)
             .join(ApplicationModel)
             .join(VacancyModel, VacancyModel.id == ApplicationModel.vacancy_id)
+            .outerjoin(
+                CareerDirectionModel,
+                CareerDirectionModel.id == ApplicationModel.direction_id,
+            )
+            .outerjoin(
+                DirectionVacancyModel,
+                and_(
+                    DirectionVacancyModel.direction_id == ApplicationModel.direction_id,
+                    DirectionVacancyModel.vacancy_id == ApplicationModel.vacancy_id,
+                ),
+            )
             .where(
                 ApplicationTaskModel.state.in_(READY_STATES),
                 ApplicationTaskModel.scheduled_at <= selected_at,
                 ApplicationModel.state == ApplicationState.APPLYING,
                 VacancyModel.availability == VacancyAvailability.ACTIVE,
                 VacancyModel.duplicate_of_id.is_(None),
+                or_(
+                    ApplicationModel.direction_id.is_(None),
+                    CareerDirectionModel.is_active.is_(True),
+                ),
             )
             .order_by(
+                direction_priority,
+                location_priority.desc().nulls_last(),
+                experience_priority.desc().nulls_last(),
                 VacancyModel.published_at.desc().nulls_last(),
                 ApplicationTaskModel.priority_score.desc(),
                 ApplicationTaskModel.scheduled_at,
@@ -162,13 +191,6 @@ class QueueTaskRepository:
         if direction_id is not None:
             statement = statement.where(ApplicationModel.direction_id == direction_id)
         if vacancy_rules_version is not None or vacancy_rule_categories is not None:
-            statement = statement.join(
-                DirectionVacancyModel,
-                and_(
-                    DirectionVacancyModel.direction_id == ApplicationModel.direction_id,
-                    DirectionVacancyModel.vacancy_id == ApplicationModel.vacancy_id,
-                ),
-            )
             statement = statement.where(DirectionVacancyModel.state == VacancyState.QUEUED)
         if vacancy_rules_version is not None:
             statement = statement.where(
@@ -502,15 +524,11 @@ class SystemStateRepository:
             raise ValueError(
                 "Нельзя включить очередь, пока выполняется управляемый поштучный отклик"
             )
-        if (
-            model.state in {SystemState.RUNNING, SystemState.PAUSED}
-            and target
-            in {
-                SystemState.AUTH_REQUIRED,
-                SystemState.CAPTCHA_REQUIRED,
-                SystemState.ACCOUNT_WARNING,
-            }
-        ):
+        if model.state in {SystemState.RUNNING, SystemState.PAUSED} and target in {
+            SystemState.AUTH_REQUIRED,
+            SystemState.CAPTCHA_REQUIRED,
+            SystemState.ACCOUNT_WARNING,
+        }:
             model.recovery_state = model.state
         elif target in {SystemState.RUNNING, SystemState.PAUSED}:
             model.recovery_state = None

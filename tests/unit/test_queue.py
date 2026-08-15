@@ -12,6 +12,7 @@ from hugin.domain import (
     ApplicationEventType,
     ApplicationNotFoundError,
     ApplicationState,
+    DirectionScope,
     DuplicateTaskError,
     InvalidStateTransitionError,
     SystemState,
@@ -20,10 +21,12 @@ from hugin.domain import (
     TaskState,
     VacancyAvailability,
     VacancyData,
+    VacancyState,
 )
 from hugin.repositories import (
     AccountRepository,
     ApplicationRepository,
+    DirectionRepository,
     QueueTaskRepository,
     ResumeRepository,
     SystemStateRepository,
@@ -34,6 +37,7 @@ from hugin.repositories.tasks import (
     FORM_PREFLIGHT_RUNNING,
 )
 from hugin.services import ApplicationAutomationService, QueueService
+from hugin.services.vacancy_analysis import RULES_VERSION
 
 pytestmark = pytest.mark.integration
 
@@ -249,6 +253,218 @@ def test_queue_prefers_fresher_vacancy_before_rule_score(settings: Settings) -> 
 
             assert claimed is not None
             assert claimed.id == expected.id
+    finally:
+        database.close()
+
+
+def test_queue_prioritizes_backend_then_adjacent_and_skips_inactive_direction(
+    settings: Settings,
+) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    now = datetime(2026, 8, 15, 12, 0, tzinfo=UTC)
+
+    try:
+        with database.sessions.begin() as session:
+            account = AccountRepository(session).create("Main account")
+            resume = ResumeRepository(session).upsert(account.id, "resume", "Python backend")
+            directions = DirectionRepository(session)
+            backend = directions.create(
+                account.id,
+                "Python backend",
+                scoring_config={"role_scope": DirectionScope.PYTHON_BACKEND.value},
+            )
+            adjacent = directions.create(
+                account.id,
+                "ИТ",
+                scoring_config={"role_scope": DirectionScope.IT_ADJACENT.value},
+            )
+            inactive = directions.create(
+                account.id,
+                "Неактивное ИТ",
+                scoring_config={"role_scope": DirectionScope.IT_ADJACENT.value},
+            )
+            directions.set_active(account.id, inactive.id, False)
+            vacancies = VacancyRepository(session)
+            applications = ApplicationRepository(session)
+            tasks = QueueTaskRepository(session)
+
+            def enqueue(
+                direction_id: int,
+                hh_id: str,
+                *,
+                published_at: datetime,
+                location_priority: float,
+            ) -> int:
+                vacancy = vacancies.upsert(
+                    VacancyData(
+                        hh_id,
+                        "Python developer",
+                        f"https://hh.ru/vacancy/{hh_id}",
+                        published_at=published_at,
+                    )
+                )
+                directions.track_vacancy(direction_id, vacancy.id)
+                directions.apply_rules(
+                    direction_id,
+                    vacancy.id,
+                    state=VacancyState.QUEUED,
+                    score=80,
+                    details={
+                        "category": "MATCH",
+                        "accepted": True,
+                        "location_priority": location_priority,
+                        "experience_priority": 90,
+                    },
+                    rules_version=RULES_VERSION,
+                )
+                application = applications.create_apply_intent(
+                    account.id,
+                    vacancy.id,
+                    resume.id,
+                    direction_id,
+                )
+                return tasks.enqueue(application.id, 80, now).id
+
+            backend_task = enqueue(
+                backend.id,
+                "backend",
+                published_at=now - timedelta(days=2),
+                location_priority=90,
+            )
+            adjacent_task = enqueue(
+                adjacent.id,
+                "adjacent",
+                published_at=now,
+                location_priority=100,
+            )
+            inactive_task = enqueue(
+                inactive.id,
+                "inactive",
+                published_at=now + timedelta(hours=1),
+                location_priority=100,
+            )
+
+            def claim() -> int:
+                claimed = tasks.claim_next(
+                    now,
+                    account_id=account.id,
+                    vacancy_rules_version=RULES_VERSION,
+                    vacancy_rule_categories=frozenset({"MATCH"}),
+                )
+                assert claimed is not None
+                return claimed.id
+
+            assert claim() == backend_task
+            tasks.transition(backend_task, TaskState.COMPLETED)
+            assert claim() == adjacent_task
+            tasks.transition(adjacent_task, TaskState.COMPLETED)
+            assert (
+                tasks.claim_next(
+                    now,
+                    account_id=account.id,
+                    vacancy_rules_version=RULES_VERSION,
+                    vacancy_rule_categories=frozenset({"MATCH"}),
+                )
+                is None
+            )
+            assert tasks.get(inactive_task).state is TaskState.PENDING
+    finally:
+        database.close()
+
+
+def test_queue_prioritizes_location_then_experience_within_backend(
+    settings: Settings,
+) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    now = datetime(2026, 8, 15, 12, 0, tzinfo=UTC)
+
+    try:
+        with database.sessions.begin() as session:
+            account = AccountRepository(session).create("Main account")
+            resume = ResumeRepository(session).upsert(account.id, "resume", "Python backend")
+            directions = DirectionRepository(session)
+            backend = directions.create(
+                account.id,
+                "Python backend",
+                scoring_config={"role_scope": DirectionScope.PYTHON_BACKEND.value},
+            )
+            vacancies = VacancyRepository(session)
+            applications = ApplicationRepository(session)
+            tasks = QueueTaskRepository(session)
+
+            def enqueue(
+                hh_id: str,
+                *,
+                published_at: datetime,
+                location_priority: float,
+                experience_priority: float,
+            ) -> int:
+                vacancy = vacancies.upsert(
+                    VacancyData(
+                        hh_id,
+                        "Python developer",
+                        f"https://hh.ru/vacancy/{hh_id}",
+                        published_at=published_at,
+                    )
+                )
+                directions.track_vacancy(backend.id, vacancy.id)
+                directions.apply_rules(
+                    backend.id,
+                    vacancy.id,
+                    state=VacancyState.QUEUED,
+                    score=80,
+                    details={
+                        "category": "MATCH",
+                        "accepted": True,
+                        "location_priority": location_priority,
+                        "experience_priority": experience_priority,
+                    },
+                    rules_version=RULES_VERSION,
+                )
+                application = applications.create_apply_intent(
+                    account.id,
+                    vacancy.id,
+                    resume.id,
+                    backend.id,
+                )
+                return tasks.enqueue(application.id, 80, now).id
+
+            spb_task = enqueue(
+                "backend-spb",
+                published_at=now - timedelta(days=2),
+                location_priority=100,
+                experience_priority=65,
+            )
+            junior_task = enqueue(
+                "backend-kazan-junior",
+                published_at=now - timedelta(days=2),
+                location_priority=95,
+                experience_priority=90,
+            )
+            senior_task = enqueue(
+                "backend-kazan-senior",
+                published_at=now,
+                location_priority=95,
+                experience_priority=65,
+            )
+
+            def claim() -> int:
+                claimed = tasks.claim_next(
+                    now,
+                    account_id=account.id,
+                    vacancy_rules_version=RULES_VERSION,
+                    vacancy_rule_categories=frozenset({"MATCH"}),
+                )
+                assert claimed is not None
+                return claimed.id
+
+            assert claim() == spb_task
+            tasks.transition(spb_task, TaskState.COMPLETED)
+            assert claim() == junior_task
+            tasks.transition(junior_task, TaskState.COMPLETED)
+            assert claim() == senior_task
     finally:
         database.close()
 
