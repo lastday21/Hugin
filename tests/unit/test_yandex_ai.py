@@ -7,7 +7,7 @@ from collections.abc import Iterator
 from email.message import Message
 from io import BytesIO
 from pathlib import Path
-from types import TracebackType
+from types import SimpleNamespace, TracebackType
 from typing import Self
 
 import pytest
@@ -79,9 +79,7 @@ def test_yandex_client_uses_selected_source_address(
             timeout: int,
         ) -> FakeResponse:
             opened.append((request, timeout))
-            return FakeResponse(
-                [b'data: {"choices":[{"message":{"content":"ok"}}]}\n']
-            )
+            return FakeResponse([b'data: {"choices":[{"message":{"content":"ok"}}]}\n'])
 
     def build_opener(
         *selected_handlers: urllib.request.BaseHandler,
@@ -98,10 +96,7 @@ def test_yandex_client_uses_selected_source_address(
     )
 
     assert client.complete("system", "user") == "ok"
-    assert any(
-        type(handler).__name__ == "_SourceAddressHTTPSHandler"
-        for handler in handlers
-    )
+    assert any(type(handler).__name__ == "_SourceAddressHTTPSHandler" for handler in handlers)
     assert opened[0][1] == 120
 
 
@@ -177,6 +172,29 @@ def test_yandex_client_rejects_empty_response(monkeypatch: pytest.MonkeyPatch) -
 
     with pytest.raises(YandexAIError, match="пустой ответ"):
         YandexAIClient("key", "folder").complete("system", "user")
+
+
+def test_yandex_client_limits_total_stream_duration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response = FakeResponse(
+        [
+            b'data: {"choices":[{"delta":{"content":"part"}}]}\n',
+            b"data: [DONE]\n",
+        ]
+    )
+    timeouts: list[float] = []
+    response.fp = SimpleNamespace(
+        raw=SimpleNamespace(_sock=SimpleNamespace(settimeout=timeouts.append))
+    )
+    moments = iter((10.0, 10.0, 12.0))
+    monkeypatch.setattr("hugin.adapters.yandex_ai.monotonic", lambda: next(moments))
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *_args, **_kwargs: response)
+
+    with pytest.raises(YandexAIError, match="Истекло время"):
+        YandexAIClient("key", "folder", timeout_seconds=1).complete("system", "user")
+
+    assert timeouts == [1.0]
 
 
 @pytest.mark.parametrize(

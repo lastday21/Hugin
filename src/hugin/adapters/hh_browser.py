@@ -827,8 +827,22 @@ try {
     // Не используем неразбираемую ссылку как подтверждение выбранного резюме.
 }
 const selectedResumeHashesFromReact = (node) => {
-    let current = node;
-    for (let level = 0; current && level < 6; level += 1, current = current.parentElement) {
+    const resumeHash = (value) => {
+        if (value === null || typeof value !== 'object') return '';
+        const attributes = value._attributes;
+        if (attributes === null || typeof attributes !== 'object') return '';
+        const hash = clean(value.hash || attributes.hash);
+        const looksLikeResume = (
+            (
+                'shortExperience' in value ||
+                'specialization' in value ||
+                'primaryEducation' in value
+            ) &&
+            ('hhid' in attributes || 'id' in attributes)
+        );
+        return looksLikeResume && /^[a-f0-9]{32,64}$/iu.test(hash) ? hash : '';
+    };
+    const hashesFrom = (...values) => {
         const hashes = new Set();
         const visited = new WeakSet();
         let visitedCount = 0;
@@ -841,12 +855,13 @@ const selectedResumeHashesFromReact = (node) => {
             }
             visited.add(value);
             visitedCount += 1;
+            const directResumeHash = resumeHash(value);
+            if (directResumeHash) hashes.add(directResumeHash);
             for (const [key, nested] of Object.entries(value)) {
                 const normalizedKey = key.replace(/[_-]/g, '').toLocaleLowerCase('en-US');
                 if (
                     typeof nested === 'string' &&
                     (
-                        normalizedKey === 'hash' ||
                         normalizedKey === 'resumehash' ||
                         normalizedKey === 'selectedresumehash'
                     ) &&
@@ -858,17 +873,24 @@ const selectedResumeHashesFromReact = (node) => {
                 scan(nested, depth + 1);
             }
         };
+        for (const value of values) scan(value, 0);
+        return hashes;
+    };
+    let current = node;
+    for (let level = 0; current && level < 6; level += 1, current = current.parentElement) {
         for (const key of Object.keys(current)) {
             if (key.startsWith('__reactFiber$')) {
-                const fiber = current[key];
-                scan(fiber?.pendingProps, 0);
-                scan(fiber?.memoizedProps, 0);
+                let fiber = current[key];
+                for (let fiberLevel = 0; fiber && fiberLevel < 12; fiberLevel += 1) {
+                    const hashes = hashesFrom(fiber.pendingProps, fiber.memoizedProps);
+                    if (hashes.size === 1) return Array.from(hashes);
+                    fiber = fiber.return;
+                }
             } else if (key.startsWith('__reactProps$')) {
-                scan(current[key], 0);
+                const hashes = hashesFrom(current[key]);
+                if (hashes.size === 1) return Array.from(hashes);
             }
         }
-        if (hashes.size === 1) return Array.from(hashes);
-        if (hashes.size > 1) return [];
     }
     return [];
 };
@@ -2104,6 +2126,7 @@ class VisibleHhBrowser:
             page.wait_for_timeout(1_500)
         except PlaywrightTimeoutError:
             return HhApplyResult(HhApplyStatus.RETRYABLE_ERROR, page.url)
+        body_text = self._page_body_text(page)
         if initial_response is not None and initial_response.status == 429:
             return HhApplyResult(
                 HhApplyStatus.RETRYABLE_ERROR,
@@ -2114,6 +2137,8 @@ class VisibleHhBrowser:
                     or _TEMPORARY_REQUEST_RETRY_SECONDS
                 ),
             )
+        if self._vacancy_is_closed(initial_response, body_text):
+            return HhApplyResult(HhApplyStatus.VACANCY_CLOSED, page.url)
         if initial_response is not None and initial_response.status == 403:
             return HhApplyResult(
                 HhApplyStatus.ACCOUNT_WARNING,
@@ -2122,15 +2147,13 @@ class VisibleHhBrowser:
             )
         access_error = self._application_access_error(
             page,
-            self._page_body_text(page),
+            body_text,
         )
         if access_error is not None:
             return access_error
         vacancy_error = self._application_vacancy_error(page, vacancy_id)
         if vacancy_error is not None:
             return vacancy_error
-        if self._vacancy_is_closed(initial_response, self._page_body_text(page)):
-            return HhApplyResult(HhApplyStatus.VACANCY_CLOSED, page.url)
         response_links = page.locator('[data-qa="vacancy-response-link-top"]:visible')
         if response_links.count() == 0:
             return HhApplyResult(HhApplyStatus.RETRYABLE_ERROR, page.url)

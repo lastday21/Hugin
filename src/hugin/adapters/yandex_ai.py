@@ -6,7 +6,9 @@ import socket
 import ssl
 import urllib.error
 import urllib.request
+from collections.abc import Iterator
 from ipaddress import IPv4Address
+from time import monotonic
 from typing import Any
 
 from hugin.diagnostics import OperationJournal
@@ -168,13 +170,9 @@ class YandexAIClient:
             else None
         )
         try:
-            open_request = (
-                self._opener.open
-                if self._opener is not None
-                else urllib.request.urlopen
-            )
+            open_request = self._opener.open if self._opener is not None else urllib.request.urlopen
             with open_request(request, timeout=self._timeout_seconds) as response:
-                for raw_line in response:
+                for raw_line in self._response_lines(response):
                     line = raw_line.decode("utf-8", errors="replace").strip()
                     if not line.startswith("data:"):
                         continue
@@ -229,6 +227,43 @@ class YandexAIClient:
                 **usage,
             )
         return result
+
+    def _response_lines(self, response: Any) -> Iterator[bytes]:
+        deadline = monotonic() + self._timeout_seconds
+        response_socket = self._response_socket(response)
+        iterator = iter(response)
+        while True:
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                raise TimeoutError
+            if response_socket is not None:
+                response_socket.settimeout(remaining)
+            try:
+                yield next(iterator)
+            except StopIteration:
+                return
+
+    @staticmethod
+    def _response_socket(response: Any) -> Any | None:
+        candidates = [response]
+        visited: set[int] = set()
+        for _ in range(5):
+            nested: list[Any] = []
+            for candidate in candidates:
+                marker = id(candidate)
+                if marker in visited:
+                    continue
+                visited.add(marker)
+                if isinstance(candidate, socket.socket) or callable(
+                    getattr(candidate, "settimeout", None)
+                ):
+                    return candidate
+                for attribute in ("fp", "raw", "_sock", "sock"):
+                    value = getattr(candidate, attribute, None)
+                    if value is not None:
+                        nested.append(value)
+            candidates = nested
+        return None
 
     def _model_uri(self) -> str:
         if "://" in self._model:

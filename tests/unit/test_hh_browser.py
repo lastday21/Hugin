@@ -864,6 +864,14 @@ def test_vacancy_details_script_recognizes_plain_external_form_urls() -> None:
     assert "externalApplicationText" in browser_module.VACANCY_DETAILS_SCRIPT
 
 
+def test_application_snapshot_ignores_unrelated_hashes_in_react_state() -> None:
+    script = browser_module.APPLICATION_FORM_SCRIPT
+
+    assert "const resumeHash = (value)" in script
+    assert "'shortExperience' in value" in script
+    assert "normalizedKey === 'hash'" not in script
+
+
 def test_visible_russian_publication_date_is_parsed() -> None:
     parsed = VisibleHhBrowser._date_time("Вакансия опубликована 30 июля 2026")
 
@@ -2552,6 +2560,32 @@ def test_application_http_403_requires_manual_account_review(tmp_path: Path) -> 
     assert result.status is HhApplyStatus.ACCOUNT_WARNING
     assert result.retry_after_seconds is None
     assert "ручная проверка" in result.confirmation
+
+
+def test_application_http_403_for_inaccessible_vacancy_skips_only_vacancy(
+    tmp_path: Path,
+) -> None:
+    page = FakePage("https://hh.ru/applicant/resumes")
+    response = FakeResponse()
+    response.status = 403
+    page.goto_response = response
+    page.locators["body"] = FakeLocator(
+        text=(
+            "Вам недоступна эта вакансия. Войдите как пользователь, "
+            "у которого есть доступ на просмотр."
+        )
+    )
+
+    result = make_browser(page, tmp_path).apply_to_vacancy(
+        "https://hh.ru/vacancy/123",
+        expected_resume_hh_id=TEST_RESUME_HH_ID,
+        expected_resume_title="Python",
+        cover_letter="Письмо",
+        submit=True,
+        submit_guard=lambda: True,
+    )
+
+    assert result.status is HhApplyStatus.VACANCY_CLOSED
 
 
 @pytest.mark.parametrize(

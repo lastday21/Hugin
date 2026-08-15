@@ -487,6 +487,22 @@ def test_safe_form_preflight_prepares_letter_for_automatic_submission(
     assert FakeApplicationService.recorded_preflights[0][0] is job
 
 
+def test_rejected_letter_does_not_delay_next_vacancy(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    worker = prepare_worker(
+        monkeypatch,
+        tmp_path,
+        letter_preparer=lambda _job: 0,
+    )
+    now = datetime(2026, 7, 27, 10, 0, tzinfo=UTC)
+
+    worker._prepare_exact_letter(fake_job(), now)
+
+    assert worker._may_prepare_letters(now)
+
+
 def test_form_preflight_exception_is_retryable_not_unknown(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

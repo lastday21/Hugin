@@ -375,9 +375,7 @@ class ApplicationWorker:
             )
             self._next_letter_attempt_at = selected_at + timedelta(minutes=15)
             return
-        self._next_letter_attempt_at = (
-            selected_at + timedelta(minutes=5) if prepared == 0 else selected_at
-        )
+        self._next_letter_attempt_at = selected_at
         if prepared:
             self._journal.record(
                 "applications",
