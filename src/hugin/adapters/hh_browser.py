@@ -2731,13 +2731,13 @@ class VisibleHhBrowser:
         cover_letter: str = "",
     ) -> HhFormReviewResult:
         page = self._require_page()
-        vacancy_url = self._canonical_vacancy_url(source_url)
+        response_url = self._application_response_url(source_url)
         try:
             response = page.goto(
-                vacancy_url,
+                response_url,
                 wait_until="domcontentloaded",
             )
-            page.wait_for_timeout(1_500)
+            page.wait_for_timeout(500)
         except PlaywrightTimeoutError:
             return HhFormReviewResult(HhFormReviewStatus.UNAVAILABLE, page.url)
         if response is not None and response.status == 429:
@@ -2750,23 +2750,22 @@ class VisibleHhBrowser:
             return HhFormReviewResult(HhFormReviewStatus.CAPTCHA_REQUIRED, page.url)
         if not self.is_authenticated():
             return HhFormReviewResult(HhFormReviewStatus.AUTH_REQUIRED, page.url)
-        if self._vacancy_is_closed(response, self._page_body_text(page)):
+        body_text = self._page_body_text(page)
+        if self._vacancy_is_closed(response, body_text):
             return HhFormReviewResult(HhFormReviewStatus.VACANCY_CLOSED, page.url)
-        response_links = page.locator('[data-qa="vacancy-response-link-top"]:visible')
-        if response_links.count() == 0:
-            return HhFormReviewResult(
-                HhFormReviewStatus.UNAVAILABLE,
-                page.url,
-                message="hh.ru не показал кнопку отклика",
-            )
+        if self._contains_any(body_text, "вы уже откликались", "отклик уже отправлен"):
+            return HhFormReviewResult(HhFormReviewStatus.ALREADY_APPLIED, page.url)
         try:
-            response_links.first.click(no_wait_after=True, timeout=min(self._timeout_ms, 10_000))
             page.locator('[data-qa="resume-title"]').first.wait_for(
                 state="visible",
                 timeout=self._timeout_ms,
             )
-            page.wait_for_timeout(500)
         except PlaywrightError:
+            body_text = self._page_body_text(page)
+            if self._vacancy_is_closed(response, body_text):
+                return HhFormReviewResult(HhFormReviewStatus.VACANCY_CLOSED, page.url)
+            if self._contains_any(body_text, "вы уже откликались", "отклик уже отправлен"):
+                return HhFormReviewResult(HhFormReviewStatus.ALREADY_APPLIED, page.url)
             return HhFormReviewResult(
                 HhFormReviewStatus.UNAVAILABLE,
                 page.url,
@@ -2864,6 +2863,34 @@ class VisibleHhBrowser:
             skipped_keys=tuple(raw_skipped),
             message="Анкета заполнена, но не отправлена",
         )
+
+    def current_screening_form_status(
+        self,
+        source_url: str,
+    ) -> HhFormReviewStatus | None:
+        vacancy_id, _normalized_url = self._vacancy_id_and_url(source_url)
+        page = self._require_page()
+        if self._application_url_vacancy_id(page.url) != vacancy_id:
+            return None
+        body_text = self._page_body_text(page)
+        if self._vacancy_is_closed(None, body_text):
+            return HhFormReviewStatus.VACANCY_CLOSED
+        if self._contains_any(
+            body_text,
+            "вы уже откликались",
+            "отклик уже отправлен",
+            "отклик успешно отправлен",
+            "вы откликнулись",
+            "отклик принят",
+        ):
+            return HhFormReviewStatus.ALREADY_APPLIED
+        submit_button = page.locator('[data-qa="vacancy-response-submit-popup"]')
+        if submit_button.count() == 1 and self._contains_any(
+            submit_button.first.inner_text(),
+            "повторно",
+        ):
+            return HhFormReviewStatus.ALREADY_APPLIED
+        return None
 
     def send_recruiter_message(
         self,

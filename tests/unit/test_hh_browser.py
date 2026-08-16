@@ -1845,6 +1845,14 @@ def test_saved_form_answers_are_refilled_without_submit(tmp_path: Path) -> None:
 
     assert result.status is HhFormReviewStatus.READY
     assert result.filled_keys == ("name:telegram",)
+    assert page.goto_calls == [
+        (
+            "https://hh.ru/applicant/vacancy_response?"
+            "vacancyId=123&startedWithQuestion=false&hhtmFrom=vacancy",
+            "domcontentloaded",
+        )
+    ]
+    assert page.locators['[data-qa="vacancy-response-link-top"]:visible'].clicked == 0
     assert page.fill_payload == [{"key": "name:telegram", "value": "@timur"}]
     assert submit.clicked == 0
 
@@ -2072,6 +2080,32 @@ def test_form_review_handles_navigation_timeout_and_rate_limit(tmp_path: Path) -
     )
     assert limit_result.status is HhFormReviewStatus.UNAVAILABLE
     assert "ограничил" in limit_result.message
+
+
+@pytest.mark.parametrize(
+    ("body_text", "expected"),
+    (
+        ("Отклик успешно отправлен", HhFormReviewStatus.ALREADY_APPLIED),
+        ("Вакансия в архиве", HhFormReviewStatus.VACANCY_CLOSED),
+        ("Форма отклика", None),
+    ),
+)
+def test_current_screening_form_status_detects_manual_completion(
+    tmp_path: Path,
+    body_text: str,
+    expected: HhFormReviewStatus | None,
+) -> None:
+    page = FakePage(
+        "https://hh.ru/applicant/vacancy_response?"
+        "vacancyId=123&startedWithQuestion=false&hhtmFrom=vacancy"
+    )
+    page.locators["body"] = FakeLocator(text=body_text)
+
+    status = make_browser(page, tmp_path).current_screening_form_status(
+        "https://hh.ru/vacancy/123"
+    )
+
+    assert status is expected
 
 
 @pytest.mark.parametrize(

@@ -26,6 +26,7 @@ from hugin.adapters.notification_gateway import (
 from hugin.core.settings import Settings
 from hugin.domain import HhFormReviewResult, HhFormReviewStatus, HhScreeningForm
 from hugin.domain.content import RecruiterMessageState
+from hugin.domain.vacancies import VacancyAvailability
 from hugin.services.hh_login import LoginResult, LoginStatus
 
 
@@ -64,6 +65,8 @@ class FakeDraftService:
     error: ClassVar[Exception | None] = None
     captured: ClassVar[list[tuple[int, HhScreeningForm]]] = []
     invalidated: ClassVar[list[int]] = []
+    sent: ClassVar[list[tuple[int, str | None]]] = []
+    availability: ClassVar[list[tuple[int, int, VacancyAvailability]]] = []
 
     def __init__(self, _session: object) -> None:
         pass
@@ -79,6 +82,20 @@ class FakeDraftService:
     def invalidate(self, form_id: int) -> None:
         self.invalidated.append(form_id)
 
+    def mark_sent(self, application_id: int, *, version_hash: str | None = None) -> None:
+        self.sent.append((application_id, version_hash))
+
+    def record_availability_check(
+        self,
+        account_id: int,
+        form_id: int,
+        availability: VacancyAvailability,
+        *,
+        checked_at: datetime,
+    ) -> None:
+        assert checked_at.tzinfo is not None
+        self.availability.append((account_id, form_id, availability))
+
 
 class FakeBrowser:
     result: ClassVar[HhFormReviewResult] = HhFormReviewResult(
@@ -88,6 +105,7 @@ class FakeBrowser:
         skipped_keys=("motivation",),
     )
     instances: ClassVar[list[FakeBrowser]] = []
+    current_status: ClassVar[HhFormReviewStatus | None] = None
 
     def __init__(
         self,
@@ -117,13 +135,22 @@ class FakeBrowser:
     def open_screening_form(self, *_args: object, **_kwargs: object) -> HhFormReviewResult:
         return self.result
 
+    def current_screening_form_status(
+        self,
+        _source_url: str,
+    ) -> HhFormReviewStatus | None:
+        return self.current_status
+
 
 @pytest.fixture(autouse=True)
 def reset_fakes() -> None:
     FakeDraftService.error = None
     FakeDraftService.captured = []
     FakeDraftService.invalidated = []
+    FakeDraftService.sent = []
+    FakeDraftService.availability = []
     FakeBrowser.instances = []
+    FakeBrowser.current_status = None
     FakeBrowser.result = HhFormReviewResult(
         HhFormReviewStatus.READY,
         "https://hh.ru/vacancy/101",
@@ -200,6 +227,23 @@ def test_bridge_restarts_browser_after_review_window_is_closed(
     bridge.close()
 
 
+def test_bridge_removes_form_after_manual_submission(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    bridge = prepare_bridge(monkeypatch, tmp_path)
+
+    assert bridge.open_form("101")["status"] == "READY"
+    FakeBrowser.current_status = HhFormReviewStatus.ALREADY_APPLIED
+
+    deadline = time.monotonic() + 2
+    while not FakeDraftService.sent and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    assert FakeDraftService.sent == [(11, "version-1")]
+    bridge.close()
+
+
 def test_bridge_refreshes_changed_form_and_invalidates_closed_one(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -225,7 +269,17 @@ def test_bridge_refreshes_changed_form_and_invalidates_closed_one(
     closed = bridge.open_form("101")
 
     assert closed == {"status": "VACANCY_CLOSED", "message": "Вакансия закрыта"}
-    assert FakeDraftService.invalidated == [12]
+    assert FakeDraftService.availability == [(1, 12, VacancyAvailability.ARCHIVED)]
+
+    FakeBrowser.result = HhFormReviewResult(
+        HhFormReviewStatus.ALREADY_APPLIED,
+        "https://hh.ru/vacancy/101",
+        message="Отклик уже отправлен",
+    )
+    applied = bridge.open_form("101")
+
+    assert applied == {"status": "ALREADY_APPLIED", "message": "Отклик уже отправлен"}
+    assert FakeDraftService.sent == [(11, "version-1")]
     bridge.close()
 
 

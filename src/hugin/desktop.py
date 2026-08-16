@@ -9,6 +9,7 @@ import webbrowser
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from importlib import import_module
 from pathlib import Path
 from queue import Empty, Queue
@@ -39,6 +40,7 @@ from hugin.domain.automation import AutomationJobKind
 from hugin.domain.communications import CommunicationNotFoundError, CommunicationStateError
 from hugin.domain.content import RecruiterMessageState
 from hugin.domain.hh import HhFormReviewStatus
+from hugin.domain.vacancies import VacancyAvailability
 from hugin.services.ai_prompts import AiPromptSettingsService
 from hugin.services.backups import BackupService
 from hugin.services.communications import CommunicationService, RecordingMessageSender
@@ -569,10 +571,19 @@ class DesktopBridge:
                     ),
                 ) as browser,
             ):
+                watched_draft: ScreeningDraft | None = None
                 while browser.is_open():
                     try:
                         command = commands.get(timeout=0.25)
                     except Empty:
+                        if watched_draft is not None:
+                            status = browser.current_screening_form_status(watched_draft.source_url)
+                            if status in {
+                                HhFormReviewStatus.VACANCY_CLOSED,
+                                HhFormReviewStatus.ALREADY_APPLIED,
+                            }:
+                                self._store_form_review_status(watched_draft, status)
+                                watched_draft = None
                         continue
                     if command is None:
                         return
@@ -589,6 +600,7 @@ class DesktopBridge:
                     except Exception as error:
                         command.response.put(error)
                         return
+                    watched_draft = command.draft if result.get("status") == "READY" else None
                     command.response.put(result)
         except Exception as error:
             self._fail_pending_form_reviews(commands, error)
@@ -661,12 +673,7 @@ class DesktopBridge:
             HhFormReviewStatus.VACANCY_CLOSED,
             HhFormReviewStatus.ALREADY_APPLIED,
         }:
-            database = create_database(self._settings)
-            try:
-                with database.sessions.begin() as session:
-                    ScreeningDraftService(session).invalidate(draft.form_id)
-            finally:
-                database.close()
+            self._store_form_review_status(draft, review.status)
         if review.status is not HhFormReviewStatus.READY:
             return self._result(
                 review.status.value,
@@ -677,6 +684,30 @@ class DesktopBridge:
             "filled": len(review.filled_keys),
             "skipped": len(review.skipped_keys),
         }
+
+    def _store_form_review_status(
+        self,
+        draft: ScreeningDraft,
+        status: HhFormReviewStatus,
+    ) -> None:
+        database = create_database(self._settings)
+        try:
+            with database.sessions.begin() as session:
+                service = ScreeningDraftService(session)
+                if status is HhFormReviewStatus.ALREADY_APPLIED:
+                    service.mark_sent(
+                        draft.application_id,
+                        version_hash=draft.version_hash,
+                    )
+                else:
+                    service.record_availability_check(
+                        self._account_id,
+                        draft.form_id,
+                        VacancyAvailability.ARCHIVED,
+                        checked_at=datetime.now(UTC),
+                    )
+        finally:
+            database.close()
 
     def _record_action(
         self,
