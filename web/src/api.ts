@@ -59,13 +59,13 @@ export async function loadWorkspace(): Promise<{
   sent: SentApplication[];
   communications: Communications;
 }> {
+  const forms = await reconcileForms();
   const [
     dashboard,
     autonomy,
     directionOptions,
     profile,
     queue,
-    forms,
     rejected,
     sent,
     communications,
@@ -76,7 +76,6 @@ export async function loadWorkspace(): Promise<{
       request<DirectionOptions>("/api/directions/options"),
       request<Profile>(`/api/profile?account_id=${ACCOUNT_ID}`),
       request<QueueItem[]>(`/api/queue?account_id=${ACCOUNT_ID}`),
-      request<FormDraft[]>(`/api/forms?account_id=${ACCOUNT_ID}`),
       request<RejectedVacancy[]>(`/api/rejected?account_id=${ACCOUNT_ID}&limit=1000`),
       request<SentApplication[]>(`/api/sent?account_id=${ACCOUNT_ID}&limit=1000`),
       request<Communications>(`/api/communications?account_id=${ACCOUNT_ID}`),
@@ -92,6 +91,14 @@ export async function loadWorkspace(): Promise<{
     sent,
     communications,
   };
+}
+
+async function reconcileForms(): Promise<FormDraft[]> {
+  const session = await request<{ key: string }>("/api/session");
+  return request<FormDraft[]>(`/api/forms/reconcile?account_id=${ACCOUNT_ID}`, {
+    method: "POST",
+    headers: { "X-Hugin-Session": session.key },
+  });
 }
 
 export function loadVacancy(vacancyId: string): Promise<VacancyCard> {

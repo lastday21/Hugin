@@ -656,6 +656,7 @@ export default function App() {
                         : current,
                     )
                   }
+                  onRefresh={() => refresh(false)}
                   onToast={showToast}
                 />
               )}
@@ -1607,15 +1608,18 @@ function AttentionView({
   tab,
   onTabChanged,
   onFormChanged,
+  onRefresh,
   onToast,
 }: {
   forms: FormDraft[];
   tab: AttentionTab;
   onTabChanged: (tab: AttentionTab) => void;
   onFormChanged: (form: FormDraft) => void;
+  onRefresh: () => Promise<void>;
   onToast: (toast: Toast) => void;
 }) {
   const [busyForm, setBusyForm] = useState<number | null>(null);
+  const busyFormRef = useRef<number | null>(null);
   const inputTabRef = useRef<HTMLButtonElement>(null);
   const reviewTabRef = useRef<HTMLButtonElement>(null);
   const inputForms = forms.filter((form) => form.state === "INPUT_REQUIRED");
@@ -1640,11 +1644,13 @@ function AttentionView({
   }
 
   async function openForm(form: FormDraft): Promise<void> {
-    if (busyForm !== null) return;
+    if (busyFormRef.current !== null) return;
+    busyFormRef.current = form.form_id;
     setBusyForm(form.form_id);
     try {
       if (window.pywebview?.api) {
         const result = await window.pywebview.api.open_form(form.vacancy_id);
+        await onRefresh();
         if (!openedByDesktop(result.status)) throw new Error(result.message);
         onToast({ kind: "success", message: result.message });
       } else {
@@ -1654,6 +1660,7 @@ function AttentionView({
     } catch (reason) {
       onToast({ kind: "error", message: readableError(reason) });
     } finally {
+      busyFormRef.current = null;
       setBusyForm(null);
     }
   }
