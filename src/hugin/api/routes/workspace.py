@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -9,6 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from hugin.adapters.hh_vacancy_status import HhVacancyStatusProbe
 from hugin.api.dependencies import read_session, require_session_key, write_session
 from hugin.database.models import (
     ApplicationModel,
@@ -461,6 +463,34 @@ def forms(
 ) -> tuple[FormDraftResponse, ...]:
     drafts = ScreeningDraftService(session).list_pending(account_id)
     return tuple(_form_response(draft) for draft in drafts)
+
+
+@router.post("/forms/reconcile", response_model=tuple[FormDraftResponse, ...])
+def reconcile_forms(
+    session: WriteSession,
+    _guard: SessionGuard,
+    account_id: int = Query(default=1, ge=1),
+) -> tuple[FormDraftResponse, ...]:
+    service = ScreeningDraftService(session)
+    checked_at = datetime.now(UTC)
+    checks = service.pending_availability_checks(
+        account_id,
+        checked_before=checked_at - timedelta(minutes=15),
+    )
+    if checks:
+        probe = HhVacancyStatusProbe()
+        with ThreadPoolExecutor(max_workers=min(8, len(checks))) as pool:
+            results = tuple(pool.map(lambda item: probe.check(item.source_url), checks))
+        for check, availability in zip(checks, results, strict=True):
+            if availability is not None:
+                service.record_availability_check(
+                    account_id,
+                    check.form_id,
+                    availability,
+                    checked_at=checked_at,
+                )
+    service.reconcile_pending_answers(account_id)
+    return tuple(_form_response(draft) for draft in service.list_pending(account_id))
 
 
 @router.post("/forms/{form_id}/answers", response_model=FormDraftResponse)

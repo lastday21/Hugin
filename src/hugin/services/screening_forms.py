@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from typing import cast
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, or_, select
 from sqlalchemy.orm import Session
 
 from hugin.database.models import (
@@ -22,7 +22,7 @@ from hugin.database.models import (
     VacancyModel,
     VerifiedFactModel,
 )
-from hugin.domain.applications import ApplicationState
+from hugin.domain.applications import ApplicationState, EventPayload
 from hugin.domain.content import (
     AnswerSource,
     ConfirmationState,
@@ -39,6 +39,7 @@ from hugin.domain.hh import (
 from hugin.domain.tasks import TaskState
 from hugin.domain.time import as_utc
 from hugin.domain.vacancies import VacancyAvailability
+from hugin.repositories.applications import ApplicationRepository
 from hugin.repositories.tasks import FORM_PREFLIGHT_PASSED, QueueTaskRepository
 from hugin.services.ai_prompts import AiPromptSettingsService
 from hugin.services.autonomy import AutonomyPolicy, AutonomyPolicyService
@@ -96,6 +97,13 @@ class StoredScreeningSubmission:
     form_id: int
     application_id: int
     payload: HhScreeningSubmission
+
+
+@dataclass(frozen=True, slots=True)
+class ScreeningAvailabilityCheck:
+    form_id: int
+    vacancy_id: str
+    source_url: str
 
 
 QUESTION_KEYS: tuple[tuple[str, tuple[re.Pattern[str], ...]], ...] = (
@@ -331,8 +339,19 @@ class ScreeningDraftService:
         forms = self._session.scalars(
             select(ScreeningFormModel)
             .join(ApplicationModel, ApplicationModel.id == ScreeningFormModel.application_id)
+            .join(VacancyModel, VacancyModel.id == ApplicationModel.vacancy_id)
+            .outerjoin(
+                ApplicationTaskModel,
+                ApplicationTaskModel.application_id == ApplicationModel.id,
+            )
             .where(
                 ApplicationModel.account_id == account_id,
+                ApplicationModel.state == ApplicationState.APPLYING,
+                VacancyModel.availability == VacancyAvailability.ACTIVE,
+                or_(
+                    ApplicationTaskModel.id.is_(None),
+                    ApplicationTaskModel.state.not_in((TaskState.SKIPPED, TaskState.COMPLETED)),
+                ),
                 ScreeningFormModel.state.in_(
                     (
                         ScreeningFormState.REVIEW_REQUIRED,
@@ -349,9 +368,19 @@ class ScreeningDraftService:
             select(ScreeningFormModel)
             .join(ApplicationModel, ApplicationModel.id == ScreeningFormModel.application_id)
             .join(VacancyModel, VacancyModel.id == ApplicationModel.vacancy_id)
+            .outerjoin(
+                ApplicationTaskModel,
+                ApplicationTaskModel.application_id == ApplicationModel.id,
+            )
             .where(
                 ApplicationModel.account_id == account_id,
+                ApplicationModel.state == ApplicationState.APPLYING,
                 VacancyModel.hh_id == vacancy_id,
+                VacancyModel.availability == VacancyAvailability.ACTIVE,
+                or_(
+                    ApplicationTaskModel.id.is_(None),
+                    ApplicationTaskModel.state.not_in((TaskState.SKIPPED, TaskState.COMPLETED)),
+                ),
                 ScreeningFormModel.state.in_(
                     (
                         ScreeningFormState.REVIEW_REQUIRED,
@@ -365,6 +394,237 @@ class ScreeningDraftService:
         if form is None:
             raise LookupError("Черновик анкеты для этой вакансии не найден")
         return self._draft(form)
+
+    def reconcile_pending_answers(self, account_id: int) -> int:
+        forms = tuple(
+            self._session.scalars(
+                select(ScreeningFormModel)
+                .join(ApplicationModel, ApplicationModel.id == ScreeningFormModel.application_id)
+                .join(VacancyModel, VacancyModel.id == ApplicationModel.vacancy_id)
+                .outerjoin(
+                    ApplicationTaskModel,
+                    ApplicationTaskModel.application_id == ApplicationModel.id,
+                )
+                .where(
+                    ApplicationModel.account_id == account_id,
+                    ApplicationModel.state == ApplicationState.APPLYING,
+                    VacancyModel.availability == VacancyAvailability.ACTIVE,
+                    or_(
+                        ApplicationTaskModel.id.is_(None),
+                        ApplicationTaskModel.state.not_in((TaskState.SKIPPED, TaskState.COMPLETED)),
+                    ),
+                    ScreeningFormModel.state.in_(
+                        (
+                            ScreeningFormState.REVIEW_REQUIRED,
+                            ScreeningFormState.INPUT_REQUIRED,
+                        )
+                    ),
+                )
+                .order_by(ScreeningFormModel.updated_at, ScreeningFormModel.id)
+            )
+        )
+        reconciled = 0
+        policy = AutonomyPolicyService(self._session).get()
+        selected_at = datetime.now(UTC)
+        for form in forms:
+            application = self._session.get(ApplicationModel, form.application_id)
+            if application is None:
+                continue
+            profile = self._session.scalar(
+                select(CandidateProfileModel).where(
+                    CandidateProfileModel.account_id == application.account_id
+                )
+            )
+            if profile is None:
+                continue
+            templates = self._templates(profile.id, application)
+            facts = self._facts(profile.id, application)
+            rows = tuple(
+                self._session.execute(
+                    select(ScreeningQuestionModel, ScreeningAnswerModel)
+                    .outerjoin(
+                        ScreeningAnswerModel,
+                        ScreeningAnswerModel.question_id == ScreeningQuestionModel.id,
+                    )
+                    .where(ScreeningQuestionModel.form_id == form.id)
+                    .order_by(ScreeningQuestionModel.position, ScreeningQuestionModel.id)
+                )
+            )
+            changed = False
+            for question, answer in rows:
+                if answer is None:
+                    answer = ScreeningAnswerModel(question_id=question.id)
+                    self._session.add(answer)
+                    changed = True
+                if answer.is_confirmed and answer.answer_text and answer.answer_text.strip():
+                    continue
+                resolved = self._resolve(
+                    self._stored_field(question),
+                    templates,
+                    facts,
+                    policy=policy,
+                    now=selected_at,
+                )
+                if resolved is None:
+                    continue
+                if (
+                    answer.answer_text != resolved.text
+                    or answer.source is not resolved.source
+                    or answer.verified_fact_id != resolved.verified_fact_id
+                    or answer.is_confirmed != resolved.confirmed
+                ):
+                    changed = True
+                answer.answer_text = resolved.text
+                answer.source = resolved.source
+                answer.verified_fact_id = resolved.verified_fact_id
+                answer.is_confirmed = resolved.confirmed
+                answer.confirmed_at = selected_at if resolved.confirmed else None
+
+            if not changed:
+                continue
+            self._session.flush()
+            refreshed_rows = tuple(
+                self._session.execute(
+                    select(ScreeningQuestionModel, ScreeningAnswerModel)
+                    .join(
+                        ScreeningAnswerModel,
+                        ScreeningAnswerModel.question_id == ScreeningQuestionModel.id,
+                    )
+                    .where(ScreeningQuestionModel.form_id == form.id)
+                )
+            )
+            required_missing = any(
+                question.is_required
+                and (
+                    answer.answer_text is None
+                    or not answer.answer_text.strip()
+                    or not answer.is_confirmed
+                )
+                for question, answer in refreshed_rows
+            )
+            has_unconfirmed_answer = any(
+                answer.answer_text is not None
+                and answer.answer_text.strip()
+                and not answer.is_confirmed
+                for _question, answer in refreshed_rows
+            )
+            if required_missing:
+                form.state = ScreeningFormState.INPUT_REQUIRED
+                form.confirmed_at = None
+            elif form.requires_confirmation or has_unconfirmed_answer:
+                form.state = ScreeningFormState.REVIEW_REQUIRED
+                form.confirmed_at = None
+            else:
+                form.state = ScreeningFormState.CONFIRMED
+                form.confirmed_at = selected_at
+                self._resume_task(form.application_id, selected_at)
+            reconciled += 1
+        self._session.flush()
+        return reconciled
+
+    def pending_availability_checks(
+        self,
+        account_id: int,
+        *,
+        checked_before: datetime,
+        limit: int = 25,
+    ) -> tuple[ScreeningAvailabilityCheck, ...]:
+        if limit < 1:
+            return ()
+        rows = self._session.execute(
+            select(ScreeningFormModel, VacancyModel)
+            .join(ApplicationModel, ApplicationModel.id == ScreeningFormModel.application_id)
+            .join(VacancyModel, VacancyModel.id == ApplicationModel.vacancy_id)
+            .outerjoin(
+                ApplicationTaskModel,
+                ApplicationTaskModel.application_id == ApplicationModel.id,
+            )
+            .where(
+                ApplicationModel.account_id == account_id,
+                ApplicationModel.state == ApplicationState.APPLYING,
+                VacancyModel.availability == VacancyAvailability.ACTIVE,
+                or_(
+                    ApplicationTaskModel.id.is_(None),
+                    ApplicationTaskModel.state.not_in((TaskState.SKIPPED, TaskState.COMPLETED)),
+                ),
+                ScreeningFormModel.state.in_(
+                    (
+                        ScreeningFormState.REVIEW_REQUIRED,
+                        ScreeningFormState.INPUT_REQUIRED,
+                    )
+                ),
+                (
+                    ScreeningFormModel.availability_checked_at.is_(None)
+                    | (ScreeningFormModel.availability_checked_at <= as_utc(checked_before))
+                ),
+            )
+            .order_by(
+                ScreeningFormModel.availability_checked_at.asc().nullsfirst(),
+                ScreeningFormModel.updated_at,
+                ScreeningFormModel.id,
+            )
+            .limit(limit)
+        )
+        return tuple(
+            ScreeningAvailabilityCheck(form.id, vacancy.hh_id, vacancy.source_url)
+            for form, vacancy in rows
+        )
+
+    def record_availability_check(
+        self,
+        account_id: int,
+        form_id: int,
+        availability: VacancyAvailability,
+        *,
+        checked_at: datetime,
+    ) -> None:
+        form = self._session.scalar(
+            select(ScreeningFormModel)
+            .join(ApplicationModel, ApplicationModel.id == ScreeningFormModel.application_id)
+            .where(
+                ScreeningFormModel.id == form_id,
+                ApplicationModel.account_id == account_id,
+            )
+        )
+        if form is None:
+            return
+        form.availability_checked_at = as_utc(checked_at)
+        if availability is VacancyAvailability.ACTIVE:
+            self._session.flush()
+            return
+        application = self._session.get(ApplicationModel, form.application_id)
+        if application is None:
+            return
+        vacancy = self._session.get(VacancyModel, application.vacancy_id)
+        if vacancy is None:
+            return
+        vacancy.availability = availability
+        form.state = ScreeningFormState.INVALIDATED
+        event_payload: EventPayload = {
+            "source": "hh.ru",
+            "availability": availability.value,
+            "form_id": form.id,
+        }
+        if application.state is ApplicationState.APPLYING:
+            ApplicationRepository(self._session).transition_state(
+                application.id,
+                ApplicationState.CLOSED,
+                event_payload,
+            )
+        task = QueueTaskRepository(self._session).get_by_application_id(application.id)
+        if task is not None and task.state in {
+            TaskState.PENDING,
+            TaskState.RETRY_SCHEDULED,
+            TaskState.REVIEW_REQUIRED,
+            TaskState.INPUT_REQUIRED,
+        }:
+            QueueTaskRepository(self._session).transition(
+                task.id,
+                TaskState.SKIPPED,
+                error_code="VACANCY_CLOSED",
+                event_payload=event_payload,
+            )
+        self._session.flush()
 
     def invalidate(self, form_id: int) -> None:
         form = self._session.get(ScreeningFormModel, form_id)
@@ -751,7 +1011,8 @@ class ScreeningDraftService:
         normalized_question = self._normalize(field.question)
         for template, fact in templates:
             fact_allowed = fact is not None and (
-                fact.state == ConfirmationState.CONFIRMED and fact.allow_in_forms
+                fact.state == ConfirmationState.CONFIRMED
+                and fact.allow_in_forms
                 and self._fact_is_current(
                     fact,
                     field.question,
@@ -769,7 +1030,7 @@ class ScreeningDraftService:
                         fact_allowed,
                     )
 
-        category = self._fact_category(field.question)
+        category = self._question_key(field.question) or self._fact_category(field.question)
         if category is None:
             return None
         for fact in facts:
@@ -841,9 +1102,7 @@ class ScreeningDraftService:
         scope = f"{application.direction_id or 0}:{application.resume_id}"
         key = f"screening:{scope}:{digest}"
         category = (
-            self._question_key(question)
-            or self._fact_category(question)
-            or "screening_answer"
+            self._question_key(question) or self._fact_category(question) or "screening_answer"
         )
         fact = self._session.scalar(
             select(VerifiedFactModel).where(

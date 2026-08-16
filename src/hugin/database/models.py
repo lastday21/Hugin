@@ -915,6 +915,7 @@ class ScreeningFormModel(Base):
     )
     requires_confirmation: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    availability_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
     )

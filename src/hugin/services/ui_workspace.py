@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from hugin.database.models import (
@@ -29,7 +29,7 @@ from hugin.database.models import (
     VacancyDiscoveryModel,
     VacancyModel,
 )
-from hugin.domain.applications import ApplicationEventType
+from hugin.domain.applications import ApplicationEventType, ApplicationState
 from hugin.domain.automation import AutomationJobKind, AutomationJobState
 from hugin.domain.content import (
     CoverLetterState,
@@ -42,6 +42,7 @@ from hugin.domain.content import (
 from hugin.domain.directions import DirectionScope, VacancyState
 from hugin.domain.tasks import TaskState
 from hugin.domain.time import day_start_utc
+from hugin.domain.vacancies import VacancyAvailability
 from hugin.repositories.applications import ApplicationRepository
 from hugin.services.ai_prompts import AiPromptSettingsService
 from hugin.services.queue import QueueService
@@ -261,8 +262,19 @@ class UiWorkspaceService:
                 select(func.count())
                 .select_from(ScreeningFormModel)
                 .join(ApplicationModel, ApplicationModel.id == ScreeningFormModel.application_id)
+                .join(VacancyModel, VacancyModel.id == ApplicationModel.vacancy_id)
+                .outerjoin(
+                    ApplicationTaskModel,
+                    ApplicationTaskModel.application_id == ApplicationModel.id,
+                )
                 .where(
                     ApplicationModel.account_id == account_id,
+                    ApplicationModel.state == ApplicationState.APPLYING,
+                    VacancyModel.availability == VacancyAvailability.ACTIVE,
+                    or_(
+                        ApplicationTaskModel.id.is_(None),
+                        ApplicationTaskModel.state.not_in((TaskState.SKIPPED, TaskState.COMPLETED)),
+                    ),
                     ScreeningFormModel.state.in_(pending_form_states),
                 )
             )

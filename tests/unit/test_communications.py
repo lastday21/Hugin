@@ -137,7 +137,7 @@ def test_communications_migration_preserves_existing_rows(settings: Settings) ->
         database.close()
 
     upgrade_database(settings)
-    assert current_revision(settings) == "0023_cover_letter_routing"
+    assert current_revision(settings) == "0025_screening_availability"
     check_database_schema(settings)
 
     migrated = create_database(settings)

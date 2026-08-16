@@ -9,9 +9,12 @@ from hugin.core.settings import Settings
 from hugin.database import create_database, upgrade_database
 from hugin.database.models import (
     AnswerTemplateModel,
+    ApplicationModel,
+    ApplicationTaskModel,
     CandidateProfileModel,
     CoverLetterModel,
     ScreeningFormModel,
+    VacancyModel,
     VerifiedFactModel,
 )
 from hugin.domain import (
@@ -22,8 +25,10 @@ from hugin.domain import (
     ScreeningFormState,
     VacancyData,
 )
+from hugin.domain.applications import ApplicationState
 from hugin.domain.content import CoverLetterState
 from hugin.domain.tasks import TaskState
+from hugin.domain.vacancies import VacancyAvailability
 from hugin.repositories import (
     AccountRepository,
     ApplicationRepository,
@@ -276,6 +281,157 @@ def test_option_answer_is_used_only_on_exact_match(settings: Settings) -> None:
             )
             assert changed_wording.answers == {}
             assert changed_wording.state is ScreeningFormState.INPUT_REQUIRED
+    finally:
+        database.close()
+
+
+def test_pending_salary_question_is_reconciled_from_confirmed_profile_fact(
+    settings: Settings,
+) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    try:
+        with database.sessions.begin() as session:
+            account = AccountRepository(session).create("Иван", "salary-reconcile-account")
+            resume = ResumeRepository(session).upsert(account.id, "resume-salary", "Python")
+            vacancy = VacancyRepository(session).upsert(
+                VacancyData(
+                    "vacancy-salary",
+                    "Python-разработчик",
+                    "https://hh.ru/vacancy/vacancy-salary",
+                )
+            )
+            application = ApplicationRepository(session).create_apply_intent(
+                account.id,
+                vacancy.id,
+                resume.id,
+            )
+            tasks = QueueTaskRepository(session)
+            task = tasks.enqueue(application.id, 90)
+            tasks.transition(task.id, TaskState.RUNNING)
+            tasks.transition(task.id, TaskState.INPUT_REQUIRED)
+            profile = CandidateProfileModel(
+                account_id=account.id,
+                active_resume_id=resume.id,
+                display_name="Иван",
+            )
+            session.add(profile)
+            session.flush()
+            service = ScreeningDraftService(session)
+            draft = service.capture(
+                application.id,
+                HhScreeningForm(
+                    fields=(
+                        HhScreeningField(
+                            "salary",
+                            (
+                                "Пожалуйста, уточните Ваши зарплатные ожидания из расчета "
+                                "стабильной ежемесячной суммы на руки."
+                            ),
+                            "textarea",
+                            is_required=True,
+                        ),
+                    )
+                ),
+            )
+            assert draft.state is ScreeningFormState.INPUT_REQUIRED
+
+            session.add(
+                VerifiedFactModel(
+                    profile_id=profile.id,
+                    category="salary_expectation",
+                    content="120 000 рублей на руки",
+                    source_type="user",
+                    source_reference="profile-question:salary_expectation",
+                    actual_at=datetime.now(UTC),
+                    state=ConfirmationState.CONFIRMED,
+                    allow_in_forms=True,
+                )
+            )
+            session.flush()
+
+            assert service.reconcile_pending_answers(account.id) == 1
+            assert service.list_pending(account.id) == ()
+            submission = service.get_auto_submission(application.id)
+            assert submission is not None
+            assert submission.payload.answers == (("salary", "120 000 рублей на руки"),)
+            assert tasks.get(task.id).state is TaskState.RETRY_SCHEDULED
+    finally:
+        database.close()
+
+
+def test_pending_forms_hide_inactive_vacancies_and_finished_applications(
+    settings: Settings,
+) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    try:
+        with database.sessions.begin() as session:
+            account = AccountRepository(session).create("Иван", "stale-form-account")
+            resume = ResumeRepository(session).upsert(account.id, "resume-stale", "Python")
+            vacancy = VacancyRepository(session).upsert(
+                VacancyData(
+                    "vacancy-stale",
+                    "Python-разработчик",
+                    "https://hh.ru/vacancy/vacancy-stale",
+                )
+            )
+            application = ApplicationRepository(session).create_apply_intent(
+                account.id,
+                vacancy.id,
+                resume.id,
+            )
+            tasks = QueueTaskRepository(session)
+            task = tasks.enqueue(application.id, 90)
+            tasks.transition(task.id, TaskState.RUNNING)
+            tasks.transition(task.id, TaskState.INPUT_REQUIRED)
+            session.add(CandidateProfileModel(account_id=account.id, display_name="Иван"))
+            session.flush()
+            service = ScreeningDraftService(session)
+            draft = service.capture(
+                application.id,
+                HhScreeningForm(
+                    fields=(
+                        HhScreeningField(
+                            "motivation",
+                            "Почему хотите работать у нас?",
+                            "textarea",
+                            is_required=True,
+                        ),
+                    )
+                ),
+            )
+            assert service.list_pending(account.id)[0].form_id == draft.form_id
+            stored_task = session.get(ApplicationTaskModel, task.id)
+            assert stored_task is not None
+            stored_task.state = TaskState.SKIPPED
+            session.flush()
+            assert service.list_pending(account.id) == ()
+            stored_task.state = TaskState.INPUT_REQUIRED
+            session.flush()
+            checks = service.pending_availability_checks(
+                account.id,
+                checked_before=datetime.now(UTC),
+            )
+            assert tuple(check.form_id for check in checks) == (draft.form_id,)
+
+            service.record_availability_check(
+                account.id,
+                draft.form_id,
+                VacancyAvailability.ARCHIVED,
+                checked_at=datetime.now(UTC),
+            )
+            assert service.list_pending(account.id) == ()
+            with pytest.raises(LookupError):
+                service.get_pending(account.id, vacancy.hh_id)
+
+            stored_vacancy = session.get(VacancyModel, vacancy.id)
+            assert stored_vacancy is not None
+            assert stored_vacancy.availability is VacancyAvailability.ARCHIVED
+            stored_application = session.get(ApplicationModel, application.id)
+            assert stored_application is not None
+            assert stored_application.state is ApplicationState.CLOSED
+            assert tasks.get(task.id).state is TaskState.SKIPPED
     finally:
         database.close()
 
