@@ -17,8 +17,8 @@ from hugin.services.vacancy_analysis import (
 )
 
 
-def test_rules_version_is_python_it_v41() -> None:
-    assert RULES_VERSION == "python_it_v41"
+def test_rules_version_is_python_it_v42() -> None:
+    assert RULES_VERSION == "python_it_v42"
 
 
 @pytest.mark.parametrize(
@@ -393,6 +393,35 @@ def test_non_development_primary_roles_are_rejected(
 
     assert PythonBackendRules().evaluate(vacancy).category is RuleCategory.REJECTED
     assert AdjacentItRules().evaluate(vacancy).category is RuleCategory.REJECTED
+
+
+@pytest.mark.parametrize(
+    ("title", "reason"),
+    [
+        ("Финансовый директор", "финансы или бухгалтерия"),
+        ("Администратор Oracle", "администрирование"),
+        ("Linux Administrator", "администрирование"),
+        ("Технический художник", "компьютерная графика"),
+        ("Haskell Backend Developer", "Haskell"),
+    ],
+)
+def test_adjacent_it_rejects_live_false_positive_roles(title: str, reason: str) -> None:
+    result = AdjacentItRules().evaluate(
+        VacancyData(
+            f"false-positive-{title}",
+            title,
+            "https://hh.ru/vacancy/false-positive",
+            description=(
+                "Участие в разработке внутренних систем и автоматизации процессов. "
+                "Работа с PostgreSQL, Docker и Linux."
+            ),
+            key_skills=("PostgreSQL", "Docker", "Linux"),
+        ),
+        RuleContext(skills=("Python, FastAPI, PostgreSQL, Docker, Linux",)),
+    )
+
+    assert result.category is RuleCategory.REJECTED
+    assert any(reason in item for item in result.reasons)
 
 
 @pytest.mark.parametrize(

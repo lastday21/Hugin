@@ -26,7 +26,7 @@ from hugin.repositories.vacancies import VacancyRepository
 from hugin.services.career_directions import CareerDirectionService
 from hugin.services.vacancy_duplicates import VacancyDuplicateDetector
 
-RULES_VERSION = "python_it_v41"
+RULES_VERSION = "python_it_v42"
 MAX_VACANCY_AGE = timedelta(days=30)
 
 
@@ -390,6 +390,23 @@ class PythonBackendRules:
     )
     _excluded_roles: ClassVar[tuple[tuple[str, str], ...]] = (
         (
+            r"\bфинансов\w*\s+директор\w*\b|\bfinancial\s+director\b|\bcfo\b|"
+            r"\bглавн\w*\s+бухгалтер\w*\b",
+            "основная роль: финансы или бухгалтерия",
+        ),
+        (
+            r"\b(?:администратор|administrator)\w*\s+"
+            r"(?:oracle|linux|unix|postgresql|mysql|баз\w*\s+данн\w*)\b|"
+            r"\b(?:oracle|linux|unix|postgresql|mysql|database)\s+"
+            r"(?:администратор|administrator)\b|\bdba\b",
+            "основная роль: системное администрирование или администрирование баз данных",
+        ),
+        (
+            r"\bтехническ\w*\s+художник\w*\b|\btechnical\s+artist\b|"
+            r"\b[23]d\s+artist\b",
+            "основная роль: компьютерная графика",
+        ),
+        (
             r"\bquant(?:itative)?\s+trader\b|\bквант\w*\s+трейдер\b",
             "основная роль: количественный трейдинг",
         ),
@@ -666,6 +683,7 @@ class PythonBackendRules:
                 "software engineer",
             )
         )
+        has_engineering_title = any(marker in title for marker in ("engineer", "инженер"))
         if (
             not rejected
             and self.scope is DirectionScope.PYTHON_BACKEND
@@ -673,6 +691,16 @@ class PythonBackendRules:
             and not has_development_title
         ):
             rejected.append("название вакансии не относится к Python backend-разработке")
+        if (
+            not rejected
+            and self.scope is DirectionScope.IT_ADJACENT
+            and destination is None
+            and not has_development_title
+            and not has_engineering_title
+        ):
+            rejected.append(
+                "название вакансии не относится к разработке или технической автоматизации"
+            )
         if not rejected and destination is not None and destination is not self.scope:
             return RuleEvaluation(
                 score=0,
@@ -1018,6 +1046,7 @@ class PythonBackendRules:
                 "nestjs",
                 "c++",
                 "rust",
+                "haskell",
             )
         )
 
@@ -1032,6 +1061,7 @@ class PythonBackendRules:
             (r"(?<!\w)c\+\+(?!\w)", "C++"),
             (r"\b1[сc]\b", "1С"),
             (r"\brust\b", "Rust"),
+            (r"\bhaskell\b", "Haskell"),
             (r"\btypescript\b|\bjavascript\b", "JavaScript/TypeScript"),
             (r"\breact\b|\bvue(?:\.js)?\b|\bangular\b", "клиентский JavaScript"),
             (r"\bruby\b|\bruby\s+on\s+rails\b|\brails\b", "Ruby/Rails"),
