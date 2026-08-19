@@ -33,6 +33,7 @@ from hugin.services.hh_profile import HhProfileSyncService
 from hugin.services.job_search import JobSearchSyncService
 from hugin.services.queue import QueueService
 from hugin.services.resume_profile import ProfileQuestionService
+from hugin.services.screening_forms import ScreeningDraftService
 from hugin.services.vacancy_analysis import RuleCategory, VacancyAnalysisService
 from hugin.services.vacancy_review import VacancyReviewEntry, VacancyReviewService
 
@@ -940,6 +941,7 @@ def _run_applications(
         attempts = 0
         attempt_limit = max(run_limit * 3, run_limit + 5) if arguments.send else 1
         while attempts < attempt_limit and sent < run_limit:
+            screening_submission = None
             with database.sessions.begin() as session:
                 runtime_service = ApplicationAutomationService(session)
                 runtime_policy = runtime_service.policy()
@@ -953,6 +955,12 @@ def _run_applications(
                     allow_paused_review=not arguments.send,
                     include_stretch=not arguments.exclude_stretch,
                 )
+                if job is not None:
+                    stored_submission = ScreeningDraftService(session).get_auto_submission(
+                        job.application.id
+                    )
+                    if stored_submission is not None:
+                        screening_submission = stored_submission.payload
             if job is None:
                 break
             attempts += 1
@@ -966,6 +974,7 @@ def _run_applications(
                     cover_letter=job.cover_letter,
                     submit=arguments.send,
                     submit_guard=lambda: _applications_enabled(settings),
+                    screening_submission=screening_submission,
                 )
             except Exception as error:
                 result = HhApplyResult(

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import delete, select
@@ -48,7 +49,9 @@ from hugin.repositories import (
 from hugin.repositories.tasks import (
     FORM_PREFLIGHT_PASSED,
     FORM_PREFLIGHT_RUNNING,
+    FORM_RETRY_EXHAUSTED,
 )
+from hugin.services import application_automation as application_automation_module
 from hugin.services.ai_prompts import DEFAULT_AI_PROMPTS
 from hugin.services.application_automation import ApplicationAutomationService
 from hugin.services.application_reconciliation import ApplicationReconciliationService
@@ -75,6 +78,82 @@ def _supervised_letter() -> str:
         "целостность данных и проверять поведение службы перед выпуском.\n\n"
         "Готов подробнее рассказать про выполненные задачи и обсудить задачи команды."
     )
+
+
+@pytest.mark.parametrize(
+    ("has_previous_submission", "expected_state", "expected_error"),
+    [
+        (False, TaskState.RETRY_SCHEDULED, HhApplyStatus.QUESTIONS_REQUIRED.value),
+        (True, TaskState.REVIEW_REQUIRED, FORM_RETRY_EXHAUSTED),
+    ],
+)
+def test_repeated_confirmed_form_does_not_loop_in_queue(
+    monkeypatch: pytest.MonkeyPatch,
+    has_previous_submission: bool,
+    expected_state: TaskState,
+    expected_error: str,
+) -> None:
+    draft = SimpleNamespace(
+        state=application_automation_module.ScreeningFormState.CONFIRMED,
+        questions=(SimpleNamespace(),),
+        answers=(SimpleNamespace(),),
+    )
+
+    class FakeScreeningDraftService:
+        def __init__(self, session: object) -> None:
+            assert session is not None
+
+        def get_auto_submission(self, application_id: int) -> object | None:
+            assert application_id == 51
+            return object() if has_previous_submission else None
+
+        def capture_questions(self, application_id: int, questions: object) -> object:
+            assert application_id == 51
+            assert questions == ("Расскажите об опыте",)  # noqa: RUF001
+            return draft
+
+    transitions: list[tuple[int, TaskState, dict[str, object]]] = []
+
+    class FakeTasks:
+        def transition(
+            self,
+            task_id: int,
+            target: TaskState,
+            **kwargs: object,
+        ) -> object:
+            transitions.append((task_id, target, kwargs))
+            return object()
+
+    monkeypatch.setattr(
+        application_automation_module,
+        "ScreeningDraftService",
+        FakeScreeningDraftService,
+    )
+    service = ApplicationAutomationService(object())  # type: ignore[arg-type]
+    service._tasks = FakeTasks()  # type: ignore[assignment]
+    job = SimpleNamespace(
+        task=SimpleNamespace(id=41),
+        application=SimpleNamespace(id=51),
+        vacancy=SimpleNamespace(source_url="https://hh.ru/vacancy/61"),
+    )
+
+    recorded = service.record_result(
+        job,
+        HhApplyResult(
+            HhApplyStatus.QUESTIONS_REQUIRED,
+            job.vacancy.source_url,
+            questions=("Расскажите об опыте",),  # noqa: RUF001
+        ),
+        now=datetime(2026, 8, 19, 8, 0, tzinfo=UTC),
+    )
+
+    assert not recorded.sent
+    assert not recorded.blocking
+    assert len(transitions) == 1
+    task_id, state, values = transitions[0]
+    assert task_id == 41
+    assert state is expected_state
+    assert values["error_code"] == expected_error
 
 
 def test_form_preflight_claims_only_task_without_current_letter(

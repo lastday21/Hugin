@@ -49,6 +49,7 @@ from hugin.repositories.directions import (
 from hugin.repositories.tasks import (
     FORM_PREFLIGHT_PASSED,
     FORM_PREFLIGHT_RUNNING,
+    FORM_RETRY_EXHAUSTED,
     QueueTaskRepository,
     SystemStateRepository,
 )
@@ -1133,21 +1134,31 @@ class ApplicationAutomationService:
             )
 
         if result.status is HhApplyStatus.QUESTIONS_REQUIRED:
+            previous_submission = ScreeningDraftService(self._session).get_auto_submission(
+                job.application.id
+            )
             draft = self._capture_screening_form(job, result)
             payload["question_count"] = len(draft.questions)
             payload["answered_count"] = len(draft.answers)
             payload["screening_form_state"] = draft.state.value
+            repeated_confirmed_form = (
+                previous_submission is not None and draft.state is ScreeningFormState.CONFIRMED
+            )
             self._tasks.transition(
                 job.task.id,
                 (
-                    TaskState.RETRY_SCHEDULED
+                    TaskState.REVIEW_REQUIRED
+                    if repeated_confirmed_form
+                    else TaskState.RETRY_SCHEDULED
                     if draft.state is ScreeningFormState.CONFIRMED
                     else TaskState.INPUT_REQUIRED
                     if draft.state is ScreeningFormState.INPUT_REQUIRED
                     else TaskState.REVIEW_REQUIRED
                 ),
                 scheduled_at=selected_at,
-                error_code=result.status.value,
+                error_code=(
+                    FORM_RETRY_EXHAUSTED if repeated_confirmed_form else result.status.value
+                ),
                 event_payload=payload,
             )
             return RecordedApplyResult(blocking=False, sent=False)

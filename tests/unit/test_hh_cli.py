@@ -77,6 +77,7 @@ class FakeBrowser:
         self.details_read: list[str] = []
         self.applications: list[tuple[str, str, str]] = []
         self.application_submit_modes: list[bool] = []
+        self.screening_submissions: list[object] = []
         FakeBrowser.created = self
 
     def __enter__(self) -> FakeBrowser:
@@ -158,11 +159,13 @@ class FakeBrowser:
         cover_letter: str,
         submit: bool = False,
         submit_guard: object = None,
+        screening_submission: object = None,
     ) -> HhApplyResult:
         assert callable(submit_guard)
         assert expected_resume_hh_id == "resume-1"
         self.applications.append((source_url, expected_resume_title, cover_letter))
         self.application_submit_modes.append(submit)
+        self.screening_submissions.append(screening_submission)
         if submit:
             return HhApplyResult(HhApplyStatus.APPLIED, source_url, "успешно")
         return HhApplyResult(
@@ -193,8 +196,17 @@ def install_fakes(
     tmp_path: Path,
     store: FakeStore,
 ) -> None:
+    class FakeScreeningDraftService:
+        def __init__(self, session: object) -> None:
+            assert session is not None
+
+        def get_auto_submission(self, application_id: int) -> None:
+            assert application_id > 0
+            return None
+
     monkeypatch.setattr(hh_cli, "WindowsCredentialStore", lambda: store)
     monkeypatch.setattr(hh_cli, "VisibleHhBrowser", FakeBrowser)
+    monkeypatch.setattr(hh_cli, "ScreeningDraftService", FakeScreeningDraftService)
     monkeypatch.setattr(hh_cli, "_resume_after_login", lambda _settings, _account_id: None)
     monkeypatch.setattr(
         hh_cli,
@@ -955,6 +967,7 @@ def test_apply_runs_queue_and_records_confirmed_result(
     install_fakes(monkeypatch, tmp_path, FakeStore())
     database = FakeDatabase()
     job = SimpleNamespace(
+        application=SimpleNamespace(id=1),
         vacancy=SimpleNamespace(
             source_url="https://hh.ru/vacancy/100",
             title="Python developer",
@@ -963,6 +976,15 @@ def test_apply_runs_queue_and_records_confirmed_result(
         direction_vacancy=SimpleNamespace(rules_details={"category": "MATCH"}),
         cover_letter="Письмо",
     )
+    saved_submission = object()
+
+    class FakeScreeningDraftService:
+        def __init__(self, session: object) -> None:
+            assert session is not None
+
+        def get_auto_submission(self, application_id: int) -> SimpleNamespace:
+            assert application_id == 1
+            return SimpleNamespace(payload=saved_submission)
 
     class FakeAutomationService:
         jobs: ClassVar[list[SimpleNamespace]] = [job]
@@ -1037,6 +1059,7 @@ def test_apply_runs_queue_and_records_confirmed_result(
         lambda session: SimpleNamespace(synchronize=lambda profile: None),
     )
     monkeypatch.setattr(hh_cli, "ApplicationAutomationService", FakeAutomationService)
+    monkeypatch.setattr(hh_cli, "ScreeningDraftService", FakeScreeningDraftService)
     lifecycle: list[str] = []
 
     def confirm_preview(_prompt: str) -> str:
@@ -1072,6 +1095,7 @@ def test_apply_runs_queue_and_records_confirmed_result(
         assert lifecycle == ["input", "exit"]
     assert FakeBrowser.created is not None
     assert FakeBrowser.created.application_submit_modes == [send]
+    assert FakeBrowser.created.screening_submissions == [saved_submission]
     assert FakeBrowser.created.applications == [
         (
             "https://hh.ru/vacancy/100",
@@ -1094,6 +1118,7 @@ def test_apply_limit_counts_only_confirmed_applications(
     database = FakeDatabase()
     jobs = [
         SimpleNamespace(
+            application=SimpleNamespace(id=1),
             vacancy=SimpleNamespace(
                 hh_id="100",
                 source_url="https://hh.ru/vacancy/100",
@@ -1103,6 +1128,7 @@ def test_apply_limit_counts_only_confirmed_applications(
             cover_letter="Письмо 1",
         ),
         SimpleNamespace(
+            application=SimpleNamespace(id=2),
             vacancy=SimpleNamespace(
                 hh_id="101",
                 source_url="https://hh.ru/vacancy/101",
@@ -1224,6 +1250,7 @@ def test_apply_keeps_queue_available_when_one_result_is_unknown(
     install_fakes(monkeypatch, tmp_path, FakeStore())
     database = FakeDatabase()
     job = SimpleNamespace(
+        application=SimpleNamespace(id=1),
         vacancy=SimpleNamespace(
             source_url="https://hh.ru/vacancy/100",
             title="Python developer",
