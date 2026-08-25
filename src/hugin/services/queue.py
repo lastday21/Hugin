@@ -90,14 +90,19 @@ class QueueService:
     def resume(self) -> SystemStateRecord:
         current = self._system.get()
         if current.state is SystemState.RUNNING:
-            return current
+            return self._without_expired_delay(current)
         if current.state is not SystemState.PAUSED:
             raise ValueError("Сначала нужно устранить защитное состояние hh.ru")
         if self._system.supervised_lease_active():
             raise ValueError(
                 "Нельзя включить очередь, пока выполняется управляемый поштучный отклик"
             )
-        return self._system.transition(SystemState.RUNNING)
+        return self._without_expired_delay(self._system.transition(SystemState.RUNNING))
+
+    def _without_expired_delay(self, current: SystemStateRecord) -> SystemStateRecord:
+        if current.next_apply_at is not None and current.next_apply_at <= datetime.now(UTC):
+            return self._system.set_next_apply_at(None)
+        return current
 
     def status(self) -> QueueStatus:
         return QueueStatus(

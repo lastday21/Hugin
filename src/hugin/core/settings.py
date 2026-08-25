@@ -52,7 +52,7 @@ class Settings(BaseSettings):
     hh_browser_timeout_ms: int = Field(default=60_000, ge=1_000, le=120_000)
     hh_browser_source_ip: IPv4Address | None = None
     hh_background_search_pages: int = Field(default=3, ge=1, le=20)
-    hh_background_detail_limit: int = Field(default=5, ge=1, le=50)
+    hh_background_detail_limit: int = Field(default=20, ge=1, le=50)
     telegram_bot_username: Literal["hugin_workbot"] = "hugin_workbot"
     notification_gateway_url: str = "http://127.0.0.1:8088"
     notification_gateway_key_file: Path | None = None
@@ -71,6 +71,10 @@ class Settings(BaseSettings):
     yandex_ai_host_ip: IPv4Address | None = None
     yandex_ai_source_ip: IPv4Address | None = None
     yandex_ai_timeout_seconds: int = Field(default=120, ge=1, le=300)
+    codex_cli_path: Path | None = None
+    codex_letter_model: str = "gpt-5.6-luna"
+    codex_letter_reasoning_effort: Literal["low", "medium", "high"] = "low"
+    codex_letter_timeout_seconds: int = Field(default=180, ge=30, le=300)
 
     @field_validator("hh_login_url", "hh_resumes_url")
     @classmethod

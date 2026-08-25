@@ -11,6 +11,7 @@ from hugin.database.models import (
     ApplicationEventModel,
     ApplicationModel,
     ApplicationTaskModel,
+    CareerDirectionModel,
     CoverLetterModel,
     DirectionVacancyModel,
     ResumeModel,
@@ -25,12 +26,14 @@ from hugin.domain.applications import (
 from hugin.domain.automation import AutomationJobKind
 from hugin.domain.content import (
     CoverLetterState,
+    IncidentSeverity,
     ScreeningFormState,
     cover_letter_instruction_version,
 )
 from hugin.domain.directions import (
     AccountRecord,
     DirectionRecord,
+    DirectionScope,
     DirectionVacancyRecord,
     ResumeRecord,
     VacancyState,
@@ -57,11 +60,14 @@ from hugin.repositories.vacancies import VacancyRepository
 from hugin.services.ai_prompts import AiPromptSettingsService
 from hugin.services.autonomy import AutonomyPolicyService
 from hugin.services.cover_letter import CoverLetterService
+from hugin.services.incidents import IncidentService
 from hugin.services.queue import QueueService
 from hugin.services.screening_forms import ScreeningDraft, ScreeningDraftService
 from hugin.services.vacancy_analysis import RULES_VERSION, RuleCategory
 
 SUPERVISED_MIN_INTERVAL = timedelta(seconds=60)
+MAX_AUTOMATIC_RETRY_ATTEMPTS = 2
+RETRY_LIMIT_REACHED = "RETRY_LIMIT_REACHED"
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,109 +140,202 @@ class ApplicationAutomationService:
         direction = self._directions.get_by_account_and_name(account.id, direction_name)
         if direction is None:
             raise LookupError(f"Направление «{direction_name}» не найдено")
-        resume = next(
-            (item for item in self._directions.list_resumes(direction.id) if item.is_active),
-            None,
-        )
+        resume = self._active_resume(direction.id)
         if resume is None:
             raise LookupError("Активное резюме направления не найдено")
 
-        allowed = {RuleCategory.MATCH.value}
-        if include_stretch:
-            allowed.add(RuleCategory.STRETCH.value)
+        allowed = self._allowed_categories(include_stretch)
         created = 0
         existing = 0
         for tracked in self._directions.list_tracked_vacancies(direction.id):
-            vacancy = self._vacancies.get(tracked.vacancy_id)
             category = tracked.rules_details.get("category")
             if (
                 tracked.rules_version != RULES_VERSION
                 or tracked.state not in {VacancyState.ANALYZED, VacancyState.QUEUED}
                 or category not in allowed
-                or vacancy.duplicate_of_id is not None
             ):
                 continue
-            current = self._applications.get_by_key(account.id, tracked.vacancy_id, resume.id)
-            if current is not None:
-                task = self._tasks.get_by_application_id(current.id)
-                if current.direction_id != direction.id:
-                    if self._can_reassign_routed_application(
-                        current,
-                        task,
-                        direction,
-                        tracked.vacancy_id,
-                    ):
-                        self._applications.reassign_direction(current.id, direction.id)
-                        if task is None:
-                            self._tasks.enqueue(current.id, self._priority(tracked))
-                        else:
-                            self._tasks.requeue_after_rule_change(
-                                task.id,
-                                priority_score=self._priority(tracked),
-                            )
-                        self._directions.set_vacancy_state(
-                            direction.id,
-                            tracked.vacancy_id,
-                            VacancyState.QUEUED,
-                        )
-                        created += 1
-                        continue
-                    existing += 1
-                    continue
-                if task is None and current.state is ApplicationState.APPLYING:
-                    self._tasks.enqueue(current.id, self._priority(tracked))
-                    self._directions.set_vacancy_state(
-                        direction.id,
-                        tracked.vacancy_id,
-                        VacancyState.QUEUED,
-                    )
-                    created += 1
-                else:
-                    if (
-                        task is not None
-                        and task.state is TaskState.SKIPPED
-                        and task.last_error_code == "VACANCY_RULES_CHANGED"
-                    ):
-                        self._tasks.requeue_after_rule_change(
-                            task.id,
-                            priority_score=self._priority(tracked),
-                        )
-                        self._directions.set_vacancy_state(
-                            direction.id,
-                            tracked.vacancy_id,
-                            VacancyState.QUEUED,
-                        )
-                        created += 1
-                    elif task is not None and task.state not in {
-                        TaskState.COMPLETED,
-                        TaskState.SKIPPED,
-                    }:
-                        self._directions.set_vacancy_state(
-                            direction.id,
-                            tracked.vacancy_id,
-                            VacancyState.QUEUED,
-                        )
-                    existing += 1
-                continue
-            application = self._applications.create_apply_intent(
-                account.id,
-                tracked.vacancy_id,
-                resume.id,
-                direction.id,
+            item_created, item_existing = self._prepare_tracked(
+                account,
+                direction,
+                resume,
+                tracked,
             )
-            self._tasks.enqueue(application.id, self._priority(tracked))
-            self._directions.set_vacancy_state(
-                direction.id,
-                tracked.vacancy_id,
-                VacancyState.QUEUED,
-            )
-            created += 1
+            created += item_created
+            existing += item_existing
         self._tasks.skip_ineligible(
             direction.id,
             rules_version=RULES_VERSION,
-            allowed_categories=frozenset(allowed),
+            allowed_categories=allowed,
         )
         return PreparationResult(account.id, direction.id, resume, created, existing)
+
+    def prepare_vacancies(
+        self,
+        *,
+        account_external_id: str,
+        vacancy_ids: tuple[int, ...],
+        include_stretch: bool,
+    ) -> int:
+        account = self._accounts.get_by_external_id(account_external_id)
+        if account is None:
+            raise LookupError("Аккаунт hh.ru не найден в базе")
+        allowed = self._allowed_categories(include_stretch)
+        created = 0
+        for vacancy_id in dict.fromkeys(vacancy_ids):
+            candidates: list[
+                tuple[DirectionRecord, ResumeRecord, DirectionVacancyRecord]
+            ] = []
+            for direction in self._directions.list_for_account(account.id):
+                if not direction.is_active:
+                    continue
+                try:
+                    tracked = self._directions.get_tracked_vacancy(direction.id, vacancy_id)
+                except LookupError:
+                    continue
+                resume = self._active_resume(direction.id)
+                if (
+                    resume is None
+                    or tracked.rules_version != RULES_VERSION
+                    or tracked.state not in {VacancyState.ANALYZED, VacancyState.QUEUED}
+                    or tracked.rules_details.get("category") not in allowed
+                ):
+                    continue
+                candidates.append((direction, resume, tracked))
+            candidates.sort(key=self._preparation_order)
+            if not candidates:
+                continue
+            direction, resume, tracked = candidates[0]
+            item_created, _item_existing = self._prepare_tracked(
+                account,
+                direction,
+                resume,
+                tracked,
+            )
+            created += item_created
+        return created
+
+    def _prepare_tracked(
+        self,
+        account: AccountRecord,
+        direction: DirectionRecord,
+        resume: ResumeRecord,
+        tracked: DirectionVacancyRecord,
+    ) -> tuple[int, int]:
+        vacancy = self._vacancies.get(tracked.vacancy_id)
+        if vacancy.duplicate_of_id is not None:
+            if self._vacancies.duplicate_family_has_sent_or_live_application(
+                account.id,
+                vacancy.id,
+            ):
+                return 0, 1
+            vacancy = self._vacancies.promote_duplicate(vacancy.id)
+
+        current = self._applications.get_by_key(account.id, tracked.vacancy_id, resume.id)
+        if current is None:
+            current = self._applications.get_for_account_vacancy(
+                account.id,
+                tracked.vacancy_id,
+            )
+        priority = self._priority(tracked)
+        if current is not None:
+            task = self._tasks.get_by_application_id(current.id)
+            if current.direction_id != direction.id:
+                if not self._can_reassign_routed_application(
+                    current,
+                    task,
+                    direction,
+                    tracked.vacancy_id,
+                ):
+                    return 0, 1
+                self._applications.reassign_direction(current.id, direction.id)
+                if task is None:
+                    self._tasks.enqueue(current.id, priority)
+                else:
+                    self._tasks.requeue_after_selection_recovery(
+                        task.id,
+                        priority_score=priority,
+                    )
+                self._directions.set_vacancy_state(
+                    direction.id,
+                    tracked.vacancy_id,
+                    VacancyState.QUEUED,
+                )
+                return 1, 0
+            if task is None and current.state is ApplicationState.APPLYING:
+                self._tasks.enqueue(current.id, priority)
+                self._directions.set_vacancy_state(
+                    direction.id,
+                    tracked.vacancy_id,
+                    VacancyState.QUEUED,
+                )
+                return 1, 0
+            if (
+                task is not None
+                and task.state is TaskState.SKIPPED
+                and task.last_error_code
+                in {"VACANCY_RULES_CHANGED", "VACANCY_DUPLICATE", "NO_RELEVANT_EVIDENCE"}
+                and current.state is ApplicationState.APPLYING
+            ):
+                self._tasks.requeue_after_selection_recovery(
+                    task.id,
+                    priority_score=priority,
+                )
+                self._directions.set_vacancy_state(
+                    direction.id,
+                    tracked.vacancy_id,
+                    VacancyState.QUEUED,
+                )
+                return 1, 0
+            if task is not None and task.state not in {
+                TaskState.COMPLETED,
+                TaskState.SKIPPED,
+            }:
+                self._directions.set_vacancy_state(
+                    direction.id,
+                    tracked.vacancy_id,
+                    VacancyState.QUEUED,
+                )
+            return 0, 1
+
+        application = self._applications.create_apply_intent(
+            account.id,
+            tracked.vacancy_id,
+            resume.id,
+            direction.id,
+        )
+        self._tasks.enqueue(application.id, priority)
+        self._directions.set_vacancy_state(
+            direction.id,
+            tracked.vacancy_id,
+            VacancyState.QUEUED,
+        )
+        return 1, 0
+
+    @staticmethod
+    def _allowed_categories(include_stretch: bool) -> frozenset[str]:
+        values = {RuleCategory.MATCH.value}
+        if include_stretch:
+            values.add(RuleCategory.STRETCH.value)
+        return frozenset(values)
+
+    def _active_resume(self, direction_id: int) -> ResumeRecord | None:
+        return next(
+            (item for item in self._directions.list_resumes(direction_id) if item.is_active),
+            None,
+        )
+
+    @staticmethod
+    def _preparation_order(
+        item: tuple[DirectionRecord, ResumeRecord, DirectionVacancyRecord],
+    ) -> tuple[int, int, float, int]:
+        direction, _resume, tracked = item
+        return (
+            0 if direction.scope is DirectionScope.PYTHON_BACKEND else 1,
+            0 if tracked.rules_details.get("category") == RuleCategory.MATCH.value else 1,
+            -(tracked.rules_score or 0),
+            direction.id,
+        )
 
     def _can_reassign_routed_application(
         self,
@@ -248,7 +347,9 @@ class ApplicationAutomationService:
         if application.state is not ApplicationState.APPLYING:
             return False
         if task is not None and (
-            task.state is not TaskState.SKIPPED or task.last_error_code != "VACANCY_RULES_CHANGED"
+            task.state is not TaskState.SKIPPED
+            or task.last_error_code
+            not in {"VACANCY_RULES_CHANGED", "VACANCY_DUPLICATE", "NO_RELEVANT_EVIDENCE"}
         ):
             return False
         if application.direction_id is None:
@@ -260,9 +361,17 @@ class ApplicationAutomationService:
             )
         except LookupError:
             return False
+        source_category = source.rules_details.get("category")
         return (
-            source.rules_details.get("category") == RuleCategory.ROUTED.value
-            and source.rules_details.get("target_scope") == target_direction.scope.value
+            source.rules_version != RULES_VERSION
+            or source_category not in {
+                RuleCategory.MATCH.value,
+                RuleCategory.STRETCH.value,
+            }
+            or (
+                source_category == RuleCategory.ROUTED.value
+                and source.rules_details.get("target_scope") == target_direction.scope.value
+            )
         )
 
     @staticmethod
@@ -466,9 +575,7 @@ class ApplicationAutomationService:
                 VacancyModel.availability == VacancyAvailability.ACTIVE,
                 DirectionVacancyModel.state == VacancyState.QUEUED,
                 DirectionVacancyModel.rules_version == RULES_VERSION,
-                DirectionVacancyModel.rules_details["category"]
-                .as_string()
-                .in_(allowed_categories),
+                DirectionVacancyModel.rules_details["category"].as_string().in_(allowed_categories),
                 CoverLetterModel.id == letter_id,
                 CoverLetterModel.state == CoverLetterState.READY,
                 CoverLetterModel.text.is_not(None),
@@ -854,6 +961,166 @@ class ApplicationAutomationService:
             ),
         )
 
+    def has_pending_application_work(
+        self,
+        *,
+        account_id: int,
+        include_stretch: bool = True,
+        include_scheduled: bool = False,
+        now: datetime | None = None,
+    ) -> bool:
+        selected_at = as_utc(now or datetime.now(UTC))
+        if self._system.get().state is not SystemState.RUNNING:
+            return False
+        allowed_categories = (
+            (RuleCategory.MATCH.value, RuleCategory.STRETCH.value)
+            if include_stretch
+            else (RuleCategory.MATCH.value,)
+        )
+        statement = (
+            select(ApplicationTaskModel.id)
+            .join(ApplicationModel)
+            .join(VacancyModel, VacancyModel.id == ApplicationModel.vacancy_id)
+            .join(
+                CareerDirectionModel,
+                CareerDirectionModel.id == ApplicationModel.direction_id,
+            )
+            .join(ResumeModel, ResumeModel.id == ApplicationModel.resume_id)
+            .join(
+                DirectionVacancyModel,
+                (DirectionVacancyModel.direction_id == ApplicationModel.direction_id)
+                & (DirectionVacancyModel.vacancy_id == ApplicationModel.vacancy_id),
+            )
+            .where(
+                ApplicationTaskModel.state.in_((TaskState.PENDING, TaskState.RETRY_SCHEDULED)),
+                ApplicationModel.account_id == account_id,
+                ApplicationModel.state == ApplicationState.APPLYING,
+                CareerDirectionModel.is_active.is_(True),
+                ResumeModel.is_active.is_(True),
+                VacancyModel.availability == VacancyAvailability.ACTIVE,
+                VacancyModel.duplicate_of_id.is_(None),
+                DirectionVacancyModel.state == VacancyState.QUEUED,
+                DirectionVacancyModel.rules_version == RULES_VERSION,
+                DirectionVacancyModel.rules_details["category"].as_string().in_(allowed_categories),
+            )
+            .limit(1)
+        )
+        if not include_scheduled:
+            statement = statement.where(ApplicationTaskModel.scheduled_at <= selected_at)
+        return self._session.scalar(statement) is not None
+
+    def claim_exact_prepared(
+        self,
+        *,
+        account_id: int,
+        task_id: int,
+        include_stretch: bool = True,
+        now: datetime | None = None,
+    ) -> ApplyJob | None:
+        selected_at = as_utc(now or datetime.now(UTC))
+        system = self._system.lock()
+        if (
+            system.state is not SystemState.RUNNING
+            or self._system.supervised_lease_active(selected_at)
+            or (system.next_apply_at is not None and as_utc(system.next_apply_at) > selected_at)
+        ):
+            return None
+        task = self._tasks.get(task_id)
+        if (
+            task.state not in (TaskState.PENDING, TaskState.RETRY_SCHEDULED)
+            or as_utc(task.scheduled_at) > selected_at
+        ):
+            return None
+        application = self._applications.get(task.application_id)
+        if (
+            application.account_id != account_id
+            or application.state is not ApplicationState.APPLYING
+            or application.direction_id is None
+        ):
+            return None
+        vacancy = self._vacancies.get(application.vacancy_id)
+        resume = self._resumes.get(application.resume_id)
+        tracked = self._directions.get_tracked_vacancy(
+            application.direction_id,
+            application.vacancy_id,
+        )
+        allowed_categories = (
+            {RuleCategory.MATCH.value, RuleCategory.STRETCH.value}
+            if include_stretch
+            else {RuleCategory.MATCH.value}
+        )
+        if (
+            vacancy.availability is not VacancyAvailability.ACTIVE
+            or vacancy.duplicate_of_id is not None
+            or not resume.is_active
+            or tracked.state is not VacancyState.QUEUED
+            or tracked.rules_version != RULES_VERSION
+            or tracked.rules_details.get("category") not in allowed_categories
+        ):
+            return None
+        instruction_version = cover_letter_instruction_version(
+            AiPromptSettingsService(self._session).get().cover_letter
+        )
+        letter = self._session.scalar(
+            select(CoverLetterModel)
+            .where(
+                CoverLetterModel.application_id == application.id,
+                CoverLetterModel.state == CoverLetterState.READY,
+                CoverLetterModel.text.is_not(None),
+                CoverLetterModel.instruction_version == instruction_version,
+            )
+            .order_by(CoverLetterModel.id.desc())
+            .limit(1)
+        )
+        if letter is None or not letter.text:
+            return None
+        claimed = self._tasks.claim_exact(task.id, selected_at)
+        if claimed is None:
+            return None
+        try:
+            CoverLetterService(self._session).validate_for_submission(
+                application_id=application.id,
+                letter_id=letter.id,
+            )
+            if as_utc(resume.updated_at) > as_utc(letter.updated_at):
+                raise ValueError("Резюме изменилось после подготовки письма")
+        except (LookupError, RuntimeError, ValueError):
+            manual_review = CoverLetterService(self._session).handle_stale_ready_letter(
+                application_id=application.id,
+                letter_id=letter.id,
+            )
+            self._tasks.transition(
+                task.id,
+                TaskState.REVIEW_REQUIRED if manual_review else TaskState.RETRY_SCHEDULED,
+                scheduled_at=selected_at,
+                error_code="COVER_LETTER_STALE",
+            )
+            return None
+        return ApplyJob(
+            task=claimed,
+            application=application,
+            vacancy=vacancy,
+            resume=resume,
+            direction_vacancy=tracked,
+            cover_letter=letter.text,
+            cover_letter_id=letter.id,
+            cover_letter_sha256=hashlib.sha256(letter.text.encode("utf-8")).hexdigest(),
+        )
+
+    def defer_letter_preparation(
+        self,
+        task_id: int,
+        *,
+        retry_at: datetime,
+    ) -> bool:
+        task = self._session.get(ApplicationTaskModel, task_id)
+        if task is None or task.state not in (TaskState.PENDING, TaskState.RETRY_SCHEDULED):
+            return False
+        task.scheduled_at = as_utc(retry_at)
+        task.last_error_code = "COVER_LETTER_PROVIDER_RETRY"
+        self._session.flush()
+        return True
+
     def claim_supervised_form_preflight(
         self,
         *,
@@ -1235,6 +1502,29 @@ class ApplicationAutomationService:
             HhApplyStatus.ACCOUNT_WARNING: SystemState.ACCOUNT_WARNING,
             HhApplyStatus.RESUME_MISMATCH: SystemState.PAUSED,
         }
+        if (
+            result.status is HhApplyStatus.RETRYABLE_ERROR
+            and job.task.attempts >= MAX_AUTOMATIC_RETRY_ATTEMPTS
+        ):
+            payload["attempts"] = job.task.attempts
+            self._tasks.transition(
+                job.task.id,
+                TaskState.REVIEW_REQUIRED,
+                error_code=RETRY_LIMIT_REACHED,
+                event_payload=payload,
+            )
+            IncidentService(self._session).report(
+                code="APPLICATION_RETRY_EXHAUSTED",
+                severity=IncidentSeverity.ERROR,
+                message=(
+                    f"Отклик на вакансию {job.vacancy.hh_id} не удалось подготовить "
+                    f"после {job.task.attempts} попыток. Автоматические повторы остановлены. "
+                    f"Последняя причина: {result.confirmation[:500] or 'не определена'}"
+                ),
+                scope_type="application_task",
+                scope_id=job.task.id,
+            )
+            return RecordedApplyResult(blocking=False, sent=False)
         effective_retry_delay = (
             timedelta(seconds=result.retry_after_seconds)
             if result.status is HhApplyStatus.RETRYABLE_ERROR
@@ -1247,6 +1537,7 @@ class ApplicationAutomationService:
             TaskState.RETRY_SCHEDULED,
             scheduled_at=retry_at,
             error_code=result.status.value,
+            event_payload=payload,
         )
         if (
             result.status is HhApplyStatus.RETRYABLE_ERROR

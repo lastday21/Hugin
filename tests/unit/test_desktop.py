@@ -473,21 +473,9 @@ def test_bridge_generates_editable_reply_draft(
     monkeypatch.setattr(desktop, "create_database", lambda _settings: ReplyDatabase())
     monkeypatch.setattr(
         desktop,
-        "AiPromptSettingsService",
-        lambda _session: SimpleNamespace(
-            get_model=lambda: "selected-model",
-            get_reasoning_effort=lambda: "high",
-        ),
-    )
-    monkeypatch.setattr(
-        desktop,
-        "configured_yandex_ai_client",
-        lambda _settings, *, model, reasoning_effort, operation: (
-            "configured-model"
-            if model == "selected-model"
-            and reasoning_effort == "high"
-            and operation == "recruiter_reply"
-            else None
+        "configured_codex_cli_client",
+        lambda _settings, *, operation: (
+            "configured-model" if operation == "recruiter_reply" else None
         ),
     )
     monkeypatch.setattr(desktop, "RecruiterReplyService", FakeReplyService)
@@ -502,14 +490,14 @@ def test_bridge_generates_editable_reply_draft(
 
     monkeypatch.setattr(
         desktop,
-        "configured_yandex_ai_client",
-        lambda _settings, *, model, reasoning_effort, operation: (_ for _ in ()).throw(
-            LookupError(f"YandexGPT не настроен: {model}, режим {reasoning_effort}")
+        "configured_codex_cli_client",
+        lambda _settings, *, operation: (_ for _ in ()).throw(
+            LookupError(f"Создание ответа не настроено: {operation}")
         ),
     )
     assert bridge.generate_reply(12) == {
         "status": "UNAVAILABLE",
-        "message": "YandexGPT не настроен: selected-model, режим high",
+        "message": "Создание ответа не настроено: recruiter_reply",
     }
 
 
@@ -987,6 +975,9 @@ def test_main_starts_window_and_always_closes_bridge(
 
         def stop(self) -> None:
             events.append("worker-stop")
+
+        def has_pending_work(self) -> bool:
+            return False
 
     monkeypatch.setattr(desktop, "get_settings", lambda: settings)
     monkeypatch.setattr(desktop, "ensure_services", lambda _settings: events.append("services"))

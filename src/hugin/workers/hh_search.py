@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+from collections.abc import Callable
 
 from hugin.adapters.credentials import WindowsCredentialStore
 from hugin.adapters.hh_browser import VisibleHhBrowser
@@ -8,7 +9,12 @@ from hugin.core.settings import Settings
 from hugin.domain.automation import AutomationJobKind, AutomationJobRecord, AutomationJobResult
 from hugin.services.hh_login import HhLoginService, LoginStatus
 from hugin.services.search_cycle import BackgroundSearchCycle
-from hugin.workers.automation import AutomationJobBlocked
+from hugin.workers.automation import AutomationJobBlocked, AutomationJobDeferred
+
+type ApplicationWorkPending = Callable[[], bool]
+
+_BACKGROUND_PROFILE_LOCK_TIMEOUT_SECONDS = 2.0
+_BACKGROUND_PROFILE_RETRY_SECONDS = 15
 
 
 class HhSearchJobHandler:
@@ -20,10 +26,12 @@ class HhSearchJobHandler:
         *,
         account_id: int = 1,
         browser_lock: threading.Lock | None = None,
+        application_work_pending: ApplicationWorkPending | None = None,
     ) -> None:
         self._settings = settings
         self._account_id = account_id
         self._browser_lock = browser_lock or threading.Lock()
+        self._application_work_pending = application_work_pending
         self._cycle = BackgroundSearchCycle(
             settings,
             page_limit=settings.hh_background_search_pages,
@@ -35,37 +43,53 @@ class HhSearchJobHandler:
             raise ValueError("Обработчик получил не поисковое задание")
         if job.account_id != self._account_id:
             raise ValueError("Фоновое задание относится к другому аккаунту")
+        if self._application_work_pending is not None and self._application_work_pending():
+            raise AutomationJobDeferred(
+                "APPLICATIONS_PENDING",
+                "Сначала обрабатываются уже найденные вакансии",
+                retry_after_seconds=60,
+            )
 
-        with (
-            self._browser_lock,
-            VisibleHhBrowser(
-                self._settings.browser_profile_dir(self._account_id),
-                self._settings.hh_login_url,
-                self._settings.hh_resumes_url,
-                self._settings.hh_search_url,
-                self._settings.hh_browser_timeout_ms,
-                start_minimized=True,
-                browser_source_ip=(
-                    str(self._settings.hh_browser_source_ip)
-                    if self._settings.hh_browser_source_ip is not None
-                    else None
-                ),
-            ) as browser,
-        ):
-            login = HhLoginService(WindowsCredentialStore()).authenticate(
-                self._account_id,
-                browser,
-            )
-            if not login.authenticated:
-                raise AutomationJobBlocked(
-                    login.status.value.upper(),
-                    self._login_message(login.status),
+        try:
+            with (
+                self._browser_lock,
+                VisibleHhBrowser(
+                    self._settings.browser_profile_dir(self._account_id),
+                    self._settings.hh_login_url,
+                    self._settings.hh_resumes_url,
+                    self._settings.hh_search_url,
+                    self._settings.hh_browser_timeout_ms,
+                    start_minimized=True,
+                    browser_source_ip=(
+                        str(self._settings.hh_browser_source_ip)
+                        if self._settings.hh_browser_source_ip is not None
+                        else None
+                    ),
+                    profile_lock_timeout_seconds=_BACKGROUND_PROFILE_LOCK_TIMEOUT_SECONDS,
+                ) as browser,
+            ):
+                login = HhLoginService(WindowsCredentialStore()).authenticate(
+                    self._account_id,
+                    browser,
                 )
-            return self._cycle.run(
-                account_id=self._account_id,
-                search_query_id=job.search_query_id,
-                browser=browser,
-            )
+                if not login.authenticated:
+                    raise AutomationJobBlocked(
+                        login.status.value.upper(),
+                        self._login_message(login.status),
+                    )
+                return self._cycle.run(
+                    account_id=self._account_id,
+                    search_query_id=job.search_query_id,
+                    browser=browser,
+                )
+        except RuntimeError as error:
+            if "Профиль hh.ru занят другой задачей" not in str(error):
+                raise
+            raise AutomationJobDeferred(
+                "BROWSER_PROFILE_BUSY",
+                "Профиль hh.ru занят; фоновый поиск быстро уступил очередь откликам",
+                retry_after_seconds=_BACKGROUND_PROFILE_RETRY_SECONDS,
+            ) from error
 
     @staticmethod
     def _login_message(status: LoginStatus) -> str:

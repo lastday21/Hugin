@@ -37,7 +37,11 @@ from hugin.repositories.communications import CommunicationRepository
 from hugin.services.autonomy import DEFAULT_AUTONOMY_POLICY, AutonomyPolicyService
 from hugin.services.hh_login import LoginStatus
 from hugin.workers import hh_sync as worker_module
-from hugin.workers.automation import AutomationJobBlocked, AutomationJobRetry
+from hugin.workers.automation import (
+    AutomationJobBlocked,
+    AutomationJobDeferred,
+    AutomationJobRetry,
+)
 
 
 def make_job(kind: AutomationJobKind) -> AutomationJobRecord:
@@ -150,10 +154,10 @@ def test_message_handler_reads_only_tracked_chats(
 
     def synchronize(
         messages: tuple[HhChatMessageData, ...],
-        _browser: object,
         *,
         allow_replies: bool,
     ) -> dict[str, int]:
+        assert not handler._browser_lock.locked()
         reply_modes.append(allow_replies)
         return {"created": len(messages)}
 
@@ -176,6 +180,70 @@ def test_message_handler_reads_only_tracked_chats(
     assert result == {"created": 1, "message_baseline_initialized": True}
     assert FakeBrowser.requested_ids == ("101",)
     assert reply_modes == [False, False, True]
+
+
+def test_sync_handler_defers_before_browser_when_application_is_ready(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(worker_module, "VisibleHhBrowser", FakeBrowser)
+    handler = worker_module.HhSyncJobHandler(
+        Settings(environment="test"),
+        AutomationJobKind.MESSAGES,
+        application_work_pending=lambda: True,
+    )
+    monkeypatch.setattr(
+        handler,
+        "_tracked_vacancy_ids",
+        lambda: pytest.fail("При готовом отклике чтение сообщений начинать нельзя"),
+    )
+
+    with pytest.raises(AutomationJobDeferred, match="готовый отклик") as raised:
+        handler(make_job(AutomationJobKind.MESSAGES))
+
+    assert raised.value.code == "APPLICATION_READY"
+    assert raised.value.retry_after_seconds == 60
+
+
+def test_sync_handler_yields_after_login_if_application_became_ready(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(worker_module, "VisibleHhBrowser", FakeBrowser)
+    monkeypatch.setattr(worker_module, "HhLoginService", FakeLoginService)
+    readiness = iter((False, True))
+    handler = worker_module.HhSyncJobHandler(
+        Settings(environment="test"),
+        AutomationJobKind.MESSAGES,
+        application_work_pending=lambda: next(readiness),
+    )
+    monkeypatch.setattr(handler, "_tracked_vacancy_ids", lambda: ("101",))
+    monkeypatch.setattr(
+        FakeBrowser,
+        "read_recruiter_messages",
+        lambda *_args: pytest.fail("После появления готового отклика сообщения читать нельзя"),
+    )
+
+    with pytest.raises(AutomationJobDeferred, match="готовый отклик"):
+        handler(make_job(AutomationJobKind.MESSAGES))
+
+
+def test_sync_handler_quickly_defers_when_browser_profile_is_busy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    handler = prepare_handler(monkeypatch, AutomationJobKind.MESSAGES)
+
+    def fail_enter(_browser: FakeBrowser) -> FakeBrowser:
+        raise RuntimeError(
+            "Профиль hh.ru занят другой задачей дольше допустимого времени"
+        )
+
+    monkeypatch.setattr(FakeBrowser, "__enter__", fail_enter)
+
+    with pytest.raises(AutomationJobDeferred) as raised:
+        handler(make_job(AutomationJobKind.MESSAGES))
+
+    assert raised.value.code == "BROWSER_PROFILE_BUSY"
+    assert raised.value.retry_after_seconds == 15
+    assert FakeBrowser.initialization_options[-1]["profile_lock_timeout_seconds"] == 2.0
 
 
 def test_status_handler_passes_statuses_to_service(
@@ -716,7 +784,7 @@ def test_handler_database_helpers_close_every_connection(
     status = HhNegotiationData("101", HhNegotiationStatus.VIEWED, "Просмотрен")
 
     assert handler._tracked_vacancy_ids() == ("101", "202")
-    assert handler._synchronize_messages((message,)) == {"created": 1}
+    assert handler._synchronize_messages((message,), allow_replies=False) == {"created": 1}
     assert handler._synchronize_statuses((status,)) == {"updated": 1}
     assert len(databases) == 3
     assert all(database.closed for database in databases)

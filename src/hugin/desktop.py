@@ -21,6 +21,7 @@ from uuid import uuid4
 
 from sqlalchemy import select
 
+from hugin.adapters.codex_cli import CodexCliError, configured_codex_cli_client
 from hugin.adapters.credentials import WindowsCredentialStore
 from hugin.adapters.hh_browser import VisibleHhBrowser
 from hugin.adapters.hh_messages import HhBrowserMessageSender
@@ -31,7 +32,6 @@ from hugin.adapters.notification_gateway import (
     NotificationGatewayTimeout,
 )
 from hugin.adapters.postgres_backup import DockerPostgresBackupAdapter
-from hugin.adapters.yandex_ai import YandexAIError
 from hugin.core.settings import Settings, get_settings
 from hugin.database import create_database, upgrade_database
 from hugin.database.models import ApplicationModel, VacancyModel
@@ -41,13 +41,11 @@ from hugin.domain.communications import CommunicationNotFoundError, Communicatio
 from hugin.domain.content import RecruiterMessageState
 from hugin.domain.hh import HhFormReviewStatus
 from hugin.domain.vacancies import VacancyAvailability
-from hugin.services.ai_prompts import AiPromptSettingsService
 from hugin.services.backups import BackupService
 from hugin.services.communications import CommunicationService, RecordingMessageSender
 from hugin.services.hh_login import HhLoginService, LoginStatus
 from hugin.services.recruiter_reply import RecruiterReplyService
 from hugin.services.screening_forms import ScreeningDraft, ScreeningDraftService
-from hugin.services.yandex_client import configured_yandex_ai_client
 from hugin.workers.applications import ApplicationWorker
 from hugin.workers.automation import AutomationWorker
 from hugin.workers.backups import BackupWorker
@@ -335,11 +333,8 @@ class DesktopBridge:
             database = create_database(self._settings)
             try:
                 with database.sessions.begin() as session:
-                    ai_settings = AiPromptSettingsService(session)
-                    client = configured_yandex_ai_client(
+                    client = configured_codex_cli_client(
                         self._settings,
-                        model=ai_settings.get_model(),
-                        reasoning_effort=ai_settings.get_reasoning_effort(),
                         operation="recruiter_reply",
                     )
                     draft = RecruiterReplyService(session, client).generate(
@@ -353,7 +348,7 @@ class DesktopBridge:
             CommunicationStateError,
             LookupError,
             ValueError,
-            YandexAIError,
+            CodexCliError,
         ) as error:
             return self._result("UNAVAILABLE", str(error))
         return self._result(
@@ -851,19 +846,27 @@ def main() -> None:
         starting.fail(error)
         raise
     browser_lock = threading.Lock()
+    application_worker = ApplicationWorker(
+        settings,
+        browser_lock=browser_lock,
+        journal=journal,
+    )
     search_handler = HhSearchJobHandler(
         settings,
         browser_lock=browser_lock,
+        application_work_pending=application_worker.has_pending_work,
     )
     messages_handler = HhSyncJobHandler(
         settings,
         AutomationJobKind.MESSAGES,
         browser_lock=browser_lock,
+        application_work_pending=application_worker.has_pending_work,
     )
     statuses_handler = HhSyncJobHandler(
         settings,
         AutomationJobKind.STATUSES,
         browser_lock=browser_lock,
+        application_work_pending=application_worker.has_pending_work,
     )
     worker = AutomationWorker(
         settings,
@@ -875,11 +878,6 @@ def main() -> None:
         authentication_recovery=messages_handler.recover_authentication,
         journal=journal,
     )
-    application_worker = ApplicationWorker(
-        settings,
-        browser_lock=browser_lock,
-        journal=journal,
-    )
     notification_worker = NotificationWorker(settings, journal=journal)
     backup_worker = BackupWorker(settings, journal=journal)
     bridge = DesktopBridge(
@@ -888,8 +886,8 @@ def main() -> None:
         journal=journal,
     )
     workers: tuple[BackgroundWorker, ...] = (
-        worker,
         application_worker,
+        worker,
         notification_worker,
         backup_worker,
     )

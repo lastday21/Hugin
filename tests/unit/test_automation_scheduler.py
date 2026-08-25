@@ -140,6 +140,37 @@ def test_scheduler_limits_failure_backoff(settings: Settings) -> None:
         database.close()
 
 
+def test_scheduler_defers_without_marking_job_failed(settings: Settings) -> None:
+    account_id, _query_id = seed_search_query(settings)
+    database = create_database(settings)
+    now = datetime(2026, 7, 26, 9, 0, tzinfo=UTC)
+
+    try:
+        with database.sessions.begin() as session:
+            scheduler = AutomationSchedulerService(session)
+            scheduler.ensure_account_jobs(account_id, now)
+            claimed = scheduler.claim_due(now)
+            assert claimed is not None
+            deferred = scheduler.defer(
+                claimed.key,
+                retry_after_seconds=60,
+                result={"deferred": True, "reason": "APPLICATIONS_PENDING"},
+                now=now,
+            )
+
+            assert deferred.state is AutomationJobState.WAITING
+            assert deferred.next_run_at == now + timedelta(seconds=60)
+            assert deferred.last_success_at is None
+            assert deferred.consecutive_failures == 0
+            assert deferred.last_error_code is None
+            assert deferred.last_result == {
+                "deferred": True,
+                "reason": "APPLICATIONS_PENDING",
+            }
+    finally:
+        database.close()
+
+
 def test_scheduler_respects_explicit_retry_delay(settings: Settings) -> None:
     account_id, _query_id = seed_search_query(settings)
     database = create_database(settings)

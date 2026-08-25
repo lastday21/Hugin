@@ -344,6 +344,31 @@ class CommunicationRepository:
         self._session.flush()
         return _message_record(model)
 
+    def approve_outgoing_for_automatic_send(
+        self,
+        *,
+        account_id: int,
+        message_id: int,
+        content_version: int,
+        content_hash: str,
+        approval_key: str,
+    ) -> RecruiterMessageRecord:
+        model = self._message_model(account_id, message_id, for_update=True)
+        self._require_outgoing(model)
+        self._require_exact_version(model, content_version, content_hash)
+        if model.state not in {
+            RecruiterMessageState.DRAFT,
+            RecruiterMessageState.REVIEW_REQUIRED,
+            RecruiterMessageState.FAILED,
+        }:
+            raise CommunicationStateError(
+                "Автоматически подтвердить можно только неотправленный ответ"
+            )
+        model.auto_send_approved = True
+        model.reply_template_key = approval_key
+        self._session.flush()
+        return _message_record(model)
+
     def confirm_outgoing_draft(
         self,
         *,
@@ -633,6 +658,28 @@ class CommunicationRepository:
         model.scheduled_at = as_utc(retry_at)
         self._session.flush()
         return _notification_record(model)
+
+    def defer_notifications(
+        self,
+        channel: NotificationChannel,
+        until: datetime,
+        *,
+        excluding_id: int | None = None,
+    ) -> int:
+        conditions = [
+            NotificationModel.channel == channel,
+            NotificationModel.state.in_({DeliveryState.PENDING, DeliveryState.FAILED}),
+            NotificationModel.scheduled_at < as_utc(until),
+        ]
+        if excluding_id is not None:
+            conditions.append(NotificationModel.id != excluding_id)
+        deferred_ids = self._session.scalars(
+            update(NotificationModel)
+            .where(*conditions)
+            .values(scheduled_at=as_utc(until))
+            .returning(NotificationModel.id)
+        )
+        return len(tuple(deferred_ids))
 
     def _message_model(
         self,

@@ -16,9 +16,17 @@ from hugin.core.settings import Settings
 from hugin.database import create_database, upgrade_database
 from hugin.diagnostics import OperationJournal, error_details
 from hugin.domain.communications import NotificationRecord
-from hugin.domain.content import NotificationChannel
+from hugin.domain.content import IncidentSeverity, NotificationChannel
 from hugin.repositories.communications import CommunicationRepository
+from hugin.services.incidents import IncidentService
 from hugin.services.notifications import NotificationService
+
+_NOTIFICATION_CHANNEL_SCOPE_IDS = {
+    NotificationChannel.WINDOWS: 1,
+    NotificationChannel.TELEGRAM: 2,
+    NotificationChannel.EMAIL: 3,
+}
+_EMAIL_DELIVERY_INTERVAL = timedelta(minutes=5)
 
 
 class NotificationChannelNotConfigured(RuntimeError):
@@ -117,6 +125,8 @@ class NotificationWorker:
                 notification.id,
                 error.code,
                 selected_at,
+                channel=notification.channel,
+                message=str(error),
             )
             run.block(reason=str(error), error_code=error.code)
         except Exception as error:
@@ -124,10 +134,16 @@ class NotificationWorker:
                 notification.id,
                 type(error).__name__,
                 selected_at + timedelta(minutes=5),
+                channel=notification.channel,
+                message=str(error),
             )
             run.fail(error, retry_in_minutes=5)
         else:
-            self._record_success(notification.id, selected_at)
+            self._record_success(
+                notification.id,
+                selected_at,
+                channel=notification.channel,
+            )
             run.succeed()
         return True
 
@@ -172,13 +188,30 @@ class NotificationWorker:
             action_url=selected_action_url or None,
         )
 
-    def _record_success(self, notification_id: int, sent_at: datetime) -> None:
+    def _record_success(
+        self,
+        notification_id: int,
+        sent_at: datetime,
+        *,
+        channel: NotificationChannel,
+    ) -> None:
         database = create_database(self._settings)
         try:
             with database.sessions.begin() as session:
-                CommunicationRepository(session).mark_notification_sent(
+                notifications = CommunicationRepository(session)
+                notifications.mark_notification_sent(
                     notification_id,
                     sent_at,
+                )
+                if channel is NotificationChannel.EMAIL:
+                    notifications.defer_notifications(
+                        NotificationChannel.EMAIL,
+                        sent_at + _EMAIL_DELIVERY_INTERVAL,
+                    )
+                IncidentService(session).resolve(
+                    code="NOTIFICATION_DELIVERY_FAILED",
+                    scope_type="notification_channel",
+                    scope_id=_NOTIFICATION_CHANNEL_SCOPE_IDS[channel],
                 )
         finally:
             database.close()
@@ -188,14 +221,34 @@ class NotificationWorker:
         notification_id: int,
         error_code: str,
         retry_at: datetime,
+        *,
+        channel: NotificationChannel,
+        message: str,
     ) -> None:
         database = create_database(self._settings)
         try:
             with database.sessions.begin() as session:
-                CommunicationRepository(session).mark_notification_failed(
+                notifications = CommunicationRepository(session)
+                notifications.mark_notification_failed(
                     notification_id,
                     error_code=error_code,
                     retry_at=retry_at,
+                )
+                if channel is NotificationChannel.EMAIL:
+                    notifications.defer_notifications(
+                        NotificationChannel.EMAIL,
+                        retry_at,
+                        excluding_id=notification_id,
+                    )
+                IncidentService(session).report(
+                    code="NOTIFICATION_DELIVERY_FAILED",
+                    severity=IncidentSeverity.ERROR,
+                    message=(
+                        f"Не удалось доставить уведомление через канал "
+                        f"{channel.value}: {message or error_code}"
+                    ),
+                    scope_type="notification_channel",
+                    scope_id=_NOTIFICATION_CHANNEL_SCOPE_IDS[channel],
                 )
         finally:
             database.close()

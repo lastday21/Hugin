@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -17,7 +17,6 @@ from hugin.repositories import (
     VacancyRepository,
 )
 from hugin.services.search_cycle import BackgroundSearchCycle
-from hugin.services.vacancy_analysis import RULES_VERSION
 
 pytestmark = pytest.mark.integration
 
@@ -31,6 +30,7 @@ class FakeSearchBrowser:
     ) -> None:
         self.profile = profile
         self.fail_page = fail_page
+        self.now = datetime.now(UTC)
         self.searches: list[tuple[str, str, int]] = []
         self.details: list[str] = []
 
@@ -58,7 +58,7 @@ class FakeSearchBrowser:
                     source_url=f"https://hh.ru/vacancy/background-10{page_number + 1}",
                     employer_name="Пример",
                     region="Москва",
-                    published_at=datetime(2026, 7, 26, 7, 0, tzinfo=UTC),
+                    published_at=self.now - timedelta(hours=2),
                 ),
             ),
         )
@@ -77,12 +77,13 @@ class FakeSearchBrowser:
             work_format="Удалённо",
             key_skills=("Python", "PostgreSQL"),
             region="Москва",
-            published_at=datetime(2026, 7, 26, 7, 0, tzinfo=UTC),
-            details_fetched_at=datetime(2026, 7, 26, 8, 0, tzinfo=UTC),
+            published_at=self.now - timedelta(hours=2),
+            details_fetched_at=self.now - timedelta(hours=1),
         )
 
 
 def test_background_search_reads_and_queues_without_applying(settings: Settings) -> None:
+    now = datetime.now(UTC)
     upgrade_database(settings)
     database = create_database(settings)
     try:
@@ -114,8 +115,8 @@ def test_background_search_reads_and_queues_without_applying(settings: Settings)
                     source_url="https://hh.ru/vacancy/legacy-v4",
                     description="Разработка серверной части на Python и PostgreSQL",
                     key_skills=("Python", "PostgreSQL"),
-                    published_at=datetime(2026, 7, 25, 7, 0, tzinfo=UTC),
-                    details_fetched_at=datetime(2026, 7, 25, 8, 0, tzinfo=UTC),
+                    published_at=now - timedelta(days=2),
+                    details_fetched_at=now - timedelta(hours=23),
                 )
             )
             directions.track_vacancy(direction.id, legacy.id)
@@ -157,7 +158,7 @@ def test_background_search_reads_and_queues_without_applying(settings: Settings)
     assert result["found"] == 2
     assert result["unique_vacancies"] == 2
     assert result["details_loaded"] == 1
-    assert result["queued"] == 2
+    assert result["queued"] == 1
     assert browser.searches == [
         ("Python backend разработчик", "1", 0),
         ("Python backend разработчик", "1", 1),
@@ -179,9 +180,9 @@ def test_background_search_reads_and_queues_without_applying(settings: Settings)
                 direction_id,
                 legacy_vacancy.id,
             )
-            assert legacy_link.rules_version == RULES_VERSION
-            assert legacy_link.state is VacancyState.QUEUED
-            assert legacy_link.rules_details["category"] == "MATCH"
+            assert legacy_link.rules_version == "python_it_v4"
+            assert legacy_link.state is VacancyState.FILTERED_OUT
+            assert legacy_link.rules_details["category"] == "REJECTED"
     finally:
         database.close()
 
@@ -246,6 +247,84 @@ def test_successful_page_is_saved_before_later_page_failure(settings: Settings) 
             assert saved.source_url == "https://hh.ru/vacancy/background-101"
     finally:
         database.close()
+
+
+def test_backlog_is_processed_before_new_search_and_stops_after_first_queue(
+    settings: Settings,
+) -> None:
+    now = datetime.now(UTC)
+    upgrade_database(settings)
+    database = create_database(settings)
+    try:
+        with database.sessions.begin() as session:
+            account = AccountRepository(session).create("Тимур", "backlog-account")
+            resume = ResumeRepository(session).upsert(
+                account.id,
+                "resume-backlog",
+                "Python backend разработчик",
+            )
+            session.add(
+                CandidateProfileModel(
+                    account_id=account.id,
+                    active_resume_id=resume.id,
+                    display_name="Тимур",
+                )
+            )
+            directions = DirectionRepository(session)
+            direction = directions.create(
+                account.id,
+                "Python backend",
+                scoring_config={"role_scope": "PYTHON_BACKEND"},
+            )
+            directions.attach_resume(direction.id, resume.id)
+            query = directions.add_query(
+                direction.id,
+                "Python backend разработчик",
+                regions=(SearchRegion("1", "Москва"),),
+                schedule_minutes=120,
+            )
+            for index in range(7):
+                vacancy = VacancyRepository(session).upsert(
+                    VacancyData(
+                        hh_id=f"backlog-{index}",
+                        title="Python backend разработчик",
+                        source_url=f"https://hh.ru/vacancy/backlog-{index}",
+                        employer_name="Пример",
+                        published_at=now - timedelta(minutes=index),
+                    )
+                )
+                directions.track_vacancy(direction.id, vacancy.id)
+            account_id = account.id
+            query_id = query.id
+    finally:
+        database.close()
+
+    browser = FakeSearchBrowser(
+        HhProfileData(
+            external_id="backlog-account",
+            label="Тимур",
+            resumes=(HhResumeData("resume-backlog", "Python backend разработчик"),),
+        )
+    )
+
+    result = BackgroundSearchCycle(settings, page_limit=3, detail_limit=20).run(
+        account_id=account_id,
+        search_query_id=query_id,
+        browser=browser,
+    )
+
+    assert result == {
+        "search_variants": 0,
+        "pages_loaded": 0,
+        "found": 0,
+        "unique_vacancies": 0,
+        "details_loaded": 1,
+        "details_failed": 0,
+        "queued": 1,
+        "backlog_processed": True,
+    }
+    assert browser.searches == []
+    assert len(browser.details) == 1
 
 
 @pytest.mark.parametrize(

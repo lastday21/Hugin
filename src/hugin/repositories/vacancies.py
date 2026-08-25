@@ -287,9 +287,14 @@ class VacancyRepository:
                 VacancyModel.id < vacancy.id,
                 VacancyModel.duplicate_of_id.is_(None),
                 VacancyModel.details_fetched_at.is_not(None),
+                VacancyModel.availability == VacancyAvailability.ACTIVE,
                 func.lower(VacancyModel.employer_name) == vacancy.employer_name.casefold(),
             )
-            .order_by(VacancyModel.created_at, VacancyModel.id)
+            .order_by(
+                VacancyModel.published_at.desc().nulls_last(),
+                VacancyModel.created_at.desc(),
+                VacancyModel.id.desc(),
+            )
             .limit(100)
         )
         return [_to_record(model) for model in models]
@@ -325,6 +330,101 @@ class VacancyRepository:
                 )
             )
             self._session.flush()
+        return _to_record(model)
+
+    def duplicate_family_ids(self, vacancy_id: int) -> tuple[int, ...]:
+        model = self._session.get(VacancyModel, vacancy_id)
+        if model is None:
+            raise LookupError("vacancy was not found")
+        canonical_id = model.duplicate_of_id or model.id
+        return tuple(
+            self._session.scalars(
+                select(VacancyModel.id)
+                .where(
+                    or_(
+                        VacancyModel.id == canonical_id,
+                        VacancyModel.duplicate_of_id == canonical_id,
+                    )
+                )
+                .order_by(VacancyModel.id)
+            )
+        )
+
+    def duplicate_family_has_sent_or_live_application(
+        self,
+        account_id: int,
+        vacancy_id: int,
+    ) -> bool:
+        family_ids = self.duplicate_family_ids(vacancy_id)
+        live_task_states = (
+            TaskState.PENDING,
+            TaskState.RUNNING,
+            TaskState.RETRY_SCHEDULED,
+            TaskState.REVIEW_REQUIRED,
+            TaskState.INPUT_REQUIRED,
+            TaskState.UNKNOWN_RESULT,
+        )
+        sent_states = (
+            ApplicationState.APPLIED,
+            ApplicationState.VIEWED,
+            ApplicationState.INVITED,
+            ApplicationState.REJECTED,
+        )
+        return bool(
+            self._session.scalar(
+                select(ApplicationModel.id)
+                .outerjoin(
+                    ApplicationTaskModel,
+                    ApplicationTaskModel.application_id == ApplicationModel.id,
+                )
+                .where(
+                    ApplicationModel.account_id == account_id,
+                    ApplicationModel.vacancy_id.in_(family_ids),
+                    or_(
+                        ApplicationModel.state.in_(sent_states),
+                        ApplicationTaskModel.state.in_(live_task_states),
+                    ),
+                )
+                .limit(1)
+            )
+        )
+
+    def promote_duplicate(self, vacancy_id: int) -> VacancyRecord:
+        model = self._session.get(VacancyModel, vacancy_id)
+        if model is None:
+            raise LookupError("vacancy was not found")
+        if model.duplicate_of_id is None:
+            return _to_record(model)
+        previous_canonical_id = model.duplicate_of_id
+        model.duplicate_of_id = None
+        self._session.flush()
+        family = tuple(
+            self._session.scalars(
+                select(VacancyModel).where(
+                    or_(
+                        VacancyModel.id == previous_canonical_id,
+                        VacancyModel.duplicate_of_id == previous_canonical_id,
+                    ),
+                    VacancyModel.id != vacancy_id,
+                )
+            )
+        )
+        for member in family:
+            member.duplicate_of_id = vacancy_id
+        self._session.add(
+            VacancyChangeModel(
+                vacancy_id=vacancy_id,
+                event_type="DUPLICATE_PROMOTED",
+                changes={
+                    "duplicate_of_id": {
+                        "before": previous_canonical_id,
+                        "after": None,
+                    },
+                    "relinked_vacancy_ids": [member.id for member in family],
+                },
+            )
+        )
+        self._session.flush()
         return _to_record(model)
 
     def list_changes(self, vacancy_id: int) -> list[VacancyChangeRecord]:

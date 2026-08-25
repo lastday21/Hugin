@@ -35,6 +35,7 @@ class FakeDatabase:
 class FakeApplicationService:
     job: ClassVar[object | None] = None
     preflight_job: ClassVar[object | None] = None
+    prepared_job: ClassVar[object | None] = None
     enabled: ClassVar[bool] = True
     sent_today: ClassVar[int] = 0
     daily_limit: ClassVar[int] = 25
@@ -47,6 +48,7 @@ class FakeApplicationService:
     recorded_preflights: ClassVar[list[tuple[ApplyJob, HhApplyResult, datetime]]] = []
     automatic_form_ready: ClassVar[bool] = False
     day_starts: ClassVar[list[datetime]] = []
+    deferred_letters: ClassVar[list[tuple[int, datetime]]] = []
 
     def __init__(self, _session: object) -> None:
         pass
@@ -107,6 +109,18 @@ class FakeApplicationService:
     def release_form_preflight(self, job: ApplyJob, *, now: datetime) -> None:
         type(self).released_preflights.append((job, now))
 
+    def claim_exact_prepared(self, **kwargs: object) -> object | None:
+        assert set(kwargs) == {"account_id", "task_id", "include_stretch", "now"}
+        assert kwargs["account_id"] == 1
+        assert kwargs["include_stretch"] is True
+        selected = type(self).prepared_job
+        type(self).prepared_job = None
+        return selected
+
+    def defer_letter_preparation(self, task_id: int, *, retry_at: datetime) -> bool:
+        type(self).deferred_letters.append((task_id, retry_at))
+        return True
+
     def record_form_preflight(
         self,
         job: ApplyJob,
@@ -155,6 +169,7 @@ def prepare_worker(
 def setup_function() -> None:
     FakeApplicationService.job = None
     FakeApplicationService.preflight_job = None
+    FakeApplicationService.prepared_job = None
     FakeApplicationService.enabled = True
     FakeApplicationService.sent_today = 0
     FakeApplicationService.daily_limit = 25
@@ -167,6 +182,7 @@ def setup_function() -> None:
     FakeApplicationService.recorded_preflights = []
     FakeApplicationService.automatic_form_ready = False
     FakeApplicationService.day_starts = []
+    FakeApplicationService.deferred_letters = []
 
 
 def fake_job(vacancy_id: str = "101") -> ApplyJob:
@@ -385,7 +401,7 @@ def test_worker_promotes_account_warning_before_application(
     assert FakeApplicationService.recorded[0][1].status is HhApplyStatus.ACCOUNT_WARNING
 
 
-def test_clean_form_is_checked_before_exact_letter_and_sent_only_next_cycle(
+def test_clean_form_is_checked_then_letter_is_prepared_and_sent_in_one_cycle(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -403,7 +419,7 @@ def test_clean_form_is_checked_before_exact_letter_and_sent_only_next_cycle(
 
     def prepare_letter(job: ApplyJob) -> int:
         prepared.append(job)
-        FakeApplicationService.job = send_job
+        FakeApplicationService.prepared_job = send_job
         return 1
 
     def send(job: ApplyJob) -> HhApplyResult:
@@ -425,12 +441,50 @@ def test_clean_form_is_checked_before_exact_letter_and_sent_only_next_cycle(
     assert worker.run_once(now)
     assert FakeApplicationService.released_preflights == [(preflight_job, now)]
     assert prepared == [preflight_job]
-    assert sent == []
-    assert FakeApplicationService.recorded == []
-
-    assert worker.run_once(now)
     assert sent == [send_job]
     assert FakeApplicationService.recorded[0][1].status is HhApplyStatus.APPLIED
+
+
+def test_automatic_queue_prepares_letter_without_second_browser_pass(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    preparation_job = fake_job()
+    send_values = vars(cast(SimpleNamespace, preparation_job)).copy()
+    send_values.update(
+        cover_letter="Здравствуйте!",
+        cover_letter_id=20,
+        cover_letter_sha256="letter-sha",
+    )
+    send_job = cast(ApplyJob, SimpleNamespace(**send_values))
+    FakeApplicationService.preflight_job = preparation_job
+    prepared: list[ApplyJob] = []
+    sent: list[ApplyJob] = []
+
+    def prepare_letter(job: ApplyJob) -> int:
+        prepared.append(job)
+        FakeApplicationService.prepared_job = send_job
+        return 1
+
+    def send(job: ApplyJob) -> HhApplyResult:
+        sent.append(job)
+        return HhApplyResult(HhApplyStatus.APPLIED, job.vacancy.source_url)
+
+    worker = prepare_worker(
+        monkeypatch,
+        tmp_path,
+        job_handler=send,
+        letter_preparer=prepare_letter,
+    )
+    worker._form_preflight_handler = lambda _job: pytest.fail(
+        "автоматическая очередь не должна открывать форму дважды"
+    )
+    now = datetime(2026, 7, 27, 10, 0, tzinfo=UTC)
+
+    assert worker.run_once(now)
+    assert FakeApplicationService.released_preflights == [(preparation_job, now)]
+    assert prepared == [preparation_job]
+    assert sent == [send_job]
 
 
 def test_form_with_questions_is_recorded_without_model_call(
@@ -498,9 +552,32 @@ def test_rejected_letter_does_not_delay_next_vacancy(
     )
     now = datetime(2026, 7, 27, 10, 0, tzinfo=UTC)
 
-    worker._prepare_exact_letter(fake_job(), now)
+    assert not worker._prepare_exact_letter(fake_job(), now)
 
-    assert worker._may_prepare_letters(now)
+    next_job = fake_job("102")
+    FakeApplicationService.preflight_job = next_job
+    worker._form_preflight_handler = lambda selected: HhApplyResult(
+        HhApplyStatus.MANUAL_REVIEW_REQUIRED,
+        selected.vacancy.source_url,
+    )
+
+    assert worker.run_once(now)
+
+
+def test_letter_provider_failure_defers_only_current_vacancy(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    job = fake_job()
+    worker = prepare_worker(
+        monkeypatch,
+        tmp_path,
+        letter_preparer=lambda _job: (_ for _ in ()).throw(RuntimeError("нет связи")),
+    )
+    now = datetime(2026, 7, 27, 10, 0, tzinfo=UTC)
+
+    assert not worker._prepare_exact_letter(job, now)
+    assert FakeApplicationService.deferred_letters == [(job.task.id, now + timedelta(minutes=15))]
 
 
 def test_form_preflight_exception_is_retryable_not_unknown(
@@ -874,7 +951,6 @@ def test_worker_prepares_one_letter_for_active_direction(
             self,
             _session: object,
             _client: object,
-            _router_client: object,
         ) -> None:
             pass
 
@@ -901,21 +977,11 @@ def test_worker_prepares_one_letter_for_active_direction(
 
     monkeypatch.setattr(applications, "create_database", lambda _settings: LetterDatabase())
     monkeypatch.setattr(applications, "ApplicationAutomationService", FakeAutomation)
+    client = object()
     monkeypatch.setattr(
         applications,
-        "AiPromptSettingsService",
-        lambda _session: SimpleNamespace(
-            get_model=lambda: "selected-model",
-            get_reasoning_effort=lambda: "high",
-        ),
-    )
-    monkeypatch.setattr(
-        applications,
-        "configured_yandex_ai_client",
-        lambda _settings, *, model, reasoning_effort, operation: {
-            ("selected-model", "high", "cover_letter"): object(),
-            ("deepseek-v4-flash/latest", "low", "cover_letter_routing"): object(),
-        }[(model, reasoning_effort, operation)],
+        "configured_codex_cli_client",
+        lambda _settings, *, operation: client if operation == "cover_letter" else None,
     )
 
     monkeypatch.setattr(applications, "CoverLetterService", FakeLetterService)
@@ -946,7 +1012,7 @@ def test_worker_does_not_create_model_client_while_paused(
     worker = prepare_worker(monkeypatch, tmp_path)
     monkeypatch.setattr(
         applications,
-        "configured_yandex_ai_client",
+        "configured_codex_cli_client",
         lambda *_args, **_kwargs: pytest.fail("модель не должна вызываться"),
     )
 

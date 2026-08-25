@@ -8,6 +8,7 @@ from hugin.domain.automation import AutomationJobResult
 from hugin.domain.hh import HhProfileData
 from hugin.domain.vacancies import (
     VacancyData,
+    VacancyRecord,
     VacancySearchResult,
     VacancyUnavailableError,
 )
@@ -35,6 +36,8 @@ class SearchCycleBrowser(Protocol):
 
 
 class BackgroundSearchCycle:
+    _DETAIL_CHUNK_SIZE = 1
+
     def __init__(
         self,
         settings: Settings,
@@ -61,6 +64,29 @@ class BackgroundSearchCycle:
         profile = browser.read_profile()
         if profile.external_id != account_external_id:
             raise RuntimeError("Аккаунт в браузере выбран неверно")
+
+        pending = self._pending(
+            account_external_id=profile.external_id,
+            direction_name=direction_name,
+        )
+        if pending:
+            details_loaded, details_failed, queued = self._process_pending(
+                account_external_id=profile.external_id,
+                direction_name=direction_name,
+                browser=browser,
+                pending=pending,
+            )
+            return {
+                "search_variants": 0,
+                "pages_loaded": 0,
+                "found": 0,
+                "unique_vacancies": 0,
+                "details_loaded": details_loaded,
+                "details_failed": details_failed,
+                "queued": queued,
+                "backlog_processed": True,
+            }
+
         search_runs: list[tuple[VacancySearchTask, tuple[VacancySearchResult, ...]]] = []
         database = create_database(self._settings)
         try:
@@ -91,57 +117,19 @@ class BackgroundSearchCycle:
                             vacancies=result.vacancies,
                         )
                 search_runs.append((task, tuple(pages)))
-            with database.sessions.begin() as session:
-                pending = VacancyAnalysisService(session).pending(
-                    account_external_id=profile.external_id,
-                    direction_name=direction_name,
-                    limit=self._detail_limit,
-                )
         finally:
             database.close()
 
-        detailed: list[VacancyData] = []
-        failed_details = 0
-        for vacancy in pending:
-            try:
-                detailed.append(browser.read_vacancy_details(vacancy.source_url))
-            except VacancyUnavailableError as error:
-                detailed.append(
-                    VacancyData(
-                        hh_id=vacancy.hh_id,
-                        title=vacancy.title,
-                        source_url=vacancy.source_url,
-                        employer_name=vacancy.employer_name,
-                        published_at=vacancy.published_at,
-                        region=vacancy.region,
-                        availability=error.availability,
-                    )
-                )
-            except RuntimeError:
-                failed_details += 1
-
-        database = create_database(self._settings)
-        try:
-            with database.sessions.begin() as session:
-                analysis = VacancyAnalysisService(session)
-                if detailed:
-                    analysis.synchronize(
-                        account_external_id=profile.external_id,
-                        direction_name=direction_name,
-                        vacancies=tuple(detailed),
-                    )
-                analysis.reanalyze(
-                    account_external_id=profile.external_id,
-                    direction_name=direction_name,
-                )
-                automation = ApplicationAutomationService(session)
-                prepared = automation.prepare(
-                    account_external_id=profile.external_id,
-                    direction_name=direction_name,
-                    include_stretch=automation.stretch_automation_enabled(),
-                )
-        finally:
-            database.close()
+        pending = self._pending(
+            account_external_id=profile.external_id,
+            direction_name=direction_name,
+        )
+        details_loaded, failed_details, queued = self._process_pending(
+            account_external_id=profile.external_id,
+            direction_name=direction_name,
+            browser=browser,
+            pending=pending,
+        )
 
         unique_vacancies = {
             vacancy.hh_id
@@ -154,10 +142,111 @@ class BackgroundSearchCycle:
             "pages_loaded": sum(len(pages) for _task, pages in search_runs),
             "found": sum(pages[0].found for _task, pages in search_runs if pages),
             "unique_vacancies": len(unique_vacancies),
-            "details_loaded": len(detailed),
+            "details_loaded": details_loaded,
             "details_failed": failed_details,
-            "queued": prepared.created,
+            "queued": queued,
+            "backlog_processed": False,
         }
+
+    def _pending(
+        self,
+        *,
+        account_external_id: str,
+        direction_name: str,
+    ) -> tuple[VacancyRecord, ...]:
+        database = create_database(self._settings)
+        try:
+            with database.sessions.begin() as session:
+                return VacancyAnalysisService(session).pending(
+                    account_external_id=account_external_id,
+                    direction_name=direction_name,
+                    limit=self._detail_limit,
+                )
+        finally:
+            database.close()
+
+    def _process_pending(
+        self,
+        *,
+        account_external_id: str,
+        direction_name: str,
+        browser: SearchCycleBrowser,
+        pending: tuple[VacancyRecord, ...],
+    ) -> tuple[int, int, int]:
+        details_loaded = 0
+        details_failed = 0
+        queued = 0
+        if not pending:
+            queued = self._synchronize_and_prepare(
+                account_external_id=account_external_id,
+                direction_name=direction_name,
+                detailed=(),
+            )
+            return details_loaded, details_failed, queued
+        for offset in range(0, len(pending), self._DETAIL_CHUNK_SIZE):
+            detailed: list[VacancyData] = []
+            for vacancy in pending[offset : offset + self._DETAIL_CHUNK_SIZE]:
+                try:
+                    detailed.append(browser.read_vacancy_details(vacancy.source_url))
+                except VacancyUnavailableError as error:
+                    detailed.append(
+                        VacancyData(
+                            hh_id=vacancy.hh_id,
+                            title=vacancy.title,
+                            source_url=vacancy.source_url,
+                            employer_name=vacancy.employer_name,
+                            published_at=vacancy.published_at,
+                            region=vacancy.region,
+                            availability=error.availability,
+                        )
+                    )
+                except RuntimeError:
+                    details_failed += 1
+            details_loaded += len(detailed)
+            queued += self._synchronize_and_prepare(
+                account_external_id=account_external_id,
+                direction_name=direction_name,
+                detailed=tuple(detailed),
+            )
+            if queued:
+                break
+        return details_loaded, details_failed, queued
+
+    def _synchronize_and_prepare(
+        self,
+        *,
+        account_external_id: str,
+        direction_name: str,
+        detailed: tuple[VacancyData, ...],
+    ) -> int:
+        database = create_database(self._settings)
+        try:
+            with database.sessions.begin() as session:
+                analysis = VacancyAnalysisService(session)
+                vacancy_ids: tuple[int, ...] = ()
+                if detailed:
+                    analyzed = analysis.synchronize(
+                        account_external_id=account_external_id,
+                        direction_name=direction_name,
+                        vacancies=detailed,
+                    )
+                    vacancy_ids = tuple(item.vacancy.id for item in analyzed)
+                automation = ApplicationAutomationService(session)
+                include_stretch = automation.stretch_automation_enabled()
+                if vacancy_ids:
+                    return automation.prepare_vacancies(
+                        account_external_id=account_external_id,
+                        vacancy_ids=vacancy_ids,
+                        include_stretch=include_stretch,
+                    )
+                prepared = automation.prepare(
+                    account_external_id=account_external_id,
+                    direction_name=direction_name,
+                    include_stretch=include_stretch,
+                )
+                return prepared.created
+        finally:
+            database.close()
 
     def _tasks(
         self,

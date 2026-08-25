@@ -199,6 +199,11 @@ SERIOUS_OBLIGATION = re.compile(
     re.IGNORECASE,
 )
 
+DATA_ACCURACY_CONFIRMATION = re.compile(
+    r"(?=.*подтвержд)(?=.*(?:сведен|данн))(?=.*достоверн)",
+    re.IGNORECASE | re.DOTALL,
+)
+
 SUPPORTED_AUTOMATIC_FIELD_TYPES = frozenset(
     {
         "checkbox",
@@ -833,20 +838,48 @@ class ScreeningDraftService:
             )
         )
         return all(
-            fact is not None
-            and fact.state is ConfirmationState.CONFIRMED
+            self._answer_still_allowed(
+                answer,
+                fact,
+                question,
+                application,
+                policy,
+                now=selected_at,
+            )
+            for answer, fact, question in rows
+        )
+
+    @classmethod
+    def _answer_still_allowed(
+        cls,
+        answer: ScreeningAnswerModel,
+        fact: VerifiedFactModel | None,
+        question: ScreeningQuestionModel,
+        application: ApplicationModel,
+        policy: AutonomyPolicy,
+        *,
+        now: datetime,
+    ) -> bool:
+        if fact is None:
+            return bool(
+                answer.source is AnswerSource.PROFILE
+                and answer.answer_text is not None
+                and cls._normalize(answer.answer_text) == "да"
+                and DATA_ACCURACY_CONFIRMATION.search(question.question_text)
+            )
+        return bool(
+            fact.state is ConfirmationState.CONFIRMED
             and fact.allow_in_forms
             and (fact.resume_id is None or fact.resume_id == application.resume_id)
             and (fact.direction_id is None or fact.direction_id == application.direction_id)
             and answer.answer_text is not None
             and answer.answer_text.strip() == fact.content.strip()
-            and self._fact_is_current(
+            and cls._fact_is_current(
                 fact,
                 question.question_text,
                 policy,
-                now=selected_at,
+                now=now,
             )
-            for answer, fact, question in rows
         )
 
     def mark_sent(
@@ -1008,6 +1041,10 @@ class ScreeningDraftService:
             or DANGEROUS_QUESTION.search(field.question)
         ):
             return None
+        if DATA_ACCURACY_CONFIRMATION.search(field.question):
+            answer = self._compatible_answer(field, "Да")
+            if answer is not None:
+                return _ResolvedAnswer(answer, AnswerSource.PROFILE, None, True)
         normalized_question = self._normalize(field.question)
         for template, fact in templates:
             fact_allowed = fact is not None and (
@@ -1200,7 +1237,8 @@ class ScreeningDraftService:
         if SERIOUS_QUESTION.search(field.question) or SERIOUS_OBLIGATION.search(field.question):
             return False
         return (
-            cls._question_key(field.question) is not None
+            DATA_ACCURACY_CONFIRMATION.search(field.question) is not None
+            or cls._question_key(field.question) is not None
             or cls._fact_category(field.question) is not None
         )
 

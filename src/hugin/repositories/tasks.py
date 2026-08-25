@@ -43,6 +43,13 @@ FORM_PREFLIGHT_RUNNING = "FORM_PREFLIGHT_RUNNING"
 FORM_PREFLIGHT_INTERRUPTED = "FORM_PREFLIGHT_INTERRUPTED"
 FORM_PREFLIGHT_PASSED = "FORM_PREFLIGHT_PASSED"
 FORM_RETRY_EXHAUSTED = "FORM_RETRY_EXHAUSTED"
+SELECTION_RECOVERY_ERRORS = frozenset(
+    {
+        "VACANCY_RULES_CHANGED",
+        "VACANCY_DUPLICATE",
+        "NO_RELEVANT_EVIDENCE",
+    }
+)
 
 
 def _task_record(model: ApplicationTaskModel) -> TaskRecord:
@@ -148,6 +155,19 @@ class QueueTaskRepository:
             ),
             else_=1,
         )
+        category_priority = case(
+            (
+                DirectionVacancyModel.rules_details["category"].as_string()
+                == "MATCH",
+                0,
+            ),
+            (
+                DirectionVacancyModel.rules_details["category"].as_string()
+                == "STRETCH",
+                1,
+            ),
+            else_=2,
+        )
         location_priority = DirectionVacancyModel.rules_details["location_priority"].as_float()
         experience_priority = DirectionVacancyModel.rules_details["experience_priority"].as_float()
         statement = (
@@ -178,10 +198,11 @@ class QueueTaskRepository:
             )
             .order_by(
                 direction_priority,
+                category_priority,
+                ApplicationTaskModel.priority_score.desc(),
                 location_priority.desc().nulls_last(),
                 experience_priority.desc().nulls_last(),
                 VacancyModel.published_at.desc().nulls_last(),
-                ApplicationTaskModel.priority_score.desc(),
                 ApplicationTaskModel.scheduled_at,
                 ApplicationTaskModel.id,
             )
@@ -289,6 +310,26 @@ class QueueTaskRepository:
             or task.last_error_code != "VACANCY_RULES_CHANGED"
         ):
             raise ValueError("Задание не было остановлено изменением правил")
+        task.state = TaskState.PENDING
+        task.priority_score = priority_score
+        task.scheduled_at = datetime.now(UTC)
+        task.last_error_code = None
+        self._session.flush()
+        return _task_record(task)
+
+    def requeue_after_selection_recovery(
+        self,
+        task_id: int,
+        *,
+        priority_score: float,
+    ) -> TaskRecord:
+        task = self._session.get(ApplicationTaskModel, task_id)
+        if (
+            task is None
+            or task.state is not TaskState.SKIPPED
+            or task.last_error_code not in SELECTION_RECOVERY_ERRORS
+        ):
+            raise ValueError("Задание не было остановлено исправленной причиной отбора")
         task.state = TaskState.PENDING
         task.priority_score = priority_score
         task.scheduled_at = datetime.now(UTC)

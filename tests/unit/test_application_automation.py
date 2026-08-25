@@ -15,6 +15,7 @@ from hugin.database.models import (
     CoverLetterFactModel,
     CoverLetterModel,
     DirectionVacancyModel,
+    IncidentModel,
     ResumeModel,
     VerifiedFactModel,
 )
@@ -33,6 +34,7 @@ from hugin.domain import (
 from hugin.domain.content import (
     ConfirmationState,
     CoverLetterState,
+    IncidentState,
     cover_letter_instruction_version,
 )
 from hugin.domain.directions import VacancyState
@@ -525,10 +527,13 @@ def test_automation_prepares_claims_and_records_results(settings: Settings) -> N
                 uncertain_job.application.id
             )[-1]
             assert unknown_event.payload["final_url"] == uncertain_vacancy.source_url
-            assert service.applied_since(
-                account.id,
-                datetime(2026, 1, 1, tzinfo=UTC),
-            ) == 2
+            assert (
+                service.applied_since(
+                    account.id,
+                    datetime(2026, 1, 1, tzinfo=UTC),
+                )
+                == 2
+            )
 
             confirmed = ApplicationReconciliationService(session).reconcile(
                 uncertain_job.task.id,
@@ -547,10 +552,13 @@ def test_automation_prepares_claims_and_records_results(settings: Settings) -> N
                 QueueTaskRepository(session).get(uncertain_job.task.id).state is TaskState.COMPLETED
             )
             assert SystemStateRepository(session).get().state is SystemState.RUNNING
-            assert service.applied_since(
-                account.id,
-                datetime(2026, 1, 1, tzinfo=UTC),
-            ) == 2
+            assert (
+                service.applied_since(
+                    account.id,
+                    datetime(2026, 1, 1, tzinfo=UTC),
+                )
+                == 2
+            )
 
             closed_vacancy = vacancies.upsert(
                 VacancyData("400", "Closed Python role", "https://hh.ru/vacancy/400")
@@ -715,9 +723,130 @@ def test_retry_after_schedules_next_run_and_account_warning_blocks_queue(
             )
 
             assert warning.blocking
-            assert (
-                SystemStateRepository(session).get().state
-                is SystemState.ACCOUNT_WARNING
+            assert SystemStateRepository(session).get().state is SystemState.ACCOUNT_WARNING
+    finally:
+        database.close()
+
+
+def test_repeated_failure_stops_after_second_attempt(settings: Settings) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    now = datetime.now(UTC) - timedelta(seconds=1)
+
+    try:
+        with database.sessions.begin() as session:
+            account = AccountRepository(session).create("Иван", "retry-limit-account")
+            resume = ResumeRepository(session).upsert(account.id, "resume-retry-limit", "Python")
+            direction = DirectionRepository(session).create(account.id, "Python backend")
+            vacancy = VacancyRepository(session).upsert(
+                VacancyData(
+                    "retry-limit",
+                    "Python-разработчик",
+                    "https://hh.ru/vacancy/retry-limit",
+                )
+            )
+            directions = DirectionRepository(session)
+            directions.track_vacancy(direction.id, vacancy.id)
+            directions.apply_rules(
+                direction.id,
+                vacancy.id,
+                state=VacancyState.QUEUED,
+                score=80,
+                details={"category": "MATCH", "accepted": True},
+                rules_version=RULES_VERSION,
+            )
+            application = ApplicationRepository(session).create_apply_intent(
+                account.id,
+                vacancy.id,
+                resume.id,
+                direction.id,
+            )
+            task = QueueTaskRepository(session).enqueue(application.id, 80, now)
+            service = ApplicationAutomationService(session)
+            SystemStateRepository(session).transition(SystemState.RUNNING)
+
+            for _attempt in range(2):
+                job = service.claim_next(direction.id)
+                assert job is not None
+                service.record_result(
+                    job,
+                    HhApplyResult(
+                        HhApplyStatus.RETRYABLE_ERROR,
+                        vacancy.source_url,
+                        "Форма отклика не открылась",
+                    ),
+                    retry_delay=timedelta(0),
+                    now=now,
+                )
+
+            stored = QueueTaskRepository(session).get(task.id)
+            assert stored.state is TaskState.REVIEW_REQUIRED
+            assert stored.last_error_code == "RETRY_LIMIT_REACHED"
+            incident = session.scalar(
+                select(IncidentModel).where(
+                    IncidentModel.code == "APPLICATION_RETRY_EXHAUSTED",
+                    IncidentModel.scope_id == task.id,
+                )
+            )
+            assert incident is not None
+            assert incident.state is IncidentState.OPEN
+    finally:
+        database.close()
+
+
+def test_priority_guard_sees_scheduled_application_work(settings: Settings) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    now = datetime.now(UTC)
+
+    try:
+        with database.sessions.begin() as session:
+            account = AccountRepository(session).create("Иван", "scheduled-guard-account")
+            resume = ResumeRepository(session).upsert(
+                account.id,
+                "resume-scheduled-guard",
+                "Python",
+            )
+            direction = DirectionRepository(session).create(account.id, "Python backend")
+            vacancy = VacancyRepository(session).upsert(
+                VacancyData(
+                    "scheduled-guard",
+                    "Python-разработчик",
+                    "https://hh.ru/vacancy/scheduled-guard",
+                )
+            )
+            directions = DirectionRepository(session)
+            directions.track_vacancy(direction.id, vacancy.id)
+            directions.apply_rules(
+                direction.id,
+                vacancy.id,
+                state=VacancyState.QUEUED,
+                score=80,
+                details={"category": "MATCH", "accepted": True},
+                rules_version=RULES_VERSION,
+            )
+            application = ApplicationRepository(session).create_apply_intent(
+                account.id,
+                vacancy.id,
+                resume.id,
+                direction.id,
+            )
+            QueueTaskRepository(session).enqueue(
+                application.id,
+                80,
+                now + timedelta(minutes=10),
+            )
+            SystemStateRepository(session).transition(SystemState.RUNNING)
+            service = ApplicationAutomationService(session)
+
+            assert not service.has_pending_application_work(
+                account_id=account.id,
+                now=now,
+            )
+            assert service.has_pending_application_work(
+                account_id=account.id,
+                include_scheduled=True,
+                now=now,
             )
     finally:
         database.close()
@@ -945,16 +1074,154 @@ def test_routed_pending_application_moves_to_target_direction(settings: Settings
                 include_stretch=False,
             )
 
-            prepared = service.prepare_for_account_id(
+            created = service.prepare_vacancies(
+                account_external_id=account.external_id or "",
+                vacancy_ids=(vacancy.id,),
+                include_stretch=False,
+            )
+
+            assert created == 1
+            moved = ApplicationRepository(session).get(application.id)
+            assert moved.direction_id == target.id
+            assert QueueTaskRepository(session).get(task.id).state is TaskState.PENDING
+    finally:
+        database.close()
+
+
+def test_prepare_recovers_letter_task_stopped_for_missing_evidence(
+    settings: Settings,
+) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    try:
+        with database.sessions.begin() as session:
+            account = AccountRepository(session).create("Иван", "letter-recovery-account")
+            resume = ResumeRepository(session).upsert(
+                account.id,
+                "letter-recovery-resume",
+                "Python backend",
+            )
+            directions = DirectionRepository(session)
+            direction = directions.create(account.id, "Python backend")
+            directions.attach_resume(direction.id, resume.id)
+            vacancy = VacancyRepository(session).upsert(
+                VacancyData(
+                    "letter-recovery-vacancy",
+                    "Python backend разработчик",
+                    "https://hh.ru/vacancy/letter-recovery-vacancy",
+                )
+            )
+            directions.track_vacancy(direction.id, vacancy.id)
+            directions.apply_rules(
+                direction.id,
+                vacancy.id,
+                state=VacancyState.ANALYZED,
+                score=80,
+                details={"category": "MATCH", "accepted": True},
+                rules_version=RULES_VERSION,
+            )
+            service = ApplicationAutomationService(session)
+            assert service.prepare_for_account_id(
                 account_id=account.id,
-                direction_name=target.name,
+                direction_name=direction.name,
+                include_stretch=False,
+            ).created == 1
+            application = ApplicationRepository(session).get_by_key(
+                account.id,
+                vacancy.id,
+                resume.id,
+            )
+            assert application is not None
+            tasks = QueueTaskRepository(session)
+            task = tasks.get_by_application_id(application.id)
+            assert task is not None
+            tasks.transition(
+                task.id,
+                TaskState.SKIPPED,
+                error_code="NO_RELEVANT_EVIDENCE",
+            )
+
+            restored = service.prepare_for_account_id(
+                account_id=account.id,
+                direction_name=direction.name,
+                include_stretch=False,
+            )
+
+            assert restored.created == 1
+            recovered = tasks.get(task.id)
+            assert recovered.state is TaskState.PENDING
+            assert recovered.last_error_code is None
+    finally:
+        database.close()
+
+
+def test_prepare_promotes_sendable_duplicate_when_family_has_no_application(
+    settings: Settings,
+) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    now = datetime.now(UTC)
+    try:
+        with database.sessions.begin() as session:
+            account = AccountRepository(session).create("Иван", "duplicate-recovery-account")
+            resume = ResumeRepository(session).upsert(
+                account.id,
+                "duplicate-recovery-resume",
+                "Python backend",
+            )
+            directions = DirectionRepository(session)
+            direction = directions.create(account.id, "Python backend")
+            directions.attach_resume(direction.id, resume.id)
+            vacancies = VacancyRepository(session)
+            canonical = vacancies.upsert(
+                VacancyData(
+                    "duplicate-old",
+                    "Python backend разработчик",
+                    "https://hh.ru/vacancy/duplicate-old",
+                    employer_name="Компания",
+                    description="Разработка сервисов на Python и FastAPI.",
+                    details_fetched_at=now,
+                )
+            )
+            current = vacancies.upsert(
+                VacancyData(
+                    "duplicate-current",
+                    "Python backend разработчик",
+                    "https://hh.ru/vacancy/duplicate-current",
+                    employer_name="Компания",
+                    description="Разработка сервисов на Python и FastAPI.",
+                    details_fetched_at=now,
+                )
+            )
+            vacancies.mark_duplicate(current.id, canonical.id, 0.99)
+            directions.track_vacancy(direction.id, current.id)
+            directions.apply_rules(
+                direction.id,
+                current.id,
+                state=VacancyState.ANALYZED,
+                score=85,
+                details={"category": "MATCH", "accepted": True},
+                rules_version=RULES_VERSION,
+            )
+
+            prepared = ApplicationAutomationService(session).prepare_for_account_id(
+                account_id=account.id,
+                direction_name=direction.name,
                 include_stretch=False,
             )
 
             assert prepared.created == 1
-            moved = ApplicationRepository(session).get(application.id)
-            assert moved.direction_id == target.id
-            assert QueueTaskRepository(session).get(task.id).state is TaskState.PENDING
+            assert vacancies.get(current.id).duplicate_of_id is None
+            assert vacancies.get(canonical.id).duplicate_of_id == current.id
+            application = ApplicationRepository(session).get_by_key(
+                account.id,
+                current.id,
+                resume.id,
+            )
+            assert application is not None
+            task = QueueTaskRepository(session).get_by_application_id(application.id)
+            assert task is not None
+            assert task.state is TaskState.PENDING
     finally:
         database.close()
 
@@ -1179,7 +1446,10 @@ def test_background_claim_and_submit_guard_require_the_same_current_letter(
             letter.failure_reason = None
             letter.context_hash = CoverLetterService(session).current_context_hash(application.id)
             session.flush()
-            job = service.claim_next(require_cover_letter=True)
+            job = service.claim_exact_prepared(
+                account_id=account.id,
+                task_id=task.id,
+            )
             assert job is not None
             assert job.cover_letter_id == letter.id
             assert job.cover_letter_sha256 == hashlib.sha256(text.encode("utf-8")).hexdigest()
@@ -1408,9 +1678,7 @@ def test_supervised_claim_requires_exact_letter_and_excludes_worker(
                 )
             session.execute(
                 delete(ApplicationEventModel).where(
-                    ApplicationEventModel.application_id.in_(
-                        session_limit_application_ids
-                    )
+                    ApplicationEventModel.application_id.in_(session_limit_application_ids)
                 )
             )
             session.flush()

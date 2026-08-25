@@ -8,7 +8,7 @@ from sqlalchemy import func, select
 
 from hugin.core.settings import Settings
 from hugin.database import create_database, upgrade_database
-from hugin.database.models import ApplicationModel
+from hugin.database.models import ApplicationModel, DirectionVacancyModel
 from hugin.domain import VacancyData, VacancyState
 from hugin.domain.directions import DirectionScope
 from hugin.repositories import AccountRepository, DirectionRepository, ResumeRepository
@@ -129,6 +129,20 @@ def test_collection_tracks_changes_discoveries_duplicates_and_rejected(
             )
             assert restored.tracking.state is VacancyState.ANALYZED
             assert restored.tracking.rules_details["manual_override"] == "ACCEPT"
+
+            tracking = session.get(
+                DirectionVacancyModel,
+                (direction.id, restored.vacancy.id),
+            )
+            assert tracking is not None
+            tracking.rules_version = "python_it_previous"
+            reanalyzed = service.reanalyze(
+                account_external_id="account-vacancies",
+                direction_name="Python backend",
+            )
+            refreshed = next(item for item in reanalyzed if item.vacancy.hh_id == "102")
+            assert refreshed.evaluation.category is RuleCategory.REJECTED
+            assert refreshed.state is VacancyState.FILTERED_OUT
     finally:
         database.close()
 

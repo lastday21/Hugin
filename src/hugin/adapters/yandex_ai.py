@@ -11,6 +11,7 @@ from ipaddress import IPv4Address
 from time import monotonic
 from typing import Any
 
+from hugin.core.network import usable_source_ipv4
 from hugin.diagnostics import OperationJournal
 
 REASONING_EFFORTS = frozenset({"low", "medium", "high"})
@@ -103,15 +104,18 @@ class YandexAIClient:
         self._reasoning_effort = reasoning_effort.strip()
         self._journal = journal
         self._operation = operation.strip() or "unspecified"
+        normalized_source_ip = str(IPv4Address(source_ip)) if source_ip else None
+        normalized_connect_ip = str(IPv4Address(connect_ip)) if connect_ip else None
+        usable_source_ip = usable_source_ipv4(normalized_source_ip)
         self._opener = (
             urllib.request.build_opener(
                 urllib.request.ProxyHandler({}),
-                _SourceAddressHTTPSHandler(source_ip, connect_ip),
+                _SourceAddressHTTPSHandler(usable_source_ip, normalized_connect_ip),
             )
-            if source_ip
+            if usable_source_ip
             else None
         )
-        if connect_ip and not source_ip:
+        if connect_ip and source_ip is None:
             raise ValueError("Для прямого адреса YandexGPT нужен исходящий сетевой адрес")
         if not self._api_key:
             raise ValueError("Не указан ключ Yandex AI Studio")

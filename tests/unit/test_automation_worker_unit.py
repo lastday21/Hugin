@@ -22,6 +22,7 @@ from hugin.domain import (
 from hugin.domain.tasks import SystemState
 from hugin.workers.automation import (
     AutomationJobBlocked,
+    AutomationJobDeferred,
     AutomationJobRetry,
     AutomationWorker,
 )
@@ -79,6 +80,9 @@ class FakeScheduler:
         self.failed: list[tuple[str, str, str, datetime | None]] = []
         self.retry_delays: list[int | None] = []
         self.completed: list[tuple[str, AutomationJobResult, datetime | None]] = []
+        self.deferred: list[
+            tuple[str, int, AutomationJobResult | None, datetime | None]
+        ] = []
 
     def ensure_configured_jobs(
         self,
@@ -87,6 +91,10 @@ class FakeScheduler:
     ) -> tuple[AutomationJobRecord, ...]:
         self.configured.append((account_id, now))
         return self.ensured_jobs
+
+    def list_for_account(self, account_id: int) -> tuple[AutomationJobRecord, ...]:
+        assert account_id == 1
+        return (self.job,) if self.job is not None else ()
 
     def recover_stale(self, now: datetime | None = None) -> None:
         self.recovered.append(now)
@@ -133,6 +141,16 @@ class FakeScheduler:
         now: datetime | None = None,
     ) -> None:
         self.completed.append((job_key, result, now))
+
+    def defer(
+        self,
+        job_key: str,
+        *,
+        retry_after_seconds: int,
+        result: AutomationJobResult | None = None,
+        now: datetime | None = None,
+    ) -> None:
+        self.deferred.append((job_key, retry_after_seconds, result, now))
 
 
 def patch_worker_storage(
@@ -240,6 +258,39 @@ def test_worker_start_stop_and_restart_are_idempotent(
     assert len(upgrades) == 2
     assert len(threads) == 2
     worker.stop()
+
+
+def test_worker_stop_timeout_marks_running_job_interrupted(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    job = make_job(AutomationJobKind.SEARCH)
+    scheduler = FakeScheduler(job)
+    database = patch_worker_storage(monkeypatch, scheduler)
+
+    class StubbornThread:
+        def is_alive(self) -> bool:
+            return True
+
+        def join(self, _timeout: float | None = None) -> None:
+            return
+
+    worker = AutomationWorker(Settings(environment="test", data_dir=tmp_path))
+    worker._thread = StubbornThread()  # type: ignore[assignment]
+
+    worker.stop(0.01)
+
+    assert worker.running
+    assert scheduler.failed == [
+        (
+            job.key,
+            "AUTOMATION_INTERRUPTED",
+            "Фоновое задание прервано при закрытии программы",
+            None,
+        )
+    ]
+    assert scheduler.retry_delays == [60]
+    assert database.closed
 
 
 def test_connected_handler_unblocks_previous_missing_source(
@@ -448,6 +499,81 @@ def test_worker_schedules_explicit_retry_delay(
     assert scheduler.failed[0][3] == now
     assert not scheduler.blocked
     assert not scheduler.completed
+
+
+def test_worker_defers_search_without_recording_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 7, 26, 8, 0, tzinfo=UTC)
+    job = make_job(AutomationJobKind.SEARCH)
+    scheduler = FakeScheduler(job)
+    patch_worker_storage(monkeypatch, scheduler)
+
+    def defer(_job: AutomationJobRecord) -> AutomationJobResult:
+        raise AutomationJobDeferred(
+            "APPLICATIONS_PENDING",
+            "Сначала обрабатываются найденные вакансии",
+            retry_after_seconds=60,
+        )
+
+    worker = AutomationWorker(
+        Settings(environment="test", data_dir=tmp_path),
+        handlers={AutomationJobKind.SEARCH: defer},
+    )
+
+    assert worker.run_once(now)
+    assert scheduler.deferred == [
+        (
+            job.key,
+            60,
+            {"deferred": True, "reason": "APPLICATIONS_PENDING"},
+            now,
+        )
+    ]
+    assert not scheduler.failed
+    assert not scheduler.blocked
+
+
+def test_worker_keeps_previous_result_when_job_is_deferred(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 7, 26, 8, 0, tzinfo=UTC)
+    job = replace(
+        make_job(AutomationJobKind.MESSAGES),
+        last_result={"message_baseline_initialized": True},
+    )
+    scheduler = FakeScheduler(job)
+    patch_worker_storage(monkeypatch, scheduler)
+
+    def defer(_job: AutomationJobRecord) -> AutomationJobResult:
+        raise AutomationJobDeferred(
+            "APPLICATION_READY",
+            "Сначала отправляется готовый отклик",
+            retry_after_seconds=60,
+        )
+
+    worker = AutomationWorker(
+        Settings(environment="test", data_dir=tmp_path),
+        handlers={AutomationJobKind.MESSAGES: defer},
+    )
+
+    assert worker.run_once(now)
+    assert scheduler.deferred == [
+        (
+            job.key,
+            60,
+            {
+                "message_baseline_initialized": True,
+                "deferred": True,
+                "reason": "APPLICATION_READY",
+            },
+            now,
+        )
+    ]
+    assert not scheduler.failed
+    assert not scheduler.blocked
 
 
 def test_worker_completes_successful_handler(

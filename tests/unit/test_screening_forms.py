@@ -285,6 +285,67 @@ def test_option_answer_is_used_only_on_exact_match(settings: Settings) -> None:
         database.close()
 
 
+def test_data_accuracy_confirmation_is_not_answered_from_experience_fact(
+    settings: Settings,
+) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    try:
+        with database.sessions.begin() as session:
+            account = AccountRepository(session).create("Иван", "accuracy-confirmation")
+            resume = ResumeRepository(session).upsert(account.id, "resume-1", "Python")
+            vacancy = VacancyRepository(session).upsert(
+                VacancyData("vacancy-accuracy", "Python", "https://hh.ru/vacancy/accuracy")
+            )
+            application = ApplicationRepository(session).create_apply_intent(
+                account.id,
+                vacancy.id,
+                resume.id,
+            )
+            profile = CandidateProfileModel(account_id=account.id, display_name="Иван")
+            session.add(profile)
+            session.flush()
+            session.add(
+                VerifiedFactModel(
+                    profile_id=profile.id,
+                    category="experience",
+                    content="Нет",
+                    source_type="user",
+                    state=ConfirmationState.CONFIRMED,
+                    allow_in_forms=True,
+                )
+            )
+            session.flush()
+
+            service = ScreeningDraftService(session)
+            draft = service.capture(
+                application.id,
+                HhScreeningForm(
+                    fields=(
+                        HhScreeningField(
+                            "question:accuracy",
+                            (
+                                "Настоящим подтверждаю, что предоставленные сведения "
+                                "являются достоверными, полными и точными."
+                            ),
+                            "radio",
+                            is_required=True,
+                            options=("Да", "Нет"),
+                        ),
+                    )
+                ),
+            )
+
+            assert draft.state is ScreeningFormState.CONFIRMED
+            assert draft.answers == {"question:accuracy": "Да"}
+            assert draft.questions[0].source is AnswerSource.PROFILE
+            submission = service.get_auto_submission(application.id)
+            assert submission is not None
+            assert service.auto_submission_allowed(submission)
+    finally:
+        database.close()
+
+
 def test_pending_salary_question_is_reconciled_from_confirmed_profile_fact(
     settings: Settings,
 ) -> None:

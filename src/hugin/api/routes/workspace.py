@@ -96,6 +96,7 @@ class BackgroundStatusResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     state: str
+    search_state: str
     last_success_at: datetime | None
     next_search_at: datetime | None
     next_messages_at: datetime | None
@@ -115,6 +116,7 @@ class DashboardResponse(BaseModel):
     delay_min_seconds: int
     delay_max_seconds: int
     applied_today: int
+    replies_sent_today: int
     remaining_today: int
     task_counts: dict[str, int]
     pending_forms: int

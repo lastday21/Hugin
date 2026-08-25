@@ -1,18 +1,22 @@
 from __future__ import annotations
 
 import threading
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
 
 import pytest
+from sqlalchemy import select
 
 import hugin.workers.notifications as worker_module
 from hugin.adapters.notifications import NotificationContent
 from hugin.core.settings import Settings
+from hugin.database import create_database, upgrade_database
+from hugin.database.models import IncidentModel, NotificationModel
 from hugin.diagnostics import OperationJournal
 from hugin.domain.communications import NotificationRecord
-from hugin.domain.content import DeliveryState, NotificationChannel
+from hugin.domain.content import DeliveryState, IncidentState, NotificationChannel
+from hugin.repositories.communications import CommunicationRepository
 
 
 def notification(
@@ -159,14 +163,16 @@ def test_worker_retries_failed_delivery(
     monkeypatch.setattr(
         worker,
         "_record_failure",
-        lambda notification_id, error_code, retry_at: recorded.append(
+        lambda notification_id, error_code, retry_at, **_details: recorded.append(
             ("failed", (notification_id, error_code, retry_at))
         ),
     )
     monkeypatch.setattr(
         worker,
         "_record_success",
-        lambda notification_id, sent_at: recorded.append(("sent", (notification_id, sent_at))),
+        lambda notification_id, sent_at, **_details: recorded.append(
+            ("sent", (notification_id, sent_at))
+        ),
     )
 
     class Sessions:
@@ -210,6 +216,125 @@ def test_worker_retries_failed_delivery(
     assert recorded[0][0] == "failed"
 
 
+@pytest.mark.integration
+def test_delivery_failure_creates_visible_incident(settings: Settings) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    now = datetime(2026, 7, 27, 8, 0, tzinfo=UTC)
+    try:
+        with database.sessions.begin() as session:
+            stored = CommunicationRepository(session).enqueue_notification(
+                deduplication_key="worker-visible-incident",
+                event_type="NEW_MESSAGE",
+                channel=NotificationChannel.EMAIL,
+                payload={"title": "Hugin", "body": "Новое сообщение"},
+                scheduled_at=now,
+            )
+
+        worker_module.NotificationWorker(settings)._record_failure(
+            stored.id,
+            "NotificationGatewayError",
+            now,
+            channel=NotificationChannel.EMAIL,
+            message="Служба уведомлений сейчас недоступна",
+        )
+
+        with database.sessions.begin() as session:
+            incident = session.scalar(
+                select(IncidentModel).where(
+                    IncidentModel.code == "NOTIFICATION_DELIVERY_FAILED",
+                    IncidentModel.scope_type == "notification_channel",
+                    IncidentModel.scope_id == 3,
+                )
+            )
+            assert incident is not None
+            assert incident.state is IncidentState.OPEN
+    finally:
+        database.close()
+
+
+@pytest.mark.integration
+def test_successful_delivery_resolves_channel_incident(settings: Settings) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    failed_at = datetime(2026, 7, 27, 8, 0, tzinfo=UTC)
+    sent_at = failed_at + timedelta(minutes=5)
+    try:
+        with database.sessions.begin() as session:
+            stored = CommunicationRepository(session).enqueue_notification(
+                deduplication_key="worker-resolved-incident",
+                event_type="NEW_MESSAGE",
+                channel=NotificationChannel.EMAIL,
+                payload={"title": "Hugin", "body": "Новое сообщение"},
+                scheduled_at=failed_at,
+            )
+
+        worker = worker_module.NotificationWorker(settings)
+        worker._record_failure(
+            stored.id,
+            "NotificationGatewayError",
+            sent_at,
+            channel=NotificationChannel.EMAIL,
+            message="Почтовая служба временно недоступна",
+        )
+        worker._record_success(
+            stored.id,
+            sent_at,
+            channel=NotificationChannel.EMAIL,
+        )
+
+        with database.sessions.begin() as session:
+            incident = session.scalar(
+                select(IncidentModel).where(
+                    IncidentModel.code == "NOTIFICATION_DELIVERY_FAILED",
+                    IncidentModel.scope_type == "notification_channel",
+                    IncidentModel.scope_id == 3,
+                )
+            )
+            assert incident is not None
+            assert incident.state is IncidentState.RESOLVED
+            assert incident.resolved_at is not None
+    finally:
+        database.close()
+
+
+@pytest.mark.integration
+def test_email_attempt_defers_the_rest_of_email_queue(settings: Settings) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    now = datetime(2026, 7, 27, 8, 0, tzinfo=UTC)
+    try:
+        with database.sessions.begin() as session:
+            repository = CommunicationRepository(session)
+            first = repository.enqueue_notification(
+                deduplication_key="email-throttle-first",
+                event_type="NEW_MESSAGE",
+                channel=NotificationChannel.EMAIL,
+                payload={"title": "Первое", "body": "Первое сообщение"},
+                scheduled_at=now,
+            )
+            second = repository.enqueue_notification(
+                deduplication_key="email-throttle-second",
+                event_type="NEW_MESSAGE",
+                channel=NotificationChannel.EMAIL,
+                payload={"title": "Второе", "body": "Второе сообщение"},
+                scheduled_at=now,
+            )
+
+        worker_module.NotificationWorker(settings)._record_success(
+            first.id,
+            now,
+            channel=NotificationChannel.EMAIL,
+        )
+
+        with database.sessions.begin() as session:
+            stored = session.get(NotificationModel, second.id)
+            assert stored is not None
+            assert stored.scheduled_at == now + worker_module._EMAIL_DELIVERY_INTERVAL
+    finally:
+        database.close()
+
+
 def test_worker_blocks_unconfigured_channel_and_records_journal(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -234,7 +359,7 @@ def test_worker_blocks_unconfigured_channel_and_records_journal(
     monkeypatch.setattr(
         worker,
         "_record_failure",
-        lambda notification_id, error_code, retry_at: recorded.append(
+        lambda notification_id, error_code, retry_at, **_details: recorded.append(
             (notification_id, error_code, retry_at)
         ),
     )

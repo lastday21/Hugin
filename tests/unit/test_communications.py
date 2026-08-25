@@ -6,7 +6,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Never
 
 import pytest
-from sqlalchemy import inspect, text
+from sqlalchemy import inspect, select, text
 from sqlalchemy.orm import Session
 
 from hugin.core.settings import Settings
@@ -17,12 +17,15 @@ from hugin.database import (
     downgrade_database,
     upgrade_database,
 )
+from hugin.database.models import CandidateProfileModel, IncidentModel, VerifiedFactModel
 from hugin.domain.communications import (
     CommunicationStateError,
     MessageSendOutcome,
     StaleMessageDraftError,
 )
 from hugin.domain.content import (
+    ConfirmationState,
+    IncidentState,
     InvitationState,
     MessageDirection,
     NotificationChannel,
@@ -41,6 +44,20 @@ from hugin.services.autonomy import DEFAULT_AUTONOMY_POLICY, AutonomyPolicyServi
 from hugin.services.communications import CommunicationService, RecordingMessageSender
 
 pytestmark = pytest.mark.integration
+
+
+class ReplyModel:
+    model_name = "reply-test"
+
+    def complete(self, _system_prompt: str, _user_prompt: str) -> str:
+        return "Здравствуйте! Готов обсудить вопрос."
+
+
+class UnsafeReplyModel:
+    model_name = "unsafe-reply-test"
+
+    def complete(self, _system_prompt: str, _user_prompt: str) -> str:
+        return "Да, давайте созвонимся завтра в 15:00."
 
 
 def create_application(
@@ -439,6 +456,15 @@ def test_unknown_send_result_is_never_repeated(settings: Settings) -> None:
             assert unknown.state is RecruiterMessageState.UNKNOWN_RESULT
             assert repeated.state is RecruiterMessageState.UNKNOWN_RESULT
             assert len(sender.attempts) == 1
+            incident = session.scalar(
+                select(IncidentModel).where(
+                    IncidentModel.code == "RECRUITER_MESSAGE_SEND_UNKNOWN",
+                    IncidentModel.scope_type == "recruiter_message",
+                    IncidentModel.scope_id == unknown.id,
+                )
+            )
+            assert incident is not None
+            assert incident.state is IncidentState.OPEN
             with pytest.raises(CommunicationStateError):
                 service.edit_outgoing_draft(
                     account_id=account_id,
@@ -847,7 +873,6 @@ def test_approved_reply_with_risky_content_stays_manual(
             )
 
             assert batch.approved == ()
-            assert batch.skipped_manual == 1
     finally:
         database.close()
 
@@ -859,7 +884,7 @@ def test_approved_reply_with_risky_content_stays_manual(
             "К сожалению, сейчас мы не готовы пригласить вас на следующий этап.",
             0,
         ),
-        ("Какие у вас зарплатные ожидания?", 1),
+        ("Заполните анкету по ссылке https://example.test/form", 1),
     ),
 )
 def test_automatic_reply_filter_does_not_construct_model_for_skipped_messages(
@@ -903,5 +928,261 @@ def test_automatic_reply_filter_does_not_construct_model_for_skipped_messages(
             assert batch.skipped_manual == expected_manual
             assert batch.failed == 0
             assert factory_calls == 0
+    finally:
+        database.close()
+
+
+def test_review_question_and_existing_backlog_get_a_draft(settings: Settings) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+
+    try:
+        with database.sessions.begin() as session:
+            account_id, application_id = create_application(
+                session,
+                account_label="Старый вопрос о зарплате",
+                vacancy_hh_id="reply-review-backlog",
+            )
+            CommunicationService(session, RecordingMessageSender()).save_incoming(
+                application_id=application_id,
+                hh_id="incoming-review-backlog",
+                body="Какие у вас зарплатные ожидания?",
+            )
+
+            batch = AutonomousReplyService(session).prepare(
+                account_id=account_id,
+                model_factory=ReplyModel,
+                include_backlog=True,
+            )
+
+            assert batch.approved == ()
+            assert batch.drafts_created == 1
+            outgoing = tuple(
+                message
+                for message in CommunicationService(
+                    session,
+                    RecordingMessageSender(),
+                ).messages(account_id)
+                if message.direction is MessageDirection.OUTGOING
+            )
+            assert len(outgoing) == 1
+            assert outgoing[0].state is RecruiterMessageState.REVIEW_REQUIRED
+    finally:
+        database.close()
+
+
+def test_new_simple_salary_question_gets_exact_confirmed_automatic_reply(
+    settings: Settings,
+) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+
+    try:
+        with database.sessions.begin() as session:
+            account_id, application_id = create_application(
+                session,
+                account_label="Однозначная зарплата",
+                vacancy_hh_id="reply-exact-salary",
+            )
+            profile = CandidateProfileModel(
+                account_id=account_id,
+                display_name="Кандидат",
+            )
+            session.add(profile)
+            session.flush()
+            session.add(
+                VerifiedFactModel(
+                    profile_id=profile.id,
+                    category="salary",
+                    content=(
+                        "Минимальная и желаемая зарплата — 120 000 рублей на руки"
+                    ),
+                    source_type="user",
+                    state=ConfirmationState.CONFIRMED,
+                    allow_in_messages=True,
+                )
+            )
+            session.flush()
+            incoming = CommunicationService(
+                session,
+                RecordingMessageSender(),
+            ).save_incoming(
+                application_id=application_id,
+                hh_id="incoming-exact-salary",
+                body="Какие у вас зарплатные ожидания?",
+            )
+
+            batch = AutonomousReplyService(session).prepare(
+                account_id=account_id,
+                incoming_message_ids=(incoming.id,),
+            )
+
+            assert batch.drafts_created == 1
+            assert len(batch.approved) == 1
+            approved = batch.approved[0]
+            outgoing = next(
+                message
+                for message in CommunicationService(
+                    session,
+                    RecordingMessageSender(),
+                ).messages(account_id)
+                if message.id == approved.message_id
+            )
+            assert outgoing.body == "Мои зарплатные ожидания — 120 000 рублей на руки."
+            assert outgoing.state is RecruiterMessageState.CONFIRMED
+            assert AutonomousReplyService(session).approved_for_send(
+                account_id=account_id,
+                message_id=approved.message_id,
+                content_version=approved.content_version,
+                content_hash=approved.content_hash,
+            )
+    finally:
+        database.close()
+
+
+def test_simple_salary_question_from_backlog_gets_exact_automatic_reply(
+    settings: Settings,
+) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+
+    try:
+        with database.sessions.begin() as session:
+            account_id, application_id = create_application(
+                session,
+                account_label="Однозначная зарплата из очереди",
+                vacancy_hh_id="reply-exact-salary-backlog",
+            )
+            profile = CandidateProfileModel(
+                account_id=account_id,
+                display_name="Кандидат",
+            )
+            session.add(profile)
+            session.flush()
+            session.add(
+                VerifiedFactModel(
+                    profile_id=profile.id,
+                    category="salary",
+                    content=(
+                        "Минимальная и желаемая зарплата — 120 000 рублей на руки"
+                    ),
+                    source_type="user",
+                    state=ConfirmationState.CONFIRMED,
+                    allow_in_messages=True,
+                )
+            )
+            session.flush()
+            CommunicationService(
+                session,
+                RecordingMessageSender(),
+            ).save_incoming(
+                application_id=application_id,
+                hh_id="incoming-exact-salary-backlog",
+                body="Какой уровень дохода вы рассматриваете?",
+            )
+
+            batch = AutonomousReplyService(session).prepare(
+                account_id=account_id,
+                include_backlog=True,
+            )
+
+            assert batch.drafts_created == 1
+            assert len(batch.approved) == 1
+            approved = batch.approved[0]
+            outgoing = next(
+                message
+                for message in CommunicationService(
+                    session,
+                    RecordingMessageSender(),
+                ).messages(account_id)
+                if message.id == approved.message_id
+            )
+            assert outgoing.body == "Мои зарплатные ожидания — 120 000 рублей на руки."
+            assert outgoing.state is RecruiterMessageState.CONFIRMED
+    finally:
+        database.close()
+
+
+def test_new_safe_question_gets_model_reply_approved_for_send(
+    settings: Settings,
+) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+
+    try:
+        with database.sessions.begin() as session:
+            account_id, application_id = create_application(
+                session,
+                account_label="Безопасный автоматический ответ",
+                vacancy_hh_id="reply-safe-model",
+            )
+            incoming = CommunicationService(
+                session,
+                RecordingMessageSender(),
+            ).save_incoming(
+                application_id=application_id,
+                hh_id="incoming-safe-model",
+                body="Подскажите, предложение для вас ещё актуально?",
+            )
+
+            batch = AutonomousReplyService(session).prepare(
+                account_id=account_id,
+                model_factory=ReplyModel,
+                incoming_message_ids=(incoming.id,),
+            )
+
+            assert batch.drafts_created == 1
+            assert len(batch.approved) == 1
+            approved = batch.approved[0]
+            assert AutonomousReplyService(session).approved_for_send(
+                account_id=account_id,
+                message_id=approved.message_id,
+                content_version=approved.content_version,
+                content_hash=approved.content_hash,
+            )
+    finally:
+        database.close()
+
+
+def test_model_reply_with_schedule_commitment_stays_for_review(
+    settings: Settings,
+) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+
+    try:
+        with database.sessions.begin() as session:
+            account_id, application_id = create_application(
+                session,
+                account_label="Небезопасный ответ модели",
+                vacancy_hh_id="reply-unsafe-model",
+            )
+            incoming = CommunicationService(
+                session,
+                RecordingMessageSender(),
+            ).save_incoming(
+                application_id=application_id,
+                hh_id="incoming-unsafe-model",
+                body="Подскажите, предложение для вас ещё актуально?",
+            )
+
+            batch = AutonomousReplyService(session).prepare(
+                account_id=account_id,
+                model_factory=UnsafeReplyModel,
+                incoming_message_ids=(incoming.id,),
+            )
+
+            assert batch.drafts_created == 1
+            assert batch.approved == ()
+            outgoing = next(
+                message
+                for message in CommunicationService(
+                    session,
+                    RecordingMessageSender(),
+                ).messages(account_id)
+                if message.direction is MessageDirection.OUTGOING
+            )
+            assert outgoing.state is RecruiterMessageState.REVIEW_REQUIRED
+            assert outgoing.auto_send_approved is False
     finally:
         database.close()

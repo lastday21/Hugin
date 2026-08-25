@@ -242,6 +242,24 @@ class AutomationSchedulerService:
         )
         return self._disable_finished_search_if_paused(failed, failed_at)
 
+    def defer(
+        self,
+        job_key: str,
+        *,
+        retry_after_seconds: int,
+        result: AutomationJobResult | None = None,
+        now: datetime | None = None,
+    ) -> AutomationJobRecord:
+        deferred_at = self._now(now)
+        delay = timedelta(seconds=max(1, min(retry_after_seconds, 86_400)))
+        deferred = self._jobs.defer(
+            job_key,
+            run_at=deferred_at + delay,
+            result=result,
+            now=deferred_at,
+        )
+        return self._disable_finished_search_if_paused(deferred, deferred_at)
+
     def recover_stale(
         self,
         now: datetime | None = None,

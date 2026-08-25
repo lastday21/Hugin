@@ -15,7 +15,7 @@ from hugin.domain import (
     AutomationJobState,
 )
 from hugin.services.hh_login import LoginResult, LoginStatus
-from hugin.workers.automation import AutomationJobBlocked
+from hugin.workers.automation import AutomationJobBlocked, AutomationJobDeferred
 from hugin.workers.hh_search import HhSearchJobHandler
 
 
@@ -134,7 +134,7 @@ def prepare_handler(
         detail_limit: int,
     ) -> FakeCycle:
         assert page_limit == 3
-        assert detail_limit == 5
+        assert detail_limit == 20
         return cycle
 
     monkeypatch.setattr(search_worker_module, "VisibleHhBrowser", create_browser)
@@ -238,4 +238,53 @@ def test_search_handler_runs_cycle_after_successful_login(
             if settings.hh_browser_source_ip is not None
             else None
         ),
+        "profile_lock_timeout_seconds": 2.0,
     }
+
+
+def test_search_waits_while_found_vacancies_are_being_processed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    handler, cycle, browsers, login_calls = prepare_handler(
+        monkeypatch,
+        LoginStatus.AUTHENTICATED,
+    )
+    handler._application_work_pending = lambda: True
+
+    with pytest.raises(AutomationJobDeferred) as raised:
+        handler(make_job())
+
+    assert raised.value.code == "APPLICATIONS_PENDING"
+    assert raised.value.retry_after_seconds == 60
+    assert not browsers
+    assert not login_calls
+    assert not cycle.calls
+
+
+def test_search_quickly_defers_when_browser_profile_is_busy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    browser_lock = threading.Lock()
+    handler, cycle, browsers, login_calls = prepare_handler(
+        monkeypatch,
+        LoginStatus.AUTHENTICATED,
+        browser_lock=browser_lock,
+    )
+
+    def fail_enter(_browser: FakeBrowser) -> FakeBrowser:
+        raise RuntimeError(
+            "Профиль hh.ru занят другой задачей дольше допустимого времени"
+        )
+
+    monkeypatch.setattr(FakeBrowser, "__enter__", fail_enter)
+
+    with pytest.raises(AutomationJobDeferred) as raised:
+        handler(make_job())
+
+    assert raised.value.code == "BROWSER_PROFILE_BUSY"
+    assert raised.value.retry_after_seconds == 15
+    assert len(browsers) == 1
+    assert not login_calls
+    assert not cycle.calls
+    assert browser_lock.acquire(blocking=False)
+    browser_lock.release()

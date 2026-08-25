@@ -120,6 +120,22 @@ class ApplicationRepository:
         )
         return _application_record(model) if model is not None else None
 
+    def get_for_account_vacancy(
+        self,
+        account_id: int,
+        vacancy_id: int,
+    ) -> ApplicationRecord | None:
+        model = self._session.scalar(
+            select(ApplicationModel)
+            .where(
+                ApplicationModel.account_id == account_id,
+                ApplicationModel.vacancy_id == vacancy_id,
+            )
+            .order_by(ApplicationModel.id)
+            .limit(1)
+        )
+        return _application_record(model) if model is not None else None
+
     def get(self, application_id: int) -> ApplicationRecord:
         model = self._session.get(ApplicationModel, application_id)
         if model is None:

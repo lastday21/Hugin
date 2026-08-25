@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import select
 
+from hugin.adapters.codex_cli import configured_codex_cli_client
 from hugin.adapters.credentials import WindowsCredentialStore
 from hugin.adapters.hh_browser import VisibleHhBrowser
 from hugin.core.settings import Settings
@@ -16,7 +17,6 @@ from hugin.diagnostics import OperationJournal, error_details
 from hugin.domain.hh import HhApplyResult, HhApplyStatus
 from hugin.domain.hh_sync import HhSyncBlockedError, HhSyncRetryableError
 from hugin.domain.time import as_utc, day_start_utc
-from hugin.services.ai_prompts import AiPromptSettingsService
 from hugin.services.application_automation import (
     ApplicationAutomationService,
     ApplyJob,
@@ -24,7 +24,6 @@ from hugin.services.application_automation import (
 from hugin.services.cover_letter import CoverLetterService
 from hugin.services.hh_login import HhLoginService, LoginStatus
 from hugin.services.screening_forms import ScreeningDraftService, StoredScreeningSubmission
-from hugin.services.yandex_client import configured_yandex_ai_client
 
 type ApplicationJobHandler = Callable[[ApplyJob], HhApplyResult]
 type FormPreflightHandler = Callable[[ApplyJob], HhApplyResult]
@@ -54,11 +53,13 @@ class ApplicationWorker:
         self._poll_seconds = poll_seconds
         self._job_handler = job_handler or self._run_job
         self._form_preflight_handler = form_preflight_handler or self._run_form_preflight
+        self._automatic_form_preflight = form_preflight_handler is not None
         self._letter_preparer = letter_preparer or self._prepare_letter
         self._journal = journal or OperationJournal(settings.data_dir)
-        self._next_letter_attempt_at: datetime | None = None
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._browser: VisibleHhBrowser | None = None
+        self._browser_owner: int | None = None
 
     @property
     def running(self) -> bool:
@@ -98,6 +99,8 @@ class ApplicationWorker:
         thread = self._thread
         if thread is not None and thread.is_alive():
             thread.join(timeout_seconds)
+        if thread is None or not thread.is_alive():
+            self._close_browser()
         self._thread = None
         self._journal.record(
             "applications",
@@ -114,16 +117,26 @@ class ApplicationWorker:
         try:
             job, may_prepare_letters = self._claim(selected_at)
             if job is None:
-                if not may_prepare_letters or not self._may_prepare_letters(selected_at):
+                if not may_prepare_letters:
+                    self._close_browser()
                     return False
-                preflight_job = self._claim_form_preflight(selected_at)
-                if preflight_job is None:
+                preparation_job = self._claim_form_preflight(selected_at)
+                if preparation_job is None:
+                    if not self.has_pending_work(selected_at):
+                        self._close_browser()
                     return False
-                self._process_form_preflight(
-                    preflight_job,
-                    selected_at,
-                    now_is_fixed=now is not None,
-                )
+                if self._automatic_form_preflight:
+                    self._process_form_preflight(
+                        preparation_job,
+                        selected_at,
+                        now_is_fixed=now is not None,
+                    )
+                else:
+                    self._prepare_and_process_application(
+                        preparation_job,
+                        selected_at,
+                        now_is_fixed=now is not None,
+                    )
                 return True
 
             self._process_application(job, selected_at, now_is_fixed=now is not None)
@@ -155,6 +168,7 @@ class ApplicationWorker:
         try:
             result = self._job_handler(job)
         except HhSyncRetryableError as error:
+            self._close_browser()
             handler_error = error
             run.fail(error, result_status=HhApplyStatus.RETRYABLE_ERROR.value)
             result = HhApplyResult(
@@ -164,6 +178,7 @@ class ApplicationWorker:
                 retry_after_seconds=error.retry_after_seconds,
             )
         except HhSyncBlockedError as error:
+            self._close_browser()
             handler_error = error
             status = self._apply_status_for_blocked_code(error.code)
             run.fail(error, result_status=status.value, error_code=error.code)
@@ -173,6 +188,7 @@ class ApplicationWorker:
                 str(error),
             )
         except Exception as error:
+            self._close_browser()
             handler_error = error
             run.fail(error, result_status=HhApplyStatus.UNKNOWN_RESULT.value)
             result = HhApplyResult(
@@ -215,7 +231,52 @@ class ApplicationWorker:
                 questions=len(result.questions),
                 warnings=len(result.warnings),
                 retry_after_seconds=result.retry_after_seconds,
+                confirmation=result.confirmation[:1000],
+                final_url=result.final_url[:1000],
             )
+
+    def _prepare_and_process_application(
+        self,
+        job: ApplyJob,
+        selected_at: datetime,
+        *,
+        now_is_fixed: bool,
+    ) -> None:
+        run = self._journal.start(
+            "applications",
+            "cover_letters.prepare_candidate",
+            account_id=self._account_id,
+            task_id=job.task.id,
+            application_id=job.application.id,
+            vacancy_id=job.vacancy.hh_id,
+            resume_id=job.resume.id,
+        )
+        database = create_database(self._settings)
+        try:
+            with database.sessions.begin() as session:
+                ApplicationAutomationService(session).release_form_preflight(
+                    job,
+                    now=selected_at,
+                )
+        except Exception as error:
+            run.fail(error, stage="release_for_letter")
+            raise
+        finally:
+            database.close()
+
+        if not self._prepare_exact_letter(job, selected_at):
+            run.succeed(prepared=False)
+            return
+        prepared_job = self._claim_exact_prepared(job.task.id, selected_at)
+        if prepared_job is None:
+            run.succeed(prepared=True, claimed=False)
+            return
+        run.succeed(prepared=True, claimed=True)
+        self._process_application(
+            prepared_job,
+            selected_at,
+            now_is_fixed=now_is_fixed,
+        )
 
     def _process_form_preflight(
         self,
@@ -314,7 +375,16 @@ class ApplicationWorker:
             questions=len(result.questions),
             warnings=len(result.warnings),
         )
-        self._prepare_exact_letter(job, selected_at)
+        prepared_at = selected_at if now_is_fixed else datetime.now(UTC)
+        if not self._prepare_exact_letter(job, prepared_at):
+            return
+        prepared_job = self._claim_exact_prepared(job.task.id, prepared_at)
+        if prepared_job is not None:
+            self._process_application(
+                prepared_job,
+                prepared_at,
+                now_is_fixed=now_is_fixed,
+            )
 
     def _claim(self, now: datetime) -> tuple[ApplyJob | None, bool]:
         database = create_database(self._settings)
@@ -359,7 +429,23 @@ class ApplicationWorker:
         finally:
             database.close()
 
-    def _prepare_exact_letter(self, job: ApplyJob, selected_at: datetime) -> None:
+    def _claim_exact_prepared(self, task_id: int, now: datetime) -> ApplyJob | None:
+        database = create_database(self._settings)
+        try:
+            with database.sessions.begin() as session:
+                service = ApplicationAutomationService(session)
+                if not service.applications_enabled():
+                    return None
+                return service.claim_exact_prepared(
+                    account_id=self._account_id,
+                    task_id=task_id,
+                    include_stretch=service.stretch_automation_enabled(),
+                    now=now,
+                )
+        finally:
+            database.close()
+
+    def _prepare_exact_letter(self, job: ApplyJob, selected_at: datetime) -> bool:
         try:
             prepared = self._letter_preparer(job)
         except (LookupError, RuntimeError, ValueError) as error:
@@ -373,9 +459,16 @@ class ApplicationWorker:
                 retry_in_minutes=15,
                 **error_details(error),
             )
-            self._next_letter_attempt_at = selected_at + timedelta(minutes=15)
-            return
-        self._next_letter_attempt_at = selected_at
+            database = create_database(self._settings)
+            try:
+                with database.sessions.begin() as session:
+                    ApplicationAutomationService(session).defer_letter_preparation(
+                        job.task.id,
+                        retry_at=selected_at + timedelta(minutes=15),
+                    )
+            finally:
+                database.close()
+            return False
         if prepared:
             self._journal.record(
                 "applications",
@@ -385,6 +478,8 @@ class ApplicationWorker:
                 vacancy_id=job.vacancy.hh_id,
                 prepared=prepared,
             )
+            return True
+        return False
 
     def _prepare_letter(self, job: ApplyJob) -> int:
         database = create_database(self._settings)
@@ -405,22 +500,13 @@ class ApplicationWorker:
                 if direction_name is None:
                     raise LookupError("Активное направление отклика не найдено")
                 include_stretch = automation.stretch_automation_enabled()
-                ai_settings = AiPromptSettingsService(session)
-                client = configured_yandex_ai_client(
+                client = configured_codex_cli_client(
                     self._settings,
-                    model=ai_settings.get_model(),
-                    reasoning_effort=ai_settings.get_reasoning_effort(),
                     operation="cover_letter",
-                )
-                router_client = configured_yandex_ai_client(
-                    self._settings,
-                    model=self._settings.yandex_ai_router_model,
-                    reasoning_effort=self._settings.yandex_ai_router_reasoning_effort,
-                    operation="cover_letter_routing",
                 )
                 if not automation.applications_enabled():
                     return 0
-                result = CoverLetterService(session, client, router_client).prepare(
+                result = CoverLetterService(session, client).prepare(
                     account_id=job.application.account_id,
                     direction_name=direction_name,
                     vacancy_hh_id=job.vacancy.hh_id,
@@ -433,37 +519,26 @@ class ApplicationWorker:
             database.close()
 
     def _run_form_preflight(self, job: ApplyJob) -> HhApplyResult:
-        with VisibleHhBrowser(
-            self._settings.browser_profile_dir(self._account_id),
-            self._settings.hh_login_url,
-            self._settings.hh_resumes_url,
-            self._settings.hh_search_url,
-            self._settings.hh_browser_timeout_ms,
-            start_minimized=True,
-            browser_source_ip=(
-                str(self._settings.hh_browser_source_ip)
-                if self._settings.hh_browser_source_ip is not None
-                else None
-            ),
-        ) as browser:
-            login = HhLoginService(WindowsCredentialStore()).authenticate(
-                self._account_id,
-                browser,
-            )
-            if not login.authenticated:
-                return HhApplyResult(
-                    self._apply_status_for_login(login.status),
-                    job.vacancy.source_url,
-                    "Перед проверкой формы требуется завершить вход в hh.ru",
-                )
-            return browser.apply_to_vacancy(
+        browser = self._get_browser()
+        login = HhLoginService(WindowsCredentialStore()).authenticate(
+            self._account_id,
+            browser,
+        )
+        if not login.authenticated:
+            self._close_browser()
+            return HhApplyResult(
+                self._apply_status_for_login(login.status),
                 job.vacancy.source_url,
-                expected_resume_hh_id=job.resume.hh_id,
-                expected_resume_title=job.resume.title,
-                cover_letter="",
-                submit=False,
-                submit_guard=None,
+                "Перед проверкой формы требуется завершить вход в hh.ru",
             )
+        return browser.apply_to_vacancy(
+            job.vacancy.source_url,
+            expected_resume_hh_id=job.resume.hh_id,
+            expected_resume_title=job.resume.title,
+            cover_letter="",
+            submit=False,
+            submit_guard=None,
+        )
 
     def _run_job(self, job: ApplyJob) -> HhApplyResult:
         application = getattr(job, "application", None)
@@ -473,7 +548,43 @@ class ApplicationWorker:
             if isinstance(application_id, int)
             else None
         )
-        with VisibleHhBrowser(
+        browser = self._get_browser()
+        login = HhLoginService(WindowsCredentialStore()).authenticate(
+            self._account_id,
+            browser,
+        )
+        if not login.authenticated:
+            self._close_browser()
+            return HhApplyResult(
+                self._apply_status_for_login(login.status),
+                job.vacancy.source_url,
+                "Перед отправкой требуется завершить вход в hh.ru",
+            )
+        if not job.cover_letter:
+            raise RuntimeError("Готовое сопроводительное письмо отсутствует")
+        return browser.apply_to_vacancy(
+            job.vacancy.source_url,
+            expected_resume_hh_id=job.resume.hh_id,
+            expected_resume_title=job.resume.title,
+            cover_letter=job.cover_letter,
+            submit=True,
+            submit_guard=lambda: self._background_submission_is_allowed(
+                job,
+                submission,
+            ),
+            screening_submission=(submission.payload if submission is not None else None),
+        )
+
+    def _get_browser(self) -> VisibleHhBrowser:
+        owner = threading.get_ident()
+        if self._browser is not None:
+            if self._browser_owner != owner:
+                raise RuntimeError("Рабочая сессия браузера принадлежит другому потоку")
+            if self._browser.is_open():
+                return self._browser
+            self._close_browser()
+
+        browser = VisibleHhBrowser(
             self._settings.browser_profile_dir(self._account_id),
             self._settings.hh_login_url,
             self._settings.hh_resumes_url,
@@ -485,30 +596,37 @@ class ApplicationWorker:
                 if self._settings.hh_browser_source_ip is not None
                 else None
             ),
-        ) as browser:
-            login = HhLoginService(WindowsCredentialStore()).authenticate(
-                self._account_id,
-                browser,
-            )
-            if not login.authenticated:
-                return HhApplyResult(
-                    self._apply_status_for_login(login.status),
-                    job.vacancy.source_url,
-                    "Перед отправкой требуется завершить вход в hh.ru",
-                )
-            if not job.cover_letter:
-                raise RuntimeError("Готовое сопроводительное письмо отсутствует")
-            return browser.apply_to_vacancy(
-                job.vacancy.source_url,
-                expected_resume_hh_id=job.resume.hh_id,
-                expected_resume_title=job.resume.title,
-                cover_letter=job.cover_letter,
-                submit=True,
-                submit_guard=lambda: self._background_submission_is_allowed(
-                    job,
-                    submission,
-                ),
-                screening_submission=(submission.payload if submission is not None else None),
+        )
+        entered = browser.__enter__()
+        self._browser = entered
+        self._browser_owner = owner
+        self._journal.record(
+            "applications",
+            "browser.session",
+            status="completed",
+            action="open",
+            account_id=self._account_id,
+        )
+        return entered
+
+    def _close_browser(self) -> None:
+        browser = self._browser
+        if browser is None:
+            return
+        owner = threading.get_ident()
+        if self._browser_owner != owner:
+            return
+        self._browser = None
+        self._browser_owner = None
+        try:
+            browser.__exit__(None, None, None)
+        finally:
+            self._journal.record(
+                "applications",
+                "browser.session",
+                status="completed",
+                action="close",
+                account_id=self._account_id,
             )
 
     @staticmethod
@@ -574,20 +692,46 @@ class ApplicationWorker:
         finally:
             database.close()
 
-    def _may_prepare_letters(self, now: datetime) -> bool:
-        return self._next_letter_attempt_at is None or self._next_letter_attempt_at <= now
+    def has_pending_work(self, now: datetime | None = None) -> bool:
+        selected_at = as_utc(now or datetime.now(UTC))
+        database = create_database(self._settings)
+        try:
+            with database.sessions.begin() as session:
+                service = ApplicationAutomationService(session)
+                if not service.applications_enabled():
+                    return False
+                policy = service.policy()
+                if (
+                    service.applied_since(
+                        self._account_id,
+                        day_start_utc(policy.timezone_name, selected_at),
+                    )
+                    >= policy.daily_limit
+                ):
+                    return False
+                return service.has_pending_application_work(
+                    account_id=self._account_id,
+                    include_stretch=service.stretch_automation_enabled(),
+                    include_scheduled=True,
+                    now=selected_at,
+                )
+        finally:
+            database.close()
 
     def _run(self) -> None:
-        while not self._stop.is_set():
-            try:
-                self.run_once()
-            except Exception as error:
-                self._journal.record(
-                    "applications",
-                    "worker.loop",
-                    status="failed",
-                    level="ERROR",
-                    account_id=self._account_id,
-                    **error_details(error),
-                )
-            self._stop.wait(self._poll_seconds)
+        try:
+            while not self._stop.is_set():
+                try:
+                    self.run_once()
+                except Exception as error:
+                    self._journal.record(
+                        "applications",
+                        "worker.loop",
+                        status="failed",
+                        level="ERROR",
+                        account_id=self._account_id,
+                        **error_details(error),
+                    )
+                self._stop.wait(self._poll_seconds)
+        finally:
+            self._close_browser()

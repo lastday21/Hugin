@@ -6,16 +6,20 @@ from dataclasses import dataclass
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from hugin.adapters.codex_cli import CodexCliError
 from hugin.adapters.yandex_ai import YandexAIError
 from hugin.database.models import (
     ApplicationModel,
+    CandidateProfileModel,
     InvitationModel,
     RecruiterMessageModel,
     VacancyModel,
+    VerifiedFactModel,
 )
 from hugin.domain.applications import ApplicationState
 from hugin.domain.communications import CommunicationStateError
 from hugin.domain.content import (
+    ConfirmationState,
     InvitationState,
     MessageDirection,
     RecruiterMessageState,
@@ -26,12 +30,17 @@ from hugin.services.recruiter_reply import RecruiterReplyService, RecruiterReply
 from hugin.services.recruiter_reply_policy import (
     RecruiterReplyDisposition,
     classify_recruiter_reply,
+    is_exact_120_net_salary_response,
+    is_simple_salary_expectation_question,
 )
 
 _BLOCKING_INVITATION_TITLES = (
     "Приглашение на собеседование",
     "Задание от работодателя",
 )
+_GENERATED_REPLY_APPROVAL_KEY = "model_safe_v1"
+_SALARY_EXPECTATION_APPROVAL_KEY = "salary_expectation_120_net"
+_SALARY_EXPECTATION_REPLY = "Мои зарплатные ожидания — 120 000 рублей на руки."
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,7 +70,11 @@ class AutonomousReplyService:
         account_id: int,
         model_factory: Callable[[], RecruiterReplyTextModel] | None = None,
         incoming_message_ids: Collection[int] = (),
+        include_backlog: bool = False,
+        backlog_limit: int = 250,
     ) -> AutonomousReplyBatch:
+        if backlog_limit < 1:
+            raise ValueError("Размер очереди сообщений должен быть положительным")
         policy = AutonomyPolicyService(self._session).get()
         if not policy.auto_prepare_replies and not policy.auto_send_approved_replies:
             return AutonomousReplyBatch((), 0, 0, 0)
@@ -111,7 +124,33 @@ class AutonomousReplyService:
         failed = 0
         model: RecruiterReplyTextModel | None = None
         communications = CommunicationService(self._session, RecordingMessageSender())
+        salary_expectation_reply = self._confirmed_salary_expectation_reply(account_id)
         eligible_incoming_ids = set(incoming_message_ids)
+        auto_send_incoming_ids = set(incoming_message_ids)
+        if include_backlog:
+            backlog_ids: list[int] = []
+            for conversation in by_application.values():
+                latest_incoming = next(
+                    (
+                        message
+                        for message in reversed(conversation)
+                        if message.direction is MessageDirection.INCOMING
+                    ),
+                    None,
+                )
+                latest_outgoing = next(
+                    (
+                        message
+                        for message in reversed(conversation)
+                        if message.direction is MessageDirection.OUTGOING
+                    ),
+                    None,
+                )
+                if latest_incoming is not None and (
+                    latest_outgoing is None or latest_outgoing.id < latest_incoming.id
+                ):
+                    backlog_ids.append(latest_incoming.id)
+            eligible_incoming_ids.update(sorted(backlog_ids, reverse=True)[:backlog_limit])
 
         for application_id, conversation in by_application.items():
             incoming = next(
@@ -133,6 +172,10 @@ class AutonomousReplyService:
                 None,
             )
             template = policy.matching_reply_template(incoming.body)
+            simple_salary_question = is_simple_salary_expectation_question(incoming.body)
+            exact_salary_reply = (
+                salary_expectation_reply if simple_salary_question else None
+            )
             details = application_details.get(application_id)
             if details is None:
                 continue
@@ -140,15 +183,39 @@ class AutonomousReplyService:
             disposition = classify_recruiter_reply(
                 application_state,
                 incoming.body,
-                template.response_text if template is not None else "",
+                (
+                    exact_salary_reply
+                    or (template.response_text if template is not None else "")
+                ),
             )
+            if simple_salary_question and exact_salary_reply is None:
+                disposition = RecruiterReplyDisposition.REVIEW_DRAFT
             if disposition is RecruiterReplyDisposition.NO_REPLY:
                 continue
-            manual = (
+            automatic_send_blocked = (
                 application_id in blocked_applications
-                or disposition is RecruiterReplyDisposition.MANUAL
+                or disposition
+                in {
+                    RecruiterReplyDisposition.REVIEW_DRAFT,
+                    RecruiterReplyDisposition.MANUAL,
+                }
             )
             if outgoing is not None and outgoing.id > incoming.id:
+                generated_reply_is_safe = (
+                    outgoing.reply_template_key == _GENERATED_REPLY_APPROVAL_KEY
+                    and classify_recruiter_reply(
+                        application_state,
+                        incoming.body,
+                        outgoing.body,
+                    )
+                    is RecruiterReplyDisposition.AUTOMATIC_DRAFT
+                )
+                salary_reply_is_safe = (
+                    outgoing.reply_template_key == _SALARY_EXPECTATION_APPROVAL_KEY
+                    and exact_salary_reply is not None
+                    and outgoing.body == exact_salary_reply
+                    and is_exact_120_net_salary_response(outgoing.body)
+                )
                 if (
                     outgoing.state
                     in {
@@ -156,11 +223,17 @@ class AutonomousReplyService:
                         RecruiterMessageState.FAILED,
                     }
                     and outgoing.auto_send_approved
-                    and template is not None
-                    and outgoing.reply_template_key == template.key
-                    and outgoing.body == template.response_text
+                    and (
+                        generated_reply_is_safe
+                        or salary_reply_is_safe
+                        or (
+                            template is not None
+                            and outgoing.reply_template_key == template.key
+                            and outgoing.body == template.response_text
+                        )
+                    )
                     and policy.auto_send_approved_replies
-                    and not manual
+                    and not automatic_send_blocked
                     and outgoing.content_hash is not None
                 ):
                     confirmed = communications.confirm_outgoing_retry(
@@ -181,10 +254,43 @@ class AutonomousReplyService:
                 continue
             if incoming.id not in eligible_incoming_ids:
                 continue
+            if exact_salary_reply is not None:
+                auto_send = (
+                    policy.auto_send_approved_replies
+                    and incoming.id in eligible_incoming_ids
+                    and not automatic_send_blocked
+                )
+                draft = communications.create_outgoing_draft(
+                    application_id=application_id,
+                    body=exact_salary_reply,
+                    auto_send_approved=auto_send,
+                    reply_template_key=(
+                        _SALARY_EXPECTATION_APPROVAL_KEY if auto_send else None
+                    ),
+                )
+                drafts_created += 1
+                if auto_send:
+                    confirmed = communications.confirm_outgoing_draft(
+                        account_id=account_id,
+                        message_id=draft.id,
+                        content_version=draft.content_version,
+                        content_hash=draft.content_hash or "",
+                    )
+                    approved.append(
+                        ApprovedReplyToSend(
+                            message_id=confirmed.id,
+                            application_id=application_id,
+                            source_url=source_url,
+                            content_hash=confirmed.content_hash or "",
+                            content_version=confirmed.content_version,
+                        )
+                    )
+                continue
             if (
                 template is not None
                 and policy.auto_send_approved_replies
-                and not manual
+                and incoming.id in auto_send_incoming_ids
+                and not automatic_send_blocked
             ):
                 draft = communications.create_outgoing_draft(
                     application_id=application_id,
@@ -208,7 +314,7 @@ class AutonomousReplyService:
                     )
                 )
                 continue
-            if manual:
+            if disposition is RecruiterReplyDisposition.MANUAL:
                 skipped_manual += 1
                 continue
             if not policy.auto_prepare_replies or model_factory is None:
@@ -216,14 +322,55 @@ class AutonomousReplyService:
             try:
                 if model is None:
                     model = model_factory()
-                RecruiterReplyService(self._session, model).generate(
+                draft = RecruiterReplyService(self._session, model).generate(
                     account_id=account_id,
                     application_id=application_id,
                 )
-            except (CommunicationStateError, ValueError, YandexAIError):
+            except (
+                CodexCliError,
+                CommunicationStateError,
+                LookupError,
+                ValueError,
+                YandexAIError,
+            ):
                 failed += 1
             else:
                 drafts_created += 1
+                generated_disposition = classify_recruiter_reply(
+                    application_state,
+                    incoming.body,
+                    draft.body,
+                )
+                if (
+                    policy.auto_send_approved_replies
+                    and incoming.id in auto_send_incoming_ids
+                    and not automatic_send_blocked
+                    and generated_disposition
+                    is RecruiterReplyDisposition.AUTOMATIC_DRAFT
+                    and draft.content_hash is not None
+                ):
+                    approved_draft = communications.approve_outgoing_for_automatic_send(
+                        account_id=account_id,
+                        message_id=draft.id,
+                        content_version=draft.content_version,
+                        content_hash=draft.content_hash,
+                        approval_key=_GENERATED_REPLY_APPROVAL_KEY,
+                    )
+                    confirmed = communications.confirm_outgoing_draft(
+                        account_id=account_id,
+                        message_id=approved_draft.id,
+                        content_version=approved_draft.content_version,
+                        content_hash=approved_draft.content_hash or "",
+                    )
+                    approved.append(
+                        ApprovedReplyToSend(
+                            message_id=confirmed.id,
+                            application_id=application_id,
+                            source_url=source_url,
+                            content_hash=confirmed.content_hash or "",
+                            content_version=confirmed.content_version,
+                        )
+                    )
 
         return AutonomousReplyBatch(
             approved=tuple(approved),
@@ -286,19 +433,37 @@ class AutonomousReplyService:
         )
         if incoming is None or message.id <= incoming.id or latest_outgoing_id != message.id:
             return False
-        template = policy.matching_reply_template(incoming.body)
-        disposition = classify_recruiter_reply(
-            application.state,
-            incoming.body,
-            template.response_text if template is not None else "",
-        )
-        if (
-            template is None
-            or template.key != message.reply_template_key
-            or template.response_text != message.body
-            or disposition is not RecruiterReplyDisposition.AUTOMATIC_DRAFT
-        ):
-            return False
+        if message.reply_template_key == _SALARY_EXPECTATION_APPROVAL_KEY:
+            salary_reply = self._confirmed_salary_expectation_reply(account_id)
+            if (
+                salary_reply is None
+                or message.body != salary_reply
+                or not is_simple_salary_expectation_question(incoming.body)
+                or not is_exact_120_net_salary_response(message.body)
+            ):
+                return False
+        elif message.reply_template_key == _GENERATED_REPLY_APPROVAL_KEY:
+            disposition = classify_recruiter_reply(
+                application.state,
+                incoming.body,
+                message.body,
+            )
+            if disposition is not RecruiterReplyDisposition.AUTOMATIC_DRAFT:
+                return False
+        else:
+            template = policy.matching_reply_template(incoming.body)
+            disposition = classify_recruiter_reply(
+                application.state,
+                incoming.body,
+                template.response_text if template is not None else "",
+            )
+            if (
+                template is None
+                or template.key != message.reply_template_key
+                or template.response_text != message.body
+                or disposition is not RecruiterReplyDisposition.AUTOMATIC_DRAFT
+            ):
+                return False
         blocking_invitation = self._session.scalar(
             select(InvitationModel.id)
             .where(
@@ -309,3 +474,30 @@ class AutonomousReplyService:
             .limit(1)
         )
         return blocking_invitation is None
+
+    def _confirmed_salary_expectation_reply(self, account_id: int) -> str | None:
+        contents = self._session.scalars(
+            select(VerifiedFactModel.content)
+            .join(
+                CandidateProfileModel,
+                CandidateProfileModel.id == VerifiedFactModel.profile_id,
+            )
+            .where(
+                CandidateProfileModel.account_id == account_id,
+                VerifiedFactModel.state == ConfirmationState.CONFIRMED,
+                VerifiedFactModel.allow_in_messages.is_(True),
+            )
+        )
+        for content in contents:
+            normalized = " ".join(content.casefold().split())
+            digits = "".join(character for character in normalized if character.isdigit())
+            if (
+                "120000" in digits
+                and "на руки" in normalized
+                and any(
+                    marker in normalized
+                    for marker in ("зарплат", "заработн", "оклад", "доход")
+                )
+            ):
+                return _SALARY_EXPECTATION_REPLY
+        return None

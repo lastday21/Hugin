@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import case, func, or_, select
 from sqlalchemy.orm import Session
 
 from hugin.database.models import (
@@ -36,6 +36,7 @@ from hugin.domain.content import (
     IncidentState,
     InvitationState,
     MessageDirection,
+    RecruiterMessageState,
     ScreeningFormState,
     cover_letter_instruction_version,
 )
@@ -53,6 +54,11 @@ ACTIVE_QUEUE_STATES = (
     TaskState.RETRY_SCHEDULED,
     TaskState.REVIEW_REQUIRED,
     TaskState.UNKNOWN_RESULT,
+)
+AUTOMATIC_QUEUE_STATES = (
+    TaskState.PENDING,
+    TaskState.RUNNING,
+    TaskState.RETRY_SCHEDULED,
 )
 BACKGROUND_HEARTBEAT_STALE_AFTER = timedelta(minutes=2)
 
@@ -74,6 +80,29 @@ def _direction_name(direction: CareerDirectionModel) -> str:
     if _direction_scope(direction) is DirectionScope.PYTHON_BACKEND:
         return "Python backend"
     return "Другое ИТ"
+
+
+def _queue_error_text(error_code: str | None) -> str | None:
+    if error_code is None or error_code in {
+        "FORM_PREFLIGHT_PASSED",
+        "FORM_PREFLIGHT_RUNNING",
+    }:
+        return None
+    descriptions = {
+        "RETRYABLE_ERROR": "hh.ru не открыл форму отклика; повтор запланирован",
+        "RETRY_LIMIT_REACHED": (
+            "форма hh.ru не открылась после нескольких попыток; нужна проверка"
+        ),
+        "FORM_PREFLIGHT_INTERRUPTED": "проверка формы прервалась и будет повторена",
+        "QUESTIONS_REQUIRED": "работодатель добавил вопросы к отклику",
+        "MANUAL_REVIEW_REQUIRED": "нужно проверить форму перед отправкой",
+        "UNKNOWN_RESULT": "hh.ru не подтвердил результат отправки",
+        "AUTH_REQUIRED": "нужно повторно войти в hh.ru",
+        "CAPTCHA_REQUIRED": "hh.ru запросил проверку пользователя",
+        "ACCOUNT_WARNING": "hh.ru ограничил работу аккаунта",
+        "RESUME_MISMATCH": "в форме выбрано не то резюме",
+    }
+    return descriptions.get(error_code, "требуется проверка причины")
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,6 +150,7 @@ class UiDashboard:
     delay_min_seconds: int
     delay_max_seconds: int
     applied_today: int
+    replies_sent_today: int
     remaining_today: int
     task_counts: dict[str, int]
     pending_forms: int
@@ -154,6 +184,7 @@ class UiQueueItem:
 @dataclass(frozen=True, slots=True)
 class UiBackgroundStatus:
     state: str
+    search_state: str
     last_success_at: datetime | None
     next_search_at: datetime | None
     next_messages_at: datetime | None
@@ -244,6 +275,24 @@ class UiWorkspaceService:
         applied_today = ApplicationRepository(self._session).count_applied_since(
             account_id,
             day_start_utc(queue.policy.timezone_name),
+        )
+        replies_sent_today = (
+            self._session.scalar(
+                select(func.count())
+                .select_from(RecruiterMessageModel)
+                .join(
+                    ApplicationModel,
+                    ApplicationModel.id == RecruiterMessageModel.application_id,
+                )
+                .where(
+                    ApplicationModel.account_id == account_id,
+                    RecruiterMessageModel.direction == MessageDirection.OUTGOING,
+                    RecruiterMessageModel.state == RecruiterMessageState.SENT,
+                    RecruiterMessageModel.content_hash.is_not(None),
+                    RecruiterMessageModel.sent_at >= day_start_utc(queue.policy.timezone_name),
+                )
+            )
+            or 0
         )
         directions = tuple(
             self._direction_summary(direction)
@@ -360,6 +409,7 @@ class UiWorkspaceService:
             delay_min_seconds=queue.policy.delay_min_seconds,
             delay_max_seconds=queue.policy.delay_max_seconds,
             applied_today=applied_today,
+            replies_sent_today=replies_sent_today,
             remaining_today=max(queue.policy.daily_limit - applied_today, 0),
             task_counts={state.value: count for state, count in queue.task_counts.items()},
             pending_forms=pending_forms,
@@ -381,7 +431,15 @@ class UiWorkspaceService:
             )
         )
         if not jobs:
-            return UiBackgroundStatus("NOT_STARTED", None, None, None, None, None)
+            return UiBackgroundStatus(
+                "NOT_STARTED",
+                "NOT_SCHEDULED",
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
 
         enabled = tuple(job for job in jobs if job.state is not AutomationJobState.DISABLED)
         failures = tuple(
@@ -402,19 +460,45 @@ class UiWorkspaceService:
             and job.state in {AutomationJobState.WAITING, AutomationJobState.FAILED}
             for job in enabled
         )
-        if failures:
-            state = "NEEDS_ATTENTION"
-        elif (running and not fresh_running) or (overdue and not fresh_running):
+        if (running and not fresh_running) or (overdue and not fresh_running):
             state = "STOPPED"
+        elif failures:
+            state = "NEEDS_ATTENTION"
         else:
             state = "RUNNING"
+        search_jobs = tuple(job for job in enabled if job.kind is AutomationJobKind.SEARCH)
+        fresh_search_running = any(
+            job.state is AutomationJobState.RUNNING
+            and (job.heartbeat_at or job.last_started_at or job.updated_at)
+            >= now - BACKGROUND_HEARTBEAT_STALE_AFTER
+            for job in search_jobs
+        )
+        search_overdue = any(
+            job.state in {AutomationJobState.WAITING, AutomationJobState.FAILED}
+            and job.next_run_at is not None
+            and job.next_run_at <= now
+            for job in search_jobs
+        )
+        if fresh_search_running:
+            search_state = "RUNNING"
+        elif search_overdue:
+            search_state = "WAITING"
+        elif search_jobs:
+            search_state = "SCHEDULED"
+        else:
+            search_state = "NOT_SCHEDULED"
         last_successes = tuple(
             job.last_success_at for job in enabled if job.last_success_at is not None
         )
         return UiBackgroundStatus(
             state=state,
+            search_state=search_state,
             last_success_at=max(last_successes) if last_successes else None,
-            next_search_at=self._next_job_time(enabled, AutomationJobKind.SEARCH),
+            next_search_at=self._next_future_job_time(
+                enabled,
+                AutomationJobKind.SEARCH,
+                now,
+            ),
             next_messages_at=self._next_job_time(enabled, AutomationJobKind.MESSAGES),
             next_statuses_at=self._next_job_time(enabled, AutomationJobKind.STATUSES),
             error=(
@@ -435,8 +519,38 @@ class UiWorkspaceService:
         )
         return min(values) if values else None
 
+    @staticmethod
+    def _next_future_job_time(
+        jobs: tuple[AutomationJobModel, ...],
+        kind: AutomationJobKind,
+        now: datetime,
+    ) -> datetime | None:
+        values = tuple(
+            job.next_run_at
+            for job in jobs
+            if job.kind is kind and job.next_run_at is not None and job.next_run_at > now
+        )
+        return min(values) if values else None
+
     def queue(self, account_id: int, limit: int = 100) -> tuple[UiQueueItem, ...]:
         self._account(account_id)
+        automatic_state_priority = case(
+            (ApplicationTaskModel.state.in_(AUTOMATIC_QUEUE_STATES), 0),
+            else_=1,
+        )
+        direction_priority = case(
+            (
+                CareerDirectionModel.scoring_config["role_scope"].as_string()
+                == DirectionScope.PYTHON_BACKEND.value,
+                0,
+            ),
+            else_=1,
+        )
+        category_priority = case(
+            (DirectionVacancyModel.rules_details["category"].as_string() == "MATCH", 0),
+            (DirectionVacancyModel.rules_details["category"].as_string() == "STRETCH", 1),
+            else_=2,
+        )
         instruction_version = cover_letter_instruction_version(
             AiPromptSettingsService(self._session).get().cover_letter
         )
@@ -476,14 +590,22 @@ class UiWorkspaceService:
                 CareerDirectionModel,
                 CareerDirectionModel.id == ApplicationModel.direction_id,
             )
+            .outerjoin(
+                DirectionVacancyModel,
+                (DirectionVacancyModel.direction_id == ApplicationModel.direction_id)
+                & (DirectionVacancyModel.vacancy_id == ApplicationModel.vacancy_id),
+            )
             .where(
                 ApplicationModel.account_id == account_id,
                 ApplicationTaskModel.state.in_(ACTIVE_QUEUE_STATES),
             )
             .order_by(
-                ApplicationTaskModel.state,
+                automatic_state_priority,
+                direction_priority,
+                category_priority,
                 ApplicationTaskModel.priority_score.desc(),
                 ApplicationTaskModel.scheduled_at,
+                ApplicationTaskModel.id,
             )
             .limit(limit)
         )
@@ -502,7 +624,7 @@ class UiWorkspaceService:
                 state=task.state.value,
                 priority=task.priority_score,
                 scheduled_at=task.scheduled_at,
-                last_error=task.last_error_code,
+                last_error=_queue_error_text(task.last_error_code),
                 letter_state=stored_letter_state.value if stored_letter_state is not None else None,
                 form_state=stored_form_state.value if stored_form_state is not None else None,
             )
@@ -717,7 +839,7 @@ class UiWorkspaceService:
                 )
                 .where(
                     ApplicationModel.direction_id == direction.id,
-                    ApplicationTaskModel.state.in_(ACTIVE_QUEUE_STATES),
+                    ApplicationTaskModel.state.in_(AUTOMATIC_QUEUE_STATES),
                 )
             )
             or 0

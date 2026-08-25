@@ -14,6 +14,7 @@ def test_default_api_is_local_only() -> None:
     assert settings.api_host == "127.0.0.1"
     assert settings.api_port == 8000
     assert settings.hh_browser_timeout_ms == 60_000
+    assert settings.hh_background_detail_limit == 20
     assert Settings.model_construct().hh_browser_source_ip is None
     assert settings.telegram_bot_username == "hugin_workbot"
     assert settings.notification_gateway_url == "http://127.0.0.1:8088"
@@ -21,6 +22,10 @@ def test_default_api_is_local_only() -> None:
     assert settings.notification_gateway_timeout_seconds == 15
     assert settings.notification_gateway_connection_timeout_seconds == 120
     assert settings.yandex_ai_model == "aliceai-llm/latest"
+    assert settings.codex_cli_path is None
+    assert settings.codex_letter_model == "gpt-5.6-luna"
+    assert settings.codex_letter_reasoning_effort == "low"
+    assert settings.codex_letter_timeout_seconds == 180
     assert Settings.model_construct().yandex_ai_host_ip is None
     assert Settings.model_construct().yandex_ai_source_ip is None
     assert settings.data_dir.is_absolute()

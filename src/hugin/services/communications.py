@@ -18,10 +18,20 @@ from hugin.domain.communications import (
     RecruiterMessageRecord,
     StaleMessageDraftError,
 )
-from hugin.domain.content import NotificationChannel, RecruiterMessageState
+from hugin.domain.content import (
+    IncidentSeverity,
+    NotificationChannel,
+    RecruiterMessageState,
+)
 from hugin.domain.directions import ConfigPayload
 from hugin.domain.time import as_utc
 from hugin.repositories.communications import CommunicationRepository
+from hugin.services.incidents import IncidentService
+
+_MESSAGE_SEND_INCIDENT_CODES = (
+    "RECRUITER_MESSAGE_SEND_FAILED",
+    "RECRUITER_MESSAGE_SEND_UNKNOWN",
+)
 
 
 class MessageSender(Protocol):
@@ -60,6 +70,7 @@ class CommunicationService:
     def __init__(self, session: Session, sender: MessageSender) -> None:
         self._repository = CommunicationRepository(session)
         self._sender = sender
+        self._incidents = IncidentService(session)
 
     def messages(self, account_id: int) -> tuple[RecruiterMessageRecord, ...]:
         return self._repository.list_messages_for_account(self._positive_id(account_id))
@@ -149,6 +160,26 @@ class CommunicationService:
             confirmed_at=self._now(confirmed_at),
         )
 
+    def approve_outgoing_for_automatic_send(
+        self,
+        *,
+        account_id: int,
+        message_id: int,
+        content_version: int,
+        content_hash: str,
+        approval_key: str,
+    ) -> RecruiterMessageRecord:
+        selected_key = approval_key.strip()
+        if not selected_key or len(selected_key) > 64:
+            raise ValueError("Некорректный ключ автоматического ответа")
+        return self._repository.approve_outgoing_for_automatic_send(
+            account_id=self._positive_id(account_id),
+            message_id=self._positive_id(message_id),
+            content_version=self._positive_id(content_version),
+            content_hash=self._hash(content_hash),
+            approval_key=selected_key,
+        )
+
     def confirm_outgoing_retry(
         self,
         *,
@@ -217,7 +248,7 @@ class CommunicationService:
             content_version=selected_version,
         )
         result = self._sender.send(request)
-        return self._repository.record_send_outcome(
+        recorded = self._repository.record_send_outcome(
             account_id=selected_account_id,
             message_id=selected_message_id,
             content_version=selected_version,
@@ -226,6 +257,41 @@ class CommunicationService:
             external_id=result.external_id,
             finished_at=self._now(finished_at),
         )
+        self._record_send_incident(recorded)
+        return recorded
+
+    def _record_send_incident(self, message: RecruiterMessageRecord) -> None:
+        if message.state is RecruiterMessageState.FAILED:
+            self._incidents.report(
+                code="RECRUITER_MESSAGE_SEND_FAILED",
+                severity=IncidentSeverity.ERROR,
+                message=(
+                    f"Не удалось отправить ответ работодателю; сообщение №{message.id} "
+                    "оставлено для безопасного повтора после проверки причины."
+                ),
+                scope_type="recruiter_message",
+                scope_id=message.id,
+            )
+            return
+        if message.state is RecruiterMessageState.UNKNOWN_RESULT:
+            self._incidents.report(
+                code="RECRUITER_MESSAGE_SEND_UNKNOWN",
+                severity=IncidentSeverity.CRITICAL,
+                message=(
+                    f"Результат отправки ответа работодателю неизвестен; сообщение "
+                    f"№{message.id} нельзя повторять до сверки с hh.ru."
+                ),
+                scope_type="recruiter_message",
+                scope_id=message.id,
+            )
+            return
+        if message.state is RecruiterMessageState.SENT:
+            for code in _MESSAGE_SEND_INCIDENT_CODES:
+                self._incidents.resolve(
+                    code=code,
+                    scope_type="recruiter_message",
+                    scope_id=message.id,
+                )
 
     def confirm_and_send(
         self,

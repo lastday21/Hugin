@@ -197,6 +197,27 @@ class AutomationJobRepository:
         self._session.flush()
         return _job_record(model)
 
+    def defer(
+        self,
+        job_key: str,
+        *,
+        run_at: datetime,
+        result: AutomationJobResult | None = None,
+        now: datetime | None = None,
+    ) -> AutomationJobRecord:
+        finished_at = as_utc(now or datetime.now(UTC))
+        model = self._running_model(job_key)
+        model.state = AutomationJobState.WAITING
+        model.next_run_at = as_utc(run_at)
+        model.last_finished_at = finished_at
+        model.heartbeat_at = finished_at
+        model.last_error_code = None
+        model.last_error_message = None
+        model.last_result = dict(result or {})
+        model.updated_at = finished_at
+        self._session.flush()
+        return _job_record(model)
+
     def fail(
         self,
         job_key: str,

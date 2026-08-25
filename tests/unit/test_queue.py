@@ -226,7 +226,7 @@ def test_unknown_result_does_not_stop_other_applications(settings: Settings) -> 
         database.close()
 
 
-def test_queue_prefers_fresher_vacancy_before_rule_score(settings: Settings) -> None:
+def test_queue_prefers_rule_score_before_freshness(settings: Settings) -> None:
     upgrade_database(settings)
     database = create_database(settings)
     now = datetime(2026, 7, 22, 12, 0, tzinfo=UTC)
@@ -246,8 +246,8 @@ def test_queue_prefers_fresher_vacancy_before_rule_score(settings: Settings) -> 
                 published_at=now - timedelta(hours=1),
             )
             repository = QueueTaskRepository(session)
-            repository.enqueue(older, 100, now)
-            expected = repository.enqueue(newer, 20, now)
+            expected = repository.enqueue(older, 100, now)
+            repository.enqueue(newer, 20, now)
 
             claimed = repository.claim_next(now)
 
@@ -257,7 +257,7 @@ def test_queue_prefers_fresher_vacancy_before_rule_score(settings: Settings) -> 
         database.close()
 
 
-def test_queue_prioritizes_backend_then_adjacent_and_skips_inactive_direction(
+def test_queue_prioritizes_backend_match_then_backend_stretch_then_adjacent(
     settings: Settings,
 ) -> None:
     upgrade_database(settings)
@@ -295,6 +295,8 @@ def test_queue_prioritizes_backend_then_adjacent_and_skips_inactive_direction(
                 *,
                 published_at: datetime,
                 location_priority: float,
+                category: str = "MATCH",
+                priority_score: float = 80,
             ) -> int:
                 vacancy = vacancies.upsert(
                     VacancyData(
@@ -309,9 +311,9 @@ def test_queue_prioritizes_backend_then_adjacent_and_skips_inactive_direction(
                     direction_id,
                     vacancy.id,
                     state=VacancyState.QUEUED,
-                    score=80,
+                    score=priority_score,
                     details={
-                        "category": "MATCH",
+                        "category": category,
                         "accepted": True,
                         "location_priority": location_priority,
                         "experience_priority": 90,
@@ -324,19 +326,29 @@ def test_queue_prioritizes_backend_then_adjacent_and_skips_inactive_direction(
                     resume.id,
                     direction_id,
                 )
-                return tasks.enqueue(application.id, 80, now).id
+                return tasks.enqueue(application.id, priority_score, now).id
 
             backend_task = enqueue(
                 backend.id,
                 "backend",
                 published_at=now - timedelta(days=2),
                 location_priority=90,
+                priority_score=20,
+            )
+            backend_stretch_task = enqueue(
+                backend.id,
+                "backend-stretch",
+                published_at=now,
+                location_priority=100,
+                category="STRETCH",
+                priority_score=95,
             )
             adjacent_task = enqueue(
                 adjacent.id,
                 "adjacent",
                 published_at=now,
                 location_priority=100,
+                priority_score=100,
             )
             inactive_task = enqueue(
                 inactive.id,
@@ -350,13 +362,15 @@ def test_queue_prioritizes_backend_then_adjacent_and_skips_inactive_direction(
                     now,
                     account_id=account.id,
                     vacancy_rules_version=RULES_VERSION,
-                    vacancy_rule_categories=frozenset({"MATCH"}),
+                    vacancy_rule_categories=frozenset({"MATCH", "STRETCH"}),
                 )
                 assert claimed is not None
                 return claimed.id
 
             assert claim() == backend_task
             tasks.transition(backend_task, TaskState.COMPLETED)
+            assert claim() == backend_stretch_task
+            tasks.transition(backend_stretch_task, TaskState.COMPLETED)
             assert claim() == adjacent_task
             tasks.transition(adjacent_task, TaskState.COMPLETED)
             assert (
@@ -364,7 +378,7 @@ def test_queue_prioritizes_backend_then_adjacent_and_skips_inactive_direction(
                     now,
                     account_id=account.id,
                     vacancy_rules_version=RULES_VERSION,
-                    vacancy_rule_categories=frozenset({"MATCH"}),
+                    vacancy_rule_categories=frozenset({"MATCH", "STRETCH"}),
                 )
                 is None
             )
@@ -500,7 +514,9 @@ def test_queue_policy_gate_and_manual_pause_are_persistent(settings: Settings) -
 
             assert queue.pause().state is SystemState.PAUSED
             assert queue.pause().state is SystemState.PAUSED
-            assert queue.resume().state is SystemState.RUNNING
+            resumed = queue.resume()
+            assert resumed.state is SystemState.RUNNING
+            assert resumed.next_apply_at is None
             assert queue.resume().state is SystemState.RUNNING
             status = queue.status()
             assert status.policy.timezone_name == "Europe/Moscow"

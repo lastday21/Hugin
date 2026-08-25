@@ -45,6 +45,7 @@ from playwright.sync_api import (
     TimeoutError as PlaywrightTimeoutError,
 )
 
+from hugin.core.network import usable_source_ipv4
 from hugin.domain.communications import MessageSendOutcome, MessageSendResult
 from hugin.domain.content import MessageDirection
 from hugin.domain.hh import (
@@ -79,6 +80,7 @@ from hugin.services.hh_login import HhCredentials, LoginStatus
 _PROFILE_LOCK_FILENAME = ".hugin-browser.lock"
 _PROFILE_LOCK_TIMEOUT_SECONDS = 180.0
 _PROFILE_LOCK_RETRY_SECONDS = 0.25
+_RESUME_OPTIONS_TIMEOUT_MS = 10_000
 _WINDOW_LIVENESS_SCRIPT = "() => true"
 _HH_HTTPS_PORT = 443
 _HH_PROXY_HOST = "127.0.0.1"
@@ -120,6 +122,7 @@ _APPLICATION_LIMIT_MARKERS = (
 )
 _TEMPORARY_NAVIGATION_ERROR_MARKERS = (
     "ERR_TIMED_OUT",
+    "ERR_EMPTY_RESPONSE",
     "ERR_CONNECTION_TIMED_OUT",
     "ERR_CONNECTION_RESET",
     "ERR_CONNECTION_CLOSED",
@@ -131,6 +134,7 @@ _TEMPORARY_NAVIGATION_ERROR_MARKERS = (
 _NETWORK_RETRY_SECONDS = 60
 _TEMPORARY_REQUEST_RETRY_SECONDS = 15 * 60
 _APPLICATION_LIMIT_RETRY_SECONDS = 24 * 60 * 60
+_SUBMISSION_RESPONSE_TIMEOUT_MS = 10_000
 _DANGEROUS_SCREENING_QUESTION = re.compile(
     r"паспорт|passport|банк|bank|банковск|карт[аы]|card|снилс|\bинн\b|полис|"
     r"удостоверен|код\s+(?:из|подтверждения)|смс|sms|otp|оплат|payment|"
@@ -686,16 +690,30 @@ const fieldFromNode = (node, position) => {
     let fieldType = tag === 'textarea' ? 'textarea' : tag === 'select' ? 'select' : inputType;
     if (!fieldType && control?.getAttribute('role') === 'combobox') fieldType = 'combobox';
     if (!fieldType) fieldType = control ? 'text' : 'unknown';
-    const optionControls = Array.from(fieldRoot.querySelectorAll('input[type="radio"]'));
+    const radioControls = Array.from(fieldRoot.querySelectorAll('input[type="radio"]'));
+    const checkboxControls = Array.from(fieldRoot.querySelectorAll('input[type="checkbox"]'));
+    const optionControls = radioControls.length
+        ? radioControls
+        : checkboxControls.length > 1 ? checkboxControls : [];
+    const optionText = (option) => clean(
+        option.closest('label, [data-qa="cell"]')?.innerText || option.value
+    );
     const options = tag === 'select'
         ? Array.from(control.options || []).map(
             (option) => clean(option.textContent || option.value)
         )
             .filter(Boolean)
-        : optionControls.map((option) => clean(
-            option.closest('label')?.innerText || option.value
-        )).filter(Boolean);
-    if (optionControls.length) fieldType = 'radio';
+        : optionControls.map(optionText).filter(Boolean);
+    if (radioControls.length) {
+        fieldType = 'radio';
+    } else if (checkboxControls.length > 1) {
+        const normalizedOptions = new Set(
+            options.map((option) => option.toLocaleLowerCase('ru-RU'))
+        );
+        fieldType = normalizedOptions.has('да') && normalizedOptions.has('нет')
+            ? 'radio'
+            : 'checkbox_group';
+    }
     const maxLengthValue = Number.parseInt(control?.getAttribute('maxlength') || '', 10);
     const normalized = question.toLocaleLowerCase('ru-RU');
     const explicitlyOptional = (
@@ -993,8 +1011,23 @@ for (const answer of answers) {
         if (!radio) { skipped.push(answer.key); continue; }
         radio.click();
     } else if (type === 'checkbox') {
-        const shouldCheck = ['да', 'true', '1', 'согласен'].includes(normalized(value));
-        if (control.checked !== shouldCheck) control.click();
+        const checkboxes = Array.from(item.node.querySelectorAll('input[type="checkbox"]'));
+        if (checkboxes.length > 1) {
+            const checkbox = checkboxes.find(
+                (candidate) => normalized(candidate.value) === normalized(value) ||
+                    normalized(
+                        candidate.closest('label, [data-qa="cell"]')?.innerText
+                    ) === normalized(value)
+            );
+            if (!checkbox) { skipped.push(answer.key); continue; }
+            for (const candidate of checkboxes) {
+                if (candidate !== checkbox && candidate.checked) candidate.click();
+            }
+            if (!checkbox.checked) checkbox.click();
+        } else {
+            const shouldCheck = ['да', 'true', '1', 'согласен'].includes(normalized(value));
+            if (control.checked !== shouldCheck) control.click();
+        }
     } else if (control.getAttribute('role') === 'combobox') {
         skipped.push(answer.key);
         continue;
@@ -1062,8 +1095,17 @@ for (const item of controls) {
         actual = clean(selected?.closest('label')?.innerText || selected?.value);
         present = Boolean(selected);
     } else if (type === 'checkbox') {
-        actual = control.checked ? 'да' : 'нет';
-        present = !item.required || control.checked;
+        const checkboxes = Array.from(item.node.querySelectorAll('input[type="checkbox"]'));
+        if (checkboxes.length > 1) {
+            const selected = checkboxes.filter((candidate) => candidate.checked);
+            actual = selected.map((candidate) => clean(
+                candidate.closest('label, [data-qa="cell"]')?.innerText || candidate.value
+            )).join(', ');
+            present = selected.length > 0;
+        } else {
+            actual = control.checked ? 'да' : 'нет';
+            present = !item.required || control.checked;
+        }
     } else {
         actual = clean(control.value);
         present = Boolean(actual);
@@ -1319,9 +1361,7 @@ class _HhHttpProxy:
             listener.settimeout(0.5)
         except OSError as error:
             listener.close()
-            raise RuntimeError(
-                "Не удалось открыть локальный канал к hh.ru"
-            ) from error
+            raise RuntimeError("Не удалось открыть локальный канал к hh.ru") from error
         self._stop.clear()
         self._listener = listener
         self._port = listener.getsockname()[1]
@@ -1382,9 +1422,7 @@ class _HhHttpProxy:
                 return
             parts = first_line.split()
             target_host, separator, target_port = (
-                parts[1].casefold().rpartition(":")
-                if len(parts) == 3
-                else ("", "", "")
+                parts[1].casefold().rpartition(":") if len(parts) == 3 else ("", "", "")
             )
             if (
                 len(parts) != 3
@@ -1394,9 +1432,7 @@ class _HhHttpProxy:
                 or not self._allowed_host(target_host)
             ):
                 client.sendall(
-                    b"HTTP/1.1 403 Forbidden\r\n"
-                    b"Connection: close\r\n"
-                    b"Content-Length: 0\r\n\r\n"
+                    b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
                 )
                 return
             remote = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -1406,10 +1442,7 @@ class _HhHttpProxy:
             remote.connect((self._resolve_host(target_host), _HH_HTTPS_PORT))
             remote.settimeout(None)
             client.settimeout(None)
-            client.sendall(
-                b"HTTP/1.1 200 Connection Established\r\n"
-                b"Connection: keep-alive\r\n\r\n"
-            )
+            client.sendall(b"HTTP/1.1 200 Connection Established\r\nConnection: keep-alive\r\n\r\n")
             upstream = threading.Thread(
                 target=self._copy,
                 args=(client, remote),
@@ -1430,9 +1463,7 @@ class _HhHttpProxy:
 
     @staticmethod
     def _allowed_host(host: str) -> bool:
-        return host in {"hh.ru", "hhcdn.ru"} or host.endswith(
-            _HH_PROXY_ALLOWED_SUFFIXES
-        )
+        return host in {"hh.ru", "hhcdn.ru"} or host.endswith(_HH_PROXY_ALLOWED_SUFFIXES)
 
     def _resolve_host(self, host: str) -> str:
         with self._resolved_hosts_lock:
@@ -1513,9 +1544,7 @@ class _HhHttpProxy:
         client.sendall(
             b"HTTP/1.1 200 OK\r\n"
             b"Content-Type: application/x-ns-proxy-autoconfig\r\n"
-            b"Cache-Control: no-store\r\n"
-            + f"Content-Length: {len(body)}\r\n\r\n".encode()
-            + body
+            b"Cache-Control: no-store\r\n" + f"Content-Length: {len(body)}\r\n\r\n".encode() + body
         )
 
     @staticmethod
@@ -1549,6 +1578,7 @@ class VisibleHhBrowser:
         *,
         start_minimized: bool = False,
         browser_source_ip: str | None = None,
+        profile_lock_timeout_seconds: float | None = None,
     ) -> None:
         self._profile_dir = profile_dir
         self._login_url = login_url
@@ -1561,7 +1591,17 @@ class VisibleHhBrowser:
         self._playwright: Playwright | None = None
         self._context: BrowserContext | None = None
         self._page: Page | None = None
-        self._profile_lock = _BrowserProfileLock(self._profile_dir / _PROFILE_LOCK_FILENAME)
+        lock_timeout = (
+            _PROFILE_LOCK_TIMEOUT_SECONDS
+            if profile_lock_timeout_seconds is None
+            else profile_lock_timeout_seconds
+        )
+        if lock_timeout < 0:
+            raise ValueError("Время ожидания профиля браузера не может быть отрицательным")
+        self._profile_lock = _BrowserProfileLock(
+            self._profile_dir / _PROFILE_LOCK_FILENAME,
+            timeout_seconds=lock_timeout,
+        )
 
     def __enter__(self) -> VisibleHhBrowser:
         self._profile_dir.mkdir(parents=True, exist_ok=True)
@@ -1576,12 +1616,11 @@ class VisibleHhBrowser:
                 if self._start_minimized
                 else ["--start-maximized"]
             )
-            if self._browser_source_ip:
-                self._network_proxy = _HhHttpProxy(self._browser_source_ip)
+            source_ip = usable_source_ipv4(self._browser_source_ip)
+            if source_ip:
+                self._network_proxy = _HhHttpProxy(source_ip)
                 self._network_proxy.start()
-                chromium_args.append(
-                    f"--proxy-pac-url={self._network_proxy.pac_url}"
-                )
+                chromium_args.append(f"--proxy-pac-url={self._network_proxy.pac_url}")
             self._context = self._playwright.chromium.launch_persistent_context(
                 str(self._profile_dir),
                 headless=False,
@@ -1657,8 +1696,7 @@ class VisibleHhBrowser:
                     "HH_RATE_LIMITED",
                     "hh.ru временно ограничил обращения при входе",
                     retry_after_seconds=(
-                        self._retry_after_seconds(response)
-                        or _TEMPORARY_REQUEST_RETRY_SECONDS
+                        self._retry_after_seconds(response) or _TEMPORARY_REQUEST_RETRY_SECONDS
                     ),
                 )
             if response is not None and response.status == 403:
@@ -1960,86 +1998,88 @@ class VisibleHhBrowser:
         if not selected_ids:
             return ()
         page = self._open_negotiations()
-        negotiations: dict[str, None] = {}
-        for item in self._negotiations_payload(page):
-            if item.get("chatAvailable") is not True:
-                continue
-            vacancy_id = self._optional_string(item, "vacancyId")
-            if vacancy_id and not vacancy_id.isdigit():
-                raise RuntimeError(
-                    "hh.ru вернул некорректный номер вакансии с перепиской"
-                )
-            vacancy_id = vacancy_id or self._vacancy_id_from_href(
-                self._optional_string(item, "vacancyHref")
-            )
-            if not vacancy_id:
-                raise RuntimeError(
-                    "hh.ru не вернул номер вакансии для доступной переписки"
-                )
-            if vacancy_id in selected_ids:
-                negotiations.setdefault(vacancy_id, None)
         messages: list[HhChatMessageData] = []
-        for vacancy_id in negotiations:
-            opened = page.evaluate(OPEN_NEGOTIATION_CHAT_SCRIPT, vacancy_id)
-            if opened is not True:
-                raise RuntimeError(
-                    f"hh.ru показал переписку вакансии {vacancy_id}, "
-                    "но не открыл её для чтения"
+        read_ids: set[str] = set()
+        page_numbers = self._negotiation_page_numbers(page)
+        pages: tuple[int | None, ...] = page_numbers or (None,)
+        for page_number in pages:
+            if page_number is not None:
+                self._select_negotiation_page(page, page_number)
+            for item in self._negotiations_payload(page):
+                if item.get("chatAvailable") is not True:
+                    continue
+                vacancy_id = self._optional_string(item, "vacancyId")
+                if vacancy_id and not vacancy_id.isdigit():
+                    raise RuntimeError("hh.ru вернул некорректный номер вакансии с перепиской")
+                vacancy_id = vacancy_id or self._vacancy_id_from_href(
+                    self._optional_string(item, "vacancyHref")
                 )
-            frame = self._wait_for_chat_frame(page)
-            if frame is None:
-                raise RuntimeError(
-                    f"Переписка вакансии {vacancy_id} не загрузилась"
-                )
-            payload = self._read_chat_messages(page, frame, vacancy_id)
-            for item in payload:
-                message_vacancy_id = self._required_string(
-                    item,
-                    "vacancyId",
-                    "идентификатора вакансии сообщения",
-                )
-                if message_vacancy_id != vacancy_id:
-                    raise RuntimeError(
-                        "hh.ru вернул сообщения из другой переписки"
-                    )
-                raw_direction = self._required_string(item, "direction", "направления сообщения")
-                try:
-                    direction = MessageDirection(raw_direction)
-                except ValueError as error:
-                    raise RuntimeError("hh.ru вернул неизвестное направление сообщения") from error
-                messages.append(
-                    HhChatMessageData(
-                        vacancy_id=message_vacancy_id,
-                        hh_id=self._required_string(
-                            item,
-                            "messageId",
-                            "идентификатора сообщения",
-                        ),
-                        direction=direction,
-                        body=self._required_string(item, "body", "текста сообщения"),
-                        displayed_time=self._optional_string(item, "displayedTime"),
-                    )
-                )
-            close = page.locator('[data-qa="chatik-close-chatik"]')
-            if close.count() != 1:
-                raise RuntimeError(
-                    f"Переписка вакансии {vacancy_id} не показала кнопку закрытия"
-                )
-            try:
-                close.first.click(no_wait_after=True)
-            except PlaywrightError as error:
-                raise RuntimeError(
-                    f"Не удалось закрыть переписку вакансии {vacancy_id}"
-                ) from error
-            page.wait_for_timeout(500)
+                if not vacancy_id:
+                    raise RuntimeError("hh.ru не вернул номер вакансии для доступной переписки")
+                if vacancy_id not in selected_ids or vacancy_id in read_ids:
+                    continue
+                self._read_recruiter_chat(page, vacancy_id, messages)
+                read_ids.add(vacancy_id)
         return tuple(messages)
+
+    def _read_recruiter_chat(
+        self,
+        page: Page,
+        vacancy_id: str,
+        messages: list[HhChatMessageData],
+    ) -> None:
+        opened = page.evaluate(OPEN_NEGOTIATION_CHAT_SCRIPT, vacancy_id)
+        if opened is not True:
+            raise RuntimeError(
+                f"hh.ru показал переписку вакансии {vacancy_id}, но не открыл её для чтения"
+            )
+        frame = self._wait_for_chat_frame(page)
+        if frame is None:
+            raise RuntimeError(f"Переписка вакансии {vacancy_id} не загрузилась")
+        payload = self._read_chat_messages(page, frame, vacancy_id)
+        for item in payload:
+            message_vacancy_id = self._required_string(
+                item,
+                "vacancyId",
+                "идентификатора вакансии сообщения",
+            )
+            if message_vacancy_id != vacancy_id:
+                raise RuntimeError("hh.ru вернул сообщения из другой переписки")
+            raw_direction = self._required_string(
+                item,
+                "direction",
+                "направления сообщения",
+            )
+            try:
+                direction = MessageDirection(raw_direction)
+            except ValueError as error:
+                raise RuntimeError("hh.ru вернул неизвестное направление сообщения") from error
+            messages.append(
+                HhChatMessageData(
+                    vacancy_id=message_vacancy_id,
+                    hh_id=self._required_string(
+                        item,
+                        "messageId",
+                        "идентификатора сообщения",
+                    ),
+                    direction=direction,
+                    body=self._required_string(item, "body", "текста сообщения"),
+                    displayed_time=self._optional_string(item, "displayedTime"),
+                )
+            )
+        close = page.locator('[data-qa="chatik-close-chatik"]')
+        if close.count() != 1:
+            raise RuntimeError(f"Переписка вакансии {vacancy_id} не показала кнопку закрытия")
+        try:
+            close.first.click(no_wait_after=True)
+        except PlaywrightError as error:
+            raise RuntimeError(f"Не удалось закрыть переписку вакансии {vacancy_id}") from error
+        page.wait_for_timeout(500)
 
     @staticmethod
     def _negotiations_payload(page: Page) -> list[dict[object, object]]:
         payload = page.evaluate(NEGOTIATIONS_SCRIPT)
-        if not isinstance(payload, list) or not all(
-            isinstance(item, dict) for item in payload
-        ):
+        if not isinstance(payload, list) or not all(isinstance(item, dict) for item in payload):
             raise RuntimeError("hh.ru вернул некорректный список откликов")
         return payload
 
@@ -2057,16 +2097,13 @@ class VisibleHhBrowser:
                 raise RuntimeError(
                     f"Не удалось прочитать переписку вакансии {vacancy_id}"
                 ) from error
-            if not isinstance(payload, list) or not all(
-                isinstance(item, dict) for item in payload
-            ):
+            if not isinstance(payload, list) or not all(isinstance(item, dict) for item in payload):
                 raise RuntimeError("hh.ru вернул некорректную переписку")
             if payload:
                 return payload
             page.wait_for_timeout(500)
         raise RuntimeError(
-            f"Переписка вакансии {vacancy_id} открылась, "
-            "но hh.ru не отдал ни одного сообщения"
+            f"Переписка вакансии {vacancy_id} открылась, но hh.ru не отдал ни одного сообщения"
         )
 
     def apply_to_vacancy(
@@ -2094,16 +2131,18 @@ class VisibleHhBrowser:
                 attempt=attempt,
             )
         except Exception as error:
+            details = str(error).strip().splitlines()[0][:500]
+            suffix = f": {details}" if details else ""
             if attempt.started:
                 return HhApplyResult(
                     HhApplyStatus.UNKNOWN_RESULT,
                     page.url,
-                    (f"Ошибка после начала отправки: {type(error).__name__}"),
+                    f"Ошибка после начала отправки: {type(error).__name__}{suffix}",
                 )
             return HhApplyResult(
                 HhApplyStatus.RETRYABLE_ERROR,
                 page.url,
-                (f"Ошибка до нажатия кнопки отправки: {type(error).__name__}"),
+                f"Ошибка до нажатия кнопки отправки: {type(error).__name__}{suffix}",
             )
 
     def _apply_to_vacancy(
@@ -2124,8 +2163,17 @@ class VisibleHhBrowser:
         try:
             initial_response = page.goto(vacancy_url, wait_until="domcontentloaded")
             page.wait_for_timeout(1_500)
-        except PlaywrightTimeoutError:
-            return HhApplyResult(HhApplyStatus.RETRYABLE_ERROR, page.url)
+        except PlaywrightError as error:
+            details = str(error).strip().splitlines()[0][:500]
+            is_network_error = isinstance(error, PlaywrightTimeoutError) or any(
+                marker in details for marker in _TEMPORARY_NAVIGATION_ERROR_MARKERS
+            )
+            return HhApplyResult(
+                HhApplyStatus.RETRYABLE_ERROR,
+                page.url,
+                f"Не загрузилась страница вакансии: {details or type(error).__name__}",
+                retry_after_seconds=(_NETWORK_RETRY_SECONDS if is_network_error else None),
+            )
         body_text = self._page_body_text(page)
         if initial_response is not None and initial_response.status == 429:
             return HhApplyResult(
@@ -2133,8 +2181,7 @@ class VisibleHhBrowser:
                 page.url,
                 "hh.ru временно ограничил обращения; отклик будет повторён автоматически",
                 retry_after_seconds=(
-                    self._retry_after_seconds(initial_response)
-                    or _TEMPORARY_REQUEST_RETRY_SECONDS
+                    self._retry_after_seconds(initial_response) or _TEMPORARY_REQUEST_RETRY_SECONDS
                 ),
             )
         if self._vacancy_is_closed(initial_response, body_text):
@@ -2156,7 +2203,11 @@ class VisibleHhBrowser:
             return vacancy_error
         response_links = page.locator('[data-qa="vacancy-response-link-top"]:visible')
         if response_links.count() == 0:
-            return HhApplyResult(HhApplyStatus.RETRYABLE_ERROR, page.url)
+            return HhApplyResult(
+                HhApplyStatus.RETRYABLE_ERROR,
+                page.url,
+                "На странице вакансии нет стандартной кнопки отклика",
+            )
         try:
             response_links.first.click(no_wait_after=True, timeout=min(self._timeout_ms, 10_000))
             page.locator('[data-qa="resume-title"]').first.wait_for(
@@ -2164,8 +2215,13 @@ class VisibleHhBrowser:
                 timeout=self._timeout_ms,
             )
             page.wait_for_timeout(500)
-        except PlaywrightError:
-            return HhApplyResult(HhApplyStatus.RETRYABLE_ERROR, page.url)
+        except PlaywrightError as error:
+            details = str(error).strip().splitlines()[0][:500]
+            return HhApplyResult(
+                HhApplyStatus.RETRYABLE_ERROR,
+                page.url,
+                f"Кнопка отклика не открыла форму: {details or type(error).__name__}",
+            )
 
         initial = self._application_snapshot(page)
         vacancy_error = self._application_vacancy_error(page, vacancy_id, initial)
@@ -2205,6 +2261,7 @@ class VisibleHhBrowser:
                 page,
                 expected_resume_hh_id=expected_resume_hh_id,
                 expected_resume_title=expected_resume_title,
+                current_snapshot=initial,
             )
         except _ResumeSelectionError as error:
             return HhApplyResult(
@@ -2267,14 +2324,22 @@ class VisibleHhBrowser:
                 if toggle.count() == 0:
                     toggle = page.locator('[data-qa="add-cover-letter"]')
                 if toggle.count() != 1:
-                    return HhApplyResult(HhApplyStatus.RETRYABLE_ERROR, page.url)
+                    return HhApplyResult(
+                        HhApplyStatus.RETRYABLE_ERROR,
+                        page.url,
+                        "В форме нет однозначной кнопки добавления сопроводительного письма",
+                    )
                 toggle.click()
             letter.first.wait_for(state="visible", timeout=self._timeout_ms)
             letter.first.fill(cover_letter.strip())
 
         submit_button = page.locator('[data-qa="vacancy-response-submit-popup"]')
         if submit_button.count() != 1:
-            return HhApplyResult(HhApplyStatus.RETRYABLE_ERROR, page.url)
+            return HhApplyResult(
+                HhApplyStatus.RETRYABLE_ERROR,
+                page.url,
+                "В открытой форме нет единственной кнопки отправки",
+            )
         if not submit:
             return HhApplyResult(
                 HhApplyStatus.MANUAL_REVIEW_REQUIRED,
@@ -2283,7 +2348,11 @@ class VisibleHhBrowser:
                 warnings=initial.warnings,
             )
         if not submit_button.first.is_enabled():
-            return HhApplyResult(HhApplyStatus.RETRYABLE_ERROR, page.url)
+            return HhApplyResult(
+                HhApplyStatus.RETRYABLE_ERROR,
+                page.url,
+                "Кнопка отправки недоступна после заполнения формы",
+            )
         if submit_guard is None:
             return HhApplyResult(
                 HhApplyStatus.MANUAL_REVIEW_REQUIRED,
@@ -2356,7 +2425,12 @@ class VisibleHhBrowser:
             return ready_error
         submit_button = page.locator('[data-qa="vacancy-response-submit-popup"]')
         if submit_button.count() != 1 or not submit_button.first.is_enabled():
-            return HhApplyResult(HhApplyStatus.RETRYABLE_ERROR, page.url)
+            return HhApplyResult(
+                HhApplyStatus.RETRYABLE_ERROR,
+                page.url,
+                "Перед нажатием кнопка отправки исчезла или стала недоступна",
+                warnings=ready.warnings,
+            )
         try:
             submission_allowed = submit_guard()
         except Exception as error:
@@ -2430,7 +2504,7 @@ class VisibleHhBrowser:
                         expected_vacancy_id=vacancy_id,
                         expected_resume_hh_id=expected_resume_hh_id,
                     ),
-                    timeout=self._timeout_ms,
+                    timeout=min(self._timeout_ms, _SUBMISSION_RESPONSE_TIMEOUT_MS),
                 ) as response_info:
                     submit_button.first.click(no_wait_after=True)
                 response = response_info.value
@@ -2539,14 +2613,14 @@ class VisibleHhBrowser:
                 ),
                 warnings=snapshot.warnings,
             )
-        if snapshot.resume_hh_id != expected_resume_hh_id.strip():
+        if snapshot.resume_hh_id and snapshot.resume_hh_id != expected_resume_hh_id.strip():
             return HhApplyResult(
                 HhApplyStatus.RESUME_MISMATCH,
                 page.url,
                 (
                     f"Перед отправкой ожидалось резюме с номером "
                     f"«{expected_resume_hh_id.strip()}», "
-                    f"выбрано «{snapshot.resume_hh_id or 'не определено'}»"
+                    f"выбрано «{snapshot.resume_hh_id}»"
                 ),
                 warnings=snapshot.warnings,
             )
@@ -2571,10 +2645,7 @@ class VisibleHhBrowser:
             return self._questions_required(
                 page.url,
                 snapshot,
-                (
-                    "Состав анкеты изменился после повторного заполнения; "
-                    "кнопка не нажата"
-                ),
+                ("Состав анкеты изменился после повторного заполнения; кнопка не нажата"),
             )
         return None
 
@@ -2582,8 +2653,7 @@ class VisibleHhBrowser:
     def _screening_form_is_dangerous(form: HhScreeningForm) -> bool:
         return bool(
             any(
-                warning in _DANGEROUS_FORM_WARNINGS
-                or _DANGEROUS_SCREENING_QUESTION.search(warning)
+                warning in _DANGEROUS_FORM_WARNINGS or _DANGEROUS_SCREENING_QUESTION.search(warning)
                 for warning in form.warnings
             )
             or any(
@@ -2618,10 +2688,7 @@ class VisibleHhBrowser:
     ) -> HhApplyResult | None:
         page_vacancy_id = cls._application_url_vacancy_id(page.url)
         form_vacancy_id = snapshot.vacancy_id if snapshot is not None else expected_vacancy_id
-        if (
-            page_vacancy_id == expected_vacancy_id
-            and form_vacancy_id == expected_vacancy_id
-        ):
+        if page_vacancy_id == expected_vacancy_id and form_vacancy_id == expected_vacancy_id:
             return None
         return HhApplyResult(
             HhApplyStatus.RETRYABLE_ERROR,
@@ -2678,11 +2745,7 @@ class VisibleHhBrowser:
         if query_ids:
             return query_ids[0] if len(query_ids) == 1 and query_ids[0].isdigit() else ""
         parts = parsed.path.strip("/").split("/")
-        return (
-            parts[1]
-            if len(parts) >= 2 and parts[0] == "vacancy" and parts[1].isdigit()
-            else ""
-        )
+        return parts[1] if len(parts) >= 2 and parts[0] == "vacancy" and parts[1].isdigit() else ""
 
     def _fill_and_verify_screening_form(
         self,
@@ -2788,6 +2851,7 @@ class VisibleHhBrowser:
                 page,
                 expected_resume_hh_id=expected_resume_hh_id,
                 expected_resume_title=expected_resume_title,
+                current_snapshot=snapshot,
             )
         except _ResumeSelectionError as error:
             return HhFormReviewResult(
@@ -2908,8 +2972,8 @@ class VisibleHhBrowser:
         except RuntimeError:
             return MessageSendResult(MessageSendOutcome.FAILED)
         try:
-            opened = page.evaluate(OPEN_NEGOTIATION_CHAT_SCRIPT, vacancy_id)
-        except PlaywrightError:
+            opened = self._open_negotiation_chat(page, vacancy_id)
+        except (PlaywrightError, RuntimeError):
             return MessageSendResult(MessageSendOutcome.FAILED)
         if opened is not True:
             return MessageSendResult(MessageSendOutcome.FAILED)
@@ -2919,17 +2983,18 @@ class VisibleHhBrowser:
 
         editor = frame.locator('[data-qa="chatik-new-message-text"]')
         submit = frame.locator('[data-qa="chatik-do-send-message"]')
-        if (
-            editor.count() != 1
-            or submit.count() != 1
-            or not editor.first.is_enabled()
-            or not submit.first.is_enabled()
-        ):
+        if editor.count() != 1 or submit.count() != 1 or not editor.first.is_enabled():
             return MessageSendResult(MessageSendOutcome.FAILED)
         before = self._outgoing_messages_snapshot(frame, vacancy_id, exact_body)
         if before is None:
             return MessageSendResult(MessageSendOutcome.FAILED)
         editor.first.fill(exact_body)
+        for _attempt in range(4):
+            if submit.first.is_enabled():
+                break
+            page.wait_for_timeout(250)
+        else:
+            return MessageSendResult(MessageSendOutcome.FAILED)
 
         response: Response | None = None
         try:
@@ -2959,6 +3024,37 @@ class VisibleHhBrowser:
             return MessageSendResult(MessageSendOutcome.FAILED)
         return MessageSendResult(MessageSendOutcome.UNKNOWN_RESULT)
 
+    def _open_negotiation_chat(self, page: Page, vacancy_id: str) -> bool:
+        if page.evaluate(OPEN_NEGOTIATION_CHAT_SCRIPT, vacancy_id) is True:
+            return True
+        for page_number in self._negotiation_page_numbers(page):
+            self._select_negotiation_page(page, page_number)
+            if page.evaluate(OPEN_NEGOTIATION_CHAT_SCRIPT, vacancy_id) is True:
+                return True
+        return False
+
+    @staticmethod
+    def _negotiation_page_numbers(page: Page) -> tuple[int, ...]:
+        numbers: set[int] = set()
+        for button in page.locator('[data-qa^="number-pages-"]').all():
+            value = button.inner_text().strip()
+            if value.isdigit() and int(value) > 0:
+                numbers.add(int(value))
+        return tuple(sorted(numbers))
+
+    def _select_negotiation_page(self, page: Page, page_number: int) -> None:
+        selected = page.locator('[data-qa*="number-pages-selected"]')
+        if selected.count() == 1 and selected.first.inner_text().strip() == str(page_number):
+            return
+        button = page.locator(f'[data-qa^="number-pages-{page_number}"]')
+        if button.count() != 1:
+            raise RuntimeError(f"hh.ru не показал страницу откликов {page_number}")
+        try:
+            button.first.click(no_wait_after=True)
+            page.wait_for_timeout(1_500)
+        except PlaywrightError as error:
+            raise RuntimeError(f"Не удалось открыть страницу откликов {page_number}") from error
+
     def _raise_message_submission_error(
         self,
         page: Page,
@@ -2984,8 +3080,7 @@ class VisibleHhBrowser:
                 "HH_RATE_LIMITED",
                 "hh.ru временно ограничил отправку сообщений",
                 retry_after_seconds=(
-                    self._retry_after_seconds(response)
-                    or _TEMPORARY_REQUEST_RETRY_SECONDS
+                    self._retry_after_seconds(response) or _TEMPORARY_REQUEST_RETRY_SECONDS
                 ),
             )
         if self._contains_any(combined_text, *_TEMPORARY_REQUEST_LIMIT_MARKERS):
@@ -3091,8 +3186,7 @@ class VisibleHhBrowser:
                 "HH_RATE_LIMITED",
                 "hh.ru временно ограничил обращения; проверка будет повторена автоматически",
                 retry_after_seconds=(
-                    self._retry_after_seconds(response)
-                    or _TEMPORARY_REQUEST_RETRY_SECONDS
+                    self._retry_after_seconds(response) or _TEMPORARY_REQUEST_RETRY_SECONDS
                 ),
             )
         if response is not None and response.status == 403:
@@ -3241,9 +3335,8 @@ class VisibleHhBrowser:
         if identifiers is None:
             return False
         vacancy_ids, resume_ids = identifiers
-        return (
-            vacancy_ids == frozenset((expected_vacancy_id.strip(),))
-            and resume_ids == frozenset((expected_resume_hh_id.strip(),))
+        return vacancy_ids == frozenset((expected_vacancy_id.strip(),)) and resume_ids == frozenset(
+            (expected_resume_hh_id.strip(),)
         )
 
     @staticmethod
@@ -3407,8 +3500,7 @@ class VisibleHhBrowser:
                 page.url,
                 "hh.ru временно ограничил отправку; отклик будет повторён автоматически",
                 retry_after_seconds=(
-                    self._retry_after_seconds(response)
-                    or _TEMPORARY_REQUEST_RETRY_SECONDS
+                    self._retry_after_seconds(response) or _TEMPORARY_REQUEST_RETRY_SECONDS
                 ),
             )
         if self._contains_any(combined_text, *_APPLICATION_LIMIT_MARKERS):
@@ -3505,8 +3597,7 @@ class VisibleHhBrowser:
                 return current_status
             raise HhSyncRetryableError(
                 "HH_LOGIN_FORM_TIMEOUT",
-                "Форма входа hh.ru не успела загрузиться; "
-                "проверка будет повторена автоматически",
+                "Форма входа hh.ru не успела загрузиться; проверка будет повторена автоматически",
                 retry_after_seconds=_NETWORK_RETRY_SECONDS,
             ) from error
 
@@ -3540,8 +3631,7 @@ class VisibleHhBrowser:
             page.wait_for_timeout(500)
         raise HhSyncRetryableError(
             "HH_LOGIN_FORM_TIMEOUT",
-            "Страница входа hh.ru не успела загрузиться; "
-            "проверка будет повторена автоматически",
+            "Страница входа hh.ru не успела загрузиться; проверка будет повторена автоматически",
             retry_after_seconds=_NETWORK_RETRY_SECONDS,
         )
 
@@ -3618,6 +3708,7 @@ class VisibleHhBrowser:
         *,
         expected_resume_hh_id: str,
         expected_resume_title: str,
+        current_snapshot: _ApplicationSnapshot | None = None,
     ) -> _ApplicationSnapshot:
         resume_hh_id = expected_resume_hh_id.strip()
         resume_title = expected_resume_title.strip()
@@ -3626,6 +3717,14 @@ class VisibleHhBrowser:
                 "У назначенного резюме отсутствует номер или название",
                 retryable=False,
             )
+
+        if (
+            current_snapshot is not None
+            and self._normalized_ui_text(current_snapshot.resume_title)
+            == self._normalized_ui_text(resume_title)
+            and current_snapshot.resume_hh_id in {"", resume_hh_id}
+        ):
+            return current_snapshot
 
         selected_card = page.locator('[data-qa="resume-title"]')
         if selected_card.count() != 1:
@@ -3643,14 +3742,38 @@ class VisibleHhBrowser:
 
         bottom_sheet_selector = '[data-qa="bottom-sheet-content"]:visible input[name="resumeId"]'
         dropdown_selector = '[data-qa="drop-base"]:visible [role="option"]'
+        global_dropdown_selector = (
+            '[role="option"][data-qa^="magritte-select-option-"]'
+        )
         options: list[Locator] = []
         uses_bottom_sheet = False
-        for _attempt in range(10):
-            page.wait_for_timeout(500)
-            options = page.locator(bottom_sheet_selector).all()
-            uses_bottom_sheet = bool(options)
-            if not options:
-                options = page.locator(dropdown_selector).all()
+        option_attempts = max(
+            1,
+            ceil(min(self._timeout_ms, _RESUME_OPTIONS_TIMEOUT_MS) / 500),
+        )
+        for opening_attempt in range(2):
+            if opening_attempt:
+                try:
+                    selected_card.first.click(
+                        force=True,
+                        no_wait_after=True,
+                        timeout=min(self._timeout_ms, 10_000),
+                    )
+                except PlaywrightError as error:
+                    raise _ResumeSelectionError(
+                        "hh.ru повторно не открыл список резюме для отклика",
+                        retryable=True,
+                    ) from error
+            for _attempt in range(option_attempts):
+                page.wait_for_timeout(500)
+                options = page.locator(bottom_sheet_selector).all()
+                uses_bottom_sheet = bool(options)
+                if not options:
+                    options = page.locator(dropdown_selector).all()
+                if not options:
+                    options = page.locator(global_dropdown_selector).all()
+                if options:
+                    break
             if options:
                 break
         option_values = [option.get_attribute("value") or "" for option in options]

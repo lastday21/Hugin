@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 from hugin.database.models import ApplicationModel, ApplicationTaskModel, VacancyModel
 from hugin.domain.applications import ApplicationState, EventPayload
 from hugin.domain.automation import AutomationJobResult
-from hugin.domain.content import MessageDirection
+from hugin.domain.content import MessageDirection, RecruiterMessageState
 from hugin.domain.hh_sync import (
     HhChatMessageData,
     HhNegotiationData,
@@ -21,6 +21,7 @@ from hugin.domain.tasks import TaskState
 from hugin.repositories.applications import ApplicationRepository
 from hugin.repositories.communications import CommunicationRepository
 from hugin.repositories.tasks import QueueTaskRepository
+from hugin.services.incidents import IncidentService
 from hugin.services.screening_forms import ScreeningDraftService
 
 _INTERVIEW_TITLE = "Приглашение на собеседование"
@@ -74,6 +75,7 @@ class HhSynchronizationService:
         self._applications = ApplicationRepository(session)
         self._communications = CommunicationRepository(session)
         self._tasks = QueueTaskRepository(session)
+        self._incidents = IncidentService(session)
 
     def tracked_vacancy_ids(self, account_id: int) -> tuple[str, ...]:
         return tuple(self._application_map(account_id))
@@ -234,6 +236,16 @@ class HhSynchronizationService:
             if is_new:
                 created += 1
             if item.direction is MessageDirection.OUTGOING:
+                if record.state is RecruiterMessageState.SENT:
+                    for code in (
+                        "RECRUITER_MESSAGE_SEND_FAILED",
+                        "RECRUITER_MESSAGE_SEND_UNKNOWN",
+                    ):
+                        self._incidents.resolve(
+                            code=code,
+                            scope_type="recruiter_message",
+                            scope_id=record.id,
+                        )
                 if is_new:
                     outgoing += 1
                 continue

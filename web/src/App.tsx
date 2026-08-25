@@ -95,7 +95,6 @@ import type {
   ResumePreview,
   SearchRegion,
   SentApplication,
-  SystemState,
   VacancyCard,
   WorkFormat,
 } from "./types";
@@ -228,6 +227,14 @@ function formatDate(value: string | null, includeDate = false): string {
   }).format(date);
 }
 
+function formatNextApply(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime()) || date.getTime() <= Date.now()) {
+    return "при первой возможности";
+  }
+  return formatDate(value);
+}
+
 function plural(value: number, one: string, few: string, many: string): string {
   const lastTwo = value % 100;
   const last = value % 10;
@@ -240,16 +247,6 @@ function plural(value: number, one: string, few: string, many: string): string {
 function formatDelayRange(minSeconds: number, maxSeconds: number): string {
   if (maxSeconds < 120) return `${minSeconds}–${maxSeconds} сек`;
   return `${Math.round(minSeconds / 60)}–${Math.round(maxSeconds / 60)} мин`;
-}
-
-function initials(label: string): string {
-  const parts = label.trim().split(/\s+/).filter(Boolean);
-  if (!parts.length) return "HH";
-  return parts
-    .slice(0, 2)
-    .map((part) => part[0])
-    .join("")
-    .toUpperCase();
 }
 
 function visibleReasons(reasons: string[]): string[] {
@@ -581,9 +578,6 @@ export default function App() {
                 aria-hidden="true"
               />
             </button>
-            <span className="avatar" aria-label={`Аккаунт: ${accountLabel}`}>
-              {initials(accountLabel)}
-            </span>
           </div>
         </header>
 
@@ -622,7 +616,6 @@ export default function App() {
                     setVacancyTab("queue");
                     setView("vacancies");
                   }}
-                  onOpenPreferences={() => setPreferencesOpen(true)}
                   onRefresh={() => void refresh(false)}
                   onToast={showToast}
                 />
@@ -783,7 +776,6 @@ function DashboardView({
   onOpenVacancy,
   onOpenAttention,
   onOpenVacancies,
-  onOpenPreferences,
   onRefresh,
   onToast,
 }: {
@@ -792,55 +784,57 @@ function DashboardView({
   onOpenVacancy: (vacancyId: string) => Promise<void>;
   onOpenAttention: (tab: AttentionTab) => void;
   onOpenVacancies: () => void;
-  onOpenPreferences: () => void;
   onRefresh: () => void;
   onToast: (toast: Toast) => void;
 }) {
   const { dashboard, queue, forms } = workspace;
-  const [changingState, setChangingState] = useState(false);
-  const [changingSearch, setChangingSearch] = useState(false);
+  const [changingHugin, setChangingHugin] = useState(false);
+  const huginRunning =
+    dashboard.system_state === "RUNNING" && dashboard.search_enabled;
 
-  async function controlQueue(action: "pause" | "resume"): Promise<void> {
-    if (changingState) return;
-    setChangingState(true);
+  async function controlHugin(action: "pause" | "resume"): Promise<void> {
+    if (changingHugin) return;
+    setChangingHugin(true);
     try {
-      await changeQueueState(action);
+      if (action === "resume") {
+        if (dashboard.system_state === "PAUSED") {
+          await changeQueueState("resume");
+        }
+        if (!dashboard.search_enabled) {
+          await changeSearchState("resume");
+        }
+      } else {
+        if (dashboard.system_state === "RUNNING") {
+          await changeQueueState("pause");
+        }
+        if (dashboard.search_enabled) {
+          await changeSearchState("pause");
+        }
+      }
       onToast({
         kind: "success",
         message:
           action === "pause"
-            ? "Новые отклики приостановлены"
-            : "Отправка новых откликов продолжена",
+            ? "Hugin приостановлен: поиск и новые отклики выключены"
+            : "Hugin запущен: поиск и новые отклики включены",
       });
       onRefresh();
     } catch (reason) {
       onToast({ kind: "error", message: readableError(reason) });
-    } finally {
-      setChangingState(false);
-    }
-  }
-
-  async function controlSearch(action: "pause" | "resume"): Promise<void> {
-    if (changingSearch) return;
-    setChangingSearch(true);
-    try {
-      await changeSearchState(action);
-      onToast({
-        kind: "success",
-        message:
-          action === "pause"
-            ? "Новые поиски остановлены; текущая проверка завершит безопасный шаг"
-            : "Поиск вакансий возобновлён",
-      });
       onRefresh();
-    } catch (reason) {
-      onToast({ kind: "error", message: readableError(reason) });
     } finally {
-      setChangingSearch(false);
+      setChangingHugin(false);
     }
   }
 
-  const system = systemPresentation(dashboard.system_state, queue.length);
+  const automaticQueue = queue.filter((item) =>
+    ["PENDING", "RUNNING", "RETRY_SCHEDULED"].includes(item.state),
+  );
+  const automaticQueueCount =
+    (dashboard.task_counts.PENDING ?? 0) +
+    (dashboard.task_counts.RUNNING ?? 0) +
+    (dashboard.task_counts.RETRY_SCHEDULED ?? 0);
+  const system = systemPresentation(dashboard, automaticQueueCount);
   const SystemIcon = system.icon;
 
   return (
@@ -853,48 +847,38 @@ function DashboardView({
           <span className="eyebrow">Состояние программы</span>
           <h2 id="system-title">{system.title}</h2>
           <p>{system.description}</p>
-          {dashboard.system_state === "RUNNING" && dashboard.next_apply_at && (
-            <span className="next-action">
-              Следующее действие — {formatDate(dashboard.next_apply_at)}
+          <div className="system-substates" aria-label="Состояние отдельных действий">
+            <span className={dashboard.search_enabled ? "active" : "paused"}>
+              Поиск {dashboard.search_enabled ? "включён" : "остановлен"}
             </span>
-          )}
+            <span
+              className={dashboard.system_state === "RUNNING" ? "active" : "paused"}
+            >
+              Отклики {dashboard.system_state === "RUNNING" ? "включены" : "остановлены"}
+            </span>
+            {dashboard.resource_saving_mode && <span>Бережный режим</span>}
+          </div>
+          <span className="next-action">{nextApplicationText(dashboard)}</span>
         </div>
         <div className="system-action">
-          <button
-            type="button"
-            className="secondary-button"
-            disabled={changingSearch}
-            onClick={() =>
-              void controlSearch(dashboard.search_enabled ? "pause" : "resume")
-            }
-          >
-            <Search size={19} aria-hidden="true" />
-            {changingSearch
-              ? "Сохраняем…"
-              : dashboard.search_enabled
-                ? "Остановить поиск"
-                : "Возобновить поиск"}
-          </button>
-          {dashboard.system_state === "RUNNING" && (
+          {(dashboard.system_state === "RUNNING" ||
+            dashboard.system_state === "PAUSED") && (
             <button
               type="button"
-              className="secondary-button"
-              disabled={changingState}
-              onClick={() => void controlQueue("pause")}
+              className={huginRunning ? "secondary-button" : "primary-button"}
+              disabled={changingHugin}
+              onClick={() => void controlHugin(huginRunning ? "pause" : "resume")}
             >
-              <CirclePause size={19} aria-hidden="true" />
-              {changingState ? "Приостанавливаем…" : "Приостановить отклики"}
-            </button>
-          )}
-          {dashboard.system_state === "PAUSED" && (
-            <button
-              type="button"
-              className="primary-button"
-              disabled={changingState}
-              onClick={() => void controlQueue("resume")}
-            >
-              <CirclePlay size={19} aria-hidden="true" />
-              {changingState ? "Продолжаем…" : "Продолжить отклики"}
+              {huginRunning ? (
+                <CirclePause size={19} aria-hidden="true" />
+              ) : (
+                <CirclePlay size={19} aria-hidden="true" />
+              )}
+              {changingHugin
+                ? "Сохраняем…"
+                : huginRunning
+                  ? "Приостановить Hugin"
+                  : "Запустить Hugin"}
             </button>
           )}
           {dashboard.system_state !== "RUNNING" &&
@@ -906,6 +890,8 @@ function DashboardView({
             )}
         </div>
       </section>
+
+      <DailyWidget dashboard={dashboard} queueLength={automaticQueueCount} />
 
       <BackgroundStatusBar dashboard={dashboard} />
 
@@ -933,28 +919,21 @@ function DashboardView({
       )}
 
       <div className="dashboard-toolbar">
-        <h2>Выбранное</h2>
-        <button type="button" className="quiet-button" onClick={onOpenPreferences}>
-          <SlidersHorizontal size={18} aria-hidden="true" />
-          Настроить главную
-        </button>
+        <h2>На контроле</h2>
       </div>
 
       {widgets.length ? (
         <div className="dashboard-grid">
-          {(widgets.includes("attention") || widgets.includes("daily")) && (
+          {widgets.includes("attention") && (
             <div className="dashboard-column">
-              {widgets.includes("attention") && (
-                <AttentionWidget forms={forms} onOpen={onOpenAttention} />
-              )}
-              {widgets.includes("daily") && <DailyWidget dashboard={dashboard} />}
+              <AttentionWidget forms={forms} onOpen={onOpenAttention} />
             </div>
           )}
           {(widgets.includes("queue") || widgets.includes("directions")) && (
             <div className="dashboard-column">
               {widgets.includes("queue") && (
                 <QueueWidget
-                  queue={queue}
+                  queue={automaticQueue}
                   onOpenVacancy={onOpenVacancy}
                   onOpenAll={onOpenVacancies}
                 />
@@ -966,12 +945,9 @@ function DashboardView({
       ) : (
         <div className="compact-empty">
           <div>
-            <strong>Все дополнительные блоки скрыты</strong>
-            <span>Выберите, что показывать на главной.</span>
+            <strong>Дополнительные блоки скрыты</strong>
+            <span>Их можно вернуть в разделе «Настройки».</span>
           </div>
-          <button type="button" className="secondary-button" onClick={onOpenPreferences}>
-            Настроить главную
-          </button>
         </div>
       )}
     </div>
@@ -980,6 +956,14 @@ function DashboardView({
 
 function BackgroundStatusBar({ dashboard }: { dashboard: Dashboard }) {
   const background = dashboard.background;
+  const searchDescription = {
+    RUNNING: "Поиск вакансий выполняется сейчас",
+    WAITING: "Поиск вакансий ожидает запуска",
+    SCHEDULED: background.next_search_at
+      ? `Следующий поиск — ${formatDate(background.next_search_at)}`
+      : "Расписание поиска обновляется",
+    NOT_SCHEDULED: "Задания поиска ещё не созданы",
+  }[background.search_state];
   const presentation = {
     RUNNING: {
       title: "Фоновые проверки работают",
@@ -994,8 +978,8 @@ function BackgroundStatusBar({ dashboard }: { dashboard: Dashboard }) {
       tone: "muted",
     },
     NEEDS_ATTENTION: {
-      title: "Фоновым проверкам нужно внимание",
-      description: background.error ?? "Одна из проверок остановлена",
+      title: "Не удалось проверить hh.ru",
+      description: friendlyBackgroundError(background.error),
       tone: "warning",
     },
     STOPPED: {
@@ -1012,13 +996,16 @@ function BackgroundStatusBar({ dashboard }: { dashboard: Dashboard }) {
         <strong>{presentation.title}</strong>
         <span>{presentation.description}</span>
       </div>
-      {background.next_search_at && background.state === "RUNNING" && (
+      {background.last_success_at && background.state !== "RUNNING" && (
+        <small>Последняя успешная проверка — {formatDate(background.last_success_at)}</small>
+      )}
+      {dashboard.search_enabled && background.state === "RUNNING" && (
         <small>
-          Следующий поиск — {formatDate(background.next_search_at)}
+          {searchDescription}
           {dashboard.resource_saving_mode ? " · бережный режим" : ""}
         </small>
       )}
-      {!dashboard.search_enabled && (
+      {!dashboard.search_enabled && !background.last_success_at && (
         <small>
           Поиск вакансий остановлен
           {dashboard.resource_saving_mode ? " · бережный режим включён" : ""}
@@ -1028,22 +1015,65 @@ function BackgroundStatusBar({ dashboard }: { dashboard: Dashboard }) {
   );
 }
 
-function systemPresentation(state: SystemState, queueLength: number) {
+function friendlyBackgroundError(error: string | null): string {
+  if (!error) {
+    return "Одна из фоновых проверок остановилась. Hugin повторит её, когда фоновая работа возобновится.";
+  }
+  if (error.includes("ERR_EMPTY_RESPONSE")) {
+    return "hh.ru не ответил во время последней проверки. Hugin повторит её, когда фоновая работа возобновится.";
+  }
+  const normalized = error.toLowerCase();
+  if (normalized.includes("timeout") || normalized.includes("timed out")) {
+    return "hh.ru слишком долго не отвечал. Hugin повторит проверку, когда фоновая работа возобновится.";
+  }
+  return "Последняя проверка завершилась ошибкой. Hugin повторит её, когда фоновая работа возобновится.";
+}
+
+function nextApplicationText(dashboard: Dashboard): string {
+  if (dashboard.system_state !== "RUNNING") {
+    return "Следующий отклик — после запуска Hugin";
+  }
+  if (dashboard.remaining_today <= 0) {
+    return "Дневной лимит выполнен — очередь продолжится завтра";
+  }
+  if (dashboard.next_apply_at) {
+    return `Следующий отклик — ${formatNextApply(dashboard.next_apply_at)}`;
+  }
+  return "Следующий отклик — при первой возможности";
+}
+
+function systemPresentation(dashboard: Dashboard, queueLength: number) {
   const queueText = queueLength
     ? `${plural(queueLength, "вакансия", "вакансии", "вакансий")} ждут обработки`
     : "Новых вакансий в очереди нет";
-  switch (state) {
+  switch (dashboard.system_state) {
     case "RUNNING":
+      if (!dashboard.search_enabled) {
+        return {
+          title: "Поиск приостановлен",
+          description: `${queueText}. Новые вакансии пока не добавляются.`,
+          tone: "neutral",
+          icon: CirclePause,
+        };
+      }
+      if (dashboard.remaining_today <= 0) {
+        return {
+          title: "Дневной лимит выполнен",
+          description: `${dashboard.applied_today} из ${dashboard.daily_limit} откликов отправлено. ${queueText}.`,
+          tone: "positive",
+          icon: CheckCircle2,
+        };
+      }
       return {
-        title: "Отклики включены",
+        title: "Hugin работает",
         description: queueText,
         tone: "positive",
         icon: CheckCircle2,
       };
     case "PAUSED":
       return {
-        title: "Отклики приостановлены",
-        description: "Новые отклики не отправляются",
+        title: "Hugin приостановлен",
+        description: `${queueText}. Новые отклики и поиск вакансий не выполняются.`,
         tone: "neutral",
         icon: CirclePause,
       };
@@ -1185,7 +1215,13 @@ function QueueWidget({
   );
 }
 
-function DailyWidget({ dashboard }: { dashboard: Dashboard }) {
+function DailyWidget({
+  dashboard,
+  queueLength,
+}: {
+  dashboard: Dashboard;
+  queueLength: number;
+}) {
   const progress =
     dashboard.daily_limit > 0
       ? Math.min((dashboard.applied_today / dashboard.daily_limit) * 100, 100)
@@ -1198,12 +1234,24 @@ function DailyWidget({ dashboard }: { dashboard: Dashboard }) {
         </span>
         <div>
           <h3 id="daily-widget-title">Сегодня</h3>
-          <p>Дневное ограничение откликов</p>
+          <p>Что Hugin уже сделал с начала дня</p>
         </div>
       </div>
-      <div className="daily-value">
-        <strong>{dashboard.applied_today}</strong>
-        <span>из {dashboard.daily_limit}</span>
+      <div className="daily-summary-values">
+        <div>
+          <strong>
+            {dashboard.applied_today} <span>из {dashboard.daily_limit}</span>
+          </strong>
+          <small>откликов отправлено</small>
+        </div>
+        <div>
+          <strong>{dashboard.replies_sent_today}</strong>
+          <small>ответов работодателям отправлено</small>
+        </div>
+        <div>
+          <strong>{queueLength}</strong>
+          <small>вакансий ждут обработки</small>
+        </div>
       </div>
       <div
         className="progress-track"
@@ -1215,10 +1263,17 @@ function DailyWidget({ dashboard }: { dashboard: Dashboard }) {
       >
         <span style={{ width: `${progress}%` }} />
       </div>
-      <p className="card-note">
-        Пауза между откликами —{" "}
-        {formatDelayRange(dashboard.delay_min_seconds, dashboard.delay_max_seconds)}
-      </p>
+      <div className="daily-notes">
+        <p className="queue-breakdown">
+          <span>{dashboard.task_counts.PENDING ?? 0} ждут обработки</span>
+          <span>{dashboard.task_counts.RETRY_SCHEDULED ?? 0} повторных попыток</span>
+          <span>{dashboard.task_counts.REVIEW_REQUIRED ?? 0} требуют проверки</span>
+        </p>
+        <p className="card-note">
+          Пауза между откликами —{" "}
+          {formatDelayRange(dashboard.delay_min_seconds, dashboard.delay_max_seconds)}
+        </p>
+      </div>
     </section>
   );
 }

@@ -57,6 +57,7 @@ export interface Incident {
 
 export interface BackgroundStatus {
   state: "NOT_STARTED" | "RUNNING" | "NEEDS_ATTENTION" | "STOPPED";
+  search_state: "NOT_SCHEDULED" | "RUNNING" | "WAITING" | "SCHEDULED";
   last_success_at: string | null;
   next_search_at: string | null;
   next_messages_at: string | null;
@@ -74,6 +75,7 @@ export interface Dashboard {
   delay_min_seconds: number;
   delay_max_seconds: number;
   applied_today: number;
+  replies_sent_today: number;
   remaining_today: number;
   task_counts: Record<string, number>;
   pending_forms: number;

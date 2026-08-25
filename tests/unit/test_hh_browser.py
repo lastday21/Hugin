@@ -45,6 +45,7 @@ from hugin.services.hh_login import HhCredentials, LoginStatus
 TEST_RESUME_HH_ID = "resume-hash"
 RESUME_OPTIONS_SELECTOR = '[data-qa="bottom-sheet-content"]:visible input[name="resumeId"]'
 RESUME_DROPDOWN_OPTIONS_SELECTOR = '[data-qa="drop-base"]:visible [role="option"]'
+RESUME_GLOBAL_OPTIONS_SELECTOR = '[role="option"][data-qa^="magritte-select-option-"]'
 
 
 class FakeLocator:
@@ -62,6 +63,7 @@ class FakeLocator:
         qa: str | None = None,
         items: list[FakeLocator] | None = None,
         on_click: Callable[[], None] | None = None,
+        on_fill: Callable[[str], None] | None = None,
         click_error: bool = False,
     ) -> None:
         self._count = count
@@ -75,6 +77,7 @@ class FakeLocator:
         self.value = value
         self.qa = qa
         self.on_click = on_click
+        self.on_fill = on_fill
         self.click_error = click_error
         self.clicked = 0
         self.no_wait_after: list[bool] = []
@@ -117,6 +120,8 @@ class FakeLocator:
     def fill(self, value: str) -> None:
         self.filled.append(value)
         self.value = value
+        if self.on_fill is not None:
+            self.on_fill(value)
 
     def wait_for(self, *, state: str, timeout: int) -> None:
         assert state in {"attached", "visible"}
@@ -1230,6 +1235,48 @@ def test_recruiter_messages_open_negotiations_once_for_all_chats(
     assert close.clicked == 2
 
 
+def test_recruiter_messages_are_read_from_later_negotiations_page(
+    tmp_path: Path,
+) -> None:
+    page = FakePage("https://hh.ru/applicant/resumes")
+    first_page = FakeLocator(text="1")
+
+    def open_second_page() -> None:
+        page.negotiations_payload = [
+            {
+                "vacancyHref": "/vacancy/202",
+                "statusQa": "",
+                "statusLabel": "",
+                "chatAvailable": True,
+            }
+        ]
+
+    second_page = FakeLocator(text="2", on_click=open_second_page)
+    page.locators['[data-qa^="number-pages-"]'] = FakeLocator(
+        items=[first_page, second_page]
+    )
+    page.locators['[data-qa*="number-pages-selected"]'] = first_page
+    page.locators['[data-qa^="number-pages-1"]'] = first_page
+    page.locators['[data-qa^="number-pages-2"]'] = second_page
+    frame = FakeFrame(
+        messages_payload=[
+            {
+                "vacancyId": "202",
+                "messageId": "message-202",
+                "direction": "INCOMING",
+                "body": "Сообщение со второй страницы",
+            }
+        ]
+    )
+    page.frames = [cast(Frame, frame)]
+    page.locators['[data-qa="chatik-close-chatik"]'] = FakeLocator()
+
+    messages = make_browser(page, tmp_path).read_recruiter_messages(("202",))
+
+    assert [message.hh_id for message in messages] == ["message-202"]
+    assert second_page.clicked == 1
+
+
 def test_recruiter_message_read_fails_if_advertised_chat_does_not_open(
     tmp_path: Path,
 ) -> None:
@@ -1524,6 +1571,7 @@ def test_application_stops_when_resume_dropdown_stays_open(tmp_path: Path) -> No
         "fields": [],
         "warnings": [],
         "resumeTitle": "Python backend разработчик",
+        "resumeHhId": "другое-резюме",
         "bodyText": "Форма отклика",
     }
     target = FakeLocator(qa=f"magritte-select-option-{TEST_RESUME_HH_ID}")
@@ -2323,7 +2371,6 @@ def test_form_change_after_repeated_fill_stops_submission(
     page.application_payloads = [
         safe_payload,
         safe_payload,
-        safe_payload,
         changed_payload,
     ]
     page.fill_result = {"filled": ["name:telegram"], "skipped": []}
@@ -2357,7 +2404,7 @@ def test_form_change_after_repeated_fill_stops_submission(
     )
 
     assert result.status is expected_status
-    assert page.application_payload_index == 4
+    assert page.application_payload_index == 3
     assert submit.clicked == 0
     assert submit.trial_clicks == []
 
@@ -2684,6 +2731,7 @@ def test_application_aborts_request_with_unexpected_resume(tmp_path: Path) -> No
         "questions": [],
         "warnings": [],
         "resumeTitle": "Python backend разработчик",
+        "resumeHhId": "",
         "bodyText": "Форма отклика",
     }
     page.response.request.post_data = "resumeHash=unexpected-resume"
@@ -2705,6 +2753,35 @@ def test_application_aborts_request_with_unexpected_resume(tmp_path: Path) -> No
     assert page.last_route is not None and page.last_route.aborted
     assert submit.clicked == 1
     assert page.route_handler is None
+
+
+def test_application_accepts_hidden_resume_id_when_actual_request_matches(
+    tmp_path: Path,
+) -> None:
+    page = FakePage("https://hh.ru/applicant/resumes")
+    page.application_payload = {
+        "questions": [],
+        "warnings": [],
+        "resumeTitle": "Python backend разработчик",
+        "resumeHhId": "",
+        "bodyText": "Форма отклика",
+    }
+    page.locators['[data-qa="vacancy-response-popup-form-letter-input"]'] = FakeLocator()
+    submit = FakeLocator()
+    page.locators['[data-qa="vacancy-response-submit-popup"]'] = submit
+
+    result = make_browser(page, tmp_path).apply_to_vacancy(
+        "https://hh.ru/vacancy/123",
+        expected_resume_hh_id=TEST_RESUME_HH_ID,
+        expected_resume_title="Python backend разработчик",
+        cover_letter="Письмо",
+        submit=True,
+        submit_guard=lambda: True,
+    )
+
+    assert result.status is HhApplyStatus.APPLIED
+    assert page.last_route is not None and not page.last_route.aborted
+    assert submit.clicked == 1
 
 
 def test_application_uses_history_when_response_body_is_unavailable(tmp_path: Path) -> None:
@@ -2876,7 +2953,6 @@ def test_application_security_warning_after_click_blocks_account(
     ("changed_key", "changed_value", "expected_status", "confirmation"),
     [
         ("resumeHhId", "другое-резюме", HhApplyStatus.RESUME_MISMATCH, "номером"),
-        ("resumeHhId", "", HhApplyStatus.RESUME_MISMATCH, "не определено"),
         (
             "coverLetter",
             "Подменённый текст",
@@ -2904,7 +2980,6 @@ def test_application_rechecks_exact_resume_id_and_letter_immediately_before_clic
     changed_payload = dict(safe_payload)
     changed_payload[changed_key] = changed_value
     page.application_payloads = [
-        safe_payload,
         safe_payload,
         safe_payload,
         safe_payload,
@@ -2983,7 +3058,6 @@ def test_form_wide_danger_is_checked_again_after_trial_click(tmp_path: Path) -> 
         safe_payload,
         safe_payload,
         safe_payload,
-        safe_payload,
         dangerous_payload,
     ]
     page.locators['[data-qa="vacancy-response-popup-form-letter-input"]'] = FakeLocator()
@@ -3011,6 +3085,7 @@ def test_application_preview_fills_letter_without_submit(tmp_path: Path) -> None
         "questions": [],
         "warnings": [],
         "resumeTitle": "Python backend разработчик",
+        "resumeHhId": "",
         "bodyText": "Форма отклика",
     }
     letter_selector = '[data-qa="vacancy-response-popup-form-letter-input"]'
@@ -3192,6 +3267,83 @@ def test_confirmed_recruiter_message_is_sent_once(tmp_path: Path) -> None:
     assert frame.locators['[data-qa="chatik-new-message-text"]'].filled == [message_body]
     assert frame.locators['[data-qa="chatik-do-send-message"]'].clicked == 1
     assert frame.locators['[data-qa="chatik-do-send-message"]'].no_wait_after == [True]
+
+
+def test_recruiter_message_waits_until_filled_text_enables_send(
+    tmp_path: Path,
+) -> None:
+    page = FakePage("https://hh.ru/applicant/resumes")
+    message_body = "Спасибо, буду на связи."
+    frame = FakeFrame(
+        messages_payloads=[
+            [],
+            [
+                {
+                    "messageId": "message-7",
+                    "direction": "OUTGOING",
+                    "body": message_body,
+                }
+            ],
+        ]
+    )
+    submit = FakeLocator(enabled=False)
+    editor = FakeLocator(on_fill=lambda _value: setattr(submit, "enabled", True))
+    frame.locators['[data-qa="chatik-new-message-text"]'] = editor
+    frame.locators['[data-qa="chatik-do-send-message"]'] = submit
+    page.frames = [cast(Frame, frame)]
+    page.response.url = "https://hh.ru/chat/101/messages"
+
+    result = make_browser(page, tmp_path).send_recruiter_message(
+        "https://hh.ru/vacancy/101",
+        message_body,
+    )
+
+    assert result.outcome is MessageSendOutcome.SENT
+    assert submit.clicked == 1
+
+
+def test_recruiter_message_finds_chat_on_later_negotiations_page(
+    tmp_path: Path,
+) -> None:
+    page = FakePage("https://hh.ru/applicant/resumes")
+    page.opened_chat = False
+    first_page = FakeLocator(text="1")
+    second_page = FakeLocator(
+        text="2",
+        on_click=lambda: setattr(page, "opened_chat", True),
+    )
+    page.locators['[data-qa^="number-pages-"]'] = FakeLocator(
+        items=[first_page, second_page]
+    )
+    page.locators['[data-qa*="number-pages-selected"]'] = first_page
+    page.locators['[data-qa^="number-pages-1"]'] = first_page
+    page.locators['[data-qa^="number-pages-2"]'] = second_page
+    message_body = "Спасибо, буду на связи."
+    frame = FakeFrame(
+        messages_payloads=[
+            [],
+            [
+                {
+                    "messageId": "message-7",
+                    "direction": "OUTGOING",
+                    "body": message_body,
+                }
+            ],
+        ]
+    )
+    frame.locators['[data-qa="chatik-new-message-text"]'] = FakeLocator()
+    frame.locators['[data-qa="chatik-do-send-message"]'] = FakeLocator()
+    page.frames = [cast(Frame, frame)]
+    page.response.url = "https://hh.ru/chat/101/messages"
+
+    result = make_browser(page, tmp_path).send_recruiter_message(
+        "https://hh.ru/vacancy/101",
+        message_body,
+    )
+
+    assert result.outcome is MessageSendOutcome.SENT
+    assert first_page.clicked == 0
+    assert second_page.clicked == 1
 
 
 @pytest.mark.parametrize(
@@ -3721,6 +3873,7 @@ def test_background_context_can_relay_hh_through_selected_network(
     playwright = FakePlaywright(chromium)
     monkeypatch.setattr(browser_module, "sync_playwright", lambda: FakeStarter(playwright))
     monkeypatch.setattr(browser_module, "_HhHttpProxy", FakeProxy)
+    monkeypatch.setattr(browser_module, "usable_source_ipv4", lambda value: value)
 
     with VisibleHhBrowser(
         tmp_path / "profile",
@@ -3740,6 +3893,30 @@ def test_background_context_can_relay_hh_through_selected_network(
         ("started",),
         ("stopped",),
     ]
+
+
+def test_background_context_uses_direct_network_when_source_address_is_stale(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    page = FakePage()
+    context = FakeContext(page)
+    chromium = FakeChromium(context)
+    playwright = FakePlaywright(chromium)
+    monkeypatch.setattr(browser_module, "sync_playwright", lambda: FakeStarter(playwright))
+    monkeypatch.setattr(browser_module, "usable_source_ipv4", lambda _value: None)
+
+    with VisibleHhBrowser(
+        tmp_path / "profile",
+        "https://hh.ru/account/login",
+        "https://hh.ru/applicant/resumes",
+        "https://hh.ru/search/vacancy",
+        4_000,
+        start_minimized=True,
+        browser_source_ip="192.168.0.18",
+    ):
+        arguments = cast(list[str], chromium.calls[0]["args"])
+        assert not any(argument.startswith("--proxy-pac-url=") for argument in arguments)
 
 
 def test_hh_proxy_uses_doh_and_caches_result(
@@ -4033,6 +4210,58 @@ def test_resume_selection_requires_unique_selected_card(tmp_path: Path) -> None:
     assert error.value.retryable
 
 
+def test_resume_selection_keeps_already_selected_exact_resume(tmp_path: Path) -> None:
+    page = FakePage()
+    page.application_payload = {
+        "fields": [],
+        "warnings": [],
+        "resumeTitle": "Python backend",
+        "resumeHhId": TEST_RESUME_HH_ID,
+        "bodyText": "Форма отклика",
+    }
+    page.locators[RESUME_OPTIONS_SELECTOR] = FakeLocator(items=[])
+    browser = make_browser(page, tmp_path)
+    current = browser._application_snapshot(cast(Page, page))
+
+    snapshot = browser._select_exact_resume(
+        cast(Page, page),
+        expected_resume_hh_id=TEST_RESUME_HH_ID,
+        expected_resume_title="Python backend",
+        current_snapshot=current,
+    )
+
+    assert snapshot.resume_hh_id == TEST_RESUME_HH_ID
+    assert snapshot.resume_title == "Python backend"
+    assert page.locators['[data-qa="resume-title"]'].clicked == 0
+
+
+def test_resume_selection_keeps_exact_title_when_page_hides_resume_id(
+    tmp_path: Path,
+) -> None:
+    page = FakePage()
+    page.application_payload = {
+        "fields": [],
+        "warnings": [],
+        "resumeTitle": "Python backend",
+        "resumeHhId": "",
+        "bodyText": "Форма отклика",
+    }
+    page.locators[RESUME_OPTIONS_SELECTOR] = FakeLocator(items=[])
+    browser = make_browser(page, tmp_path)
+    current = browser._application_snapshot(cast(Page, page))
+
+    snapshot = browser._select_exact_resume(
+        cast(Page, page),
+        expected_resume_hh_id=TEST_RESUME_HH_ID,
+        expected_resume_title="Python backend",
+        current_snapshot=current,
+    )
+
+    assert snapshot.resume_hh_id == ""
+    assert snapshot.resume_title == "Python backend"
+    assert page.locators['[data-qa="resume-title"]'].clicked == 0
+
+
 def test_resume_selection_reports_card_click_failure(tmp_path: Path) -> None:
     page = FakePage()
     page.locators['[data-qa="resume-title"]'] = FakeLocator(click_error=True)
@@ -4062,6 +4291,56 @@ def test_resume_selection_stops_when_options_do_not_load(tmp_path: Path) -> None
         )
 
     assert error.value.retryable
+
+
+def test_resume_selection_reopens_list_when_first_click_is_lost(tmp_path: Path) -> None:
+    page = FakePage()
+    payload: dict[str, object] = {
+        "fields": [],
+        "warnings": [],
+        "resumeTitle": "Нефтяной геолог",
+        "resumeHhId": "other-resume",
+        "bodyText": "Форма отклика",
+    }
+    page.application_payload = payload
+    opening_clicks = 0
+
+    def select_target() -> None:
+        payload["resumeTitle"] = "Python backend"
+        payload["resumeHhId"] = TEST_RESUME_HH_ID
+        page.locators[RESUME_DROPDOWN_OPTIONS_SELECTOR] = FakeLocator(items=[])
+
+    target = FakeLocator(
+        qa=f"magritte-select-option-{TEST_RESUME_HH_ID}",
+        on_click=select_target,
+    )
+
+    def open_on_second_click() -> None:
+        nonlocal opening_clicks
+        opening_clicks += 1
+        if opening_clicks == 2:
+            page.locators[RESUME_DROPDOWN_OPTIONS_SELECTOR] = FakeLocator(items=[target])
+
+    selected_card = FakeLocator(on_click=open_on_second_click)
+    page.locators['[data-qa="resume-title"]'] = selected_card
+    page.locators[RESUME_OPTIONS_SELECTOR] = FakeLocator(items=[])
+    page.locators[RESUME_DROPDOWN_OPTIONS_SELECTOR] = FakeLocator(items=[])
+    page.locators[RESUME_GLOBAL_OPTIONS_SELECTOR] = FakeLocator(items=[])
+    browser = make_browser(page, tmp_path)
+    current = browser._application_snapshot(cast(Page, page))
+
+    snapshot = browser._select_exact_resume(
+        cast(Page, page),
+        expected_resume_hh_id=TEST_RESUME_HH_ID,
+        expected_resume_title="Python backend",
+        current_snapshot=current,
+    )
+
+    assert selected_card.clicked == 2
+    assert selected_card.force_clicks == [False, True]
+    assert target.clicked == 1
+    assert snapshot.resume_hh_id == TEST_RESUME_HH_ID
+    assert snapshot.resume_title == "Python backend"
 
 
 def test_resume_selection_rejects_ambiguous_option_values(tmp_path: Path) -> None:

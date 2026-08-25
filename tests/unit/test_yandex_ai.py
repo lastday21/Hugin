@@ -12,6 +12,7 @@ from typing import Self
 
 import pytest
 
+import hugin.adapters.yandex_ai as yandex_module
 from hugin.adapters.yandex_ai import YandexAIClient, YandexAIError
 from hugin.diagnostics import OperationJournal
 
@@ -89,6 +90,7 @@ def test_yandex_client_uses_selected_source_address(
         return FakeOpener()
 
     monkeypatch.setattr(urllib.request, "build_opener", build_opener)
+    monkeypatch.setattr(yandex_module, "usable_source_ipv4", lambda value: value)
     client = YandexAIClient(
         "key",
         "folder",
@@ -99,6 +101,20 @@ def test_yandex_client_uses_selected_source_address(
     assert client.complete("system", "user") == "ok"
     assert any(type(handler).__name__ == "_SourceAddressHTTPSHandler" for handler in handlers)
     assert opened[0][1] == 120
+
+
+def test_yandex_client_uses_system_route_when_source_address_is_stale(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(yandex_module, "usable_source_ipv4", lambda _value: None)
+    client = YandexAIClient(
+        "key",
+        "folder",
+        connect_ip="158.160.54.160",
+        source_ip="192.168.0.18",
+    )
+
+    assert client._opener is None
 
 
 def test_yandex_client_rejects_invalid_source_address() -> None:

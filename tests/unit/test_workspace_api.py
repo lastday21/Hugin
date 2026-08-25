@@ -291,6 +291,7 @@ def test_workspace_endpoints_return_real_data_and_protect_changes(settings: Sett
         assert dashboard_data["search_enabled"] is True
         assert dashboard_data["resource_saving_mode"] is True
         assert dashboard_data["applied_today"] == 1
+        assert dashboard_data["replies_sent_today"] == 0
         assert dashboard_data["remaining_today"] == 24
         assert dashboard_data["delay_min_seconds"] == 30
         assert dashboard_data["delay_max_seconds"] == 60
@@ -302,6 +303,7 @@ def test_workspace_endpoints_return_real_data_and_protect_changes(settings: Sett
         assert dashboard_data["invitations"] == 1
         assert dashboard_data["background"] == {
             "state": "NOT_STARTED",
+            "search_state": "NOT_SCHEDULED",
             "last_success_at": None,
             "next_search_at": None,
             "next_messages_at": None,
@@ -740,6 +742,120 @@ def test_workspace_endpoints_return_real_data_and_protect_changes(settings: Sett
             ).status_code
             == 422
         )
+    finally:
+        app.state.database.close()
+
+
+def test_queue_endpoint_uses_the_same_direction_and_category_priority_as_worker(
+    settings: Settings,
+) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    try:
+        with database.sessions.begin() as session:
+            account = AccountRepository(session).create("Тимур", "queue-order-account")
+            resume = ResumeRepository(session).upsert(account.id, "queue-order-resume", "Python")
+            directions = DirectionRepository(session)
+            backend = directions.create(
+                account.id,
+                "Python backend",
+                scoring_config={"role_scope": "PYTHON_BACKEND"},
+            )
+            adjacent = directions.create(
+                account.id,
+                "ИТ",
+                scoring_config={"role_scope": "IT_ADJACENT"},
+            )
+            applications = ApplicationRepository(session)
+            tasks = QueueTaskRepository(session)
+
+            cases = (
+                ("backend-match", backend.id, "MATCH", 60),
+                ("backend-stretch", backend.id, "STRETCH", 99),
+                ("adjacent-match", adjacent.id, "MATCH", 100),
+                ("adjacent-stretch", adjacent.id, "STRETCH", 100),
+            )
+            for hh_id, direction_id, category, priority in cases:
+                vacancy = VacancyRepository(session).upsert(
+                    VacancyData(
+                        hh_id=hh_id,
+                        title=hh_id,
+                        source_url=f"https://hh.ru/vacancy/{hh_id}",
+                    )
+                )
+                directions.track_vacancy(direction_id, vacancy.id)
+                directions.apply_rules(
+                    direction_id,
+                    vacancy.id,
+                    state=VacancyState.QUEUED,
+                    score=priority,
+                    details={"category": category},
+                    rules_version="queue-order-test",
+                )
+                application = applications.create_apply_intent(
+                    account.id,
+                    vacancy.id,
+                    resume.id,
+                    direction_id,
+                )
+                tasks.enqueue(application.id, priority_score=priority)
+    finally:
+        database.close()
+
+    app = create_app(settings)
+    try:
+        response = request(app, "GET", f"/api/queue?account_id={account.id}")
+        assert response.status_code == 200
+        assert [item["vacancy_id"] for item in response.json()] == [
+            "backend-match",
+            "backend-stretch",
+            "adjacent-match",
+            "adjacent-stretch",
+        ]
+    finally:
+        app.state.database.close()
+
+
+def test_dashboard_counts_only_hugin_replies_sent_today(settings: Settings) -> None:
+    account_id, _vacancy_id, _rejected_id = seed_workspace(settings)
+    database = create_database(settings)
+    try:
+        with database.sessions.begin() as session:
+            application_id = session.scalar(
+                select(ApplicationModel.id)
+                .where(ApplicationModel.account_id == account_id)
+                .order_by(ApplicationModel.id)
+                .limit(1)
+            )
+            assert application_id is not None
+            session.add_all(
+                (
+                    RecruiterMessageModel(
+                        application_id=application_id,
+                        direction=MessageDirection.OUTGOING,
+                        body="Ответ Hugin",
+                        content_hash="a" * 64,
+                        state=RecruiterMessageState.SENT,
+                        sent_at=datetime.now(UTC),
+                    ),
+                    RecruiterMessageModel(
+                        application_id=application_id,
+                        hh_id="historical-cover-letter",
+                        direction=MessageDirection.OUTGOING,
+                        body="Сопроводительное письмо из истории hh.ru",
+                        state=RecruiterMessageState.SENT,
+                        sent_at=datetime.now(UTC),
+                    ),
+                )
+            )
+    finally:
+        database.close()
+
+    app = create_app(settings)
+    try:
+        dashboard = request(app, "GET", f"/api/dashboard?account_id={account_id}")
+        assert dashboard.status_code == 200
+        assert dashboard.json()["replies_sent_today"] == 1
     finally:
         app.state.database.close()
 

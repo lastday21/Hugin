@@ -1,7 +1,6 @@
 export type DashboardWidget =
   | "attention"
   | "queue"
-  | "daily"
   | "directions";
 
 export interface DashboardWidgetDefinition {
@@ -22,11 +21,6 @@ export const dashboardWidgetDefinitions: DashboardWidgetDefinition[] = [
     description: "Первые вакансии из очереди",
   },
   {
-    id: "daily",
-    label: "Сегодня",
-    description: "Использованный лимит и пауза между откликами",
-  },
-  {
     id: "directions",
     label: "Направления",
     description: "Активные направления и их состояние",
@@ -36,7 +30,6 @@ export const dashboardWidgetDefinitions: DashboardWidgetDefinition[] = [
 export const defaultDashboardWidgets: DashboardWidget[] = [
   "attention",
   "queue",
-  "daily",
 ];
 
 const storageKey = "hugin.dashboard.widgets.v1";

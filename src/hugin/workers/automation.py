@@ -45,6 +45,13 @@ class AutomationJobRetry(RuntimeError):
         self.retry_after_seconds = max(1, min(retry_after_seconds, 86_400))
 
 
+class AutomationJobDeferred(RuntimeError):
+    def __init__(self, code: str, message: str, *, retry_after_seconds: int) -> None:
+        super().__init__(message)
+        self.code = code.strip()[:64] or "AUTOMATION_DEFERRED"
+        self.retry_after_seconds = max(1, min(retry_after_seconds, 86_400))
+
+
 class AutomationWorker:
     def __init__(
         self,
@@ -114,6 +121,19 @@ class AutomationWorker:
         thread = self._thread
         if thread is not None and thread.is_alive():
             thread.join(timeout_seconds)
+        if thread is not None and thread.is_alive():
+            interrupted = self._interrupt_running_jobs()
+            self._journal.record(
+                "automation",
+                "worker.lifecycle",
+                status="blocked",
+                level="WARNING",
+                action="stop",
+                account_id=self._account_id,
+                interrupted_jobs=interrupted,
+                reason="WORKER_STOP_TIMEOUT",
+            )
+            return
         self._thread = None
         self._journal.record(
             "automation",
@@ -122,6 +142,32 @@ class AutomationWorker:
             action="stop",
             account_id=self._account_id,
         )
+
+    def _interrupt_running_jobs(self) -> int:
+        database = create_database(self._settings)
+        try:
+            with database.sessions.begin() as session:
+                scheduler = AutomationSchedulerService(session)
+                running = tuple(
+                    job
+                    for job in scheduler.list_for_account(self._account_id)
+                    if job.state is AutomationJobState.RUNNING
+                )
+                interrupted = 0
+                for job in running:
+                    try:
+                        scheduler.fail(
+                            job.key,
+                            error_code="AUTOMATION_INTERRUPTED",
+                            error_message="Фоновое задание прервано при закрытии программы",
+                            retry_after_seconds=60,
+                        )
+                    except AutomationJobStateError:
+                        continue
+                    interrupted += 1
+                return interrupted
+        finally:
+            database.close()
 
     def run_once(self, now: datetime | None = None) -> bool:
         database = create_database(self._settings)
@@ -168,6 +214,20 @@ class AutomationWorker:
 
             try:
                 result = self._run_handler(job, handler)
+            except AutomationJobDeferred as error:
+                deferred_result: AutomationJobResult = {
+                    **job.last_result,
+                    "deferred": True,
+                    "reason": error.code,
+                }
+                with database.sessions.begin() as session:
+                    AutomationSchedulerService(session).defer(
+                        job.key,
+                        retry_after_seconds=error.retry_after_seconds,
+                        result=deferred_result,
+                        now=now,
+                    )
+                run.succeed(result=deferred_result)
             except AutomationJobBlocked as error:
                 with database.sessions.begin() as session:
                     AutomationSchedulerService(session).block(
