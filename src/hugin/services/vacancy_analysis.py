@@ -26,7 +26,7 @@ from hugin.repositories.vacancies import VacancyRepository
 from hugin.services.career_directions import CareerDirectionService
 from hugin.services.vacancy_duplicates import VacancyDuplicateDetector
 
-RULES_VERSION = "python_it_v50"
+RULES_VERSION = "python_it_v52"
 MAX_VACANCY_AGE = timedelta(days=30)
 
 
@@ -227,8 +227,12 @@ class VacancyRoleRouter:
                 _normalize_rule_text(" ".join(vacancy.key_skills)),
             )
         )
-        testing_title = any(
-            marker in title for marker in ("тестирован", "тестировщик", "qa engineer", "qa-инженер")
+        testing_title = (
+            any(
+                marker in title
+                for marker in ("тестирован", "тестировщик", "qa engineer", "qa-инженер")
+            )
+            or re.search(r"\b(?:a?qa)\b", title) is not None
         )
         automated_testing = any(
             marker in complete_text
@@ -245,6 +249,8 @@ class VacancyRoleRouter:
         if testing_title and automated_testing and "python" in complete_text:
             return DirectionScope.IT_ADJACENT
         if cls.is_build_infrastructure_role(title, complete_text):
+            return DirectionScope.IT_ADJACENT
+        if "python" in title and any(marker in title for marker in ("rpa", "роботизац")):
             return DirectionScope.IT_ADJACENT
         if any(marker in title for marker in cls._adjacent_title_markers):
             return DirectionScope.IT_ADJACENT
@@ -311,6 +317,7 @@ class PythonBackendRules:
     )
     _stretch_specializations: ClassVar[tuple[str, ...]] = (
         "ai agent",
+        "ai-enabled",
         "ai engineer",
         "llm engineer",
         "nlp engineer",
@@ -394,8 +401,12 @@ class PythonBackendRules:
         r"(?:техническ\w*\s+поддержк\w*|"
         r"консультир\w*\s+(?:клиент\w*|пользовател\w*)|"
         r"настройк\w*\s+оборудован\w*|"
-        r"сопровожд\w*[^.!?]{0,120}(?:процесс\w*|систем\w*|загруз\w*)|"
-        r"монитор\w*[^.!?]{0,120}(?:процесс\w*|загруз\w*|систем\w*)|"
+        r"сопровожд\w*[^.!?]{0,120}"
+        r"(?:процесс\w*|систем\w*|загруз\w*|хранилищ\w*|dwh|двх)|"
+        r"монитор\w*[^.!?]{0,120}"
+        r"(?:процесс\w*|загруз\w*|систем\w*|хранилищ\w*|dwh|двх)|"
+        r"(?:решени\w*|разбор\w*)[^.!?]{0,80}инцидент\w*[^.!?]{0,80}"
+        r"(?:хранилищ\w*|dwh|двх)|"
         r"разбир\w*[^.!?]{0,80}(?:сбо\w*|ошиб\w*)|"
         r"передав\w*\s+информац\w*[^.!?]{0,80}(?:команд\w*|смен\w*))"
     )
@@ -416,6 +427,37 @@ class PythonBackendRules:
     _model_training_stack_pattern: ClassVar[re.Pattern[str]] = re.compile(
         r"(?:\bpytorch\b|\btransformers\b|\bcuda\b|\btensorrt\b|"
         r"\bopencv\b|\byolo\w*\b|\bvllm\b|\bsglang\b|\bmulti[ -]?gpu\b)"
+    )
+    _ml_science_title_pattern: ClassVar[re.Pattern[str]] = re.compile(
+        r"(?:\b(?:ai|ml)[ /-]?(?:engineer|scientist)\b|"
+        r"\bdata[ -]?scientist\b|\b(?:ai|ml)[ -]?инженер\w*\b|"
+        r"\b(?:инженер|специалист)\w*\s+по\s+(?:ai|ии|ml)\b)"
+    )
+    _system_software_primary_pattern: ClassVar[re.Pattern[str]] = re.compile(
+        r"(?:\bmanagement\s+plane\b|\bcontrol\s+plane\b|"
+        r"\bсетев\w*\s+ос\b|\bnetwork\s+operating\s+system\b|"
+        r"\bнизкоуровнев\w*\s+компонент\w*\b|"
+        r"\b(?:user[ -]?space|userspace)\s+(?:ос\s+)?linux\b|"
+        r"\bоперационн\w*\s+систем\w*\b)"
+    )
+    _system_software_duty_pattern: ClassVar[re.Pattern[str]] = re.compile(
+        r"(?:\bsystemd\b|\bjournald\b|\bnetlink\b|\bnetworking\b|"
+        r"\b(?:системн\w*|конфигурационн\w*)\s+(?:сервис\w*|демон\w*)\b|"
+        r"\bсетев\w*\s+подсистем\w*\b|\bдемон\w*\s+уровн\w*\b)"
+        r"|(?:разрабатыв\w*|проектир\w*)\s+пакет\w*\s+для\s+ос\b|"
+        r"\bпатч\w*\s+open[ -]?source\b"
+    )
+    _low_level_linux_duty_pattern: ClassVar[re.Pattern[str]] = re.compile(
+        r"\b(?:разраб\w*|поддержива\w*)[^.!?]{0,120}"
+        r"\bнизкоуровнев\w*\s+компонент\w*\b[^.!?]{0,120}"
+        r"\b(?:user[ -]?space|userspace)\b[^.!?]{0,50}\blinux\b"
+    )
+    _non_coding_development_pattern: ClassVar[re.Pattern[str]] = re.compile(
+        r"(?:"
+        r"писать\s+код\w*(?:\s+кажд\w*\s+день)?\s+не\s+требу\w*|"
+        r"регулярн\w*\s+написан\w*\s+код\w*\s+не\s+требу\w*|"
+        r"не\s+требу\w*\s+(?:регулярн\w*\s+)?писать\s+код\w*"
+        r")"
     )
     _excluded_roles: ClassVar[tuple[tuple[str, str], ...]] = (
         (
@@ -604,20 +646,24 @@ class PythonBackendRules:
         r"\bглавн"
         r")"
     )
-    _managerial_level_pattern: ClassVar[re.Pattern[str]] = re.compile(
+    _candidate_level_description_pattern: ClassVar[re.Pattern[str]] = re.compile(
         r"(?:"
-        r"\b(?:head|architect)\b|"
-        r"\b(?:tech|team)[\s-]*lead\b|"
-        r"\bтех[\s-]*лид\b|"
-        r"\bтехническ\w*\s+лидер\w*\b|"
-        r"\bруководител|"
-        r"\bархитектор"
+        r"(?:^|[.!?]\s+)(?:ищем|требуется|нужен|нужна|приглашаем)"
+        r"[^.!?]{0,80}\b(?:senior|lead|principal|ведущ\w*|старш\w*|главн\w*)\b|"
+        r"\b(?:позици\w*|ваканси\w*|роль|уровень)\b[^.!?]{0,60}"
+        r"\b(?:senior|lead|principal|ведущ\w*|старш\w*|главн\w*)\b"
         r")"
+    )
+    _supervisor_level_context_pattern: ClassVar[re.Pattern[str]] = re.compile(
+        r"(?:под\s+руководств\w*|под\s+наставничеств\w*|"
+        r"в\s+команд\w*\s+с)[^.!?]{0,120}"
+        r"\b(?:senior|lead|principal|ведущ\w*|старш\w*|главн\w*)\b[^.!?]*"
     )
     _senior_responsibility_pattern: ClassVar[re.Pattern[str]] = re.compile(
         r"(?:"
         r"\b(?:руковод\w+|управлен\w+)\s+(?:команд|разработ)|"
         r"\bруководств\w*\s+команд|"
+        r"\b(?:лид\w*|вести)\s+команд\w*|"
         r"\bв\s+подчинени\w*\s+\d+\s+(?:разработ|инженер|сотрудник)|"
         r"\bформирован\w+\s+(?:команд|техническ\w+\s+стратег)|"
         r"\bответствен\w+\s+за\s+(?:архитектур|техническ\w+\s+стратег|найм|команд)|"
@@ -866,19 +912,16 @@ class PythonBackendRules:
             reasons.append(
                 "требование от двух лет опыта снижает приоритет, но само по себе не блокирует"
             )
-        level_context = " ".join((title, requirements, description))
-        elevated_level = self._elevated_level_pattern.search(level_context) is not None
-        senior_responsibilities = " ".join((responsibilities, requirements, description))
-        senior_responsibilities = self._negated_senior_responsibility_pattern.sub(
-            "",
-            senior_responsibilities,
+        level_reason, level_rejection = self._senior_level_outcome(
+            title,
+            experience_requirements,
+            responsibilities,
+            description,
         )
-        if re.search(r"\b(?:head|architect)\b|\bруководител|\bархитектор", title):
-            rejected.append("руководящая или архитектурная роль выше целевого")
-        elif elevated_level and self._senior_responsibility_pattern.search(senior_responsibilities):
-            rejected.append("уровень Senior/Lead с обязанностями, существенно выше текущего опыта")
-        elif elevated_level:
-            reasons.append("уровень Senior/Lead снижает приоритет, но сам по себе не блокирует")
+        if level_reason is not None:
+            reasons.append(level_reason)
+        if level_rejection is not None:
+            rejected.append(level_rejection)
         if self._founding_engineer_pattern.search(complete_text):
             stretch_reasons.append(
                 "роль первого инженера требует ручной проверки масштаба ответственности"
@@ -898,6 +941,9 @@ class PythonBackendRules:
             )
 
         has_development = any(marker in complete_text for marker in self._development_markers)
+        non_coding_context = " ".join((title, responsibilities, requirements))
+        if self._non_coding_development_pattern.search(non_coding_context):
+            rejected.append("роль не предполагает регулярного написания кода")
         if (
             self.scope is DirectionScope.IT_ADJACENT
             and VacancyRoleRouter.is_build_infrastructure_role(title, complete_text)
@@ -912,6 +958,7 @@ class PythonBackendRules:
                     marker in {"аналитик", "analyst"}
                     and has_development_title
                     and self._substantial_coding_evidence(complete_text)
+                    and not self._is_analysis_led_prototyping_role(title, responsibilities)
                 ):
                     stretch_reasons.append(
                         "аналитическая роль содержит существенную разработку на Python; "
@@ -946,6 +993,15 @@ class PythonBackendRules:
         mandatory_other_stack = self._mandatory_other_stack(experience_requirements)
         if mandatory_other_stack is not None:
             rejected.append(f"другой обязательный основной стек: {mandatory_other_stack}")
+        primary_duty_text = self._without_optional_requirements(
+            responsibilities or description
+        )
+        primary_duty_other_stack = self._primary_duty_other_stack(
+            primary_duty_text,
+            profile_tokens,
+        )
+        if primary_duty_other_stack is not None:
+            rejected.append(f"основные обязанности требуют другой стек: {primary_duty_other_stack}")
         described_other_stack = self._described_other_stack(description)
         if described_other_stack is not None:
             rejected.append(f"основной стек вакансии — {described_other_stack}")
@@ -962,6 +1018,20 @@ class PythonBackendRules:
             rejected.append("обязательный промышленный стек обработки данных не подтверждён")
         if self.scope is DirectionScope.IT_ADJACENT and len(mandatory_skill_gaps) >= 4:
             rejected.append("слишком много обязательных технологий не подтверждено")
+        if self._unsupported_ml_science_role(
+            title,
+            responsibilities,
+            experience_requirements,
+        ):
+            rejected.append(
+                "основная работа требует неподтверждённой Data Science/ML-специализации"
+            )
+        if self._unsupported_system_software_role(
+            title,
+            " ".join((responsibilities, description)),
+            experience_requirements,
+        ):
+            rejected.append("основная работа — системные компоненты или сетевая ОС")
         model_training_context = " ".join((title, responsibilities, experience_requirements))
         if self._model_training_pattern.search(model_training_context):
             rejected.append(
@@ -1141,16 +1211,83 @@ class PythonBackendRules:
                 "автоматизированн",
                 "автотест",
                 "test automation",
+                "qa automation",
+                "qa аutomation",
+                "sdet",
+                "software development engineer in test",
             )
         )
-        load_testing_is_development = any(
-            marker in title for marker in ("инженер по тестированию", "test engineer")
-        ) and any(marker in complete_text for marker in ("locust", "pytest"))
+        title_is_testing = title_is_automation or any(
+            marker in title
+            for marker in ("инженер по тестированию", "test engineer", "тестировщик")
+        )
+        title_limits_automation = re.search(
+            r"(?:\bmanual\b|\bручн\w*)|"
+            r"\b(?:базов\w*|начальн\w*)\s+(?:навык\w*\s+)?"
+            r"(?:автоматизац\w*|automation)\b",
+            title,
+        ) is not None
+        needs_primary_automation_evidence = title_is_testing and (
+            not title_is_automation or title_limits_automation
+        )
+        manual_testing_signals = sum(
+            re.search(pattern, complete_text) is not None
+            for pattern in (
+                r"\bручн\w*\s+тестирован\w*\b",
+                r"\b(?:функциональн\w*|интеграционн\w*|регрессионн\w*|"
+                r"системн\w*|приемочн\w*|smoke|исследовательск\w*)\s+тестирован\w*\b",
+                r"\b(?:тест[ -]?кейс\w*|тестов\w*\s+дизайн\w*|тестов\w*\s+документац\w*)\b",
+                r"\b(?:баг[ -]?репорт\w*|заведени\w*\s+(?:задач\w*|дефект\w*)|"
+                r"контрол\w*\s+исправлен\w*\s+дефект\w*)\b",
+                r"\b(?:разворачив\w*|администрир\w*)[^.!?]{0,100}"
+                r"(?:виртуальн\w*\s+машин\w*|linux|windows)\b",
+            )
+        )
         python_is_explicit = "python" in title or (
             "python" in complete_text
             and any(marker in complete_text for marker in ("pytest", "locust", "автотест"))
         )
-        return (title_is_automation or load_testing_is_development) and python_is_explicit
+        python_is_optional = re.search(
+            r"(?:\bpython\b[^.!?]{0,80}\b(?:c\+\+|java|go)\b[^.!?]{0,80}"
+            r"приветств\w*|приветств\w*[^.!?]{0,80}\bpython\b)",
+            complete_text,
+        )
+        automation_development = re.search(
+            r"(?:"
+            r"(?:разраб\w*|созда\w*)[^.!?]{0,120}"
+            r"(?:автотест\w*|автоматиз\w*\s+(?:тест\w*|провер\w*)|pytest|test automation)|"
+            r"писать\w*[^.!?]{0,80}"
+            r"(?:автотест\w*|автоматиз\w*\s+(?:тест\w*|провер\w*)|pytest|test automation)|"
+            r"(?:автотест\w*|автоматиз\w*\s+(?:тест\w*|провер\w*)|pytest|test automation)"
+            r"[^.!?]{0,120}(?:разраб\w*|созда\w*)"
+            r")",
+            complete_text,
+        )
+        return (
+            title_is_testing
+            and python_is_explicit
+            and python_is_optional is None
+            and automation_development is not None
+            and manual_testing_signals
+            < (1 if needs_primary_automation_evidence else 3)
+        )
+
+    @staticmethod
+    def _is_analysis_led_prototyping_role(title: str, responsibilities: str) -> bool:
+        if not any(marker in title for marker in ("аналитик", "analyst")):
+            return False
+        if "прототип" not in responsibilities:
+            return False
+        analysis_signals = sum(
+            re.search(pattern, responsibilities) is not None
+            for pattern in (
+                r"\bсбор\w*[^.!?]{0,100}\bтребован\w*\b",
+                r"\b(?:функциональн\w*|системн\w*|интеграционн\w*)\s+требован\w*\b",
+                r"\b(?:техническ\w*\s+задан\w*|техническ\w*\s+документац\w*)\b",
+                r"\bпередач\w*[^.!?]{0,140}\bпромышленн\w*\s+разработ\w*\b",
+            )
+        )
+        return analysis_signals >= 2
 
     @classmethod
     def _unsupported_adjacent_role(cls, title: str, complete_text: str) -> str | None:
@@ -1329,10 +1466,11 @@ class PythonBackendRules:
             (r"\bnode(?:\.js)?\b|\bnodejs\b|\bnestjs\b", "Node.js"),
             (r"\btypescript\b", "TypeScript"),
             (r"(?<!\w)[cс]\+\+(?!\w)", "C++"),
+            (r"(?<!\w)[xх]\+\+(?!\w)", "X++"),
             (r"\bscala\b", "Scala"),
             (r"\brust\b", "Rust"),
             (r"\bruby\b|\brails\b", "Ruby/Rails"),
-            (r"\babap\b", "ABAP"),
+            (r"\babap\b|\bавар\b", "ABAP"),
         )
         optional_clause = re.compile(
             r"(?:будет\s+(?:плюсом|преимуществом)|желательно|необязательно|"
@@ -1366,6 +1504,22 @@ class PythonBackendRules:
             is not None
         ):
             return "Python указан только как вспомогательный язык"
+        return None
+
+    @staticmethod
+    def _primary_duty_other_stack(text: str, profile_tokens: set[str]) -> str | None:
+        if re.search(
+            r"(?:скриптов\w*\s+язык\w*.{0,50}\bpawn\b|"
+            r"\bpawn\b.{0,70}серверн\w+\s+сторон)",
+            text,
+        ):
+            return "Pawn"
+        if "plsql" not in profile_tokens and re.search(
+            r"\b(?:разраб\w*|писать\w*|созда\w*)[^.!?]{0,120}"
+            r"\bpl\s*/\s*sql\b",
+            text,
+        ):
+            return "Oracle PL/SQL"
         return None
 
     @staticmethod
@@ -1404,6 +1558,7 @@ class PythonBackendRules:
                 "javascript",
                 "typescript",
                 "react",
+                "nuxt",
                 "next.js",
                 "nextjs",
                 "vue",
@@ -1414,6 +1569,52 @@ class PythonBackendRules:
             if marker in requirements
         }
         return bool(markers) and not profile_tokens & markers
+
+    @classmethod
+    def _unsupported_ml_science_role(
+        cls,
+        title: str,
+        responsibilities: str,
+        requirements: str,
+    ) -> bool:
+        if cls._ml_science_title_pattern.search(title) is None:
+            return False
+        text = " ".join((responsibilities, requirements))
+        science_signals = sum(
+            re.search(pattern, text) is not None
+            for pattern in (
+                r"\bмат\w*\.?\s+статистик\w*\b|\bматематическ\w*\s+статистик\w*\b",
+                r"\bклассическ\w*\s+(?:алгоритм\w*\s+)?ml\b",
+                r"\b(?:кластеризац\w*|регресси\w*|классификац\w*)\b",
+                r"\b(?:data\s+science|ds|da)\b[^.!?]{0,80}\bml\b|"
+                r"\bml\b[^.!?]{0,80}\b(?:data\s+science|ds|da)\b",
+                r"\bисследовательск\w*\s+анализ\w*\s+данн\w*\b|"
+                r"\bпроведен\w*\s+эксперимент\w*\b",
+                r"\bлинейн\w*\s+алгебр\w*\b|\bметод\w*\s+оптимизац\w*\b|"
+                r"\bтеори\w*\s+вероятност\w*\b",
+            )
+        )
+        model_stack = re.search(
+            r"\b(?:xgboost|catboost|lightgbm|pytorch|tensorflow|keras|sklearn)\b",
+            text,
+        )
+        return science_signals >= 2 and model_stack is not None
+
+    @classmethod
+    def _unsupported_system_software_role(
+        cls,
+        title: str,
+        responsibilities: str,
+        requirements: str,
+    ) -> bool:
+        primary_context = " ".join((title, responsibilities))
+        text = " ".join((primary_context, requirements))
+        if cls._low_level_linux_duty_pattern.search(text) is not None:
+            return True
+        return (
+            cls._system_software_primary_pattern.search(primary_context) is not None
+            and cls._system_software_duty_pattern.search(text) is not None
+        )
 
     @staticmethod
     def _unsupported_sql_specialization(title: str, requirements: str) -> bool:
@@ -1537,6 +1738,16 @@ class PythonBackendRules:
         profile_tokens: set[str],
     ) -> tuple[str, ...]:
         specialist_requirements = (
+            (
+                "Oracle Database",
+                r"\boracle(?:\s+database)?\b",
+                frozenset({"oracle"}),
+            ),
+            (
+                "PL/SQL",
+                r"\bpl\s*/\s*sql\b|\bplsql\b",
+                frozenset({"plsql"}),
+            ),
             (
                 "Apache Spark",
                 r"\b(?:apache\s+)?spark(?:\s+sql)?\b|\bpyspark\b",
@@ -1791,12 +2002,16 @@ class PythonBackendRules:
     def _mandatory_requirements(cls, vacancy: VacancyData) -> str:
         if vacancy.required_qualifications and vacancy.required_qualifications.strip():
             return cls._without_optional_requirements(vacancy.required_qualifications)
-        description = vacancy.description or ""
+        description = "\n".join(
+            value
+            for value in (vacancy.responsibilities, vacancy.description)
+            if value and value.strip()
+        )
         heading_expression = (
             r"(?:"
             r"(?:основные\s+)?требования|"
             r"что\s+мы\s+жд[её]м[^:\n]*|"
-            r"что\s+мы\s+ожидаем|"
+            r"что\s+мы\s+ожидаем(?:\s+от\s+кандидат\w*)?|"
             r"жд[её]м\s+от\s+тебя|"
             r"мы\s+ожидаем\s+от\s+тебя|"
             r"мы\s+жд[её]м\s+от\s+вас|"
@@ -1839,12 +2054,20 @@ class PythonBackendRules:
 
     @staticmethod
     def _without_optional_requirements(value: str) -> str:
+        value = re.sub(
+            r"(?is)(?<!\w)ст[еэ]к\s+желательн\w*\s*:\s*.*?"
+            r"(?=\s*\d+[.)]\s*(?:опыт\w*|знан\w*|умени\w*|понимани\w*|"
+            r"владени\w*|навык\w*|способност\w*))",
+            " ",
+            value,
+        )
         optional_section = (
             r"(?:"
             r"будет\s+(?:плюсом|преимуществом)"
             r"(?:\s+и\s+[^:.\n]{1,60})?|"
             r"желательн\w*\s+навык\w*(?:\s*\(будет\s+плюсом\))?|"
             r"желательно|"
+            r"ст[еэ]к\s+желательн\w*|"
             r"необязательно|"
             r"приветствуется|"
             r"optional|"
@@ -1881,7 +2104,11 @@ class PythonBackendRules:
 
     @staticmethod
     def _substantial_coding_evidence(text: str) -> bool:
-        if re.search(r"\b(?:писать\s+код|write\s+(?:the\s+)?code)\b", text):
+        if re.search(
+            r"\b(?:писать\s+(?:код|программ\w*|скрипт\w*)|"
+            r"write\s+(?:the\s+)?code)\b",
+            text,
+        ):
             return True
         sections = re.split(
             r"(?:[.!?;]+|\s+[—–•●▪]\s+|\s+-\s+)",
@@ -1902,6 +2129,35 @@ class PythonBackendRules:
             for section in sections
         )
 
+    @classmethod
+    def _senior_level_outcome(
+        cls,
+        title: str,
+        requirements: str,
+        responsibilities: str,
+        description: str,
+    ) -> tuple[str | None, str | None]:
+        level_context = cls._supervisor_level_context_pattern.sub(
+            " ",
+            " ".join((title, requirements)),
+        )
+        elevated_level = (
+            cls._elevated_level_pattern.search(level_context) is not None
+            or cls._candidate_level_description_pattern.search(description) is not None
+        )
+        senior_responsibilities = " ".join((responsibilities, requirements, description))
+        senior_responsibilities = cls._negated_senior_responsibility_pattern.sub(
+            "",
+            senior_responsibilities,
+        )
+        if re.search(r"\b(?:head|architect)\b|\bруководител|\bархитектор", title):
+            return None, "руководящая или архитектурная роль выше целевого"
+        if elevated_level and cls._senior_responsibility_pattern.search(senior_responsibilities):
+            return None, "уровень Senior/Lead с обязанностями, существенно выше текущего опыта"
+        if elevated_level:
+            return "уровень Senior/Lead снижает приоритет, но сам по себе не блокирует", None
+        return None, None
+
     @staticmethod
     def _tokens(text: str) -> set[str]:
         return {
@@ -1914,7 +2170,8 @@ class PythonBackendRules:
         }
 
     def _profile_skill_tokens(self, values: tuple[str, ...]) -> set[str]:
-        return self._tokens(" ".join(values))
+        text = re.sub(r"(?i)\bpl\s*/\s*sql\b", " plsql ", " ".join(values))
+        return self._tokens(text)
 
     @classmethod
     def _minimum_required_experience(
@@ -2104,7 +2361,8 @@ class PythonBackendRules:
         description_requires_office = re.search(
             r"(?:"
             r"\bформат работы\s*:\s*(?:только\s+)?(?:в\s+)?офис(?:е|ный)?\b|"
-            r"\b(?:только\s+)?работа\s+в\s+офисе\b"
+            r"\b(?:только\s+)?работа\s+в\s+офисе\b|"
+            r"\bполн\w*\s+(?:рабоч\w*\s+)?день\s+в\s+офисе\b"
             r")",
             vacancy_text,
         )
