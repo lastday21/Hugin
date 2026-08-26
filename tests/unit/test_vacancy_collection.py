@@ -248,6 +248,122 @@ def test_exact_body_repost_with_changed_title_is_not_queued_twice(
         database.close()
 
 
+def test_duplicate_detection_does_not_depend_on_detail_fetch_order(
+    settings: Settings,
+) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    try:
+        with database.sessions.begin() as session:
+            account = AccountRepository(session).create(
+                "Тест",
+                "duplicate-detail-order-account",
+            )
+            assert account.external_id is not None
+            resume = ResumeRepository(session).upsert(
+                account.id,
+                "resume-detail-order",
+                "Python",
+            )
+            directions = DirectionRepository(session)
+            direction = directions.create(account.id, "Python backend")
+            directions.attach_resume(direction.id, resume.id)
+
+            repository = VacancyRepository(session)
+            title = "Python backend разработчик"
+            earlier = repository.upsert(
+                VacancyData(
+                    "136547864",
+                    title,
+                    "https://hh.ru/vacancy/136547864",
+                    employer_name="Ромашка",
+                )
+            )
+            later = repository.upsert(
+                VacancyData(
+                    "136547866",
+                    title,
+                    "https://hh.ru/vacancy/136547866",
+                    employer_name="Ромашка",
+                )
+            )
+            assert earlier.id < later.id
+
+            analysis = VacancyAnalysisService(session)
+            later_result = analysis.synchronize(
+                account_external_id=account.external_id,
+                direction_name=direction.name,
+                vacancies=(detailed_vacancy("136547866", title),),
+            )
+            assert later_result[0].vacancy.duplicate_of_id is None
+
+            automation = ApplicationAutomationService(session)
+            assert (
+                automation.prepare_vacancies(
+                    account_external_id=account.external_id,
+                    vacancy_ids=(later.id,),
+                    include_stretch=False,
+                )
+                == 1
+            )
+
+            earlier_result = analysis.synchronize(
+                account_external_id=account.external_id,
+                direction_name=direction.name,
+                vacancies=(detailed_vacancy("136547864", title),),
+            )
+
+            assert earlier_result[0].vacancy.duplicate_of_id == later.id
+            assert repository.get(later.id).duplicate_of_id is None
+            assert (
+                automation.prepare_vacancies(
+                    account_external_id=account.external_id,
+                    vacancy_ids=(earlier.id,),
+                    include_stretch=False,
+                )
+                == 0
+            )
+            assert session.scalar(select(func.count(ApplicationModel.id))) == 1
+    finally:
+        database.close()
+
+
+def test_relinking_canonical_vacancy_keeps_duplicate_family_flat(
+    settings: Settings,
+) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    try:
+        with database.sessions.begin() as session:
+            repository = VacancyRepository(session)
+            title = "Python backend разработчик"
+            first = repository.upsert(detailed_vacancy("duplicate-family-1", title))
+            second = repository.upsert(detailed_vacancy("duplicate-family-2", title))
+            third = repository.upsert(detailed_vacancy("duplicate-family-3", title))
+            new_canonical = repository.upsert(
+                detailed_vacancy("duplicate-family-4", title)
+            )
+
+            repository.mark_duplicate(second.id, first.id, 0.99)
+            repository.mark_duplicate(third.id, first.id, 0.99)
+            repository.mark_duplicate(first.id, new_canonical.id, 0.99)
+
+            expected_family = tuple(
+                sorted((first.id, second.id, third.id, new_canonical.id))
+            )
+            assert repository.get(first.id).duplicate_of_id == new_canonical.id
+            assert repository.get(second.id).duplicate_of_id == new_canonical.id
+            assert repository.get(third.id).duplicate_of_id == new_canonical.id
+            assert repository.get(new_canonical.id).duplicate_of_id is None
+            for vacancy_id in expected_family:
+                assert repository.duplicate_family_ids(vacancy_id) == expected_family
+
+            with pytest.raises(ValueError, match="duplicate cycle"):
+                repository.mark_duplicate(new_canonical.id, second.id, 0.99)
+    finally:
+        database.close()
+
+
 def test_fullstack_found_by_python_is_routed_to_it_without_duplicate_task(
     settings: Settings,
 ) -> None:

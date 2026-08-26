@@ -284,7 +284,7 @@ class VacancyRepository:
         models = self._session.scalars(
             select(VacancyModel)
             .where(
-                VacancyModel.id < vacancy.id,
+                VacancyModel.id != vacancy.id,
                 VacancyModel.duplicate_of_id.is_(None),
                 VacancyModel.details_fetched_at.is_not(None),
                 VacancyModel.availability == VacancyAvailability.ACTIVE,
@@ -312,10 +312,32 @@ class VacancyRepository:
         if model is None or canonical is None:
             raise LookupError("vacancy was not found")
         actual_canonical_id = canonical.duplicate_of_id or canonical.id
+        if actual_canonical_id == model.id:
+            raise ValueError("vacancy duplicate cycle is not allowed")
+
+        children = tuple(
+            self._session.scalars(
+                select(VacancyModel).where(VacancyModel.duplicate_of_id == model.id)
+            )
+        )
+        for child in children:
+            child.duplicate_of_id = actual_canonical_id
+            self._session.add(
+                VacancyChangeModel(
+                    vacancy_id=child.id,
+                    event_type="DUPLICATE_LINKED",
+                    changes={
+                        "duplicate_of_id": {
+                            "before": model.id,
+                            "after": actual_canonical_id,
+                        },
+                        "reason": "canonical_relinked",
+                    },
+                )
+            )
         if model.duplicate_of_id != actual_canonical_id:
             previous = model.duplicate_of_id
             model.duplicate_of_id = actual_canonical_id
-            self._session.flush()
             self._session.add(
                 VacancyChangeModel(
                     vacancy_id=model.id,
@@ -329,7 +351,7 @@ class VacancyRepository:
                     },
                 )
             )
-            self._session.flush()
+        self._session.flush()
         return _to_record(model)
 
     def duplicate_family_ids(self, vacancy_id: int) -> tuple[int, ...]:
