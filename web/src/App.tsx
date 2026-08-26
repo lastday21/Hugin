@@ -1267,7 +1267,14 @@ function DailyWidget({
         <p className="queue-breakdown">
           <span>{dashboard.task_counts.PENDING ?? 0} ждут обработки</span>
           <span>{dashboard.task_counts.RETRY_SCHEDULED ?? 0} повторных попыток</span>
-          <span>{dashboard.task_counts.REVIEW_REQUIRED ?? 0} требуют проверки</span>
+          <span>
+            {plural(
+              dashboard.task_counts.REVIEW_REQUIRED ?? 0,
+              "задание остановлено",
+              "задания остановлены",
+              "заданий остановлено",
+            )}
+          </span>
         </p>
         <p className="card-note">
           Пауза между откликами —{" "}
