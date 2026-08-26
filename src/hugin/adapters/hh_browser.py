@@ -3758,9 +3758,7 @@ class VisibleHhBrowser:
 
         bottom_sheet_selector = '[data-qa="bottom-sheet-content"]:visible input[name="resumeId"]'
         dropdown_selector = '[data-qa="drop-base"]:visible [role="option"]'
-        global_dropdown_selector = (
-            '[role="option"][data-qa^="magritte-select-option-"]'
-        )
+        global_dropdown_selector = '[role="option"][data-qa^="magritte-select-option-"]'
         options: list[Locator] = []
         uses_bottom_sheet = False
         option_attempts = max(
@@ -4193,6 +4191,16 @@ class VisibleHhBrowser:
             else:
                 salary_from = amounts[0]
         folded = normalized.casefold()
+        period_multiplier = Decimal(1)
+        if re.search(r"(?:\b(?:за|в)\s+час\b|/\s*час\b)", folded):
+            period_multiplier = Decimal(160)
+        elif re.search(r"(?:\b(?:за|в)\s+смену\b|/\s*смену\b)", folded):
+            period_multiplier = Decimal(20)
+        elif re.search(r"(?:\b(?:за|в)\s+день\b|/\s*день\b)", folded):
+            period_multiplier = Decimal(21)
+        if period_multiplier != 1:
+            salary_from = salary_from * period_multiplier if salary_from is not None else None
+            salary_to = salary_to * period_multiplier if salary_to is not None else None
         currency = None
         currencies = (("₽", "RUR"), ("руб", "RUR"), ("$", "USD"), ("€", "EUR"), ("₸", "KZT"))
         for marker, code in currencies:

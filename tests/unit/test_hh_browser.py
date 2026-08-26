@@ -290,9 +290,7 @@ class FakePage:
                     VisibleHhBrowser._application_url_vacancy_id(self.url),
                 )
                 payload.setdefault("resumeHhId", TEST_RESUME_HH_ID)
-                letter = self.locators.get(
-                    '[data-qa="vacancy-response-popup-form-letter-input"]'
-                )
+                letter = self.locators.get('[data-qa="vacancy-response-popup-form-letter-input"]')
                 payload.setdefault(
                     "coverLetter",
                     letter.value if letter is not None and letter.value is not None else "",
@@ -464,9 +462,7 @@ def test_public_hh_page_requires_an_authenticated_account_marker(tmp_path: Path)
 
     assert not browser.is_authenticated()
 
-    page.locators[browser_module._AUTHENTICATED_APPLICANT_SELECTOR] = FakeLocator(
-        visible=True
-    )
+    page.locators[browser_module._AUTHENTICATED_APPLICANT_SELECTOR] = FakeLocator(visible=True)
 
     assert browser.is_authenticated()
 
@@ -475,9 +471,7 @@ def test_minimized_authenticated_page_uses_present_account_marker(
     tmp_path: Path,
 ) -> None:
     page = FakePage("https://baymak.hh.ru/")
-    page.locators[browser_module._AUTHENTICATED_APPLICANT_SELECTOR] = FakeLocator(
-        visible=False
-    )
+    page.locators[browser_module._AUTHENTICATED_APPLICANT_SELECTOR] = FakeLocator(visible=False)
 
     assert make_browser(page, tmp_path).is_authenticated()
 
@@ -586,9 +580,7 @@ def test_login_waits_for_authenticated_redirect_before_credentials(
 
     def finish_redirect() -> None:
         page.url = "https://baymak.hh.ru/"
-        page.locators[browser_module._AUTHENTICATED_APPLICANT_SELECTOR] = FakeLocator(
-            visible=True
-        )
+        page.locators[browser_module._AUTHENTICATED_APPLICANT_SELECTOR] = FakeLocator(visible=True)
 
     page.load_state_callback = finish_redirect
     browser = make_browser(page, tmp_path)
@@ -597,9 +589,7 @@ def test_login_waits_for_authenticated_redirect_before_credentials(
     status = browser.submit_credentials(HhCredentials("+7 912 345-67-89", "secret"))
 
     assert status is LoginStatus.AUTHENTICATED
-    assert (
-        page.locators.get('[data-qa="magritte-phone-input-national-number-input"]') is None
-    )
+    assert page.locators.get('[data-qa="magritte-phone-input-national-number-input"]') is None
 
 
 def test_login_without_ready_page_retries_before_loading_credentials(
@@ -975,6 +965,9 @@ def test_apply_reports_closed_vacancy_before_looking_for_response_button(
             (None, Decimal("200000"), "RUR", True),
         ),
         ("от 1 500 $", (Decimal("1500"), None, "USD", None)),
+        ("до 1 100 ₽ на руки в час", (None, Decimal("176000"), "RUR", False)),
+        ("от 8 000 ₽ за смену", (Decimal("160000"), None, "RUR", None)),
+        ("5 000–7 000 ₽ в день", (Decimal("105000"), Decimal("147000"), "RUR", None)),
     ],
 )
 def test_salary_text_is_normalized(
@@ -1271,9 +1264,7 @@ def test_recruiter_messages_open_negotiations_once_for_all_chats(
     messages = make_browser(page, tmp_path).read_recruiter_messages(("101", "202"))
 
     assert [message.vacancy_id for message in messages] == ["101", "202"]
-    assert page.goto_calls == [
-        ("https://hh.ru/applicant/negotiations", "domcontentloaded")
-    ]
+    assert page.goto_calls == [("https://hh.ru/applicant/negotiations", "domcontentloaded")]
     assert page.opened_vacancy_ids == ["101", "202"]
     assert close.clicked == 2
 
@@ -1295,9 +1286,7 @@ def test_recruiter_messages_are_read_from_later_negotiations_page(
         ]
 
     second_page = FakeLocator(text="2", on_click=open_second_page)
-    page.locators['[data-qa^="number-pages-"]'] = FakeLocator(
-        items=[first_page, second_page]
-    )
+    page.locators['[data-qa^="number-pages-"]'] = FakeLocator(items=[first_page, second_page])
     page.locators['[data-qa*="number-pages-selected"]'] = first_page
     page.locators['[data-qa^="number-pages-1"]'] = first_page
     page.locators['[data-qa^="number-pages-2"]'] = second_page
@@ -2192,9 +2181,7 @@ def test_current_screening_form_status_detects_manual_completion(
     )
     page.locators["body"] = FakeLocator(text=body_text)
 
-    status = make_browser(page, tmp_path).current_screening_form_status(
-        "https://hh.ru/vacancy/123"
-    )
+    status = make_browser(page, tmp_path).current_screening_form_status("https://hh.ru/vacancy/123")
 
     assert status is expected
 
@@ -3377,9 +3364,7 @@ def test_recruiter_message_finds_chat_on_later_negotiations_page(
         text="2",
         on_click=lambda: setattr(page, "opened_chat", True),
     )
-    page.locators['[data-qa^="number-pages-"]'] = FakeLocator(
-        items=[first_page, second_page]
-    )
+    page.locators['[data-qa^="number-pages-"]'] = FakeLocator(items=[first_page, second_page])
     page.locators['[data-qa*="number-pages-selected"]'] = first_page
     page.locators['[data-qa^="number-pages-1"]'] = first_page
     page.locators['[data-qa^="number-pages-2"]'] = second_page
@@ -3716,10 +3701,7 @@ def test_challenge_has_priority_over_authenticated_page(tmp_path: Path) -> None:
     page = FakePage("https://hh.ru/applicant/resumes")
     page.locators[browser_module._CAPTCHA_SELECTOR] = FakeLocator(visible=True)
 
-    assert (
-        make_browser(page, tmp_path)._classify(cast(Page, page))
-        is LoginStatus.CAPTCHA_REQUIRED
-    )
+    assert make_browser(page, tmp_path)._classify(cast(Page, page)) is LoginStatus.CAPTCHA_REQUIRED
 
 
 def test_authenticated_page_has_priority_over_form_states(tmp_path: Path) -> None:
