@@ -6,7 +6,11 @@ from typing import cast
 from sqlalchemy import case, func, select
 from sqlalchemy.orm import Session
 
-from hugin.database.models import AutomationJobModel
+from hugin.database.models import (
+    AutomationJobModel,
+    CareerDirectionModel,
+    DirectionSearchQueryModel,
+)
 from hugin.domain.automation import (
     AutomationJobKind,
     AutomationJobNotFoundError,
@@ -16,6 +20,7 @@ from hugin.domain.automation import (
     AutomationJobStateError,
     automation_job_key,
 )
+from hugin.domain.directions import DirectionScope
 from hugin.domain.time import as_utc
 
 CLAIMABLE_STATES = (AutomationJobState.WAITING, AutomationJobState.FAILED)
@@ -141,8 +146,24 @@ class AutomationJobRepository:
             (AutomationJobModel.kind == AutomationJobKind.STATUSES, 1),
             else_=2,
         )
+        search_direction_priority = case(
+            (
+                CareerDirectionModel.scoring_config["role_scope"].as_string()
+                == DirectionScope.PYTHON_BACKEND.value,
+                0,
+            ),
+            else_=1,
+        )
         statement = (
             select(AutomationJobModel)
+            .outerjoin(
+                DirectionSearchQueryModel,
+                DirectionSearchQueryModel.id == AutomationJobModel.search_query_id,
+            )
+            .outerjoin(
+                CareerDirectionModel,
+                CareerDirectionModel.id == DirectionSearchQueryModel.direction_id,
+            )
             .where(
                 AutomationJobModel.state.in_(CLAIMABLE_STATES),
                 AutomationJobModel.next_run_at.is_not(None),
@@ -150,10 +171,11 @@ class AutomationJobRepository:
             )
             .order_by(
                 priority,
+                search_direction_priority,
                 AutomationJobModel.next_run_at,
                 AutomationJobModel.key,
             )
-            .with_for_update(skip_locked=True)
+            .with_for_update(of=AutomationJobModel, skip_locked=True)
             .limit(1)
         )
         if not search_enabled:

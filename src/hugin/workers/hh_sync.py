@@ -37,6 +37,7 @@ from hugin.workers.automation import (
     AutomationJobBlocked,
     AutomationJobDeferred,
     AutomationJobRetry,
+    background_browser_access,
 )
 
 type ApplicationWorkPending = Callable[[], bool]
@@ -90,7 +91,14 @@ class HhSyncJobHandler:
         vacancy_ids = self._tracked_vacancy_ids()
         try:
             with (
-                self._browser_lock,
+                background_browser_access(
+                    self._browser_lock,
+                    timeout_seconds=_BACKGROUND_PROFILE_LOCK_TIMEOUT_SECONDS,
+                    message=(
+                        "Профиль hh.ru занят; фоновая проверка быстро уступила очередь откликам"
+                    ),
+                    retry_after_seconds=_BACKGROUND_PROFILE_RETRY_SECONDS,
+                ),
                 VisibleHhBrowser(
                     self._settings.browser_profile_dir(self._account_id),
                     self._settings.hh_login_url,
@@ -287,7 +295,12 @@ class HhSyncJobHandler:
         unknown = 0
         cancelled = 0
         with (
-            self._browser_lock,
+            background_browser_access(
+                self._browser_lock,
+                timeout_seconds=_BACKGROUND_PROFILE_LOCK_TIMEOUT_SECONDS,
+                message=("Профиль hh.ru занят; отправка ответа быстро уступила очередь откликам"),
+                retry_after_seconds=_BACKGROUND_PROFILE_RETRY_SECONDS,
+            ),
             VisibleHhBrowser(
                 self._settings.browser_profile_dir(self._account_id),
                 self._settings.hh_login_url,

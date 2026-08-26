@@ -125,6 +125,8 @@ def prepare_handler(
     monkeypatch: pytest.MonkeyPatch,
     kind: AutomationJobKind,
     settings: Settings | None = None,
+    *,
+    browser_lock: threading.Lock | None = None,
 ) -> worker_module.HhSyncJobHandler:
     monkeypatch.setattr(worker_module, "VisibleHhBrowser", FakeBrowser)
     monkeypatch.setattr(worker_module, "HhLoginService", FakeLoginService)
@@ -134,6 +136,7 @@ def prepare_handler(
     handler = worker_module.HhSyncJobHandler(
         settings or Settings(environment="test"),
         kind,
+        browser_lock=browser_lock,
     )
     monkeypatch.setattr(handler, "_tracked_vacancy_ids", lambda: ("101",))
     return handler
@@ -244,6 +247,33 @@ def test_sync_handler_quickly_defers_when_browser_profile_is_busy(
     assert raised.value.code == "BROWSER_PROFILE_BUSY"
     assert raised.value.retry_after_seconds == 15
     assert FakeBrowser.initialization_options[-1]["profile_lock_timeout_seconds"] == 2.0
+
+
+def test_sync_handler_does_not_wait_for_shared_browser_access(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    browser_lock = threading.Lock()
+    browser_lock.acquire()
+    monkeypatch.setattr(
+        worker_module,
+        "_BACKGROUND_PROFILE_LOCK_TIMEOUT_SECONDS",
+        0.01,
+    )
+    handler = prepare_handler(
+        monkeypatch,
+        AutomationJobKind.MESSAGES,
+        browser_lock=browser_lock,
+    )
+
+    try:
+        with pytest.raises(AutomationJobDeferred) as raised:
+            handler(make_job(AutomationJobKind.MESSAGES))
+    finally:
+        browser_lock.release()
+
+    assert raised.value.code == "BROWSER_PROFILE_BUSY"
+    assert raised.value.retry_after_seconds == 15
+    assert not FakeBrowser.initialization_options
 
 
 def test_status_handler_passes_statuses_to_service(

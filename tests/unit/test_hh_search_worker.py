@@ -288,3 +288,32 @@ def test_search_quickly_defers_when_browser_profile_is_busy(
     assert not cycle.calls
     assert browser_lock.acquire(blocking=False)
     browser_lock.release()
+
+
+def test_search_does_not_wait_for_shared_browser_access(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    browser_lock = threading.Lock()
+    browser_lock.acquire()
+    monkeypatch.setattr(
+        search_worker_module,
+        "_BACKGROUND_PROFILE_LOCK_TIMEOUT_SECONDS",
+        0.01,
+    )
+    handler, cycle, browsers, login_calls = prepare_handler(
+        monkeypatch,
+        LoginStatus.AUTHENTICATED,
+        browser_lock=browser_lock,
+    )
+
+    try:
+        with pytest.raises(AutomationJobDeferred) as raised:
+            handler(make_job())
+    finally:
+        browser_lock.release()
+
+    assert raised.value.code == "BROWSER_PROFILE_BUSY"
+    assert raised.value.retry_after_seconds == 15
+    assert not browsers
+    assert not login_calls
+    assert not cycle.calls

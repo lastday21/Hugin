@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import threading
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 
 from hugin.core.settings import Settings
@@ -50,6 +51,26 @@ class AutomationJobDeferred(RuntimeError):
         super().__init__(message)
         self.code = code.strip()[:64] or "AUTOMATION_DEFERRED"
         self.retry_after_seconds = max(1, min(retry_after_seconds, 86_400))
+
+
+@contextmanager
+def background_browser_access(
+    browser_lock: threading.Lock,
+    *,
+    timeout_seconds: float,
+    message: str,
+    retry_after_seconds: int,
+) -> Iterator[None]:
+    if not browser_lock.acquire(timeout=timeout_seconds):
+        raise AutomationJobDeferred(
+            "BROWSER_PROFILE_BUSY",
+            message,
+            retry_after_seconds=retry_after_seconds,
+        )
+    try:
+        yield
+    finally:
+        browser_lock.release()
 
 
 class AutomationWorker:

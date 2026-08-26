@@ -13,6 +13,7 @@ from hugin.domain import (
     TaskState,
     VacancyData,
 )
+from hugin.domain.directions import DirectionScope
 from hugin.repositories import (
     AccountRepository,
     ApplicationRepository,
@@ -102,6 +103,52 @@ def test_scheduler_uses_resource_saving_intervals_and_does_not_catch_up(
             assert claimed.kind is AutomationJobKind.SEARCH
             completed = scheduler.complete(claimed.key, now=search_finished_at)
             assert completed.next_run_at == search_finished_at + timedelta(minutes=240)
+    finally:
+        database.close()
+
+
+def test_scheduler_processes_python_backlog_before_older_adjacent_backlog(
+    settings: Settings,
+) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    due_at = datetime(2026, 7, 26, 8, 0, tzinfo=UTC)
+
+    try:
+        with database.sessions.begin() as session:
+            account = AccountRepository(session).create("Порядок фонового поиска")
+            directions = DirectionRepository(session)
+            backend = directions.create(
+                account.id,
+                "Python backend",
+                scoring_config={"role_scope": DirectionScope.PYTHON_BACKEND.value},
+            )
+            adjacent = directions.create(
+                account.id,
+                "ИТ",
+                scoring_config={"role_scope": DirectionScope.IT_ADJACENT.value},
+            )
+            backend_query = directions.add_query(backend.id, "Python разработчик")
+            adjacent_query = directions.add_query(adjacent.id, "Разработчик автоматизации")
+            scheduler = AutomationSchedulerService(session)
+            scheduler.ensure_search_job(
+                account_id=account.id,
+                search_query_id=adjacent_query.id,
+                interval_minutes=120,
+                now=due_at,
+            )
+            scheduler.ensure_search_job(
+                account_id=account.id,
+                search_query_id=backend_query.id,
+                interval_minutes=120,
+                now=due_at + timedelta(minutes=1),
+            )
+
+        with database.sessions.begin() as session:
+            claimed = AutomationSchedulerService(session).claim_due(due_at + timedelta(minutes=2))
+
+            assert claimed is not None
+            assert claimed.search_query_id == backend_query.id
     finally:
         database.close()
 
