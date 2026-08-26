@@ -179,10 +179,6 @@ def classify_recruiter_reply(
     return RecruiterReplyDisposition.NO_REPLY
 
 
-def requires_manual_reply(*texts: str) -> bool:
-    return requires_manual_action(*texts) or requires_review_draft(*texts)
-
-
 def requires_manual_action(*texts: str) -> bool:
     return any(
         _EXTERNAL_ACTION_REQUEST_PATTERN.search(text) is not None

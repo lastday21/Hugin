@@ -297,26 +297,6 @@ class QueueTaskRepository:
         )
         return _task_record(task) if task is not None else None
 
-    def requeue_after_rule_change(
-        self,
-        task_id: int,
-        *,
-        priority_score: float,
-    ) -> TaskRecord:
-        task = self._session.get(ApplicationTaskModel, task_id)
-        if (
-            task is None
-            or task.state is not TaskState.SKIPPED
-            or task.last_error_code != "VACANCY_RULES_CHANGED"
-        ):
-            raise ValueError("Задание не было остановлено изменением правил")
-        task.state = TaskState.PENDING
-        task.priority_score = priority_score
-        task.scheduled_at = datetime.now(UTC)
-        task.last_error_code = None
-        self._session.flush()
-        return _task_record(task)
-
     def requeue_after_selection_recovery(
         self,
         task_id: int,

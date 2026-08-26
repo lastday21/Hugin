@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from email.message import Message
 from io import BytesIO
 from urllib.error import HTTPError
 from urllib.request import Request
@@ -54,7 +55,7 @@ def test_vacancy_status_probe_reads_hh_page(
 
 def test_vacancy_status_probe_handles_missing_and_unsafe_pages() -> None:
     def missing(request: Request, *, timeout: float) -> FakeResponse:
-        raise HTTPError(request.full_url, 404, "not found", {}, None)
+        raise HTTPError(request.full_url, 404, "not found", Message(), None)
 
     probe = HhVacancyStatusProbe(missing)
 
