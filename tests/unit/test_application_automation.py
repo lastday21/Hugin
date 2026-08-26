@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 from sqlalchemy import delete, select
@@ -26,6 +27,7 @@ from hugin.domain import (
     HhApplyResult,
     HhApplyStatus,
     ReconciliationStatus,
+    ScreeningFormState,
     SystemState,
     TaskState,
     VacancyAvailability,
@@ -55,7 +57,7 @@ from hugin.repositories.tasks import (
 )
 from hugin.services import application_automation as application_automation_module
 from hugin.services.ai_prompts import DEFAULT_AI_PROMPTS
-from hugin.services.application_automation import ApplicationAutomationService
+from hugin.services.application_automation import ApplicationAutomationService, ApplyJob
 from hugin.services.application_reconciliation import ApplicationReconciliationService
 from hugin.services.autonomy import AutonomyPolicyService
 from hugin.services.cover_letter import MANUAL_REVIEW_MODEL, CoverLetterService
@@ -96,7 +98,7 @@ def test_repeated_confirmed_form_does_not_loop_in_queue(
     expected_error: str,
 ) -> None:
     draft = SimpleNamespace(
-        state=application_automation_module.ScreeningFormState.CONFIRMED,
+        state=ScreeningFormState.CONFIRMED,
         questions=(SimpleNamespace(),),
         answers=(SimpleNamespace(),),
     )
@@ -133,10 +135,13 @@ def test_repeated_confirmed_form_does_not_loop_in_queue(
     )
     service = ApplicationAutomationService(object())  # type: ignore[arg-type]
     service._tasks = FakeTasks()  # type: ignore[assignment]
-    job = SimpleNamespace(
-        task=SimpleNamespace(id=41),
-        application=SimpleNamespace(id=51),
-        vacancy=SimpleNamespace(source_url="https://hh.ru/vacancy/61"),
+    job = cast(
+        ApplyJob,
+        SimpleNamespace(
+            task=SimpleNamespace(id=41),
+            application=SimpleNamespace(id=51),
+            vacancy=SimpleNamespace(source_url="https://hh.ru/vacancy/61"),
+        ),
     )
 
     recorded = service.record_result(
@@ -678,6 +683,7 @@ def test_retry_after_schedules_next_run_and_account_warning_blocks_queue(
                     HhApplyStatus.RETRYABLE_ERROR,
                     vacancy.source_url,
                     retry_after_seconds=120,
+                    retry_blocks_queue=True,
                 ),
                 now=now,
             )
@@ -782,6 +788,197 @@ def test_repeated_failure_stops_after_second_attempt(settings: Settings) -> None
             stored = QueueTaskRepository(session).get(task.id)
             assert stored.state is TaskState.REVIEW_REQUIRED
             assert stored.last_error_code == "RETRY_LIMIT_REACHED"
+            incident = session.scalar(
+                select(IncidentModel).where(
+                    IncidentModel.code == "APPLICATION_RETRY_EXHAUSTED",
+                    IncidentModel.scope_id == task.id,
+                )
+            )
+            assert incident is not None
+            assert incident.state is IncidentState.OPEN
+    finally:
+        database.close()
+
+
+def test_temporary_network_failure_remains_scheduled_after_second_attempt(
+    settings: Settings,
+) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    now = datetime.now(UTC) - timedelta(seconds=121)
+
+    try:
+        with database.sessions.begin() as session:
+            account = AccountRepository(session).create("Иван", "network-retry-account")
+            resume = ResumeRepository(session).upsert(
+                account.id,
+                "resume-network-retry",
+                "Python",
+            )
+            direction = DirectionRepository(session).create(account.id, "Python backend")
+            vacancy = VacancyRepository(session).upsert(
+                VacancyData(
+                    "network-retry",
+                    "Python-разработчик",
+                    "https://hh.ru/vacancy/network-retry",
+                )
+            )
+            directions = DirectionRepository(session)
+            directions.track_vacancy(direction.id, vacancy.id)
+            directions.apply_rules(
+                direction.id,
+                vacancy.id,
+                state=VacancyState.QUEUED,
+                score=80,
+                details={"category": "MATCH", "accepted": True},
+                rules_version=RULES_VERSION,
+            )
+            application = ApplicationRepository(session).create_apply_intent(
+                account.id,
+                vacancy.id,
+                resume.id,
+                direction.id,
+            )
+            task = QueueTaskRepository(session).enqueue(application.id, 80, now)
+            following_vacancy = VacancyRepository(session).upsert(
+                VacancyData(
+                    "following-network-retry",
+                    "Python-разработчик",
+                    "https://hh.ru/vacancy/following-network-retry",
+                )
+            )
+            directions.track_vacancy(direction.id, following_vacancy.id)
+            directions.apply_rules(
+                direction.id,
+                following_vacancy.id,
+                state=VacancyState.QUEUED,
+                score=70,
+                details={"category": "MATCH", "accepted": True},
+                rules_version=RULES_VERSION,
+            )
+            following_application = ApplicationRepository(session).create_apply_intent(
+                account.id,
+                following_vacancy.id,
+                resume.id,
+                direction.id,
+            )
+            QueueTaskRepository(session).enqueue(following_application.id, 70, now)
+            service = ApplicationAutomationService(session)
+            SystemStateRepository(session).transition(SystemState.RUNNING)
+
+            failed_at = now
+            for _attempt in range(2):
+                job = service.claim_next(direction.id)
+                assert job is not None
+                service.record_result(
+                    job,
+                    HhApplyResult(
+                        HhApplyStatus.RETRYABLE_ERROR,
+                        vacancy.source_url,
+                        "Vacancy page did not load",
+                        retry_after_seconds=60,
+                    ),
+                    now=failed_at,
+                )
+                failed_at += timedelta(seconds=60)
+
+            stored = QueueTaskRepository(session).get(task.id)
+            assert stored.state is TaskState.RETRY_SCHEDULED
+            assert stored.last_error_code == HhApplyStatus.RETRYABLE_ERROR.value
+            assert stored.scheduled_at == failed_at
+            assert SystemStateRepository(session).get().next_apply_at is None
+            following_job = service.claim_next(
+                direction.id,
+                now=failed_at - timedelta(seconds=60),
+            )
+            assert following_job is not None
+            assert following_job.vacancy.hh_id == following_vacancy.hh_id
+            incident = session.scalar(
+                select(IncidentModel).where(
+                    IncidentModel.code == "APPLICATION_RETRY_EXHAUSTED",
+                    IncidentModel.scope_id == task.id,
+                )
+            )
+            assert incident is None
+    finally:
+        database.close()
+
+
+@pytest.mark.parametrize("retry_blocks_queue", [False, True])
+def test_temporary_network_failure_stops_after_five_attempts(
+    settings: Settings,
+    *,
+    retry_blocks_queue: bool,
+) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    failed_at = datetime.now(UTC) - timedelta(minutes=10)
+
+    try:
+        with database.sessions.begin() as session:
+            account = AccountRepository(session).create("Иван", "bounded-network-retry")
+            resume = ResumeRepository(session).upsert(
+                account.id,
+                "resume-bounded-network-retry",
+                "Python",
+            )
+            direction = DirectionRepository(session).create(account.id, "Python backend")
+            vacancy = VacancyRepository(session).upsert(
+                VacancyData(
+                    "bounded-network-retry",
+                    "Python-разработчик",
+                    "https://hh.ru/vacancy/bounded-network-retry",
+                )
+            )
+            directions = DirectionRepository(session)
+            directions.track_vacancy(direction.id, vacancy.id)
+            directions.apply_rules(
+                direction.id,
+                vacancy.id,
+                state=VacancyState.QUEUED,
+                score=80,
+                details={"category": "MATCH", "accepted": True},
+                rules_version=RULES_VERSION,
+            )
+            application = ApplicationRepository(session).create_apply_intent(
+                account.id,
+                vacancy.id,
+                resume.id,
+                direction.id,
+            )
+            task = QueueTaskRepository(session).enqueue(application.id, 80, failed_at)
+            service = ApplicationAutomationService(session)
+            SystemStateRepository(session).transition(SystemState.RUNNING)
+
+            recorded = None
+            for _attempt in range(
+                application_automation_module.MAX_SCHEDULED_RETRY_ATTEMPTS
+            ):
+                job = service.claim_next(direction.id, now=failed_at)
+                assert job is not None
+                recorded = service.record_result(
+                    job,
+                    HhApplyResult(
+                        HhApplyStatus.RETRYABLE_ERROR,
+                        vacancy.source_url,
+                        "Vacancy page did not load",
+                        retry_after_seconds=60,
+                        retry_blocks_queue=retry_blocks_queue,
+                    ),
+                    now=failed_at,
+                )
+                failed_at += timedelta(seconds=60)
+
+            stored = QueueTaskRepository(session).get(task.id)
+            assert stored.state is TaskState.REVIEW_REQUIRED
+            assert stored.last_error_code == "RETRY_LIMIT_REACHED"
+            expected_next_apply_at = failed_at if retry_blocks_queue else None
+            assert recorded is not None
+            assert recorded.next_apply_at == expected_next_apply_at
+            assert (
+                SystemStateRepository(session).get().next_apply_at
+                == expected_next_apply_at
+            )
             incident = session.scalar(
                 select(IncidentModel).where(
                     IncidentModel.code == "APPLICATION_RETRY_EXHAUSTED",

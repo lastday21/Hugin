@@ -176,6 +176,7 @@ class ApplicationWorker:
                 job.vacancy.source_url,
                 str(error),
                 retry_after_seconds=error.retry_after_seconds,
+                retry_blocks_queue=True,
             )
         except HhSyncBlockedError as error:
             self._close_browser()
@@ -305,6 +306,7 @@ class ApplicationWorker:
                 job.vacancy.source_url,
                 str(error),
                 retry_after_seconds=error.retry_after_seconds,
+                retry_blocks_queue=True,
             )
         except HhSyncBlockedError as error:
             handler_error = error
@@ -330,6 +332,7 @@ class ApplicationWorker:
                 "Предварительная проверка не нажимала кнопку отправки; проверка будет повторена",
                 warnings=result.warnings,
                 retry_after_seconds=result.retry_after_seconds,
+                retry_blocks_queue=result.retry_blocks_queue,
             )
 
         finished_at = selected_at if now_is_fixed else datetime.now(UTC)

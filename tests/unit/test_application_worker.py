@@ -379,6 +379,7 @@ def test_worker_retries_login_timeout_without_marking_unknown(
     _, result, delay, _ = FakeApplicationService.recorded[0]
     assert result.status is HhApplyStatus.RETRYABLE_ERROR
     assert result.retry_after_seconds == 60
+    assert result.retry_blocks_queue
     assert delay is None
 
 
@@ -599,6 +600,34 @@ def test_form_preflight_exception_is_retryable_not_unknown(
 
     assert worker.run_once(datetime(2026, 7, 27, 10, 0, tzinfo=UTC))
     assert FakeApplicationService.recorded[0][1].status is HhApplyStatus.RETRYABLE_ERROR
+
+
+def test_form_preflight_retryable_error_blocks_queue(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    job = fake_job()
+    FakeApplicationService.preflight_job = job
+
+    def fail(_job: ApplyJob) -> HhApplyResult:
+        raise HhSyncRetryableError(
+            "HH_NETWORK_TIMEOUT",
+            "Страница входа hh.ru временно недоступна",
+            retry_after_seconds=60,
+        )
+
+    worker = prepare_worker(
+        monkeypatch,
+        tmp_path,
+        form_preflight_handler=fail,
+        letter_preparer=lambda _job: pytest.fail("модель не должна вызываться"),
+    )
+
+    assert worker.run_once(datetime(2026, 7, 27, 10, 0, tzinfo=UTC))
+    result = FakeApplicationService.recorded[0][1]
+    assert result.status is HhApplyStatus.RETRYABLE_ERROR
+    assert result.retry_after_seconds == 60
+    assert result.retry_blocks_queue
 
 
 def test_form_preflight_unknown_result_is_downgraded_to_retry(

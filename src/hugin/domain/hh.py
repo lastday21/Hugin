@@ -183,3 +183,4 @@ class HhApplyResult:
     retry_after_seconds: int | None = None
     screening_form: HhScreeningForm | None = None
     screening_form_version_hash: str | None = None
+    retry_blocks_queue: bool = False

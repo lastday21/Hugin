@@ -67,6 +67,7 @@ from hugin.services.vacancy_analysis import RULES_VERSION, RuleCategory
 
 SUPERVISED_MIN_INTERVAL = timedelta(seconds=60)
 MAX_AUTOMATIC_RETRY_ATTEMPTS = 2
+MAX_SCHEDULED_RETRY_ATTEMPTS = 5
 RETRY_LIMIT_REACHED = "RETRY_LIMIT_REACHED"
 
 
@@ -799,7 +800,9 @@ class ApplicationAutomationService:
         require_cover_letter: bool = False,
         allow_paused_review: bool = False,
         include_stretch: bool = True,
+        now: datetime | None = None,
     ) -> ApplyJob | None:
+        selected_at = as_utc(now or datetime.now(UTC))
         instruction_version = cover_letter_instruction_version(
             AiPromptSettingsService(self._session).get().cover_letter
         )
@@ -810,6 +813,7 @@ class ApplicationAutomationService:
             if self._system.supervised_lease_active():
                 raise RuntimeError("Проверка без отправки недоступна во время управляемого отклика")
             task = self._tasks.claim_next(
+                selected_at,
                 account_id=account_id,
                 direction_id=direction_id,
                 require_ready_cover_letter=require_cover_letter,
@@ -828,6 +832,7 @@ class ApplicationAutomationService:
             )
         else:
             task = self._queue.claim_next(
+                selected_at,
                 account_id=account_id,
                 direction_id=direction_id,
                 require_ready_cover_letter=require_cover_letter,
@@ -1315,6 +1320,7 @@ class ApplicationAutomationService:
             payload["source"] = "hh.ru"
         if result.retry_after_seconds is not None:
             payload["retry_after_seconds"] = result.retry_after_seconds
+            payload["retry_blocks_queue"] = result.retry_blocks_queue
         if result.screening_form_version_hash is not None:
             payload["screening_form_version_hash"] = result.screening_form_version_hash
         if result.status in {HhApplyStatus.APPLIED, HhApplyStatus.ALREADY_APPLIED}:
@@ -1504,8 +1510,19 @@ class ApplicationAutomationService:
         }
         if (
             result.status is HhApplyStatus.RETRYABLE_ERROR
-            and job.task.attempts >= MAX_AUTOMATIC_RETRY_ATTEMPTS
+            and job.task.attempts
+            >= (
+                MAX_SCHEDULED_RETRY_ATTEMPTS
+                if result.retry_after_seconds is not None
+                else MAX_AUTOMATIC_RETRY_ATTEMPTS
+            )
         ):
+            queue_retry_at = None
+            if result.retry_after_seconds is not None and result.retry_blocks_queue:
+                queue_retry_at = selected_at + timedelta(
+                    seconds=result.retry_after_seconds
+                )
+                self._system.set_next_apply_at(queue_retry_at)
             payload["attempts"] = job.task.attempts
             self._tasks.transition(
                 job.task.id,
@@ -1524,7 +1541,31 @@ class ApplicationAutomationService:
                 scope_type="application_task",
                 scope_id=job.task.id,
             )
-            return RecordedApplyResult(blocking=False, sent=False)
+            return RecordedApplyResult(
+                blocking=False,
+                sent=False,
+                next_apply_at=queue_retry_at,
+            )
+
+        return self._record_retry_or_blocked_result(
+            job,
+            result,
+            payload,
+            selected_at=selected_at,
+            retry_delay=retry_delay,
+            target_state=system_states.get(result.status),
+        )
+
+    def _record_retry_or_blocked_result(
+        self,
+        job: ApplyJob,
+        result: HhApplyResult,
+        payload: EventPayload,
+        *,
+        selected_at: datetime,
+        retry_delay: timedelta,
+        target_state: SystemState | None,
+    ) -> RecordedApplyResult:
         effective_retry_delay = (
             timedelta(seconds=result.retry_after_seconds)
             if result.status is HhApplyStatus.RETRYABLE_ERROR
@@ -1542,9 +1583,9 @@ class ApplicationAutomationService:
         if (
             result.status is HhApplyStatus.RETRYABLE_ERROR
             and result.retry_after_seconds is not None
+            and result.retry_blocks_queue
         ):
             self._system.set_next_apply_at(retry_at)
-        target_state = system_states.get(result.status)
         if target_state is not None:
             self._transition_system(target_state)
         return RecordedApplyResult(
@@ -1554,6 +1595,7 @@ class ApplicationAutomationService:
                 retry_at
                 if result.status is HhApplyStatus.RETRYABLE_ERROR
                 and result.retry_after_seconds is not None
+                and result.retry_blocks_queue
                 else None
             ),
         )

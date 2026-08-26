@@ -130,6 +130,7 @@ _TEMPORARY_NAVIGATION_ERROR_MARKERS = (
     "ERR_NAME_NOT_RESOLVED",
     "ERR_INTERNET_DISCONNECTED",
     "ERR_NETWORK_CHANGED",
+    "Target page, context or browser has been closed",
 )
 _NETWORK_RETRY_SECONDS = 60
 _TEMPORARY_REQUEST_RETRY_SECONDS = 15 * 60
@@ -143,6 +144,15 @@ _DANGEROUS_SCREENING_QUESTION = re.compile(
     r"испытательн|тестов.*задан|видео",
     re.IGNORECASE,
 )
+
+
+def _is_temporary_navigation_error(error: PlaywrightError) -> bool:
+    message = str(error)
+    return isinstance(error, PlaywrightTimeoutError) or any(
+        marker in message for marker in _TEMPORARY_NAVIGATION_ERROR_MARKERS
+    )
+
+
 _FORM_ATTACHMENT_WARNING = "Форма содержит загрузку файла"
 _FORM_EXTERNAL_LINK_WARNING = "Форма содержит внешнюю ссылку"
 _FORM_TEST_ASSIGNMENT_WARNING = "Форма содержит тестовое или испытательное задание"
@@ -1712,12 +1722,14 @@ class VisibleHhBrowser:
         except PlaywrightError as error:
             message = str(error)
             if "ERR_ABORTED" in message:
-                page.wait_for_timeout(500)
-                if self.is_authenticated():
-                    return
-            if isinstance(error, PlaywrightTimeoutError) or any(
-                marker in message for marker in _TEMPORARY_NAVIGATION_ERROR_MARKERS
-            ):
+                try:
+                    page.wait_for_timeout(500)
+                    if self.is_authenticated():
+                        return
+                except PlaywrightError as followup_error:
+                    error = followup_error
+                    message = str(followup_error)
+            if _is_temporary_navigation_error(error):
                 raise HhSyncRetryableError(
                     "HH_NETWORK_TIMEOUT",
                     "Страница входа hh.ru временно недоступна; "
@@ -2165,9 +2177,7 @@ class VisibleHhBrowser:
             page.wait_for_timeout(1_500)
         except PlaywrightError as error:
             details = str(error).strip().splitlines()[0][:500]
-            is_network_error = isinstance(error, PlaywrightTimeoutError) or any(
-                marker in details for marker in _TEMPORARY_NAVIGATION_ERROR_MARKERS
-            )
+            is_network_error = _is_temporary_navigation_error(error)
             return HhApplyResult(
                 HhApplyStatus.RETRYABLE_ERROR,
                 page.url,
@@ -2183,6 +2193,7 @@ class VisibleHhBrowser:
                 retry_after_seconds=(
                     self._retry_after_seconds(initial_response) or _TEMPORARY_REQUEST_RETRY_SECONDS
                 ),
+                retry_blocks_queue=True,
             )
         if self._vacancy_is_closed(initial_response, body_text):
             return HhApplyResult(HhApplyStatus.VACANCY_CLOSED, page.url)
@@ -2719,6 +2730,7 @@ class VisibleHhBrowser:
                 page.url,
                 "hh.ru временно ограничил отправку откликов; попытка будет повторена автоматически",
                 retry_after_seconds=_APPLICATION_LIMIT_RETRY_SECONDS,
+                retry_blocks_queue=True,
             )
         if self._contains_any(body_text, *_TEMPORARY_REQUEST_LIMIT_MARKERS):
             return HhApplyResult(
@@ -2726,6 +2738,7 @@ class VisibleHhBrowser:
                 page.url,
                 "hh.ru временно ограничил обращения; попытка будет повторена автоматически",
                 retry_after_seconds=_TEMPORARY_REQUEST_RETRY_SECONDS,
+                retry_blocks_queue=True,
             )
         if not self.is_authenticated():
             return HhApplyResult(HhApplyStatus.AUTH_REQUIRED, page.url)
@@ -3502,6 +3515,7 @@ class VisibleHhBrowser:
                 retry_after_seconds=(
                     self._retry_after_seconds(response) or _TEMPORARY_REQUEST_RETRY_SECONDS
                 ),
+                retry_blocks_queue=True,
             )
         if self._contains_any(combined_text, *_APPLICATION_LIMIT_MARKERS):
             return HhApplyResult(
@@ -3509,6 +3523,7 @@ class VisibleHhBrowser:
                 page.url,
                 "hh.ru временно ограничил отправку откликов; попытка будет повторена автоматически",
                 retry_after_seconds=_APPLICATION_LIMIT_RETRY_SECONDS,
+                retry_blocks_queue=True,
             )
         if self._contains_any(combined_text, *_TEMPORARY_REQUEST_LIMIT_MARKERS):
             return HhApplyResult(
@@ -3516,6 +3531,7 @@ class VisibleHhBrowser:
                 page.url,
                 "hh.ru временно ограничил обращения; попытка будет повторена автоматически",
                 retry_after_seconds=_TEMPORARY_REQUEST_RETRY_SECONDS,
+                retry_blocks_queue=True,
             )
         return None
 

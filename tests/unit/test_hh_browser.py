@@ -536,6 +536,49 @@ def test_aborted_login_redirect_is_accepted_for_authenticated_page(tmp_path: Pat
     assert browser.is_authenticated()
 
 
+def test_closed_page_during_aborted_login_redirect_is_retried(tmp_path: Path) -> None:
+    class ClosedDuringRedirectPage(FakePage):
+        def wait_for_timeout(self, timeout: int) -> None:
+            assert timeout == 500
+            raise Error("Page.wait_for_timeout: Target page, context or browser has been closed")
+
+    page = ClosedDuringRedirectPage()
+    page.goto_error = Error("net::ERR_ABORTED")
+
+    with pytest.raises(HhSyncRetryableError) as error:
+        make_browser(page, tmp_path).open_login()
+
+    assert error.value.code == "HH_NETWORK_TIMEOUT"
+    assert error.value.retry_after_seconds == browser_module._NETWORK_RETRY_SECONDS
+
+
+def test_closed_page_during_aborted_login_authentication_check_is_retried(
+    tmp_path: Path,
+) -> None:
+    class ClosedBeforeAuthenticationCheckPage(FakePage):
+        def __init__(self) -> None:
+            self.closed_after_wait = False
+            super().__init__("https://hh.ru/applicant/resumes")
+
+        def wait_for_timeout(self, timeout: int) -> None:
+            assert timeout == 500
+            self.closed_after_wait = True
+
+        def locator(self, selector: str) -> FakeLocator:
+            if self.closed_after_wait:
+                raise Error("Locator.count: Target page, context or browser has been closed")
+            return super().locator(selector)
+
+    page = ClosedBeforeAuthenticationCheckPage()
+    page.goto_error = Error("net::ERR_ABORTED")
+
+    with pytest.raises(HhSyncRetryableError) as error:
+        make_browser(page, tmp_path).open_login()
+
+    assert error.value.code == "HH_NETWORK_TIMEOUT"
+    assert error.value.retry_after_seconds == browser_module._NETWORK_RETRY_SECONDS
+
+
 def test_login_waits_for_authenticated_redirect_before_credentials(
     tmp_path: Path,
 ) -> None:
@@ -2621,6 +2664,27 @@ def test_application_respects_retry_after_header(tmp_path: Path) -> None:
 
     assert result.status is HhApplyStatus.RETRYABLE_ERROR
     assert result.retry_after_seconds == 120
+    assert result.retry_blocks_queue
+
+
+def test_application_navigation_timeout_delays_only_current_vacancy(
+    tmp_path: Path,
+) -> None:
+    page = FakePage("https://hh.ru/applicant/resumes")
+    page.goto_error = TimeoutError("Page.goto: Timeout 60000ms exceeded")
+
+    result = make_browser(page, tmp_path).apply_to_vacancy(
+        "https://hh.ru/vacancy/123",
+        expected_resume_hh_id=TEST_RESUME_HH_ID,
+        expected_resume_title="Python backend разработчик",
+        cover_letter="Письмо",
+        submit=True,
+        submit_guard=lambda: True,
+    )
+
+    assert result.status is HhApplyStatus.RETRYABLE_ERROR
+    assert result.retry_after_seconds == browser_module._NETWORK_RETRY_SECONDS
+    assert not result.retry_blocks_queue
 
 
 def test_application_http_403_requires_manual_account_review(tmp_path: Path) -> None:
@@ -2695,6 +2759,7 @@ def test_application_text_limits_are_retried_automatically(
 
     assert result.status is HhApplyStatus.RETRYABLE_ERROR
     assert result.retry_after_seconds == expected_delay
+    assert result.retry_blocks_queue
     assert "автоматически" in result.confirmation
 
 
