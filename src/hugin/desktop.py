@@ -749,6 +749,16 @@ def project_directory(start: Path | None = None) -> Path:
     raise RuntimeError("Не найден compose.yaml. Запустите Hugin из каталога проекта.")
 
 
+def activate_project_directory() -> Path:
+    try:
+        root = project_directory(Path(__file__).resolve())
+    except RuntimeError:
+        root = project_directory()
+    os.chdir(root)
+    get_settings.cache_clear()
+    return root
+
+
 def api_is_ready(url: str) -> bool:
     try:
         opener = build_opener(ProxyHandler({}))
@@ -928,6 +938,7 @@ def main() -> None:
 
 def launch() -> None:
     try:
+        activate_project_directory()
         with single_desktop_instance():
             main()
     except Exception as error:

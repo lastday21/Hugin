@@ -861,6 +861,42 @@ def test_project_directory_and_health_probe(
     assert not desktop.api_is_ready("http://127.0.0.1:8010")
 
 
+def test_activate_project_directory_prefers_module_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "project"
+    module_path = root / "src" / "hugin" / "desktop.py"
+    module_path.parent.mkdir(parents=True)
+    module_path.write_text("", encoding="utf-8")
+    (root / "compose.yaml").write_text("services: {}", encoding="utf-8")
+    current = tmp_path / "launcher"
+    current.mkdir()
+    (current / "compose.yaml").write_text("services: {}", encoding="utf-8")
+
+    monkeypatch.chdir(current)
+    monkeypatch.setattr(desktop, "__file__", str(module_path))
+
+    assert desktop.activate_project_directory() == root
+    assert Path.cwd() == root
+
+
+def test_activate_project_directory_falls_back_to_working_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    (root / "compose.yaml").write_text("services: {}", encoding="utf-8")
+    module_path = tmp_path / "installed" / "hugin" / "desktop.py"
+
+    monkeypatch.chdir(root)
+    monkeypatch.setattr(desktop, "__file__", str(module_path))
+
+    assert desktop.activate_project_directory() == root
+    assert Path.cwd() == root
+
+
 def test_ensure_services_starts_docker_and_reports_failures(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1049,6 +1085,7 @@ def test_launch_shows_error_instead_of_leaving_hidden_failure(
         yield
 
     monkeypatch.setattr(desktop, "single_desktop_instance", instance)
+    monkeypatch.setattr(desktop, "activate_project_directory", lambda: tmp_path)
     monkeypatch.setattr(
         desktop,
         "get_settings",
