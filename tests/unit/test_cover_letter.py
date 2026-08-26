@@ -46,9 +46,11 @@ from hugin.services.cover_letter import (
     CoverLetterValidationError,
     _ensure_relevant_evidence,
     _letter_similarity,
+    _matching_tokens,
     _relevant_excerpt,
     _SelectedFact,
     _set_similarity,
+    _shares_token,
     _without_future_plans,
     _without_irrelevant_context_lines,
     _work_experience_excerpt,
@@ -1438,6 +1440,74 @@ def test_unrelated_near_duplicate_is_rejected_after_all_corrections(
         database.close()
 
 
+def test_similar_letter_is_allowed_without_confirmed_unique_vacancy_focus(
+    settings: Settings,
+) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    model = FakeModel([_letter()])
+    similar_text = _letter().replace(
+        (
+            "В одном из проектов реализовал прикладную логику сервиса и настроил "
+            "автоматические проверки, чтобы изменения можно было безопасно проверять "
+            "перед выпуском."
+        ),
+        (
+            "В проекте каталога проектировал REST API и схему PostgreSQL, а также "
+            "настраивал автоматические проверки изменений."
+        ),
+    )
+
+    try:
+        with database.sessions.begin() as session:
+            account_id, direction_id, _, _ = _prepare_data(session)
+            first = CoverLetterService(session, model).prepare(
+                account_id=account_id,
+                direction_name="Python backend",
+            )
+            assert first.generated == 1
+            assert 0.75 <= _letter_similarity(_letter(), similar_text) < 0.92
+
+            vacancy = VacancyRepository(session).upsert(
+                VacancyData(
+                    hh_id="letter-unsupported-focus",
+                    title="Python-разработчик Django",
+                    source_url="https://hh.ru/vacancy/letter-unsupported-focus",
+                    employer_name="Другая компания",
+                    published_at=datetime(2026, 8, 25, tzinfo=UTC),
+                    description="Разработка серверной части на Django и Kubernetes.",
+                    key_skills=("Python", "Django", "PostgreSQL", "Kubernetes"),
+                    details_fetched_at=datetime(2026, 8, 25, tzinfo=UTC),
+                )
+            )
+            directions = DirectionRepository(session)
+            directions.track_vacancy(direction_id, vacancy.id)
+            directions.apply_rules(
+                direction_id,
+                vacancy.id,
+                state=VacancyState.ANALYZED,
+                score=80,
+                details={"category": "MATCH", "accepted": True},
+                rules_version=RULES_VERSION,
+            )
+            ApplicationAutomationService(session).prepare_for_account_id(
+                account_id=account_id,
+                direction_name="Python backend",
+                include_stretch=True,
+            )
+            service = CoverLetterService(session)
+            candidate = service._candidates(
+                account_id,
+                direction_id,
+                vacancy.hh_id,
+            )[0]
+            facts = service._select_facts(candidate, direction_id)
+
+            assert not service._conflicting_similar_text(candidate, similar_text, facts)
+    finally:
+        database.close()
+
+
 def test_prepare_can_target_exactly_one_vacancy(settings: Settings) -> None:
     upgrade_database(settings)
     database = create_database(settings)
@@ -2327,6 +2397,37 @@ def test_common_stack_is_not_vacancy_focus_when_confirmed_duty_exists() -> None:
         validate_cover_letter(common_stack_only, vacancy, facts)
 
     assert error.value.code == "NO_VACANCY_FOCUS"
+
+
+def test_git_requirement_accepts_confirmed_github_actions_focus() -> None:
+    vacancy = _vacancy()
+    vacancy.title = "Python developer"
+    vacancy.key_skills = ["Python", "Django Framework", "PostgreSQL", "REST", "Git"]
+    facts = (
+        _SelectedFact(
+            id=1,
+            category="work_experience",
+            content=(
+                "Разрабатывал серверную часть на Python, проектировал REST API и схему "
+                "PostgreSQL. Настраивал Git и автоматические проверки через GitHub Actions."
+            ),
+        ),
+    )
+    text = (
+        "Здравствуйте!\n\nРазрабатывал серверную часть на Python: проектировал REST API "
+        "и схему PostgreSQL, отделял прикладную логику от доступа к данным и проверял "
+        "обработку ошибок. Для изменений настраивал автоматические проверки через GitHub "
+        "Actions, чтобы проверять код перед выпуском.\n\nГотов разобрать проектирование REST "
+        "API, работу со схемой PostgreSQL и организацию автоматических проверок."
+    )
+
+    validate_cover_letter(text, vacancy, facts)
+
+
+def test_git_fact_does_not_confirm_specific_github_or_gitlab_requirement() -> None:
+    assert _matching_tokens({"git"}, {"github", "gitlab"}) == {"git"}
+    assert not _matching_tokens({"github", "gitlab"}, {"git"})
+    assert not _shares_token({"git"}, {"github", "gitlab"})
 
 
 def test_common_stack_facts_do_not_cover_specific_vacancy_duty() -> None:

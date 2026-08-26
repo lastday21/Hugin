@@ -1080,7 +1080,7 @@ class CoverLetterService:
         if self._conflicting_similar_text(
             candidate,
             normalized,
-            tuple(fact.id for fact in used_facts),
+            used_facts,
         ):
             raise CoverLetterValidationError(
                 "NEAR_DUPLICATE_TEXT",
@@ -1539,7 +1539,7 @@ class CoverLetterService:
         if self._conflicting_similar_text(
             candidate,
             text,
-            tuple(fact.id for fact in used_facts),
+            used_facts,
         ):
             raise CoverLetterValidationError(
                 "NEAR_DUPLICATE_TEXT",
@@ -2131,7 +2131,7 @@ class CoverLetterService:
         self,
         candidate: _Candidate,
         text: str,
-        fact_ids: tuple[int, ...],
+        facts: tuple[_SelectedFact, ...],
     ) -> bool:
         rows = tuple(
             self._session.execute(
@@ -2166,7 +2166,8 @@ class CoverLetterService:
 
         current_root = candidate.vacancy.duplicate_of_id or candidate.vacancy.id
         current_focus = _vacancy_focus_tokens(candidate.vacancy) - _GENERIC_RELEVANCE_TERMS
-        current_fact_ids = set(fact_ids)
+        current_fact_ids = {fact.id for fact in facts}
+        current_fact_tokens = _tokens("\n".join(fact.content for fact in facts))
         text_tokens = _tokens(text)
         for letter_id, previous_text, previous_vacancy in rows:
             if not previous_text:
@@ -2184,8 +2185,12 @@ class CoverLetterService:
             previous_focus = _vacancy_focus_tokens(previous_vacancy) - _GENERIC_RELEVANCE_TERMS
             focus_similarity = _set_similarity(current_focus, previous_focus)
             unique_current = current_focus - previous_focus
-            unique_in_text = _matching_tokens(unique_current, text_tokens)
-            if focus_similarity < 0.55 and len(unique_in_text) < 2:
+            confirmed_unique = _matching_tokens(unique_current, current_fact_tokens)
+            if not confirmed_unique:
+                continue
+            unique_in_text = _matching_tokens(confirmed_unique, text_tokens)
+            required_unique_count = min(2, len(confirmed_unique))
+            if focus_similarity < 0.55 and len(unique_in_text) < required_unique_count:
                 return True
         return False
 
@@ -2802,7 +2807,12 @@ def _shares_token(expected: set[str], actual: set[str]) -> bool:
 
 
 def _matching_tokens(expected: set[str], actual: set[str]) -> set[str]:
-    return {token for token in expected if _shares_token({token}, actual)}
+    return {
+        token
+        for token in expected
+        if _shares_token({token}, actual)
+        or (token == "git" and bool(actual & {"github", "gitlab"}))
+    }
 
 
 def _meaningful_overlap(vacancy_tokens: set[str], evidence_tokens: set[str]) -> set[str]:
