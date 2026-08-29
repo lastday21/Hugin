@@ -90,6 +90,7 @@ class HhSearchJobHandler:
                     account_id=self._account_id,
                     search_query_id=job.search_query_id,
                     browser=browser,
+                    prefer_fresh_search=job.last_result.get("backlog_processed") is True,
                 )
         except RuntimeError as error:
             if "Профиль hh.ru занят другой задачей" not in str(error):

@@ -24,6 +24,7 @@ def make_job(
     kind: AutomationJobKind = AutomationJobKind.SEARCH,
     account_id: int = 1,
     search_query_id: int | None = 7,
+    last_result: AutomationJobResult | None = None,
 ) -> AutomationJobRecord:
     now = datetime(2026, 7, 26, 8, 0, tzinfo=UTC)
     return AutomationJobRecord(
@@ -41,7 +42,7 @@ def make_job(
         consecutive_failures=0,
         last_error_code=None,
         last_error_message=None,
-        last_result={},
+        last_result=dict(last_result or {}),
         created_at=now,
         updated_at=now,
     )
@@ -75,7 +76,7 @@ class FakeBrowser:
 class FakeCycle:
     def __init__(self, result: AutomationJobResult) -> None:
         self.result = result
-        self.calls: list[tuple[int, int, object]] = []
+        self.calls: list[tuple[int, int, object, bool]] = []
 
     def run(
         self,
@@ -83,8 +84,9 @@ class FakeCycle:
         account_id: int,
         search_query_id: int,
         browser: object,
+        prefer_fresh_search: bool = False,
     ) -> AutomationJobResult:
-        self.calls.append((account_id, search_query_id, browser))
+        self.calls.append((account_id, search_query_id, browser, prefer_fresh_search))
         return self.result
 
 
@@ -227,7 +229,7 @@ def test_search_handler_runs_cycle_after_successful_login(
     assert browsers[0].entered
     assert browsers[0].exited
     assert login_calls == [(1, browsers[0])]
-    assert cycle.calls == [(1, 7, browsers[0])]
+    assert cycle.calls == [(1, 7, browsers[0], False)]
     settings = Settings(environment="test")
     assert browsers[0].arguments[0] == settings.browser_profile_dir(1)
     assert browsers[0].arguments[-1] == settings.hh_browser_timeout_ms
@@ -240,6 +242,21 @@ def test_search_handler_runs_cycle_after_successful_login(
         ),
         "profile_lock_timeout_seconds": 2.0,
     }
+
+
+def test_search_forces_fresh_results_after_backlog_pass(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    handler, cycle, browsers, login_calls = prepare_handler(
+        monkeypatch,
+        LoginStatus.AUTHENTICATED,
+    )
+
+    result = handler(make_job(last_result={"backlog_processed": True, "queued": 1}))
+
+    assert result == {"found": 4, "queued": 2}
+    assert login_calls == [(1, browsers[0])]
+    assert cycle.calls == [(1, 7, browsers[0], True)]
 
 
 def test_search_waits_while_found_vacancies_are_being_processed(
@@ -272,9 +289,7 @@ def test_search_quickly_defers_when_browser_profile_is_busy(
     )
 
     def fail_enter(_browser: FakeBrowser) -> FakeBrowser:
-        raise RuntimeError(
-            "Профиль hh.ru занят другой задачей дольше допустимого времени"
-        )
+        raise RuntimeError("Профиль hh.ru занят другой задачей дольше допустимого времени")
 
     monkeypatch.setattr(FakeBrowser, "__enter__", fail_enter)
 

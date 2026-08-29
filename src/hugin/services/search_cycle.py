@@ -59,6 +59,7 @@ class BackgroundSearchCycle:
         account_id: int,
         search_query_id: int,
         browser: SearchCycleBrowser,
+        prefer_fresh_search: bool = False,
     ) -> AutomationJobResult:
         account_external_id, direction_name, tasks = self._tasks(account_id, search_query_id)
         profile = browser.read_profile()
@@ -69,7 +70,7 @@ class BackgroundSearchCycle:
             account_external_id=profile.external_id,
             direction_name=direction_name,
         )
-        if pending:
+        if pending and not prefer_fresh_search:
             details_loaded, details_failed, queued = self._process_pending(
                 account_external_id=profile.external_id,
                 direction_name=direction_name,

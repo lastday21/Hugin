@@ -7,7 +7,7 @@ import pytest
 from hugin.core.settings import Settings
 from hugin.database import create_database, upgrade_database
 from hugin.database.models import CandidateProfileModel
-from hugin.domain import SearchRegion, VacancyData, VacancyState
+from hugin.domain import SearchRegion, VacancyData, VacancyState, WorkFormat
 from hugin.domain.hh import HhProfileData, HhResumeData
 from hugin.domain.vacancies import VacancySearchResult
 from hugin.repositories import (
@@ -32,6 +32,7 @@ class FakeSearchBrowser:
         self.fail_page = fail_page
         self.now = datetime.now(UTC)
         self.searches: list[tuple[str, str, int]] = []
+        self.search_filters: list[dict[str, object]] = []
         self.details: list[str] = []
 
     def read_profile(self) -> HhProfileData:
@@ -47,6 +48,7 @@ class FakeSearchBrowser:
     ) -> VacancySearchResult:
         assert filters is not None
         self.searches.append((query, area, page_number))
+        self.search_filters.append(dict(filters))
         if page_number == self.fail_page:
             raise RuntimeError("страница поиска временно недоступна")
         return VacancySearchResult(
@@ -325,6 +327,85 @@ def test_backlog_is_processed_before_new_search_and_stops_after_first_queue(
     }
     assert browser.searches == []
     assert len(browser.details) == 1
+
+
+def test_fresh_search_turn_bypasses_backlog_and_covers_remote_russia(
+    settings: Settings,
+) -> None:
+    now = datetime.now(UTC)
+    upgrade_database(settings)
+    database = create_database(settings)
+    try:
+        with database.sessions.begin() as session:
+            account = AccountRepository(session).create("Тимур", "fresh-search-account")
+            resume = ResumeRepository(session).upsert(
+                account.id,
+                "resume-fresh-search",
+                "Python backend разработчик",
+            )
+            session.add(
+                CandidateProfileModel(
+                    account_id=account.id,
+                    active_resume_id=resume.id,
+                    display_name="Тимур",
+                )
+            )
+            directions = DirectionRepository(session)
+            direction = directions.create(
+                account.id,
+                "Python backend",
+                scoring_config={
+                    "role_scope": "PYTHON_BACKEND",
+                    "search_settings": {"remote_all_russia": True},
+                },
+            )
+            directions.attach_resume(direction.id, resume.id)
+            query = directions.add_query(
+                direction.id,
+                "Python backend разработчик",
+                regions=(SearchRegion("1", "Москва"),),
+                work_formats=(WorkFormat.REMOTE, WorkFormat.ON_SITE, WorkFormat.HYBRID),
+                schedule_minutes=120,
+            )
+            backlog = VacancyRepository(session).upsert(
+                VacancyData(
+                    hh_id="fresh-search-backlog",
+                    title="Python backend разработчик",
+                    source_url="https://hh.ru/vacancy/fresh-search-backlog",
+                    employer_name="Пример",
+                    published_at=now - timedelta(days=1),
+                )
+            )
+            directions.track_vacancy(direction.id, backlog.id)
+            account_id = account.id
+            query_id = query.id
+    finally:
+        database.close()
+
+    browser = FakeSearchBrowser(
+        HhProfileData(
+            external_id="fresh-search-account",
+            label="Тимур",
+            resumes=(HhResumeData("resume-fresh-search", "Python backend разработчик"),),
+        )
+    )
+
+    result = BackgroundSearchCycle(settings, page_limit=1, detail_limit=1).run(
+        account_id=account_id,
+        search_query_id=query_id,
+        browser=browser,
+        prefer_fresh_search=True,
+    )
+
+    assert result["backlog_processed"] is False
+    assert result["search_variants"] == 2
+    assert result["pages_loaded"] == 2
+    assert browser.searches == [
+        ("Python backend разработчик", "1", 0),
+        ("Python backend разработчик", "113", 0),
+    ]
+    assert browser.search_filters[0]["work_format"] == ["HYBRID", "ON_SITE"]
+    assert browser.search_filters[1]["work_format"] == ["REMOTE"]
 
 
 @pytest.mark.parametrize(
