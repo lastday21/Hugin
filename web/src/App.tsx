@@ -85,6 +85,7 @@ import type {
   EmploymentForm,
   FormDraft,
   FormQuestion,
+  Incident,
   NotificationSettings,
   Profile,
   ProfileFact,
@@ -834,6 +835,7 @@ function DashboardView({
     (dashboard.task_counts.PENDING ?? 0) +
     (dashboard.task_counts.RUNNING ?? 0) +
     (dashboard.task_counts.RETRY_SCHEDULED ?? 0);
+  const dashboardIncidents = compactDashboardIncidents(dashboard.incidents);
   const system = systemPresentation(dashboard, automaticQueueCount);
   const SystemIcon = system.icon;
 
@@ -895,7 +897,7 @@ function DashboardView({
 
       <BackgroundStatusBar dashboard={dashboard} />
 
-      {dashboard.incidents.length > 0 && (
+      {dashboardIncidents.length > 0 && (
         <section className="incident-list" aria-labelledby="incident-title">
           <div className="section-heading">
             <div>
@@ -903,7 +905,7 @@ function DashboardView({
               <h2 id="incident-title">Ошибки и предупреждения</h2>
             </div>
           </div>
-          {dashboard.incidents.map((incident) => (
+          {dashboardIncidents.map((incident) => (
             <div
               className={`incident-row ${incident.severity.toLowerCase()}`}
               key={incident.id}
@@ -952,6 +954,29 @@ function DashboardView({
       )}
     </div>
   );
+}
+
+function compactDashboardIncidents(incidents: Incident[]): Incident[] {
+  const messageFailures = incidents.filter(
+    (incident) => incident.code === "RECRUITER_MESSAGE_SEND_FAILED",
+  );
+  if (!messageFailures.length) return incidents;
+
+  const latest = messageFailures[0];
+  const groupedFailure: Incident = {
+    ...latest,
+    severity: "WARNING",
+    message:
+      messageFailures.length === 1
+        ? "Ответ работодателю не отправлен. Если он уже разрешён, Hugin повторит отправку; иначе ответ ждёт решения в разделе «Общение»."
+        : `Не отправлены ${messageFailures.length} ответов работодателям. Уже разрешённые Hugin повторит; остальные ждут решения в разделе «Общение».`,
+  };
+  return [
+    groupedFailure,
+    ...incidents.filter(
+      (incident) => incident.code !== "RECRUITER_MESSAGE_SEND_FAILED",
+    ),
+  ].sort((left, right) => right.created_at.localeCompare(left.created_at));
 }
 
 function BackgroundStatusBar({ dashboard }: { dashboard: Dashboard }) {
