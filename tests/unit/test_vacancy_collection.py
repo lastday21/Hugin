@@ -9,12 +9,22 @@ from sqlalchemy import func, select
 from hugin.core.settings import Settings
 from hugin.database import create_database, upgrade_database
 from hugin.database.models import ApplicationModel, DirectionVacancyModel
-from hugin.domain import VacancyData, VacancyState
+from hugin.domain import VacancyAvailability, VacancyData, VacancyState
+from hugin.domain.applications import ApplicationState
 from hugin.domain.directions import DirectionScope
-from hugin.repositories import AccountRepository, DirectionRepository, ResumeRepository
+from hugin.repositories import (
+    AccountRepository,
+    ApplicationRepository,
+    DirectionRepository,
+    ResumeRepository,
+)
 from hugin.repositories.vacancies import VacancyRepository
 from hugin.services.application_automation import ApplicationAutomationService
-from hugin.services.vacancy_analysis import RuleCategory, VacancyAnalysisService
+from hugin.services.vacancy_analysis import (
+    RULES_VERSION,
+    RuleCategory,
+    VacancyAnalysisService,
+)
 from hugin.services.vacancy_review import VacancyReviewService
 
 pytestmark = pytest.mark.integration
@@ -78,14 +88,12 @@ def test_collection_tracks_changes_discoveries_duplicates_and_rejected(
 
             assert [result.evaluation.category for result in results] == [
                 RuleCategory.MATCH,
-                RuleCategory.MATCH,
+                RuleCategory.REJECTED,
                 RuleCategory.REJECTED,
             ]
-            assert results[1].state is VacancyState.ANALYZED
+            assert results[1].state is VacancyState.FILTERED_OUT
             assert results[1].vacancy.duplicate_of_id == results[0].vacancy.id
-            assert any(
-                "обрабатывается отдельно" in reason for reason in results[1].evaluation.reasons
-            )
+            assert "дубликат вакансии" in results[1].evaluation.reasons
 
             directions.record_discovery(
                 direction_id=direction.id,
@@ -115,6 +123,19 @@ def test_collection_tracks_changes_discoveries_duplicates_and_rejected(
             assert len(repository.list_discoveries(updated.id)) == 1
 
             review = VacancyReviewService(session)
+            review.restore(
+                account_id=account.id,
+                direction_name="Python backend",
+                hh_id="101",
+            )
+            rechecked = service.reanalyze(
+                account_external_id="account-vacancies",
+                direction_name="Python backend",
+            )
+            duplicate = next(item for item in rechecked if item.vacancy.hh_id == "101")
+            assert duplicate.evaluation.category is RuleCategory.REJECTED
+            assert duplicate.state is VacancyState.FILTERED_OUT
+
             rejected = review.list_rejected(
                 account_id=account.id,
                 direction_name="Python backend",
@@ -328,6 +349,241 @@ def test_duplicate_detection_does_not_depend_on_detail_fetch_order(
         database.close()
 
 
+def test_reanalysis_promotes_active_duplicate_with_archived_canonical(
+    settings: Settings,
+) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    try:
+        with database.sessions.begin() as session:
+            account = AccountRepository(session).create(
+                "Тест",
+                "persisted-duplicate-account",
+            )
+            assert account.external_id is not None
+            resume = ResumeRepository(session).upsert(
+                account.id,
+                "persisted-duplicate-resume",
+                "Python",
+            )
+            directions = DirectionRepository(session)
+            direction = directions.create(account.id, "Python backend")
+            directions.attach_resume(direction.id, resume.id)
+
+            vacancies = VacancyRepository(session)
+            canonical = vacancies.upsert(
+                detailed_vacancy("persisted-canonical", "Python backend разработчик")
+            )
+            duplicate = vacancies.upsert(
+                detailed_vacancy("persisted-duplicate", "Python backend разработчик")
+            )
+            vacancies.mark_duplicate(duplicate.id, canonical.id, 0.99)
+            directions.track_vacancy(direction.id, canonical.id)
+            vacancies.mark_unavailable(canonical.id, VacancyAvailability.ARCHIVED)
+            directions.track_vacancy(direction.id, duplicate.id)
+            directions.apply_rules(
+                direction.id,
+                duplicate.id,
+                state=VacancyState.ANALYZED,
+                score=90,
+                details={
+                    "accepted": True,
+                    "category": RuleCategory.MATCH.value,
+                    "manual_override": "ACCEPT",
+                    "reasons": ["решение изменено пользователем"],
+                },
+                rules_version=RULES_VERSION,
+            )
+
+            stored = vacancies.get(duplicate.id)
+            assert stored.duplicate_of_id == canonical.id
+            assert vacancies.list_duplicate_candidates(stored) == []
+
+            reanalyzed = VacancyAnalysisService(session).reanalyze(
+                account_external_id=account.external_id,
+                direction_name=direction.name,
+            )
+            result = next(item for item in reanalyzed if item.vacancy.id == duplicate.id)
+            canonical_result = next(item for item in reanalyzed if item.vacancy.id == canonical.id)
+
+            assert result.evaluation.category is RuleCategory.MATCH
+            assert result.evaluation.accepted
+            assert result.state is VacancyState.ANALYZED
+            assert result.vacancy.duplicate_of_id is None
+            assert vacancies.get(duplicate.id).duplicate_of_id is None
+            assert vacancies.get(canonical.id).duplicate_of_id == duplicate.id
+            assert canonical_result.evaluation.category is RuleCategory.REJECTED
+            assert canonical_result.state is VacancyState.CLOSED
+            assert (
+                directions.get_tracked_vacancy(direction.id, canonical.id).rules_details["category"]
+                == RuleCategory.REJECTED.value
+            )
+
+            prepared = ApplicationAutomationService(session).prepare_for_account_id(
+                account_id=account.id,
+                direction_name=direction.name,
+                include_stretch=False,
+            )
+
+            assert prepared.created == 1
+            application = session.scalar(select(ApplicationModel))
+            assert application is not None
+            assert application.vacancy_id == duplicate.id
+    finally:
+        database.close()
+
+
+def test_reanalysis_uses_updated_duplicate_family_after_promotion(
+    settings: Settings,
+) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    try:
+        with database.sessions.begin() as session:
+            account = AccountRepository(session).create(
+                "Тест",
+                "duplicate-family-promotion-account",
+            )
+            assert account.external_id is not None
+            resume = ResumeRepository(session).upsert(
+                account.id,
+                "duplicate-family-promotion-resume",
+                "Python",
+            )
+            directions = DirectionRepository(session)
+            direction = directions.create(account.id, "Python backend")
+            directions.attach_resume(direction.id, resume.id)
+
+            vacancies = VacancyRepository(session)
+            first_active = vacancies.upsert(
+                detailed_vacancy("family-active-first", "Python backend разработчик")
+            )
+            old_canonical = vacancies.upsert(
+                detailed_vacancy("family-old-canonical", "Python backend разработчик")
+            )
+            later_active = vacancies.upsert(
+                detailed_vacancy("family-active-later", "Python backend разработчик")
+            )
+            vacancies.mark_duplicate(first_active.id, old_canonical.id, 0.99)
+            vacancies.mark_duplicate(later_active.id, old_canonical.id, 0.99)
+            for vacancy in (first_active, old_canonical, later_active):
+                directions.track_vacancy(direction.id, vacancy.id)
+            vacancies.mark_unavailable(
+                old_canonical.id,
+                VacancyAvailability.ARCHIVED,
+            )
+
+            results = VacancyAnalysisService(session).reanalyze(
+                account_external_id=account.external_id,
+                direction_name=direction.name,
+            )
+            by_id = {item.vacancy.id: item for item in results}
+
+            assert by_id[first_active.id].evaluation.category is RuleCategory.MATCH
+            assert by_id[first_active.id].vacancy.duplicate_of_id is None
+            assert by_id[old_canonical.id].evaluation.category is RuleCategory.REJECTED
+            assert by_id[old_canonical.id].state is VacancyState.CLOSED
+            assert by_id[later_active.id].evaluation.category is RuleCategory.REJECTED
+            assert by_id[later_active.id].state is VacancyState.FILTERED_OUT
+            assert vacancies.get(old_canonical.id).duplicate_of_id == first_active.id
+            assert vacancies.get(later_active.id).duplicate_of_id == first_active.id
+
+            prepared = ApplicationAutomationService(session).prepare_for_account_id(
+                account_id=account.id,
+                direction_name=direction.name,
+                include_stretch=False,
+            )
+
+            assert prepared.created == 1
+            application = session.scalar(select(ApplicationModel))
+            assert application is not None
+            assert application.vacancy_id == first_active.id
+    finally:
+        database.close()
+
+
+def test_reanalysis_keeps_duplicate_blocked_when_family_has_sent_application(
+    settings: Settings,
+) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    try:
+        with database.sessions.begin() as session:
+            account = AccountRepository(session).create(
+                "Тест",
+                "persisted-duplicate-sent-account",
+            )
+            assert account.external_id is not None
+            resume = ResumeRepository(session).upsert(
+                account.id,
+                "persisted-duplicate-sent-resume",
+                "Python",
+            )
+            directions = DirectionRepository(session)
+            direction = directions.create(account.id, "Python backend")
+            directions.attach_resume(direction.id, resume.id)
+
+            vacancies = VacancyRepository(session)
+            canonical = vacancies.upsert(
+                detailed_vacancy("persisted-sent-canonical", "Python backend разработчик")
+            )
+            duplicate = vacancies.upsert(
+                detailed_vacancy("persisted-sent-duplicate", "Python backend разработчик")
+            )
+            vacancies.mark_duplicate(duplicate.id, canonical.id, 0.99)
+            directions.track_vacancy(direction.id, canonical.id)
+            directions.track_vacancy(direction.id, duplicate.id)
+            directions.apply_rules(
+                direction.id,
+                duplicate.id,
+                state=VacancyState.ANALYZED,
+                score=90,
+                details={
+                    "accepted": True,
+                    "category": RuleCategory.MATCH.value,
+                    "manual_override": "ACCEPT",
+                    "reasons": ["решение изменено пользователем"],
+                },
+                rules_version=RULES_VERSION,
+            )
+            applications = ApplicationRepository(session)
+            application = applications.create_apply_intent(
+                account.id,
+                canonical.id,
+                resume.id,
+                direction.id,
+            )
+            applications.transition_state(
+                application.id,
+                ApplicationState.APPLIED,
+                {"source": "hh.ru"},
+            )
+            vacancies.mark_unavailable(canonical.id, VacancyAvailability.ARCHIVED)
+
+            reanalyzed = VacancyAnalysisService(session).reanalyze(
+                account_external_id=account.external_id,
+                direction_name=direction.name,
+            )
+            result = next(item for item in reanalyzed if item.vacancy.id == duplicate.id)
+
+            assert result.evaluation.category is RuleCategory.REJECTED
+            assert result.state is VacancyState.FILTERED_OUT
+            assert vacancies.get(duplicate.id).duplicate_of_id == canonical.id
+            assert (
+                ApplicationAutomationService(session)
+                .prepare_for_account_id(
+                    account_id=account.id,
+                    direction_name=direction.name,
+                    include_stretch=False,
+                )
+                .created
+                == 0
+            )
+            assert session.scalar(select(func.count(ApplicationModel.id))) == 1
+    finally:
+        database.close()
+
+
 def test_relinking_canonical_vacancy_keeps_duplicate_family_flat(
     settings: Settings,
 ) -> None:
@@ -340,17 +596,13 @@ def test_relinking_canonical_vacancy_keeps_duplicate_family_flat(
             first = repository.upsert(detailed_vacancy("duplicate-family-1", title))
             second = repository.upsert(detailed_vacancy("duplicate-family-2", title))
             third = repository.upsert(detailed_vacancy("duplicate-family-3", title))
-            new_canonical = repository.upsert(
-                detailed_vacancy("duplicate-family-4", title)
-            )
+            new_canonical = repository.upsert(detailed_vacancy("duplicate-family-4", title))
 
             repository.mark_duplicate(second.id, first.id, 0.99)
             repository.mark_duplicate(third.id, first.id, 0.99)
             repository.mark_duplicate(first.id, new_canonical.id, 0.99)
 
-            expected_family = tuple(
-                sorted((first.id, second.id, third.id, new_canonical.id))
-            )
+            expected_family = tuple(sorted((first.id, second.id, third.id, new_canonical.id)))
             assert repository.get(first.id).duplicate_of_id == new_canonical.id
             assert repository.get(second.id).duplicate_of_id == new_canonical.id
             assert repository.get(third.id).duplicate_of_id == new_canonical.id

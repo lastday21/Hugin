@@ -38,6 +38,7 @@ from hugin.repositories import (
     SystemStateRepository,
 )
 from hugin.repositories.vacancies import VacancyRepository
+from hugin.services.ai_prompts import DEFAULT_COVER_LETTER_PROMPT
 from hugin.services.application_automation import ApplicationAutomationService
 from hugin.services.cover_letter import (
     MANUAL_REVIEW_MODEL,
@@ -52,6 +53,7 @@ from hugin.services.cover_letter import (
     _set_similarity,
     _shares_token,
     _without_future_plans,
+    _without_generic_closing,
     _without_irrelevant_context_lines,
     _work_experience_excerpt,
     build_cover_letter_prompt,
@@ -85,6 +87,17 @@ def _letter() -> str:
         "прикладную логику от доступа к данным и проверял обработку ошибок.\n\n"
         "Буду рад подробнее обсудить задачи серверной части и рассказать о реализованных "
         "решениях."
+    )
+
+
+def _gap_dominated_letter() -> str:
+    return (
+        "Здравствуйте!\n\n"
+        "Прямого опыта с FastAPI и PostgreSQL у меня пока нет. Разрабатывал серверные "
+        "приложения на Python, настраивал автоматические проверки и разбирал требования "
+        "к интеграциям. При доработке служб отделял прикладную логику от доступа к данным, "
+        "проверял обработку ошибок и основные сценарии перед выпуском изменений.\n\n"
+        "Готов рассказать о реализованной прикладной логике и автоматических проверках."
     )
 
 
@@ -280,6 +293,8 @@ def test_yandex_letter_uses_only_confirmed_facts_and_is_saved(settings: Settings
             assert result.generated == 1
             assert result.failed == 0
             assert "Полное описание" in model.prompts[0][1]
+            assert "Дополнительные пожелания пользователя" not in model.prompts[0][1]
+            assert DEFAULT_COVER_LETTER_PROMPT not in model.prompts[0][1]
             assert "Настраивал автоматические проверки" in model.prompts[0][1]
             assert "Kubernetes" not in model.prompts[0][1]
             assert "github.com" not in model.prompts[0][1]
@@ -287,7 +302,7 @@ def test_yandex_letter_uses_only_confirmed_facts_and_is_saved(settings: Settings
             letter = session.scalar(select(CoverLetterModel))
             assert letter is not None
             assert letter.state == CoverLetterState.READY
-            assert letter.text == _letter()
+            assert letter.text == _without_generic_closing(_letter())
             assert letter.context_hash
             fact_ids = tuple(
                 session.scalars(
@@ -311,13 +326,25 @@ def test_yandex_letter_uses_only_confirmed_facts_and_is_saved(settings: Settings
             assert repeated.already_ready == 1
             assert len(model.prompts) == 1
 
+            current_hash = CoverLetterService(session).current_context_hash(letter.application_id)
+            compatible_hashes = CoverLetterService(session).compatible_context_hashes(
+                letter.application_id
+            )
+            assert compatible_hashes[0] == current_hash
+            assert len(compatible_hashes) == 2
+            letter.context_hash = compatible_hashes[1]
+            CoverLetterService(session).validate_for_submission(
+                application_id=letter.application_id,
+                letter_id=letter.id,
+            )
+
             SystemStateRepository(session).transition(SystemState.RUNNING)
             job = ApplicationAutomationService(session).claim_next(
                 direction_id,
                 require_cover_letter=True,
             )
             assert job is not None
-            assert job.cover_letter == _letter()
+            assert job.cover_letter == _without_generic_closing(_letter())
             selected_instruction_version = letter.instruction_version
             letter.instruction_version = "changed-after-submit"
             replacement = CoverLetterModel(
@@ -343,6 +370,38 @@ def test_yandex_letter_uses_only_confirmed_facts_and_is_saved(settings: Settings
             assert sent_letter.sent_at is not None
             assert replacement.state == CoverLetterState.READY
             assert replacement.sent_at is None
+            applied_event = ApplicationRepository(session).list_events(job.application.id)[-1]
+            assert (
+                applied_event.payload["cover_letter_instruction_version"]
+                == selected_instruction_version
+            )
+    finally:
+        database.close()
+
+
+def test_submission_stops_letter_dominated_by_key_experience_gaps(
+    settings: Settings,
+) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    try:
+        with database.sessions.begin() as session:
+            account_id, _, _, _ = _prepare_data(session)
+            CoverLetterService(session, FakeModel([_letter()])).prepare(
+                account_id=account_id,
+                direction_name="Python backend",
+            )
+            letter = session.scalar(select(CoverLetterModel))
+            assert letter is not None
+            letter.text = _gap_dominated_letter()
+
+            with pytest.raises(CoverLetterValidationError) as error:
+                CoverLetterService(session).validate_for_submission(
+                    application_id=letter.application_id,
+                    letter_id=letter.id,
+                )
+
+            assert error.value.code == "KEY_EXPERIENCE_GAPS_DOMINATE"
     finally:
         database.close()
 
@@ -377,7 +436,7 @@ def test_user_confirmed_work_fact_uses_writer_without_approved_candidate(
             letter = session.scalar(select(CoverLetterModel))
             assert letter is not None
             assert letter.state is CoverLetterState.READY
-            assert letter.text == _letter()
+            assert letter.text == _without_generic_closing(_letter())
             assert letter.generation_mode is CoverLetterGenerationMode.MODEL_NEW
     finally:
         database.close()
@@ -413,7 +472,7 @@ def test_legacy_ready_letter_is_rebuilt_before_sending(settings: Settings) -> No
             assert result.generated == 1
             assert result.already_ready == 0
             assert len(replacement_writer.prompts) == 1
-            assert letter.text == _alternative_letter()
+            assert letter.text == _without_generic_closing(_alternative_letter())
             assert letter.generation_mode is CoverLetterGenerationMode.MODEL_NEW
     finally:
         database.close()
@@ -537,8 +596,8 @@ def test_light_router_can_make_limited_valid_edit(
             account_id, _, source, vacancy_hh_id = _prepare_routing_target(session)
             assert source.text is not None
             edited = source.text.replace(
-                "Буду рад подробнее обсудить задачи серверной части",
-                "Буду рад подробнее обсудить развитие серверной части и интеграций",
+                "с задачами развития серверной части и интеграций",
+                "с задачами развития серверной части, API и интеграций",
             )
             writer = FakeModel([])
             writer.model_name = "strong-writer"
@@ -668,7 +727,7 @@ def test_invalid_light_edit_falls_back_to_strong_writer(
                 select(CoverLetterModel).where(CoverLetterModel.id != source.id)
             )
             assert target is not None
-            assert target.text == _alternative_letter()
+            assert target.text == _without_generic_closing(_alternative_letter())
             assert target.generation_mode is CoverLetterGenerationMode.MODEL_NEW
             assert target.model_name == "strong-writer"
             assert target.router_model_name == "light-router"
@@ -953,7 +1012,7 @@ def test_ready_model_letter_without_current_prompt_version_is_regenerated(
             assert repeated.already_ready == 0
             assert len(model.prompts) == 2
             assert letter.prompt_version_id is not None
-            assert letter.text == _letter().replace("Буду рад", "Готов")
+            assert letter.text == _without_generic_closing(_letter().replace("Буду рад", "Готов"))
     finally:
         database.close()
 
@@ -983,7 +1042,7 @@ def test_unconfirmed_number_is_corrected_once(settings: Settings) -> None:
             letter = session.scalar(select(CoverLetterModel))
             assert letter is not None
             assert letter.state is CoverLetterState.READY
-            assert letter.text == _letter()
+            assert letter.text == _without_generic_closing(_letter())
             assert letter.failure_reason is None
             assert len(model.prompts) == 2
             assert "Код проверки: UNCONFIRMED_NUMBER" in model.prompts[1][1]
@@ -1049,7 +1108,7 @@ def test_template_phrase_is_corrected_once_with_specific_reason(
             letter = session.scalar(select(CoverLetterModel))
             assert letter is not None
             assert letter.state is CoverLetterState.READY
-            assert letter.text == _letter()
+            assert letter.text == _without_generic_closing(_letter())
             assert letter.failure_reason is None
             rejection = session.scalar(select(CoverLetterRejectionModel))
             assert rejection is not None
@@ -1118,7 +1177,7 @@ def test_third_correction_can_pass_with_all_previous_rejections_in_prompt(
             task = session.scalar(select(ApplicationTaskModel))
             assert letter is not None
             assert letter.state is CoverLetterState.READY
-            assert letter.text == _letter()
+            assert letter.text == _without_generic_closing(_letter())
             assert letter.failure_reason is None
             rejections = tuple(
                 session.scalars(
@@ -2531,6 +2590,27 @@ def test_prompt_normalization_and_context_selection() -> None:
     assert "Здравствуйте!" in prompt
 
 
+@pytest.mark.parametrize(
+    "closing",
+    (
+        "Готов подробно рассказать, как проверял изменения перед выпуском.",
+        "Готов обсудить, как организована работа серверной части.",
+        "Буду рад подробнее разобрать реализованное решение.",
+    ),
+)
+def test_generic_closing_is_removed_without_another_model_call(closing: str) -> None:
+    body = (
+        "Здравствуйте!\n\n"
+        "В личном проекте реализовал серверную часть на Python и FastAPI, спроектировал "
+        "схему PostgreSQL и подготовил миграции Alembic. Для проверки изменений добавил "
+        "автоматические тесты, сборку Docker-образа и отдельную проверку основных сценариев. "
+        "Такой порядок позволил воспроизводимо проверять изменения до запуска приложения. "
+        "При доработке сервиса отдельно проверял обработку ошибок и сохранение состояния."
+    )
+
+    assert _without_generic_closing(f"{body}\n\n{closing}") == body
+
+
 def test_letter_similarity_detects_paraphrased_template_but_not_distinct_evidence() -> None:
     first = (
         "Здравствуйте!\n\nРазрабатываю сервис на Python и FastAPI, работаю с PostgreSQL "
@@ -2824,6 +2904,27 @@ def test_honest_absence_of_unconfirmed_technology_is_allowed() -> None:
     vacancy.description = "Откликайся и опиши опыт работы с Airflow."
 
     validate_cover_letter(text, vacancy, _fact())
+
+
+def test_letter_listing_several_missing_key_technologies_is_rejected() -> None:
+    text = (
+        "Здравствуйте!\n\nПрямого опыта с Kubernetes и Terraform у меня пока нет. "
+        "Также пока не работал с SIEM и администрированием Linux. Разрабатывал серверные "
+        "приложения на Python и FastAPI, работал с PostgreSQL и настраивал автоматические "
+        "проверки. При доработке служб отделял прикладную логику от доступа к данным, "
+        "проверял обработку ошибок и основные сценарии перед выпуском изменений.\n\n"
+        "Готов рассказать о реализованных серверных решениях и проверках."
+    )
+    vacancy = _vacancy()
+    vacancy.description = (
+        "Разработка сервисов на Python, FastAPI и PostgreSQL. Требуются Kubernetes, "
+        "Terraform, SIEM и администрирование Linux."
+    )
+
+    with pytest.raises(CoverLetterValidationError) as error:
+        validate_cover_letter(text, vacancy, _fact())
+
+    assert error.value.code == "KEY_EXPERIENCE_GAPS_DOMINATE"
 
 
 def test_marketplace_experience_request_rejects_evasive_answer() -> None:

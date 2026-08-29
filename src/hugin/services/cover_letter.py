@@ -38,7 +38,11 @@ from hugin.domain.directions import VacancyState
 from hugin.domain.tasks import TaskState
 from hugin.domain.vacancies import VacancyAvailability
 from hugin.repositories.tasks import QueueTaskRepository
-from hugin.services.ai_prompts import AiPromptSettingsService, with_user_prompt
+from hugin.services.ai_prompts import (
+    DEFAULT_COVER_LETTER_PROMPT,
+    AiPromptSettingsService,
+    with_user_prompt,
+)
 from hugin.services.cover_letter_routing import (
     ROUTER_SYSTEM_PROMPT,
     RoutingCandidate,
@@ -58,6 +62,18 @@ MANUAL_REVIEW_MODEL = "manual-review"
 MIN_LETTER_LENGTH = 350
 MAX_LETTER_LENGTH = 2000
 MAX_FACT_CONTEXT_LENGTH = 7_000
+
+
+def _cover_letter_prompt_variants(base_prompt: str, user_instruction: str) -> tuple[str, ...]:
+    legacy_prompt = with_user_prompt(base_prompt, user_instruction)
+    if user_instruction.strip() != DEFAULT_COVER_LETTER_PROMPT.strip():
+        return (legacy_prompt,)
+    return (base_prompt, legacy_prompt)
+
+
+def _prompt_hash(prompt: str) -> str:
+    return hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+
 
 SYSTEM_PROMPT = """Ты пишешь индивидуальные сопроводительные письма на русском языке для
 отклика через hh.ru на ИТ-вакансии. Письмо должно звучать как сообщение живого специалиста,
@@ -159,6 +175,8 @@ _TECHNOLOGY_PATTERNS = (
     ("Docker", re.compile(r"\bdocker\b", re.IGNORECASE)),
     ("RabbitMQ", re.compile(r"\brabbitmq\b", re.IGNORECASE)),
     ("Kubernetes", re.compile(r"\bkubernetes\b|(?<![A-Za-z])k8s(?![A-Za-z])", re.IGNORECASE)),
+    ("Terraform", re.compile(r"\bterraform\b", re.IGNORECASE)),
+    ("SIEM", re.compile(r"(?<![A-Za-z])siem(?![A-Za-z])", re.IGNORECASE)),
     ("Temporal", re.compile(r"\btemporal\b", re.IGNORECASE)),
     ("MongoDB", re.compile(r"\bmongodb\b", re.IGNORECASE)),
     ("MySQL", re.compile(r"\bmysql\b", re.IGNORECASE)),
@@ -255,6 +273,12 @@ _REQUIRED_OPENING = re.compile(
     r"(?:со\s+(?:слова|знака|фразы)|с\s+(?:кодовой\s+)?фразы)"
     r")\s*[:—-]?\s*[«\"']?([^\n.!?;»\"']{1,80})",
     re.IGNORECASE,
+)
+_GENERIC_CLOSING_SENTENCE = re.compile(
+    r"(?:\n\s*\n|(?<=[.!?])\s+)"
+    r"(?:готов(?:\s+(?:подробно|подробнее))?|буду\s+рад(?:\s+(?:подробно|подробнее))?)\s+"
+    r"(?:рассказать|разобрать|обсудить)\b[^.!?]*[.!?]\s*$",
+    re.IGNORECASE | re.DOTALL,
 )
 _EDUCATION_RELEVANCE = re.compile(
     r"\b(?:образован\w*|студент\w*|магистр\w*|бакалавр\w*|"
@@ -1206,7 +1230,7 @@ class CoverLetterService:
             self._replace_fact_links(letter.id, tuple(used_fact_ids))
         elif used_fact_ids != stored_fact_ids:
             raise ValueError("Журнал источников сопроводительного письма устарел")
-        if letter.context_hash != self.current_context_hash(application.id):
+        if letter.context_hash not in self.compatible_context_hashes(application.id):
             raise ValueError("Данные вакансии, правила или подтверждённые факты изменились")
 
     def handle_stale_ready_letter(
@@ -1234,6 +1258,9 @@ class CoverLetterService:
         return False
 
     def current_context_hash(self, application_id: int) -> str:
+        return self.compatible_context_hashes(application_id)[0]
+
+    def compatible_context_hashes(self, application_id: int) -> tuple[str, ...]:
         row = self._session.execute(
             select(
                 ApplicationModel,
@@ -1261,7 +1288,7 @@ class CoverLetterService:
         candidate = _Candidate(application, vacancy, resume, tracked)
         facts = self._select_facts(candidate, direction.id)
         instruction = AiPromptSettingsService(self._session).get().cover_letter
-        user_prompt = with_user_prompt(
+        prompt_variants = _cover_letter_prompt_variants(
             build_cover_letter_prompt(
                 vacancy,
                 direction.name,
@@ -1270,7 +1297,7 @@ class CoverLetterService:
             ),
             instruction,
         )
-        return hashlib.sha256(user_prompt.encode("utf-8")).hexdigest()
+        return tuple(_prompt_hash(prompt) for prompt in prompt_variants)
 
     def _prepare_one(
         self,
@@ -1282,7 +1309,7 @@ class CoverLetterService:
     ) -> CoverLetterPreparationItem:
         model = self._require_model()
         facts = self._select_facts(candidate, direction.id)
-        user_prompt = with_user_prompt(
+        prompt_variants = _cover_letter_prompt_variants(
             build_cover_letter_prompt(
                 candidate.vacancy,
                 direction.name,
@@ -1291,14 +1318,16 @@ class CoverLetterService:
             ),
             user_instruction,
         )
-        context_hash = hashlib.sha256(user_prompt.encode("utf-8")).hexdigest()
+        user_prompt = prompt_variants[0]
+        compatible_context_hashes = frozenset(_prompt_hash(prompt) for prompt in prompt_variants)
+        context_hash = _prompt_hash(user_prompt)
         letter = self._current_letter(candidate.application.id, instruction_version)
         if (
             letter is not None
             and letter.state is CoverLetterState.READY
             and letter.model_name == MANUAL_REVIEW_MODEL
         ):
-            if not letter.text or letter.context_hash != context_hash:
+            if not letter.text or letter.context_hash not in compatible_context_hashes:
                 return self._item(
                     candidate,
                     CoverLetterState.READY,
@@ -1324,7 +1353,7 @@ class CoverLetterService:
             letter is not None
             and letter.state is CoverLetterState.READY
             and letter.text
-            and letter.context_hash == context_hash
+            and letter.context_hash in compatible_context_hashes
             and letter.prompt_version_id == prompt_version.id
             and (
                 letter.generation_mode is not CoverLetterGenerationMode.LEGACY
@@ -1342,17 +1371,30 @@ class CoverLetterService:
                 )
             )
         ):
+            prepared_text = _without_generic_closing(letter.text)
             try:
-                validate_cover_letter(letter.text, candidate.vacancy, facts)
+                used_facts = validate_cover_letter(prepared_text, candidate.vacancy, facts)
             except CoverLetterValidationError:
                 pass
             else:
+                if prepared_text != letter.text:
+                    self._save_ready(
+                        letter,
+                        prepared_text,
+                        tuple(fact.id for fact in used_facts),
+                        reused_from_id=letter.reused_from_id,
+                        generation_mode=letter.generation_mode,
+                        model_name=letter.model_name,
+                        router_model_name=letter.router_model_name,
+                        router_confidence=letter.router_confidence,
+                        router_reason=letter.router_reason,
+                    )
                 return self._item(candidate, CoverLetterState.READY, "existing")
         if (
             letter is not None
             and letter.state is CoverLetterState.FAILED
             and _is_permanent_preparation_failure(letter.failure_reason)
-            and letter.context_hash == context_hash
+            and letter.context_hash in compatible_context_hashes
             and letter.model_name == model.model_name
             and letter.prompt_version_id == prompt_version.id
         ):
@@ -1388,14 +1430,15 @@ class CoverLetterService:
             )
         source = self._duplicate_source(candidate, instruction_version)
         if source is not None and source.text:
+            source_text = _without_generic_closing(source.text)
             try:
-                duplicate_facts = validate_cover_letter(source.text, candidate.vacancy, facts)
+                duplicate_facts = validate_cover_letter(source_text, candidate.vacancy, facts)
             except CoverLetterValidationError:
                 pass
             else:
                 self._save_ready(
                     letter,
-                    source.text,
+                    source_text,
                     tuple(fact.id for fact in duplicate_facts),
                     reused_from_id=source.id,
                     generation_mode=CoverLetterGenerationMode.DUPLICATE_REUSE,
@@ -1530,7 +1573,9 @@ class CoverLetterService:
         candidate: _Candidate,
         facts: tuple[_SelectedFact, ...],
     ) -> tuple[str, tuple[_SelectedFact, ...]]:
-        text = normalize_cover_letter(model.complete(SYSTEM_PROMPT, user_prompt))
+        text = _without_generic_closing(
+            normalize_cover_letter(model.complete(SYSTEM_PROMPT, user_prompt))
+        )
         try:
             used_facts = validate_cover_letter(text, candidate.vacancy, facts)
         except CoverLetterValidationError as error:
@@ -1664,7 +1709,7 @@ class CoverLetterService:
             )
         assert decision.text is not None
         assert selected.letter.text is not None
-        edited_text = normalize_cover_letter(decision.text)
+        edited_text = _without_generic_closing(normalize_cover_letter(decision.text))
         similarity = _letter_similarity(edited_text, selected.letter.text)
         if edited_text == selected.letter.text or similarity < _MIN_EDIT_SIMILARITY:
             return _RoutingAttempt(
@@ -2463,6 +2508,11 @@ def normalize_cover_letter(response: str) -> str:
     return "\n".join(normalized).strip()
 
 
+def _without_generic_closing(text: str) -> str:
+    shortened = _GENERIC_CLOSING_SENTENCE.sub("", text).rstrip()
+    return shortened if len(shortened) >= MIN_LETTER_LENGTH else text
+
+
 def _confirmed_experience_facts(
     facts: tuple[_SelectedFact, ...],
 ) -> tuple[_SelectedFact, ...]:
@@ -2508,6 +2558,30 @@ def _unconfirmed_requested_experience(
         if any(pattern.search(fragment) is not None for fragment in request_fragments)
         and pattern.search(experience_fact_text) is None
     )
+
+
+def _dominant_key_experience_gap(text: str, vacancy: VacancyModel) -> str | None:
+    vacancy_text = _vacancy_text(vacancy)
+    vacancy_focus = _vacancy_focus_tokens(vacancy) - _GENERIC_RELEVANCE_TERMS
+    gap_segments: list[str] = []
+    for raw_segment in re.split(r"(?:\n+|(?<=[.!?])\s+)", text):
+        segment = " ".join(raw_segment.split())
+        if not segment or _NEGATED_TECHNOLOGY_EXPERIENCE.search(segment) is None:
+            continue
+        topics = {
+            label
+            for label, pattern in _EXPERIENCE_REQUEST_TOPICS
+            if pattern.search(vacancy_text) is not None and pattern.search(segment) is not None
+        }
+        shared_focus = _matching_tokens(vacancy_focus, _tokens(segment))
+        if not topics and not shared_focus:
+            continue
+        gap_segments.append(segment)
+        if len(topics) >= 2 or len(shared_focus) >= 3:
+            return segment
+    if len(gap_segments) >= 2:
+        return " ".join(gap_segments[:2])
+    return None
 
 
 def validate_cover_letter(
@@ -2579,6 +2653,16 @@ def validate_cover_letter(
     claim_text = "\n".join(
         line for line in text.splitlines() if line.strip().casefold() != target_line
     )
+    dominant_gap = _dominant_key_experience_gap(claim_text, vacancy)
+    if dominant_gap is not None:
+        raise CoverLetterValidationError(
+            "KEY_EXPERIENCE_GAPS_DOMINATE",
+            (
+                "Письмо в основном перечисляет отсутствие ключевого опыта вместо "
+                "подходящего подтверждённого примера"
+            ),
+            rejected_fragment=dominant_gap,
+        )
     fact_text = "\n".join(fact.content for fact in facts)
     experience_facts = _confirmed_experience_facts(facts)
     experience_fact_text = "\n".join(fact.content for fact in experience_facts)

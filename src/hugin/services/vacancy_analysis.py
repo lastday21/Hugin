@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -26,8 +27,10 @@ from hugin.repositories.vacancies import VacancyRepository
 from hugin.services.career_directions import CareerDirectionService
 from hugin.services.vacancy_duplicates import VacancyDuplicateDetector
 
-RULES_VERSION = "python_it_v53"
+RULES_VERSION = "python_it_v54"
 MAX_VACANCY_AGE = timedelta(days=30)
+MINIMUM_ACCEPTABLE_NET_SALARY = 120_000
+MINIMUM_ACCEPTABLE_GROSS_SALARY = 137_932
 
 
 def _normalize_rule_text(value: str | None) -> str:
@@ -789,6 +792,15 @@ class PythonBackendRules:
         stretch_reasons: list[str] = []
         components: list[RuleComponent] = []
 
+        if not any(
+            (
+                description,
+                responsibilities,
+                requirements,
+                _normalize_rule_text(vacancy.preferred_qualifications),
+            )
+        ):
+            rejected.append("описание вакансии отсутствует")
         if vacancy.availability is not VacancyAvailability.ACTIVE:
             rejected.append(f"вакансия недоступна: {vacancy.availability.value}")
         if self._is_too_old(vacancy.published_at):
@@ -870,7 +882,8 @@ class PythonBackendRules:
                     )
                 ):
                     stretch_reasons.append(
-                        "Python указан как один из допустимых языков; требуется ручная проверка"
+                        "Python указан как один из допустимых языков; "
+                        "вакансия идёт после более точных совпадений"
                     )
                 else:
                     rejected.append("Python указан только как один из необязательных языков")
@@ -915,7 +928,8 @@ class PythonBackendRules:
             rejected.append(level_rejection)
         if self._founding_engineer_pattern.search(complete_text):
             stretch_reasons.append(
-                "роль первого инженера требует ручной проверки масштаба ответственности"
+                "роль первого инженера идёт после более точных совпадений из-за масштаба "
+                "ответственности"
             )
         if self._described_level_pattern.search(" ".join((description, requirements))):
             reasons.append("уровень Middle/Senior указан как риск, а не самостоятельный запрет")
@@ -964,7 +978,7 @@ class PythonBackendRules:
                 ):
                     stretch_reasons.append(
                         "аналитическая роль содержит существенную разработку на Python; "
-                        "требуется ручная проверка"
+                        "вакансия идёт после более точных совпадений"
                     )
                     continue
                 if marker in {
@@ -990,7 +1004,7 @@ class PythonBackendRules:
         elif other_stack is not None:
             stretch_reasons.append(
                 f"в названии вместе с Python указан другой основной стек: {other_stack}; "
-                "требуется ручная проверка"
+                "вакансия идёт после более точных совпадений"
             )
         mandatory_other_stack = self._mandatory_other_stack(experience_requirements)
         if mandatory_other_stack is not None:
@@ -1070,6 +1084,9 @@ class PythonBackendRules:
             rejected.append("обязательный переезд противоречит подтверждённым настройкам")
         if self._location_conflicts(vacancy, context):
             rejected.append("офис или гибрид находится вне выбранных регионов")
+        salary_rejection = self._salary_rejection(vacancy)
+        if salary_rejection is not None:
+            rejected.append(salary_rejection)
         format_score = self._work_format_score(vacancy, context)
         if format_score is not None:
             if format_score == 0:
@@ -1108,10 +1125,14 @@ class PythonBackendRules:
                 )
 
         experience_score = self._experience_score(experience)
+        if minimum_required_experience is not None and minimum_required_experience >= 3:
+            experience_score = min(experience_score or 100, 65)
         if experience_score is not None:
             experience_reason = "требования к опыту не являются самостоятельным запретом"
-            if "3-6" in experience or "от 3" in experience:
-                experience_reason = "опыт от трёх лет указан как пожелание; это не запрет"
+            if minimum_required_experience is not None and minimum_required_experience >= 3:
+                experience_reason = "обязательный стаж от трёх лет снижает приоритет"
+            elif "3-6" in experience or "от 3" in experience:
+                experience_reason = "опыт от трёх лет снижает приоритет, но не блокирует"
             self._component(
                 components,
                 reasons,
@@ -1149,7 +1170,7 @@ class PythonBackendRules:
             if specialization_stretch:
                 reasons.append(
                     "отдельная специализация; потребуется дополнительная подготовка "
-                    "и ручная проверка"
+                    "и вакансия пойдёт после более точных совпадений"
                 )
         else:
             category = RuleCategory.MATCH
@@ -2418,6 +2439,22 @@ class PythonBackendRules:
         return min(max(ratio * 100, 0), 100)
 
     @staticmethod
+    def _salary_rejection(vacancy: VacancyData) -> str | None:
+        upper_bound = vacancy.salary_to
+        if upper_bound is None or vacancy.salary_currency not in {None, "RUR", "RUB"}:
+            return None
+        if vacancy.salary_gross is True:
+            if upper_bound >= MINIMUM_ACCEPTABLE_GROSS_SALARY:
+                return None
+            return (
+                "верхняя зарплата до вычета налога ниже 137 932 рублей — "
+                "эквивалента 120 000 рублей на руки при ставке 13%"
+            )
+        if upper_bound < MINIMUM_ACCEPTABLE_NET_SALARY:
+            return "верхняя зарплата ниже 120 000 рублей на руки"
+        return None
+
+    @staticmethod
     def _region_score(vacancy: VacancyData, context: RuleContext) -> float | None:
         if not context.regions or not vacancy.region:
             return None
@@ -2632,10 +2669,36 @@ class VacancyAnalysisService:
         vacancy: VacancyData,
         context: RuleContext,
     ) -> VacancyAnalysisResult:
+        stored = self._vacancies.get(stored.id)
         tracked = self._directions.get_tracked_vacancy(direction.id, stored.id)
         rules = self._rules[direction.scope]
+        if stored.duplicate_of_id is not None and stored.availability is VacancyAvailability.ACTIVE:
+            with suppress(LookupError):
+                canonical = self._vacancies.get(stored.duplicate_of_id)
+                if (
+                    canonical.availability is not VacancyAvailability.ACTIVE
+                    and not self._vacancies.duplicate_family_has_sent_or_live_application(
+                        direction.account_id,
+                        stored.id,
+                    )
+                ):
+                    stored = self._vacancies.promote_duplicate(stored.id)
+        candidates = self._vacancies.list_duplicate_candidates(stored)
+        duplicate = self._duplicates.find(stored, candidates)
+        if duplicate is not None:
+            stored = self._vacancies.mark_duplicate(
+                stored.id,
+                duplicate.canonical.id,
+                duplicate.similarity,
+            )
+        canonical_hh_id = duplicate.canonical.hh_id if duplicate is not None else None
+        if stored.duplicate_of_id is not None and canonical_hh_id is None:
+            with suppress(LookupError):
+                canonical_hh_id = self._vacancies.get(stored.duplicate_of_id).hh_id
+        is_duplicate = stored.duplicate_of_id is not None
         if (
             vacancy.availability is VacancyAvailability.ACTIVE
+            and not is_duplicate
             and tracked.rules_details.get("manual_override") == "ACCEPT"
             and tracked.rules_version == RULES_VERSION
             and not rules._is_too_old(vacancy.published_at)
@@ -2673,27 +2736,20 @@ class VacancyAnalysisService:
             )
             return VacancyAnalysisResult(stored, evaluation, state)
 
-        candidates = self._vacancies.list_duplicate_candidates(stored)
-        duplicate = self._duplicates.find(stored, candidates)
-        if duplicate is not None:
-            stored = self._vacancies.mark_duplicate(
-                stored.id,
-                duplicate.canonical.id,
-                duplicate.similarity,
-            )
-
         evaluation = rules.evaluate(vacancy, context)
-        if duplicate is not None:
+        if is_duplicate:
+            duplicate_reasons = ["дубликат вакансии"]
+            if canonical_hh_id is not None:
+                duplicate_reasons.append(f"основная публикация: {canonical_hh_id}")
             evaluation = RuleEvaluation(
                 evaluation.score,
-                evaluation.category,
+                RuleCategory.REJECTED,
                 (
                     *evaluation.reasons,
-                    "найдена похожая публикация той же компании; вакансия обрабатывается отдельно",
-                    f"связанная вакансия: {duplicate.canonical.hh_id}",
+                    *duplicate_reasons,
                 ),
                 evaluation.components,
-                evaluation.target_scope,
+                None,
             )
         if vacancy.availability is not VacancyAvailability.ACTIVE:
             state = VacancyState.CLOSED
