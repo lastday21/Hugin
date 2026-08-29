@@ -9,6 +9,9 @@ from hugin.domain.content import (
     InvitationState,
     MessageDirection,
     NotificationChannel,
+    RecruiterActionKind,
+    RecruiterActionSource,
+    RecruiterActionState,
     RecruiterMessageState,
 )
 from hugin.domain.directions import ConfigPayload
@@ -18,6 +21,18 @@ class MessageSendOutcome(StrEnum):
     SENT = "SENT"
     FAILED = "FAILED"
     UNKNOWN_RESULT = "UNKNOWN_RESULT"
+
+
+class MessageSendFailureCode(StrEnum):
+    NEGOTIATIONS_OPEN_FAILED = "HH_MESSAGE_NEGOTIATIONS_OPEN_FAILED"
+    CHAT_OPEN_FAILED = "HH_MESSAGE_CHAT_OPEN_FAILED"
+    CHAT_NOT_FOUND = "HH_MESSAGE_CHAT_NOT_FOUND"
+    CHAT_FRAME_MISSING = "HH_MESSAGE_CHAT_FRAME_MISSING"
+    EDITOR_UNAVAILABLE = "HH_MESSAGE_EDITOR_UNAVAILABLE"
+    SNAPSHOT_UNAVAILABLE = "HH_MESSAGE_SNAPSHOT_UNAVAILABLE"
+    SUBMIT_UNAVAILABLE = "HH_MESSAGE_SUBMIT_UNAVAILABLE"
+    HTTP_4XX = "HH_MESSAGE_HTTP_4XX"
+    UNSPECIFIED = "HH_MESSAGE_FAILED_UNSPECIFIED"
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,6 +52,20 @@ class RecruiterMessageRecord:
     auto_send_approved: bool
     reply_template_key: str | None
     created_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class RecruiterMessageActionRecord:
+    message_id: int
+    kind: RecruiterActionKind
+    state: RecruiterActionState
+    source: RecruiterActionSource
+    reason_code: str
+    reason: str
+    due_at: datetime | None
+    resolved_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,6 +112,7 @@ class MessageSendRequest:
 class MessageSendResult:
     outcome: MessageSendOutcome
     external_id: str | None = None
+    failure_code: MessageSendFailureCode | None = None
 
 
 class CommunicationNotFoundError(LookupError):

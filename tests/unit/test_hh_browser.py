@@ -19,7 +19,7 @@ from playwright.sync_api import Error, Frame, Locator, Page, Response, TimeoutEr
 
 from hugin.adapters import hh_browser as browser_module
 from hugin.adapters.hh_browser import VisibleHhBrowser
-from hugin.domain.communications import MessageSendOutcome
+from hugin.domain.communications import MessageSendFailureCode, MessageSendOutcome
 from hugin.domain.content import MessageDirection
 from hugin.domain.hh import (
     HhApplyStatus,
@@ -192,6 +192,8 @@ class FakePage:
         self.opened_chat = True
         self.opened_vacancy_ids: list[str] = []
         self.frames: list[Frame] = []
+        self.advance_existing_chat_frames = True
+        self.chat_frame_revision = 0
         self.keyboard = FakeKeyboard()
         self.response = FakeResponse()
         self.goto_response: FakeResponse | None = None
@@ -265,6 +267,13 @@ class FakePage:
         if expression == browser_module.OPEN_NEGOTIATION_CHAT_SCRIPT:
             assert isinstance(argument, str)
             self.opened_vacancy_ids.append(argument)
+            if self.opened_chat and self.advance_existing_chat_frames:
+                self.chat_frame_revision += 1
+                for frame in self.frames:
+                    if "chatik.hh.ru/chat/" not in frame.url:
+                        continue
+                    base_url = frame.url.partition("#test-open-")[0]
+                    cast(FakeFrame, frame).url = f"{base_url}#test-open-{self.chat_frame_revision}"
             return self.opened_chat
         if expression == browser_module.RESUME_DETAILS_SCRIPT:
             return self.resume_payload
@@ -1209,9 +1218,9 @@ def test_recruiter_messages_are_read_from_tracked_chats(tmp_path: Path) -> None:
     page.frames = [cast(Frame, frame)]
     page.locators['[data-qa="chatik-close-chatik"]'] = FakeLocator()
 
-    messages = make_browser(page, tmp_path).read_recruiter_messages(("101",))
+    result = make_browser(page, tmp_path).read_recruiter_messages(("101",))
 
-    assert [(item.hh_id, item.direction, item.body) for item in messages] == [
+    assert [(item.hh_id, item.direction, item.body) for item in result.messages] == [
         ("message-1", MessageDirection.INCOMING, "Приглашаем на собеседование."),
         ("message-2", MessageDirection.OUTGOING, "Спасибо!"),
     ]
@@ -1261,12 +1270,196 @@ def test_recruiter_messages_open_negotiations_once_for_all_chats(
     close = FakeLocator()
     page.locators['[data-qa="chatik-close-chatik"]'] = close
 
-    messages = make_browser(page, tmp_path).read_recruiter_messages(("101", "202"))
+    result = make_browser(page, tmp_path).read_recruiter_messages(("101", "202"))
 
-    assert [message.vacancy_id for message in messages] == ["101", "202"]
+    assert [message.vacancy_id for message in result.messages] == ["101", "202"]
     assert page.goto_calls == [("https://hh.ru/applicant/negotiations", "domcontentloaded")]
     assert page.opened_vacancy_ids == ["101", "202"]
     assert close.clicked == 2
+
+
+def test_recruiter_messages_ignore_stale_frame_when_next_chat_opens(
+    tmp_path: Path,
+) -> None:
+    lead_vacancy_id = "135773461"
+    web_vacancy_id = "136502225"
+
+    class ArgumentStampedFrame(FakeFrame):
+        def __init__(self, *, url: str, message_id: str, body: str) -> None:
+            super().__init__(url=url)
+            self.message_id = message_id
+            self.body = body
+
+        def evaluate(self, expression: str, argument: object = None) -> object:
+            assert expression == browser_module.CHAT_MESSAGES_SCRIPT
+            assert isinstance(argument, str)
+            self.evaluated_vacancy_ids.append(argument)
+            return [
+                {
+                    "vacancyId": argument,
+                    "messageId": self.message_id,
+                    "direction": "INCOMING",
+                    "body": self.body,
+                }
+            ]
+
+    stale_web_frame = ArgumentStampedFrame(
+        url="https://chatik.hh.ru/chat/stale-web",
+        message_id="15259623027",
+        body="Какой у вас опыт работы с HTML5, CSS3 и ES6?",
+    )
+    lead_frame = ArgumentStampedFrame(
+        url="https://chatik.hh.ru/chat/lead",
+        message_id="lead-message",
+        body="Какой у вас опыт руководства серверной разработкой?",
+    )
+    web_frame = ArgumentStampedFrame(
+        url="https://chatik.hh.ru/chat/web",
+        message_id="15259623027",
+        body="Какой у вас опыт работы с HTML5, CSS3 и ES6?",
+    )
+
+    class ChatTransitionPage(FakePage):
+        def evaluate(self, expression: str, argument: object = None) -> object:
+            if expression == browser_module.OPEN_NEGOTIATION_CHAT_SCRIPT:
+                assert isinstance(argument, str)
+                self.opened_vacancy_ids.append(argument)
+                fresh_frame = {
+                    lead_vacancy_id: lead_frame,
+                    web_vacancy_id: web_frame,
+                }[argument]
+                self.frames.append(cast(Frame, fresh_frame))
+                return True
+            return super().evaluate(expression, argument)
+
+    page = ChatTransitionPage("https://hh.ru/applicant/resumes")
+    page.negotiations_payload = [
+        {
+            "vacancyHref": f"/vacancy/{lead_vacancy_id}",
+            "statusQa": "",
+            "statusLabel": "",
+            "chatAvailable": True,
+        },
+        {
+            "vacancyHref": f"/vacancy/{web_vacancy_id}",
+            "statusQa": "",
+            "statusLabel": "",
+            "chatAvailable": True,
+        },
+    ]
+    page.frames = [cast(Frame, stale_web_frame)]
+    close = FakeLocator()
+    page.locators['[data-qa="chatik-close-chatik"]'] = close
+
+    result = make_browser(page, tmp_path).read_recruiter_messages((lead_vacancy_id, web_vacancy_id))
+
+    assert [(message.vacancy_id, message.hh_id) for message in result.messages] == [
+        (lead_vacancy_id, "lead-message"),
+        (web_vacancy_id, "15259623027"),
+    ]
+    assert result.failures == ()
+    assert stale_web_frame.evaluated_vacancy_ids == []
+    assert close.clicked == 2
+
+
+def test_recruiter_message_read_rejects_unchanged_stale_frame(tmp_path: Path) -> None:
+    vacancy_id = "135773461"
+    page = FakePage("https://hh.ru/applicant/resumes")
+    page.negotiations_payload = [
+        {
+            "vacancyHref": f"/vacancy/{vacancy_id}",
+            "statusQa": "",
+            "statusLabel": "",
+            "chatAvailable": True,
+        }
+    ]
+    page.advance_existing_chat_frames = False
+    stale_frame = FakeFrame(
+        url="https://chatik.hh.ru/chat/stale",
+        messages_payload=[
+            {
+                "vacancyId": vacancy_id,
+                "messageId": "stale-message",
+                "direction": "INCOMING",
+                "body": "Сообщение из прежней переписки",
+            }
+        ],
+    )
+    page.frames = [cast(Frame, stale_frame)]
+    page.locators['[data-qa="chatik-close-chatik"]'] = FakeLocator()
+
+    result = make_browser(page, tmp_path).read_recruiter_messages((vacancy_id,))
+
+    assert result.messages == ()
+    assert [(failure.vacancy_id, failure.code) for failure in result.failures] == [
+        (vacancy_id, "HH_CHAT_NOT_LOADED")
+    ]
+    assert stale_frame.evaluated_vacancy_ids == []
+
+
+def test_bad_chat_before_national_lottery_does_not_stop_message_reading(
+    tmp_path: Path,
+) -> None:
+    bad_vacancy_id = "135428288"
+    national_lottery_vacancy_id = "136354935"
+    page = FakePage("https://hh.ru/applicant/resumes")
+    page.negotiations_payload = [
+        {
+            "vacancyHref": f"/vacancy/{bad_vacancy_id}",
+            "statusQa": "",
+            "statusLabel": "",
+            "chatAvailable": True,
+        },
+        {
+            "vacancyHref": f"/vacancy/{national_lottery_vacancy_id}",
+            "statusQa": "",
+            "statusLabel": "",
+            "chatAvailable": True,
+        },
+    ]
+
+    class MessagesByVacancyFrame(FakeFrame):
+        def evaluate(self, expression: str, argument: object = None) -> object:
+            assert expression == browser_module.CHAT_MESSAGES_SCRIPT
+            assert isinstance(argument, str)
+            self.evaluated_vacancy_ids.append(argument)
+            if argument == bad_vacancy_id:
+                return []
+            assert argument == national_lottery_vacancy_id
+            return [
+                {
+                    "vacancyId": national_lottery_vacancy_id,
+                    "messageId": "national-lottery-message",
+                    "direction": "INCOMING",
+                    "body": "Расскажите о своём опыте.",
+                }
+            ]
+
+    frame = MessagesByVacancyFrame()
+    page.frames = [cast(Frame, frame)]
+    close = FakeLocator()
+    page.locators['[data-qa="chatik-close-chatik"]'] = close
+
+    result = make_browser(page, tmp_path).read_recruiter_messages(
+        (bad_vacancy_id, national_lottery_vacancy_id)
+    )
+
+    assert [message.vacancy_id for message in result.messages] == [national_lottery_vacancy_id]
+    assert [(failure.vacancy_id, failure.code) for failure in result.failures] == [
+        (bad_vacancy_id, "HH_CHAT_EMPTY")
+    ]
+    assert page.opened_vacancy_ids == [bad_vacancy_id, national_lottery_vacancy_id]
+    assert close.clicked == 2
+
+
+def test_recruiter_message_read_does_not_hide_rate_limit(tmp_path: Path) -> None:
+    page = FakePage("https://hh.ru/applicant/resumes")
+    page.locators["body"] = FakeLocator(text="Слишком много запросов. Попробуйте позже.")
+
+    with pytest.raises(HhSyncRetryableError) as error:
+        make_browser(page, tmp_path).read_recruiter_messages(("136354935",))
+
+    assert error.value.code == "HH_RATE_LIMITED"
 
 
 def test_recruiter_messages_are_read_from_later_negotiations_page(
@@ -1303,9 +1496,9 @@ def test_recruiter_messages_are_read_from_later_negotiations_page(
     page.frames = [cast(Frame, frame)]
     page.locators['[data-qa="chatik-close-chatik"]'] = FakeLocator()
 
-    messages = make_browser(page, tmp_path).read_recruiter_messages(("202",))
+    result = make_browser(page, tmp_path).read_recruiter_messages(("202",))
 
-    assert [message.hh_id for message in messages] == ["message-202"]
+    assert [message.hh_id for message in result.messages] == ["message-202"]
     assert second_page.clicked == 1
 
 
@@ -1323,8 +1516,12 @@ def test_recruiter_message_read_fails_if_advertised_chat_does_not_open(
     ]
     page.opened_chat = False
 
-    with pytest.raises(RuntimeError, match="не открыл"):
-        make_browser(page, tmp_path).read_recruiter_messages(("101",))
+    result = make_browser(page, tmp_path).read_recruiter_messages(("101",))
+
+    assert result.messages == ()
+    assert [(failure.vacancy_id, failure.code) for failure in result.failures] == [
+        ("101", "HH_CHAT_OPEN_FAILED")
+    ]
 
 
 def test_recruiter_message_read_fails_if_chat_frame_does_not_load(
@@ -1340,8 +1537,12 @@ def test_recruiter_message_read_fails_if_chat_frame_does_not_load(
         }
     ]
 
-    with pytest.raises(RuntimeError, match="не загрузилась"):
-        make_browser(page, tmp_path).read_recruiter_messages(("101",))
+    result = make_browser(page, tmp_path).read_recruiter_messages(("101",))
+
+    assert result.messages == ()
+    assert [(failure.vacancy_id, failure.code) for failure in result.failures] == [
+        ("101", "HH_CHAT_NOT_LOADED")
+    ]
 
 
 def test_recruiter_message_read_does_not_accept_silently_empty_chat(
@@ -1358,8 +1559,12 @@ def test_recruiter_message_read_does_not_accept_silently_empty_chat(
     ]
     page.frames = [cast(Frame, FakeFrame(messages_payload=[]))]
 
-    with pytest.raises(RuntimeError, match="ни одного сообщения"):
-        make_browser(page, tmp_path).read_recruiter_messages(("101",))
+    result = make_browser(page, tmp_path).read_recruiter_messages(("101",))
+
+    assert result.messages == ()
+    assert [(failure.vacancy_id, failure.code) for failure in result.failures] == [
+        ("101", "HH_CHAT_EMPTY")
+    ]
 
 
 def test_recruiter_message_read_rejects_messages_from_another_chat(
@@ -1390,8 +1595,12 @@ def test_recruiter_message_read_rejects_messages_from_another_chat(
         )
     ]
 
-    with pytest.raises(RuntimeError, match="другой переписки"):
-        make_browser(page, tmp_path).read_recruiter_messages(("101",))
+    result = make_browser(page, tmp_path).read_recruiter_messages(("101",))
+
+    assert result.messages == ()
+    assert [(failure.vacancy_id, failure.code) for failure in result.failures] == [
+        ("101", "HH_CHAT_INVALID")
+    ]
 
 
 @pytest.mark.parametrize(
@@ -3354,6 +3563,116 @@ def test_recruiter_message_waits_until_filled_text_enables_send(
     assert submit.clicked == 1
 
 
+def test_recruiter_message_uses_fresh_frame_instead_of_stale_editor(
+    tmp_path: Path,
+) -> None:
+    message_body = "Спасибо, буду на связи."
+    stale_frame = FakeFrame(url="https://chatik.hh.ru/chat/stale", messages_payload=[])
+    stale_editor = FakeLocator()
+    stale_submit = FakeLocator()
+    stale_frame.locators['[data-qa="chatik-new-message-text"]'] = stale_editor
+    stale_frame.locators['[data-qa="chatik-do-send-message"]'] = stale_submit
+    fresh_frame = FakeFrame(
+        url="https://chatik.hh.ru/chat/fresh",
+        messages_payloads=[
+            [],
+            [
+                {
+                    "messageId": "fresh-message",
+                    "direction": "OUTGOING",
+                    "body": message_body,
+                }
+            ],
+        ],
+    )
+    fresh_editor = FakeLocator()
+    fresh_submit = FakeLocator()
+    fresh_frame.locators['[data-qa="chatik-new-message-text"]'] = fresh_editor
+    fresh_frame.locators['[data-qa="chatik-do-send-message"]'] = fresh_submit
+
+    class ChatTransitionPage(FakePage):
+        def evaluate(self, expression: str, argument: object = None) -> object:
+            if expression == browser_module.OPEN_NEGOTIATION_CHAT_SCRIPT:
+                assert argument == "101"
+                self.opened_vacancy_ids.append(argument)
+                self.frames.append(cast(Frame, fresh_frame))
+                return True
+            return super().evaluate(expression, argument)
+
+    page = ChatTransitionPage("https://hh.ru/applicant/resumes")
+    page.frames = [cast(Frame, stale_frame)]
+    page.response.url = "https://hh.ru/chat/101/messages"
+
+    result = make_browser(page, tmp_path).send_recruiter_message(
+        "https://hh.ru/vacancy/101",
+        message_body,
+    )
+
+    assert result.outcome is MessageSendOutcome.SENT
+    assert stale_editor.filled == []
+    assert stale_submit.clicked == 0
+    assert fresh_editor.filled == [message_body]
+    assert fresh_submit.clicked == 1
+
+
+def test_recruiter_message_rejects_unchanged_stale_editor(tmp_path: Path) -> None:
+    page = FakePage("https://hh.ru/applicant/resumes")
+    page.advance_existing_chat_frames = False
+    stale_frame = FakeFrame(url="https://chatik.hh.ru/chat/stale", messages_payload=[])
+    stale_editor = FakeLocator()
+    stale_submit = FakeLocator()
+    stale_frame.locators['[data-qa="chatik-new-message-text"]'] = stale_editor
+    stale_frame.locators['[data-qa="chatik-do-send-message"]'] = stale_submit
+    page.frames = [cast(Frame, stale_frame)]
+
+    result = make_browser(page, tmp_path).send_recruiter_message(
+        "https://hh.ru/vacancy/101",
+        "Ответ",
+    )
+
+    assert result.outcome is MessageSendOutcome.FAILED
+    assert result.failure_code is MessageSendFailureCode.CHAT_FRAME_MISSING
+    assert stale_editor.filled == []
+    assert stale_submit.clicked == 0
+
+
+def test_recruiter_message_supports_current_dynamic_chat_controls(
+    tmp_path: Path,
+) -> None:
+    page = FakePage("https://hh.ru/applicant/resumes")
+    message_body = "Спасибо, буду на связи."
+    frame = FakeFrame(
+        messages_payloads=[
+            [],
+            [
+                {
+                    "messageId": "message-7",
+                    "direction": "OUTGOING",
+                    "body": message_body,
+                }
+            ],
+        ]
+    )
+    submit = FakeLocator()
+
+    def show_submit(_value: str) -> None:
+        frame.locators['[data-qa="chatik-do-send-message"]'] = submit
+
+    editor = FakeLocator(on_fill=show_submit)
+    frame.locators['[data-qa="text-input"]'] = editor
+    page.frames = [cast(Frame, frame)]
+    page.response.url = "https://hh.ru/chat/101/messages"
+
+    result = make_browser(page, tmp_path).send_recruiter_message(
+        "https://hh.ru/vacancy/101",
+        message_body,
+    )
+
+    assert result.outcome is MessageSendOutcome.SENT
+    assert editor.filled == [message_body]
+    assert submit.clicked == 1
+
+
 def test_recruiter_message_finds_chat_on_later_negotiations_page(
     tmp_path: Path,
 ) -> None:
@@ -3394,6 +3713,96 @@ def test_recruiter_message_finds_chat_on_later_negotiations_page(
     assert result.outcome is MessageSendOutcome.SENT
     assert first_page.clicked == 0
     assert second_page.clicked == 1
+
+
+def test_recruiter_message_reports_negotiations_open_failure(tmp_path: Path) -> None:
+    page = FakePage("https://hh.ru/applicant/resumes")
+    page.goto_error = Error("navigation failed")
+
+    result = make_browser(page, tmp_path).send_recruiter_message(
+        "https://hh.ru/vacancy/101",
+        "Ответ",
+    )
+
+    assert result.outcome is MessageSendOutcome.FAILED
+    assert result.failure_code is MessageSendFailureCode.NEGOTIATIONS_OPEN_FAILED
+
+
+def test_recruiter_message_reports_chat_open_failure(tmp_path: Path) -> None:
+    class ChatOpenErrorPage(FakePage):
+        def evaluate(self, expression: str, argument: object = None) -> object:
+            if expression == browser_module.OPEN_NEGOTIATION_CHAT_SCRIPT:
+                raise Error("chat failed")
+            return super().evaluate(expression, argument)
+
+    page = ChatOpenErrorPage("https://hh.ru/applicant/resumes")
+
+    result = make_browser(page, tmp_path).send_recruiter_message(
+        "https://hh.ru/vacancy/101",
+        "Ответ",
+    )
+
+    assert result.outcome is MessageSendOutcome.FAILED
+    assert result.failure_code is MessageSendFailureCode.CHAT_OPEN_FAILED
+
+
+def test_recruiter_message_reports_missing_chat_frame(tmp_path: Path) -> None:
+    page = FakePage("https://hh.ru/applicant/resumes")
+
+    result = make_browser(page, tmp_path).send_recruiter_message(
+        "https://hh.ru/vacancy/101",
+        "Ответ",
+    )
+
+    assert result.outcome is MessageSendOutcome.FAILED
+    assert result.failure_code is MessageSendFailureCode.CHAT_FRAME_MISSING
+
+
+def test_recruiter_message_reports_unavailable_editor(tmp_path: Path) -> None:
+    page = FakePage("https://hh.ru/applicant/resumes")
+    page.frames = [cast(Frame, FakeFrame())]
+
+    result = make_browser(page, tmp_path).send_recruiter_message(
+        "https://hh.ru/vacancy/101",
+        "Ответ",
+    )
+
+    assert result.outcome is MessageSendOutcome.FAILED
+    assert result.failure_code is MessageSendFailureCode.EDITOR_UNAVAILABLE
+
+
+def test_recruiter_message_reports_unavailable_submit(tmp_path: Path) -> None:
+    page = FakePage("https://hh.ru/applicant/resumes")
+    frame = FakeFrame(messages_payload=[])
+    frame.locators['[data-qa="chatik-new-message-text"]'] = FakeLocator()
+    page.frames = [cast(Frame, frame)]
+
+    result = make_browser(page, tmp_path).send_recruiter_message(
+        "https://hh.ru/vacancy/101",
+        "Ответ",
+    )
+
+    assert result.outcome is MessageSendOutcome.FAILED
+    assert result.failure_code is MessageSendFailureCode.SUBMIT_UNAVAILABLE
+
+
+def test_recruiter_message_reports_http_4xx(tmp_path: Path) -> None:
+    page = FakePage("https://hh.ru/applicant/resumes")
+    frame = FakeFrame(messages_payloads=[[], []])
+    frame.locators['[data-qa="chatik-new-message-text"]'] = FakeLocator()
+    frame.locators['[data-qa="chatik-do-send-message"]'] = FakeLocator()
+    page.frames = [cast(Frame, frame)]
+    page.response.url = "https://hh.ru/chat/101/messages"
+    page.response.status = 422
+    page.locators["body"] = FakeLocator(text="Переписка")
+
+    result = make_browser(page, tmp_path).send_recruiter_message(
+        "https://hh.ru/vacancy/101",
+        "Ответ",
+    )
+
+    assert result.outcome is MessageSendOutcome.FAILED
+    assert result.failure_code is MessageSendFailureCode.HTTP_4XX
 
 
 @pytest.mark.parametrize(
@@ -3505,6 +3914,7 @@ def test_message_is_not_sent_without_initial_outgoing_snapshot(tmp_path: Path) -
     )
 
     assert result.outcome is MessageSendOutcome.FAILED
+    assert result.failure_code is MessageSendFailureCode.SNAPSHOT_UNAVAILABLE
     assert frame.locators['[data-qa="chatik-do-send-message"]'].clicked == 0
 
 
@@ -3622,6 +4032,7 @@ def test_recruiter_message_is_not_sent_without_unique_chat(tmp_path: Path) -> No
     )
 
     assert result.outcome is MessageSendOutcome.FAILED
+    assert result.failure_code is MessageSendFailureCode.CHAT_NOT_FOUND
 
 
 def test_email_and_password_are_filled(tmp_path: Path) -> None:

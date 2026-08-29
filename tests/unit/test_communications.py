@@ -9,6 +9,7 @@ import pytest
 from sqlalchemy import inspect, select, text
 from sqlalchemy.orm import Session
 
+from hugin.adapters.codex_cli import CodexCliError
 from hugin.core.settings import Settings
 from hugin.database import (
     check_database_schema,
@@ -19,7 +20,9 @@ from hugin.database import (
 )
 from hugin.database.models import CandidateProfileModel, IncidentModel, VerifiedFactModel
 from hugin.domain.communications import (
+    CommunicationNotFoundError,
     CommunicationStateError,
+    MessageSendFailureCode,
     MessageSendOutcome,
     StaleMessageDraftError,
 )
@@ -29,6 +32,9 @@ from hugin.domain.content import (
     InvitationState,
     MessageDirection,
     NotificationChannel,
+    RecruiterActionKind,
+    RecruiterActionSource,
+    RecruiterActionState,
     RecruiterMessageState,
 )
 from hugin.domain.vacancies import VacancyData
@@ -58,6 +64,25 @@ class UnsafeReplyModel:
 
     def complete(self, _system_prompt: str, _user_prompt: str) -> str:
         return "Да, давайте созвонимся завтра в 15:00."
+
+
+class RequirementModel:
+    model_name = "requirement-test"
+
+    def __init__(self, response: str) -> None:
+        self.response = response
+        self.calls = 0
+
+    def complete(self, _system_prompt: str, _user_prompt: str) -> str:
+        self.calls += 1
+        return self.response
+
+
+class FailingRequirementModel:
+    model_name = "requirement-failure-test"
+
+    def complete(self, _system_prompt: str, _user_prompt: str) -> str:
+        raise CodexCliError("Проверка необходимости ответа недоступна")
 
 
 def create_application(
@@ -154,7 +179,7 @@ def test_communications_migration_preserves_existing_rows(settings: Settings) ->
         database.close()
 
     upgrade_database(settings)
-    assert current_revision(settings) == "0025_screening_availability"
+    assert current_revision(settings) == "0026_message_actions"
     check_database_schema(settings)
 
     migrated = create_database(settings)
@@ -231,6 +256,76 @@ def test_communications_migration_preserves_existing_rows(settings: Settings) ->
             assert tuple(states) == ("RECEIVED", "FAILED")
     finally:
         downgraded.close()
+
+
+def test_message_actions_are_scoped_to_owned_incoming_and_kind(
+    settings: Settings,
+) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    try:
+        with database.sessions.begin() as session:
+            account_id, application_id = create_application(
+                session,
+                account_label="Составное действие",
+                vacancy_hh_id="communications-composite-action",
+            )
+            foreign_account_id, _ = create_application(
+                session,
+                account_label="Чужое действие",
+                vacancy_hh_id="communications-foreign-action",
+            )
+            communications = CommunicationService(session, RecordingMessageSender())
+            incoming = communications.save_incoming(
+                application_id=application_id,
+                hh_id="incoming-composite-action",
+                body="Заполните анкету и сообщите, когда закончите.",
+            )
+            outgoing = communications.create_outgoing_draft(
+                application_id=application_id,
+                body="Сообщу после заполнения.",
+            )
+            communications.require_external_action(
+                account_id=account_id,
+                message_id=incoming.id,
+                kind=RecruiterActionKind.EXTERNAL_FORM,
+                source=RecruiterActionSource.RULE,
+                reason_code="FORM_REQUIRED",
+                reason="Требуется заполнить внешнюю анкету.",
+            )
+            communications.record_reply_requirement(
+                account_id=account_id,
+                message_id=incoming.id,
+                required=True,
+                source=RecruiterActionSource.SYSTEM,
+                reason_code="REPLY_AFTER_FORM_REQUIRED",
+                reason="После анкеты требуется ответить работодателю.",
+            )
+
+            actions = communications.message_actions(account_id)
+
+            assert {(action.message_id, action.kind) for action in actions} == {
+                (incoming.id, RecruiterActionKind.REPLY),
+                (incoming.id, RecruiterActionKind.EXTERNAL_FORM),
+            }
+            with pytest.raises(CommunicationNotFoundError, match="Сообщение не найдено"):
+                communications.complete_external_action(
+                    account_id=foreign_account_id,
+                    message_id=incoming.id,
+                    kind=RecruiterActionKind.EXTERNAL_FORM,
+                    reason_code="USER_CONFIRMED_SUBMITTED",
+                    reason="Чужой аккаунт не может менять действие.",
+                )
+            with pytest.raises(CommunicationStateError, match="только для входящего"):
+                communications.complete_external_action(
+                    account_id=account_id,
+                    message_id=outgoing.id,
+                    kind=RecruiterActionKind.EXTERNAL_FORM,
+                    reason_code="USER_CONFIRMED_SUBMITTED",
+                    reason="Исходящий черновик не является действием.",
+                )
+    finally:
+        database.close()
 
 
 def test_incoming_invitations_and_notifications_are_idempotent(settings: Settings) -> None:
@@ -484,6 +579,77 @@ def test_unknown_send_result_is_never_repeated(settings: Settings) -> None:
             assert reconciled.id == unknown.id
             assert reconciled.state is RecruiterMessageState.SENT
             assert reconciled.hh_id == "hh-confirmed-outgoing"
+    finally:
+        database.close()
+
+
+def test_failed_send_incident_records_only_safe_stage_code(settings: Settings) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    draft_body = "СЕКРЕТНЫЙ_ТЕКСТ_ЧЕРНОВИКА"
+
+    try:
+        with database.sessions.begin() as session:
+            account_id, application_id = create_application(
+                session,
+                account_label="Диагностика отправки",
+                vacancy_hh_id="communications-failed-stage",
+            )
+            service = CommunicationService(
+                session,
+                RecordingMessageSender(
+                    MessageSendOutcome.FAILED,
+                    MessageSendFailureCode.CHAT_NOT_FOUND,
+                ),
+            )
+            draft = service.create_outgoing_draft(
+                application_id=application_id,
+                body=draft_body,
+            )
+            assert draft.content_hash is not None
+
+            failed = service.confirm_and_send(
+                account_id=account_id,
+                message_id=draft.id,
+                content_version=draft.content_version,
+                content_hash=draft.content_hash,
+            )
+
+            assert failed.state is RecruiterMessageState.FAILED
+            incident = session.scalar(
+                select(IncidentModel).where(
+                    IncidentModel.code == "RECRUITER_MESSAGE_SEND_FAILED",
+                    IncidentModel.scope_type == "recruiter_message",
+                    IncidentModel.scope_id == draft.id,
+                )
+            )
+            assert incident is not None
+            assert MessageSendFailureCode.CHAT_NOT_FOUND.value in incident.message
+            assert draft_body not in incident.message
+
+            service.confirm_outgoing_retry(
+                account_id=account_id,
+                message_id=draft.id,
+                content_version=draft.content_version,
+                content_hash=draft.content_hash,
+            )
+            CommunicationService(
+                session,
+                RecordingMessageSender(
+                    MessageSendOutcome.FAILED,
+                    MessageSendFailureCode.HTTP_4XX,
+                ),
+            ).send_confirmed(
+                account_id=account_id,
+                message_id=draft.id,
+                content_version=draft.content_version,
+                content_hash=draft.content_hash,
+            )
+
+            session.refresh(incident)
+            assert MessageSendFailureCode.HTTP_4XX.value in incident.message
+            assert MessageSendFailureCode.CHAT_NOT_FOUND.value not in incident.message
+            assert draft_body not in incident.message
     finally:
         database.close()
 
@@ -920,6 +1086,7 @@ def test_automatic_reply_filter_does_not_construct_model_for_skipped_messages(
             batch = AutonomousReplyService(session).prepare(
                 account_id=account_id,
                 model_factory=model_factory,
+                requirement_model_factory=model_factory,
                 incoming_message_ids=(incoming.id,),
             )
 
@@ -927,6 +1094,318 @@ def test_automatic_reply_filter_does_not_construct_model_for_skipped_messages(
             assert batch.drafts_created == 0
             assert batch.skipped_manual == expected_manual
             assert batch.failed == 0
+            assert factory_calls == 0
+            actions = CommunicationService(
+                session,
+                RecordingMessageSender(),
+            ).message_actions(account_id)
+            if expected_manual:
+                assert len(actions) == 1
+                assert actions[0].kind is RecruiterActionKind.EXTERNAL_FORM
+                assert actions[0].state is RecruiterActionState.REQUIRED
+                assert actions[0].source is RecruiterActionSource.RULE
+            else:
+                assert actions == ()
+    finally:
+        database.close()
+
+
+def test_hh_invitation_reminder_prepares_draft_for_unanswered_question(
+    settings: Settings,
+) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+
+    class ReminderReplyModel:
+        model_name = "reminder-reply-test"
+
+        def __init__(self) -> None:
+            self.prompts: list[str] = []
+
+        def complete(self, _system_prompt: str, user_prompt: str) -> str:
+            self.prompts.append(user_prompt)
+            return "Использовал Celery для фоновой обработки задач."
+
+    model = ReminderReplyModel()
+    try:
+        with database.sessions.begin() as session:
+            account_id, application_id = create_application(
+                session,
+                account_label="Вопрос перед напоминанием hh.ru",
+                vacancy_hh_id="reply-before-hh-reminder",
+            )
+            communications = CommunicationService(session, RecordingMessageSender())
+            question = communications.save_incoming(
+                application_id=application_id,
+                hh_id="incoming-question-before-hh-reminder",
+                body="Расскажите, пожалуйста, как вы применяли Celery?",
+            )
+            reminder = communications.save_incoming(
+                application_id=application_id,
+                hh_id="incoming-hh-invitation-reminder",
+                body="Напоминаем: ответьте на приглашение работодателя.",
+            )
+
+            batch = AutonomousReplyService(session).prepare(
+                account_id=account_id,
+                model_factory=lambda: model,
+                incoming_message_ids=(reminder.id,),
+            )
+
+            outgoing = next(
+                message
+                for message in communications.messages(account_id)
+                if message.direction is MessageDirection.OUTGOING
+            )
+            assert question.id < reminder.id < outgoing.id
+            assert batch.drafts_created == 1
+            assert batch.approved == ()
+            assert outgoing.state is RecruiterMessageState.REVIEW_REQUIRED
+            assert outgoing.auto_send_approved is False
+            assert len(model.prompts) == 1
+            assert "как вы применяли Celery?" in model.prompts[0]
+            assert "Напоминаем: ответьте" not in model.prompts[0]
+    finally:
+        database.close()
+
+
+def test_ambiguous_message_uses_requirement_model_before_reply_model(
+    settings: Settings,
+) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    requirement_model = RequirementModel("NO_REPLY_REQUIRED")
+    reply_factory_calls = 0
+
+    def reply_model_factory() -> ReplyModel:
+        nonlocal reply_factory_calls
+        reply_factory_calls += 1
+        return ReplyModel()
+
+    try:
+        with database.sessions.begin() as session:
+            account_id, application_id = create_application(
+                session,
+                account_label="Неоднозначное уведомление",
+                vacancy_hh_id="reply-ambiguous-no-reply",
+            )
+            incoming = CommunicationService(
+                session,
+                RecordingMessageSender(),
+            ).save_incoming(
+                application_id=application_id,
+                hh_id="incoming-ambiguous-no-reply",
+                body="Давайте пока оставим это здесь.",
+            )
+
+            batch = AutonomousReplyService(session).prepare(
+                account_id=account_id,
+                model_factory=reply_model_factory,
+                requirement_model_factory=lambda: requirement_model,
+                incoming_message_ids=(incoming.id,),
+            )
+            repeated_model = RequirementModel("REPLY_REQUIRED")
+            repeated = AutonomousReplyService(session).prepare(
+                account_id=account_id,
+                model_factory=reply_model_factory,
+                requirement_model_factory=lambda: repeated_model,
+                incoming_message_ids=(incoming.id,),
+            )
+            action = CommunicationService(
+                session,
+                RecordingMessageSender(),
+            ).message_actions(account_id)[0]
+
+            assert batch.approved == ()
+            assert batch.drafts_created == 0
+            assert batch.failed == 0
+            assert repeated.approved == ()
+            assert repeated.drafts_created == 0
+            assert requirement_model.calls == 1
+            assert repeated_model.calls == 0
+            assert reply_factory_calls == 0
+            assert action.message_id == incoming.id
+            assert action.kind is RecruiterActionKind.REPLY
+            assert action.state is RecruiterActionState.NOT_REQUIRED
+            assert action.source is RecruiterActionSource.MODEL
+            assert action.reason_code == "MODEL_NO_REPLY_REQUIRED"
+            assert action.resolved_at is not None
+    finally:
+        database.close()
+
+
+def test_ambiguous_message_requiring_reply_creates_review_draft(
+    settings: Settings,
+) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    requirement_model = RequirementModel("REPLY_REQUIRED")
+
+    try:
+        with database.sessions.begin() as session:
+            account_id, application_id = create_application(
+                session,
+                account_label="Неоднозначный ответ",
+                vacancy_hh_id="reply-ambiguous-required",
+            )
+            incoming = CommunicationService(
+                session,
+                RecordingMessageSender(),
+            ).save_incoming(
+                application_id=application_id,
+                hh_id="incoming-ambiguous-required",
+                body="Давайте пока оставим это здесь.",
+            )
+
+            batch = AutonomousReplyService(session).prepare(
+                account_id=account_id,
+                model_factory=ReplyModel,
+                requirement_model_factory=lambda: requirement_model,
+                incoming_message_ids=(incoming.id,),
+            )
+
+            outgoing = next(
+                message
+                for message in CommunicationService(
+                    session,
+                    RecordingMessageSender(),
+                ).messages(account_id)
+                if message.direction is MessageDirection.OUTGOING
+            )
+            action = CommunicationService(
+                session,
+                RecordingMessageSender(),
+            ).message_actions(account_id)[0]
+            assert batch.drafts_created == 1
+            assert batch.approved == ()
+            assert batch.failed == 0
+            assert outgoing.state is RecruiterMessageState.REVIEW_REQUIRED
+            assert outgoing.auto_send_approved is False
+            assert action.message_id == incoming.id
+            assert action.state is RecruiterActionState.REQUIRED
+            assert action.source is RecruiterActionSource.MODEL
+            assert action.resolved_at is None
+    finally:
+        database.close()
+
+
+def test_requirement_model_failure_keeps_ambiguous_message_actionable(
+    settings: Settings,
+) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+
+    try:
+        with database.sessions.begin() as session:
+            account_id, application_id = create_application(
+                session,
+                account_label="Ошибка проверки сообщения",
+                vacancy_hh_id="reply-ambiguous-failure",
+            )
+            incoming = CommunicationService(
+                session,
+                RecordingMessageSender(),
+            ).save_incoming(
+                application_id=application_id,
+                hh_id="incoming-ambiguous-failure",
+                body="Давайте пока оставим это здесь.",
+            )
+
+            batch = AutonomousReplyService(session).prepare(
+                account_id=account_id,
+                model_factory=ReplyModel,
+                requirement_model_factory=FailingRequirementModel,
+                incoming_message_ids=(incoming.id,),
+            )
+
+            outgoing = next(
+                message
+                for message in CommunicationService(
+                    session,
+                    RecordingMessageSender(),
+                ).messages(account_id)
+                if message.direction is MessageDirection.OUTGOING
+            )
+            action = CommunicationService(
+                session,
+                RecordingMessageSender(),
+            ).message_actions(account_id)[0]
+            assert batch.drafts_created == 1
+            assert batch.approved == ()
+            assert batch.failed == 1
+            assert outgoing.state is RecruiterMessageState.REVIEW_REQUIRED
+            assert action.message_id == incoming.id
+            assert action.state is RecruiterActionState.REQUIRED
+            assert action.source is RecruiterActionSource.SYSTEM
+            assert action.reason_code == "CLASSIFIER_FAILED_SAFE_FALLBACK"
+            assert action.resolved_at is None
+    finally:
+        database.close()
+
+
+def test_automatic_reply_does_not_continue_proven_repeated_bot_cycle(
+    settings: Settings,
+) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    factory_calls = 0
+
+    def model_factory() -> ReplyModel:
+        nonlocal factory_calls
+        factory_calls += 1
+        return ReplyModel()
+
+    try:
+        with database.sessions.begin() as session:
+            account_id, application_id = create_application(
+                session,
+                account_label="Повторяющийся бот",
+                vacancy_hh_id="reply-repeated-bot-cycle",
+            )
+            communications = CommunicationService(session, RecordingMessageSender())
+            question = "На каком курсе ты учишься?"
+            for index, incoming_body in enumerate(
+                (question, "  НА КАКОМ КУРСЕ ТЫ УЧИШЬСЯ?  "),
+                start=1,
+            ):
+                communications.save_incoming(
+                    application_id=application_id,
+                    hh_id=f"incoming-repeated-{index}",
+                    body=incoming_body,
+                )
+                draft = communications.create_outgoing_draft(
+                    application_id=application_id,
+                    body="Учусь на последнем курсе.",
+                )
+                communications.confirm_and_send(
+                    account_id=account_id,
+                    message_id=draft.id,
+                    content_version=draft.content_version,
+                    content_hash=draft.content_hash or "",
+                )
+            latest = communications.save_incoming(
+                application_id=application_id,
+                hh_id="incoming-repeated-3",
+                body=question,
+            )
+
+            batch = AutonomousReplyService(session).prepare(
+                account_id=account_id,
+                model_factory=model_factory,
+                incoming_message_ids=(latest.id,),
+            )
+
+            outgoing = tuple(
+                message
+                for message in communications.messages(account_id)
+                if message.direction is MessageDirection.OUTGOING
+            )
+            assert batch.approved == ()
+            assert batch.drafts_created == 0
+            assert batch.skipped_manual == 0
+            assert batch.failed == 0
+            assert len(outgoing) == 2
+            assert all(message.state is RecruiterMessageState.SENT for message in outgoing)
             assert factory_calls == 0
     finally:
         database.close()
@@ -994,9 +1473,7 @@ def test_new_simple_salary_question_gets_exact_confirmed_automatic_reply(
                 VerifiedFactModel(
                     profile_id=profile.id,
                     category="salary",
-                    content=(
-                        "Минимальная и желаемая зарплата — 120 000 рублей на руки"
-                    ),
+                    content=("Минимальная и желаемая зарплата — 120 000 рублей на руки"),
                     source_type="user",
                     state=ConfirmationState.CONFIRMED,
                     allow_in_messages=True,
@@ -1063,9 +1540,7 @@ def test_simple_salary_question_from_backlog_gets_exact_automatic_reply(
                 VerifiedFactModel(
                     profile_id=profile.id,
                     category="salary",
-                    content=(
-                        "Минимальная и желаемая зарплата — 120 000 рублей на руки"
-                    ),
+                    content=("Минимальная и желаемая зарплата — 120 000 рублей на руки"),
                     source_type="user",
                     state=ConfirmationState.CONFIRMED,
                     allow_in_messages=True,

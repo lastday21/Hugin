@@ -108,14 +108,17 @@ class HhSynchronizationService:
                 else "hh.ru"
             )
             if current.state is ApplicationState.APPLYING:
+                applied_payload: EventPayload = {
+                    "hh_status": HhNegotiationStatus.APPLIED.value,
+                    "source": event_source,
+                    "status_label": item.status_label[:255],
+                }
+                if event_source == "hugin_reconciliation" and task is not None:
+                    applied_payload["task_id"] = task.id
                 current = self._applications.transition_state(
                     current.id,
                     ApplicationState.APPLIED,
-                    {
-                        "hh_status": HhNegotiationStatus.APPLIED.value,
-                        "source": event_source,
-                        "status_label": item.status_label[:255],
-                    },
+                    applied_payload,
                 )
                 updated += 1
             if target is not current.state and target in APPLICATION_TRANSITIONS[current.state]:
@@ -237,6 +240,11 @@ class HhSynchronizationService:
                 created += 1
             if item.direction is MessageDirection.OUTGOING:
                 if record.state is RecruiterMessageState.SENT:
+                    self._communications.complete_reply_action_for_sent_outgoing(
+                        account_id=account_id,
+                        message_id=record.id,
+                        completed_at=record.sent_at or selected_at,
+                    )
                     for code in (
                         "RECRUITER_MESSAGE_SEND_FAILED",
                         "RECRUITER_MESSAGE_SEND_UNKNOWN",

@@ -50,3 +50,16 @@ class HhChatMessageData:
             raise ValueError("Некорректный идентификатор сообщения hh.ru")
         if not self.body.strip():
             raise ValueError("Пустое сообщение hh.ru")
+
+
+@dataclass(frozen=True, slots=True)
+class HhChatReadFailure:
+    vacancy_id: str
+    code: str
+    message: str
+
+
+@dataclass(frozen=True, slots=True)
+class HhRecruiterMessagesReadResult:
+    messages: tuple[HhChatMessageData, ...] = ()
+    failures: tuple[HhChatReadFailure, ...] = ()

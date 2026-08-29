@@ -502,7 +502,7 @@ def test_workspace_endpoints_return_real_data_and_protect_changes(settings: Sett
         assert request(app, "POST", read_path).status_code == 403
         read = request(app, "POST", read_path, headers=headers)
         assert read.status_code == 200
-        assert read.json()["unread_messages"] == 0
+        assert read.json()["unread_messages"] == 1
 
         draft_path = (
             f"/api/communications/conversations/"

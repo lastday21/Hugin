@@ -10,6 +10,7 @@ from hugin.core.settings import Settings
 from hugin.database import create_database, upgrade_database
 from hugin.domain.applications import ApplicationState
 from hugin.domain.content import InvitationState, MessageDirection, RecruiterMessageState
+from hugin.domain.directions import VacancyState
 from hugin.domain.hh_sync import (
     HhChatMessageData,
     HhNegotiationData,
@@ -20,6 +21,7 @@ from hugin.domain.vacancies import VacancyData
 from hugin.repositories import (
     AccountRepository,
     ApplicationRepository,
+    DirectionRepository,
     QueueTaskRepository,
     ResumeRepository,
     VacancyRepository,
@@ -271,6 +273,9 @@ def test_status_sync_reconciles_unknown_application_automatically(
                 "unknown-sync-resume",
                 "Python backend",
             )
+            directions = DirectionRepository(session)
+            direction = directions.create(account.id, "Python backend")
+            directions.attach_resume(direction.id, resume.id)
             vacancy = VacancyRepository(session).upsert(
                 VacancyData(
                     hh_id="unknown-sync-vacancy",
@@ -278,10 +283,25 @@ def test_status_sync_reconciles_unknown_application_automatically(
                     source_url="https://hh.ru/vacancy/unknown-sync-vacancy",
                 )
             )
+            attempt_details = {
+                "category": "MATCH",
+                "accepted": True,
+                "reasons": ["оценка в момент попытки"],
+            }
+            directions.track_vacancy(direction.id, vacancy.id)
+            directions.apply_rules(
+                direction.id,
+                vacancy.id,
+                state=VacancyState.QUEUED,
+                score=88,
+                details=attempt_details,
+                rules_version="snapshot-rules-v1",
+            )
             application = ApplicationRepository(session).create_apply_intent(
                 account.id,
                 vacancy.id,
                 resume.id,
+                direction.id,
             )
             tasks = QueueTaskRepository(session)
             task = tasks.enqueue(application.id, 80)
@@ -290,6 +310,29 @@ def test_status_sync_reconciles_unknown_application_automatically(
                 task.id,
                 TaskState.UNKNOWN_RESULT,
                 error_code="UNKNOWN_RESULT",
+                event_payload={
+                    "selection_snapshot": {
+                        "category": "MATCH",
+                        "fit_score": 88,
+                        "rules_version": "snapshot-rules-v1",
+                        "rules_details": attempt_details,
+                        "direction_id": direction.id,
+                        "resume_id": resume.id,
+                        "cover_letter_id": None,
+                    }
+                },
+            )
+            directions.apply_rules(
+                direction.id,
+                vacancy.id,
+                state=VacancyState.QUEUED,
+                score=42,
+                details={
+                    "category": "STRETCH",
+                    "accepted": True,
+                    "reasons": ["повторная оценка после попытки"],
+                },
+                rules_version="snapshot-rules-v2",
             )
 
             HhSynchronizationService(session).synchronize_statuses(
@@ -310,6 +353,12 @@ def test_status_sync_reconciles_unknown_application_automatically(
             assert tasks.get(task.id).state is TaskState.COMPLETED
             events = ApplicationRepository(session).list_events(application.id)
             assert events[-1].payload["source"] == "hugin_reconciliation"
+            assert events[-1].payload["task_id"] == task.id
+            assert events[-1].payload["category"] == "MATCH"
+            assert events[-1].payload["fit_score"] == 88
+            assert events[-1].payload["rules_version"] == "snapshot-rules-v1"
+            assert events[-1].payload["rules_details"] == attempt_details
+            assert events[-1].payload["snapshot_missing"] is False
             service = ApplicationAutomationService(session)
             assert (
                 service.applied_since(

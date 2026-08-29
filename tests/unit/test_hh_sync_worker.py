@@ -20,8 +20,10 @@ from hugin.domain.communications import MessageSendOutcome, MessageSendResult
 from hugin.domain.content import MessageDirection, RecruiterMessageState
 from hugin.domain.hh_sync import (
     HhChatMessageData,
+    HhChatReadFailure,
     HhNegotiationData,
     HhNegotiationStatus,
+    HhRecruiterMessagesReadResult,
     HhSyncBlockedError,
     HhSyncRetryableError,
 )
@@ -69,6 +71,7 @@ def make_job(kind: AutomationJobKind) -> AutomationJobRecord:
 
 class FakeBrowser:
     messages: ClassVar[tuple[HhChatMessageData, ...]] = ()
+    message_failures: ClassVar[tuple[HhChatReadFailure, ...]] = ()
     statuses: ClassVar[tuple[HhNegotiationData, ...]] = ()
     requested_ids: ClassVar[tuple[str, ...] | None] = None
     initialization_options: ClassVar[list[dict[str, object]]] = []
@@ -85,9 +88,12 @@ class FakeBrowser:
     def read_recruiter_messages(
         self,
         vacancy_ids: tuple[str, ...],
-    ) -> tuple[HhChatMessageData, ...]:
+    ) -> HhRecruiterMessagesReadResult:
         type(self).requested_ids = vacancy_ids
-        return self.messages
+        return HhRecruiterMessagesReadResult(
+            messages=self.messages,
+            failures=self.message_failures,
+        )
 
     def read_application_statuses(self) -> tuple[HhNegotiationData, ...]:
         return self.statuses
@@ -185,6 +191,55 @@ def test_message_handler_reads_only_tracked_chats(
     assert reply_modes == [False, False, True]
 
 
+def test_message_handler_records_bad_chat_without_losing_other_messages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    national_lottery_message = HhChatMessageData(
+        vacancy_id="136354935",
+        hh_id="national-lottery-message",
+        direction=MessageDirection.INCOMING,
+        body="Расскажите про свой опыт.",
+    )
+    monkeypatch.setattr(FakeBrowser, "messages", (national_lottery_message,))
+    monkeypatch.setattr(
+        FakeBrowser,
+        "message_failures",
+        (
+            HhChatReadFailure(
+                vacancy_id="135428288",
+                code="HH_CHAT_EMPTY",
+                message=("Переписка открылась, но hh.ru не отдал сообщения"),
+            ),
+        ),
+    )
+    handler = prepare_handler(monkeypatch, AutomationJobKind.MESSAGES)
+    monkeypatch.setattr(
+        handler,
+        "_tracked_vacancy_ids",
+        lambda: ("135428288", "136354935"),
+    )
+    synchronized: list[tuple[HhChatMessageData, ...]] = []
+
+    def synchronize(
+        messages: tuple[HhChatMessageData, ...],
+        *,
+        allow_replies: bool,
+    ) -> dict[str, int]:
+        assert not allow_replies
+        synchronized.append(messages)
+        return {"created": len(messages)}
+
+    monkeypatch.setattr(handler, "_synchronize_messages", synchronize)
+
+    result = handler(make_job(AutomationJobKind.MESSAGES))
+
+    assert synchronized == [(national_lottery_message,)]
+    assert result["created"] == 1
+    assert result["message_chats_failed"] == 1
+    assert result["message_chat_failure_ids"] == "135428288"
+    assert "HH_CHAT_EMPTY" in str(result["message_chat_failure_details"])
+
+
 def test_sync_handler_defers_before_browser_when_application_is_ready(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -235,9 +290,7 @@ def test_sync_handler_quickly_defers_when_browser_profile_is_busy(
     handler = prepare_handler(monkeypatch, AutomationJobKind.MESSAGES)
 
     def fail_enter(_browser: FakeBrowser) -> FakeBrowser:
-        raise RuntimeError(
-            "Профиль hh.ru занят другой задачей дольше допустимого времени"
-        )
+        raise RuntimeError("Профиль hh.ru занят другой задачей дольше допустимого времени")
 
     monkeypatch.setattr(FakeBrowser, "__enter__", fail_enter)
 

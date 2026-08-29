@@ -18,6 +18,7 @@ from hugin.domain.automation import (
 from hugin.domain.content import RecruiterMessageState
 from hugin.domain.hh_sync import (
     HhChatMessageData,
+    HhChatReadFailure,
     HhNegotiationData,
     HhSyncBlockedError,
     HhSyncRetryableError,
@@ -126,18 +127,17 @@ class HhSyncJobHandler:
                     )
                 self._defer_for_application()
                 if self.kind is AutomationJobKind.MESSAGES:
-                    messages = browser.read_recruiter_messages(vacancy_ids)
+                    message_read = browser.read_recruiter_messages(vacancy_ids)
                 else:
                     statuses = browser.read_application_statuses()
             if self.kind is AutomationJobKind.MESSAGES:
                 synchronized = self._synchronize_messages(
-                    messages,
-                    allow_replies=(
-                        job.last_result.get("message_baseline_initialized") is True
-                    ),
+                    message_read.messages,
+                    allow_replies=(job.last_result.get("message_baseline_initialized") is True),
                 )
                 return {
                     **synchronized,
+                    **self._chat_failure_metrics(message_read.failures),
                     "message_baseline_initialized": True,
                 }
             return self._synchronize_statuses(statuses)
@@ -158,6 +158,20 @@ class HhSyncJobHandler:
                 "Профиль hh.ru занят; фоновая проверка быстро уступила очередь откликам",
                 retry_after_seconds=_BACKGROUND_PROFILE_RETRY_SECONDS,
             ) from error
+
+    @staticmethod
+    def _chat_failure_metrics(
+        failures: tuple[HhChatReadFailure, ...],
+    ) -> AutomationJobResult:
+        if not failures:
+            return {}
+        return {
+            "message_chats_failed": len(failures),
+            "message_chat_failure_ids": ",".join(failure.vacancy_id for failure in failures),
+            "message_chat_failure_details": " | ".join(
+                f"{failure.vacancy_id} [{failure.code}]: {failure.message}" for failure in failures
+            )[:2_000],
+        }
 
     def _defer_for_application(self) -> None:
         if self._application_work_pending is not None and self._application_work_pending():
@@ -268,6 +282,12 @@ class HhSyncJobHandler:
                     model_factory=lambda: configured_codex_cli_client(
                         self._settings,
                         operation="recruiter_reply",
+                    ),
+                    requirement_model_factory=lambda: configured_codex_cli_client(
+                        self._settings,
+                        operation="recruiter_reply_requirement",
+                        model=self._settings.codex_reply_requirement_model,
+                        timeout_seconds=self._settings.codex_reply_requirement_timeout_seconds,
                     ),
                 )
         finally:
@@ -385,23 +405,27 @@ class HhSyncJobHandler:
                 if current is target:
                     return
                 if (
-                    current in {SystemState.RUNNING, SystemState.PAUSED}
-                    and target
-                    in {
-                        SystemState.AUTH_REQUIRED,
-                        SystemState.CAPTCHA_REQUIRED,
-                        SystemState.ACCOUNT_WARNING,
-                    }
-                ) or (
-                    current is SystemState.AUTH_REQUIRED
-                    and target
-                    in {
-                        SystemState.CAPTCHA_REQUIRED,
-                        SystemState.ACCOUNT_WARNING,
-                    }
-                ) or (
-                    current is SystemState.CAPTCHA_REQUIRED
-                    and target is SystemState.ACCOUNT_WARNING
+                    (
+                        current in {SystemState.RUNNING, SystemState.PAUSED}
+                        and target
+                        in {
+                            SystemState.AUTH_REQUIRED,
+                            SystemState.CAPTCHA_REQUIRED,
+                            SystemState.ACCOUNT_WARNING,
+                        }
+                    )
+                    or (
+                        current is SystemState.AUTH_REQUIRED
+                        and target
+                        in {
+                            SystemState.CAPTCHA_REQUIRED,
+                            SystemState.ACCOUNT_WARNING,
+                        }
+                    )
+                    or (
+                        current is SystemState.CAPTCHA_REQUIRED
+                        and target is SystemState.ACCOUNT_WARNING
+                    )
                 ):
                     repository.transition(target)
         finally:

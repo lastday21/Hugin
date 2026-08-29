@@ -11,16 +11,21 @@ from sqlalchemy.orm import Session
 from hugin.domain.communications import (
     CommunicationStateError,
     InvitationRecord,
+    MessageSendFailureCode,
     MessageSendOutcome,
     MessageSendRequest,
     MessageSendResult,
     NotificationRecord,
+    RecruiterMessageActionRecord,
     RecruiterMessageRecord,
     StaleMessageDraftError,
 )
 from hugin.domain.content import (
     IncidentSeverity,
     NotificationChannel,
+    RecruiterActionKind,
+    RecruiterActionSource,
+    RecruiterActionState,
     RecruiterMessageState,
 )
 from hugin.domain.directions import ConfigPayload
@@ -41,8 +46,13 @@ class MessageSender(Protocol):
 class RecordingMessageSender:
     """Record requested sends without opening a browser or using the network."""
 
-    def __init__(self, outcome: MessageSendOutcome = MessageSendOutcome.SENT) -> None:
+    def __init__(
+        self,
+        outcome: MessageSendOutcome = MessageSendOutcome.SENT,
+        failure_code: MessageSendFailureCode | None = None,
+    ) -> None:
         self.outcome = outcome
+        self.failure_code = failure_code
         self._attempts: list[MessageSendRequest] = []
         self._results: dict[tuple[int, int, str], MessageSendResult] = {}
 
@@ -61,7 +71,7 @@ class RecordingMessageSender:
             if self.outcome is MessageSendOutcome.SENT
             else None
         )
-        result = MessageSendResult(self.outcome, external_id)
+        result = MessageSendResult(self.outcome, external_id, self.failure_code)
         self._results[key] = result
         return result
 
@@ -104,6 +114,128 @@ class CommunicationService:
             self._positive_id(account_id),
             self._positive_id(message_id),
             self._now(read_at),
+        )
+
+    def message_actions(self, account_id: int) -> tuple[RecruiterMessageActionRecord, ...]:
+        return self._repository.list_message_actions_for_account(self._positive_id(account_id))
+
+    def record_reply_requirement(
+        self,
+        *,
+        account_id: int,
+        message_id: int,
+        required: bool,
+        source: RecruiterActionSource,
+        reason_code: str,
+        reason: str,
+        changed_at: datetime | None = None,
+    ) -> RecruiterMessageActionRecord:
+        if source not in {RecruiterActionSource.MODEL, RecruiterActionSource.SYSTEM}:
+            raise ValueError("Проверку необходимости ответа сохраняет модель или система")
+        return self._record_message_action(
+            account_id=account_id,
+            message_id=message_id,
+            kind=RecruiterActionKind.REPLY,
+            state=(
+                RecruiterActionState.REQUIRED if required else RecruiterActionState.NOT_REQUIRED
+            ),
+            source=source,
+            reason_code=reason_code,
+            reason=reason,
+            due_at=None,
+            changed_at=changed_at,
+            preserve_resolved=True,
+        )
+
+    def complete_external_action(
+        self,
+        *,
+        account_id: int,
+        message_id: int,
+        kind: RecruiterActionKind,
+        reason_code: str,
+        reason: str,
+        changed_at: datetime | None = None,
+    ) -> RecruiterMessageActionRecord:
+        if kind is RecruiterActionKind.REPLY:
+            raise ValueError("Ответ в hh.ru нельзя завершить как внешнее действие")
+        return self._record_message_action(
+            account_id=account_id,
+            message_id=message_id,
+            kind=kind,
+            state=RecruiterActionState.COMPLETED,
+            source=RecruiterActionSource.USER,
+            reason_code=reason_code,
+            reason=reason,
+            due_at=None,
+            changed_at=changed_at,
+            preserve_resolved=False,
+        )
+
+    def require_external_action(
+        self,
+        *,
+        account_id: int,
+        message_id: int,
+        kind: RecruiterActionKind,
+        source: RecruiterActionSource,
+        reason_code: str,
+        reason: str,
+        due_at: datetime | None = None,
+        changed_at: datetime | None = None,
+    ) -> RecruiterMessageActionRecord:
+        if kind is RecruiterActionKind.REPLY:
+            raise ValueError("Для ответа в hh.ru используется отдельная проверка")
+        if source is RecruiterActionSource.MODEL:
+            raise ValueError("Модель не может назначать внешнее действие")
+        return self._record_message_action(
+            account_id=account_id,
+            message_id=message_id,
+            kind=kind,
+            state=RecruiterActionState.REQUIRED,
+            source=source,
+            reason_code=reason_code,
+            reason=reason,
+            due_at=due_at,
+            changed_at=changed_at,
+            preserve_resolved=True,
+        )
+
+    def dismiss_incoming_action(
+        self,
+        *,
+        account_id: int,
+        message_id: int,
+        kind: RecruiterActionKind,
+        source: RecruiterActionSource,
+        reason_code: str,
+        reason: str,
+        changed_at: datetime | None = None,
+    ) -> RecruiterMessageActionRecord:
+        if source is RecruiterActionSource.MODEL:
+            raise ValueError("Модель не может исключать этап отбора")
+        return self._record_message_action(
+            account_id=account_id,
+            message_id=message_id,
+            kind=kind,
+            state=RecruiterActionState.DISMISSED,
+            source=source,
+            reason_code=reason_code,
+            reason=reason,
+            due_at=None,
+            changed_at=changed_at,
+            preserve_resolved=source is not RecruiterActionSource.USER,
+        )
+
+    def dismiss_expired_actions(
+        self,
+        *,
+        account_id: int,
+        changed_at: datetime | None = None,
+    ) -> int:
+        return self._repository.dismiss_expired_message_actions(
+            account_id=self._positive_id(account_id),
+            changed_at=self._now(changed_at),
         )
 
     def create_outgoing_draft(
@@ -235,6 +367,12 @@ class CommunicationService:
             RecruiterMessageState.FAILED,
             RecruiterMessageState.UNKNOWN_RESULT,
         }:
+            if message.state is RecruiterMessageState.SENT:
+                self._repository.complete_reply_action_for_sent_outgoing(
+                    account_id=selected_account_id,
+                    message_id=selected_message_id,
+                    completed_at=self._now(finished_at),
+                )
             return message
         if message.state is not RecruiterMessageState.CONFIRMED:
             raise CommunicationStateError(
@@ -257,17 +395,29 @@ class CommunicationService:
             external_id=result.external_id,
             finished_at=self._now(finished_at),
         )
-        self._record_send_incident(recorded)
+        if recorded.state is RecruiterMessageState.SENT:
+            self._repository.complete_reply_action_for_sent_outgoing(
+                account_id=selected_account_id,
+                message_id=selected_message_id,
+                completed_at=recorded.sent_at or self._now(finished_at),
+            )
+        self._record_send_incident(recorded, result.failure_code)
         return recorded
 
-    def _record_send_incident(self, message: RecruiterMessageRecord) -> None:
+    def _record_send_incident(
+        self,
+        message: RecruiterMessageRecord,
+        failure_code: MessageSendFailureCode | None,
+    ) -> None:
         if message.state is RecruiterMessageState.FAILED:
+            selected_failure_code = failure_code or MessageSendFailureCode.UNSPECIFIED
             self._incidents.report(
                 code="RECRUITER_MESSAGE_SEND_FAILED",
                 severity=IncidentSeverity.ERROR,
                 message=(
                     f"Не удалось отправить ответ работодателю; сообщение №{message.id} "
-                    "оставлено для безопасного повтора после проверки причины."
+                    "оставлено для безопасного повтора после проверки причины. "
+                    f"Код этапа: {selected_failure_code.value}."
                 ),
                 scope_type="recruiter_message",
                 scope_id=message.id,
@@ -394,6 +544,39 @@ class CommunicationService:
     @staticmethod
     def content_hash(body: str) -> str:
         return sha256(body.encode("utf-8")).hexdigest()
+
+    def _record_message_action(
+        self,
+        *,
+        account_id: int,
+        message_id: int,
+        kind: RecruiterActionKind,
+        state: RecruiterActionState,
+        source: RecruiterActionSource,
+        reason_code: str,
+        reason: str,
+        due_at: datetime | None,
+        changed_at: datetime | None,
+        preserve_resolved: bool,
+    ) -> RecruiterMessageActionRecord:
+        selected_code = reason_code.strip().upper()
+        if not selected_code or len(selected_code) > 64:
+            raise ValueError("Код причины действия должен содержать от 1 до 64 символов")
+        selected_reason = " ".join(reason.split())
+        if not selected_reason or len(selected_reason) > 1000:
+            raise ValueError("Причина действия должна содержать от 1 до 1000 символов")
+        return self._repository.record_message_action(
+            account_id=self._positive_id(account_id),
+            message_id=self._positive_id(message_id),
+            kind=kind,
+            state=state,
+            source=source,
+            reason_code=selected_code,
+            reason=selected_reason,
+            due_at=as_utc(due_at) if due_at is not None else None,
+            changed_at=self._now(changed_at),
+            preserve_resolved=preserve_resolved,
+        )
 
     @staticmethod
     def _body(value: str) -> str:

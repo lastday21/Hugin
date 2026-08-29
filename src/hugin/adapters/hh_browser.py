@@ -46,7 +46,11 @@ from playwright.sync_api import (
 )
 
 from hugin.core.network import usable_source_ipv4
-from hugin.domain.communications import MessageSendOutcome, MessageSendResult
+from hugin.domain.communications import (
+    MessageSendFailureCode,
+    MessageSendOutcome,
+    MessageSendResult,
+)
 from hugin.domain.content import MessageDirection
 from hugin.domain.hh import (
     HhApplyResult,
@@ -64,8 +68,10 @@ from hugin.domain.hh import (
 )
 from hugin.domain.hh_sync import (
     HhChatMessageData,
+    HhChatReadFailure,
     HhNegotiationData,
     HhNegotiationStatus,
+    HhRecruiterMessagesReadResult,
     HhSyncBlockedError,
     HhSyncRetryableError,
 )
@@ -1275,6 +1281,12 @@ class _ResumeSelectionError(RuntimeError):
         self.retryable = retryable
 
 
+class _HhChatReadError(RuntimeError):
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
 class _BrowserProfileLock:
     def __init__(
         self,
@@ -2005,12 +2017,13 @@ class VisibleHhBrowser:
     def read_recruiter_messages(
         self,
         vacancy_ids: tuple[str, ...],
-    ) -> tuple[HhChatMessageData, ...]:
+    ) -> HhRecruiterMessagesReadResult:
         selected_ids = {value.strip() for value in vacancy_ids if value.strip()}
         if not selected_ids:
-            return ()
+            return HhRecruiterMessagesReadResult()
         page = self._open_negotiations()
         messages: list[HhChatMessageData] = []
+        failures: list[HhChatReadFailure] = []
         read_ids: set[str] = set()
         page_numbers = self._negotiation_page_numbers(page)
         pages: tuple[int | None, ...] = page_numbers or (None,)
@@ -2030,62 +2043,111 @@ class VisibleHhBrowser:
                     raise RuntimeError("hh.ru не вернул номер вакансии для доступной переписки")
                 if vacancy_id not in selected_ids or vacancy_id in read_ids:
                     continue
-                self._read_recruiter_chat(page, vacancy_id, messages)
                 read_ids.add(vacancy_id)
-        return tuple(messages)
+                try:
+                    messages.extend(self._read_recruiter_chat(page, vacancy_id))
+                except _HhChatReadError as error:
+                    failures.append(
+                        HhChatReadFailure(
+                            vacancy_id=vacancy_id,
+                            code=error.code,
+                            message=str(error),
+                        )
+                    )
+        return HhRecruiterMessagesReadResult(
+            messages=tuple(messages),
+            failures=tuple(failures),
+        )
 
     def _read_recruiter_chat(
         self,
         page: Page,
         vacancy_id: str,
-        messages: list[HhChatMessageData],
-    ) -> None:
+    ) -> tuple[HhChatMessageData, ...]:
+        previous_frames = self._chat_frame_snapshot(page)
         opened = page.evaluate(OPEN_NEGOTIATION_CHAT_SCRIPT, vacancy_id)
         if opened is not True:
-            raise RuntimeError(
-                f"hh.ru показал переписку вакансии {vacancy_id}, но не открыл её для чтения"
+            raise _HhChatReadError(
+                "HH_CHAT_OPEN_FAILED",
+                f"hh.ru показал переписку вакансии {vacancy_id}, но не открыл её для чтения",
             )
-        frame = self._wait_for_chat_frame(page)
-        if frame is None:
-            raise RuntimeError(f"Переписка вакансии {vacancy_id} не загрузилась")
-        payload = self._read_chat_messages(page, frame, vacancy_id)
-        for item in payload:
-            message_vacancy_id = self._required_string(
-                item,
-                "vacancyId",
-                "идентификатора вакансии сообщения",
-            )
-            if message_vacancy_id != vacancy_id:
-                raise RuntimeError("hh.ru вернул сообщения из другой переписки")
-            raw_direction = self._required_string(
-                item,
-                "direction",
-                "направления сообщения",
-            )
-            try:
-                direction = MessageDirection(raw_direction)
-            except ValueError as error:
-                raise RuntimeError("hh.ru вернул неизвестное направление сообщения") from error
-            messages.append(
-                HhChatMessageData(
-                    vacancy_id=message_vacancy_id,
-                    hh_id=self._required_string(
-                        item,
-                        "messageId",
-                        "идентификатора сообщения",
-                    ),
-                    direction=direction,
-                    body=self._required_string(item, "body", "текста сообщения"),
-                    displayed_time=self._optional_string(item, "displayedTime"),
+        try:
+            frame = self._wait_for_chat_frame(page, previous_frames)
+            if frame is None:
+                raise _HhChatReadError(
+                    "HH_CHAT_NOT_LOADED",
+                    f"Переписка вакансии {vacancy_id} не загрузилась",
                 )
-            )
+            payload = self._read_chat_messages(page, frame, vacancy_id)
+            messages = self._parse_chat_messages(payload, vacancy_id)
+        except Exception:
+            with suppress(_HhChatReadError):
+                self._close_recruiter_chat(page, vacancy_id)
+            raise
+        self._close_recruiter_chat(page, vacancy_id)
+        return messages
+
+    def _parse_chat_messages(
+        self,
+        payload: list[dict[object, object]],
+        vacancy_id: str,
+    ) -> tuple[HhChatMessageData, ...]:
+        messages: list[HhChatMessageData] = []
+        try:
+            for item in payload:
+                message_vacancy_id = self._required_string(
+                    item,
+                    "vacancyId",
+                    "идентификатора вакансии сообщения",
+                )
+                if message_vacancy_id != vacancy_id:
+                    raise RuntimeError("hh.ru вернул сообщения из другой переписки")
+                raw_direction = self._required_string(
+                    item,
+                    "direction",
+                    "направления сообщения",
+                )
+                try:
+                    direction = MessageDirection(raw_direction)
+                except ValueError as error:
+                    raise RuntimeError("hh.ru вернул неизвестное направление сообщения") from error
+                messages.append(
+                    HhChatMessageData(
+                        vacancy_id=message_vacancy_id,
+                        hh_id=self._required_string(
+                            item,
+                            "messageId",
+                            "идентификатора сообщения",
+                        ),
+                        direction=direction,
+                        body=self._required_string(item, "body", "текста сообщения"),
+                        displayed_time=self._optional_string(item, "displayedTime"),
+                    )
+                )
+        except (HhSyncBlockedError, HhSyncRetryableError):
+            raise
+        except (RuntimeError, ValueError) as error:
+            raise _HhChatReadError(
+                "HH_CHAT_INVALID",
+                f"Переписка вакансии {vacancy_id} содержит некорректные данные: {error}",
+            ) from error
+        return tuple(messages)
+
+    @staticmethod
+    def _close_recruiter_chat(page: Page, vacancy_id: str) -> None:
         close = page.locator('[data-qa="chatik-close-chatik"]')
         if close.count() != 1:
-            raise RuntimeError(f"Переписка вакансии {vacancy_id} не показала кнопку закрытия")
+            raise _HhChatReadError(
+                "HH_CHAT_CLOSE_FAILED",
+                f"Переписка вакансии {vacancy_id} не показала кнопку закрытия",
+            )
         try:
             close.first.click(no_wait_after=True)
         except PlaywrightError as error:
-            raise RuntimeError(f"Не удалось закрыть переписку вакансии {vacancy_id}") from error
+            raise _HhChatReadError(
+                "HH_CHAT_CLOSE_FAILED",
+                f"Не удалось закрыть переписку вакансии {vacancy_id}",
+            ) from error
         page.wait_for_timeout(500)
 
     @staticmethod
@@ -2106,16 +2168,21 @@ class VisibleHhBrowser:
             try:
                 payload = frame.evaluate(CHAT_MESSAGES_SCRIPT, vacancy_id)
             except PlaywrightError as error:
-                raise RuntimeError(
-                    f"Не удалось прочитать переписку вакансии {vacancy_id}"
+                raise _HhChatReadError(
+                    "HH_CHAT_READ_FAILED",
+                    f"Не удалось прочитать переписку вакансии {vacancy_id}",
                 ) from error
             if not isinstance(payload, list) or not all(isinstance(item, dict) for item in payload):
-                raise RuntimeError("hh.ru вернул некорректную переписку")
+                raise _HhChatReadError(
+                    "HH_CHAT_INVALID",
+                    f"Переписка вакансии {vacancy_id} вернула некорректные данные",
+                )
             if payload:
                 return payload
             page.wait_for_timeout(500)
-        raise RuntimeError(
-            f"Переписка вакансии {vacancy_id} открылась, но hh.ru не отдал ни одного сообщения"
+        raise _HhChatReadError(
+            "HH_CHAT_EMPTY",
+            f"Переписка вакансии {vacancy_id} открылась, но hh.ru не отдал ни одного сообщения",
         )
 
     def apply_to_vacancy(
@@ -2983,31 +3050,55 @@ class VisibleHhBrowser:
         except (HhSyncBlockedError, HhSyncRetryableError):
             raise
         except RuntimeError:
-            return MessageSendResult(MessageSendOutcome.FAILED)
+            return MessageSendResult(
+                MessageSendOutcome.FAILED,
+                failure_code=MessageSendFailureCode.NEGOTIATIONS_OPEN_FAILED,
+            )
+        previous_frames = self._chat_frame_snapshot(page)
         try:
             opened = self._open_negotiation_chat(page, vacancy_id)
         except (PlaywrightError, RuntimeError):
-            return MessageSendResult(MessageSendOutcome.FAILED)
+            return MessageSendResult(
+                MessageSendOutcome.FAILED,
+                failure_code=MessageSendFailureCode.CHAT_OPEN_FAILED,
+            )
         if opened is not True:
-            return MessageSendResult(MessageSendOutcome.FAILED)
-        frame = self._wait_for_chat_frame(page)
+            return MessageSendResult(
+                MessageSendOutcome.FAILED,
+                failure_code=MessageSendFailureCode.CHAT_NOT_FOUND,
+            )
+        frame = self._wait_for_chat_frame(page, previous_frames)
         if frame is None:
-            return MessageSendResult(MessageSendOutcome.FAILED)
+            return MessageSendResult(
+                MessageSendOutcome.FAILED,
+                failure_code=MessageSendFailureCode.CHAT_FRAME_MISSING,
+            )
 
         editor = frame.locator('[data-qa="chatik-new-message-text"]')
-        submit = frame.locator('[data-qa="chatik-do-send-message"]')
-        if editor.count() != 1 or submit.count() != 1 or not editor.first.is_enabled():
-            return MessageSendResult(MessageSendOutcome.FAILED)
+        if editor.count() != 1:
+            editor = frame.locator('[data-qa="text-input"]')
+        if editor.count() != 1 or not editor.first.is_enabled():
+            return MessageSendResult(
+                MessageSendOutcome.FAILED,
+                failure_code=MessageSendFailureCode.EDITOR_UNAVAILABLE,
+            )
         before = self._outgoing_messages_snapshot(frame, vacancy_id, exact_body)
         if before is None:
-            return MessageSendResult(MessageSendOutcome.FAILED)
+            return MessageSendResult(
+                MessageSendOutcome.FAILED,
+                failure_code=MessageSendFailureCode.SNAPSHOT_UNAVAILABLE,
+            )
         editor.first.fill(exact_body)
         for _attempt in range(4):
-            if submit.first.is_enabled():
+            submit = frame.locator('[data-qa="chatik-do-send-message"]')
+            if submit.count() == 1 and submit.first.is_enabled():
                 break
             page.wait_for_timeout(250)
         else:
-            return MessageSendResult(MessageSendOutcome.FAILED)
+            return MessageSendResult(
+                MessageSendOutcome.FAILED,
+                failure_code=MessageSendFailureCode.SUBMIT_UNAVAILABLE,
+            )
 
         response: Response | None = None
         try:
@@ -3034,7 +3125,10 @@ class VisibleHhBrowser:
                     external_id,
                 )
         if response is not None and 400 <= response.status < 500:
-            return MessageSendResult(MessageSendOutcome.FAILED)
+            return MessageSendResult(
+                MessageSendOutcome.FAILED,
+                failure_code=MessageSendFailureCode.HTTP_4XX,
+            )
         return MessageSendResult(MessageSendOutcome.UNKNOWN_RESULT)
 
     def _open_negotiation_chat(self, page: Page, vacancy_id: str) -> bool:
@@ -3253,11 +3347,31 @@ class VisibleHhBrowser:
             raise RuntimeError("hh.ru не показал номер вакансии после открытия отклика")
         return vacancy_id
 
-    def _wait_for_chat_frame(self, page: Page) -> Frame | None:
+    @staticmethod
+    def _chat_frame_snapshot(page: Page) -> tuple[tuple[Frame, str], ...]:
+        return tuple(
+            (candidate, candidate.url)
+            for candidate in page.frames
+            if "chatik.hh.ru/chat/" in candidate.url
+        )
+
+    def _wait_for_chat_frame(
+        self,
+        page: Page,
+        previous_frames: tuple[tuple[Frame, str], ...] = (),
+    ) -> Frame | None:
         attempts = max(min(self._timeout_ms // 500, 20), 1)
         for _attempt in range(attempts):
             frame = next(
-                (candidate for candidate in page.frames if "chatik.hh.ru/chat/" in candidate.url),
+                (
+                    candidate
+                    for candidate in reversed(page.frames)
+                    if "chatik.hh.ru/chat/" in candidate.url
+                    and all(
+                        candidate is not previous or candidate.url != previous_url
+                        for previous, previous_url in previous_frames
+                    )
+                ),
                 None,
             )
             if frame is not None:

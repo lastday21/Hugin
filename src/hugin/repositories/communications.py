@@ -13,6 +13,7 @@ from hugin.database.models import (
     ApplicationModel,
     InvitationModel,
     NotificationModel,
+    RecruiterMessageActionModel,
     RecruiterMessageModel,
 )
 from hugin.domain.communications import (
@@ -21,6 +22,7 @@ from hugin.domain.communications import (
     InvitationRecord,
     MessageSendOutcome,
     NotificationRecord,
+    RecruiterMessageActionRecord,
     RecruiterMessageRecord,
     StaleMessageDraftError,
 )
@@ -29,6 +31,9 @@ from hugin.domain.content import (
     InvitationState,
     MessageDirection,
     NotificationChannel,
+    RecruiterActionKind,
+    RecruiterActionSource,
+    RecruiterActionState,
     RecruiterMessageState,
 )
 from hugin.domain.directions import ConfigPayload
@@ -66,6 +71,21 @@ def _message_record(model: RecruiterMessageModel) -> RecruiterMessageRecord:
         auto_send_approved=model.auto_send_approved,
         reply_template_key=model.reply_template_key,
         created_at=as_utc(model.created_at),
+    )
+
+
+def _message_action_record(model: RecruiterMessageActionModel) -> RecruiterMessageActionRecord:
+    return RecruiterMessageActionRecord(
+        message_id=model.message_id,
+        kind=model.kind,
+        state=model.state,
+        source=model.source,
+        reason_code=model.reason_code,
+        reason=model.reason,
+        due_at=_optional_utc(model.due_at),
+        resolved_at=_optional_utc(model.resolved_at),
+        created_at=as_utc(model.created_at),
+        updated_at=as_utc(model.updated_at),
     )
 
 
@@ -253,6 +273,168 @@ class CommunicationRepository:
             model.read_at = as_utc(read_at)
             self._session.flush()
         return _message_record(model)
+
+    def list_message_actions_for_account(
+        self,
+        account_id: int,
+    ) -> tuple[RecruiterMessageActionRecord, ...]:
+        models = self._session.scalars(
+            select(RecruiterMessageActionModel)
+            .join(
+                RecruiterMessageModel,
+                RecruiterMessageModel.id == RecruiterMessageActionModel.message_id,
+            )
+            .join(
+                ApplicationModel,
+                ApplicationModel.id == RecruiterMessageModel.application_id,
+            )
+            .where(ApplicationModel.account_id == account_id)
+            .order_by(
+                RecruiterMessageActionModel.message_id,
+                RecruiterMessageActionModel.kind,
+            )
+        )
+        return tuple(_message_action_record(model) for model in models)
+
+    def record_message_action(
+        self,
+        *,
+        account_id: int,
+        message_id: int,
+        kind: RecruiterActionKind,
+        state: RecruiterActionState,
+        source: RecruiterActionSource,
+        reason_code: str,
+        reason: str,
+        due_at: datetime | None,
+        changed_at: datetime,
+        preserve_resolved: bool,
+    ) -> RecruiterMessageActionRecord:
+        message = self._message_model(account_id, message_id, for_update=True)
+        if message.direction is not MessageDirection.INCOMING:
+            raise CommunicationStateError(
+                "Состояние действия можно сохранить только для входящего сообщения"
+            )
+        model = self._session.get(
+            RecruiterMessageActionModel,
+            (message_id, kind),
+            with_for_update=True,
+        )
+        resolved_states = {
+            RecruiterActionState.COMPLETED,
+            RecruiterActionState.DISMISSED,
+            RecruiterActionState.NOT_REQUIRED,
+        }
+        if model is not None and preserve_resolved and model.state in resolved_states:
+            return _message_action_record(model)
+
+        resolved_at = None if state is RecruiterActionState.REQUIRED else as_utc(changed_at)
+        if model is None:
+            model = RecruiterMessageActionModel(
+                message_id=message_id,
+                kind=kind,
+                state=state,
+                source=source,
+                reason_code=reason_code,
+                reason=reason,
+                due_at=_optional_utc(due_at),
+                resolved_at=resolved_at,
+                created_at=as_utc(changed_at),
+                updated_at=as_utc(changed_at),
+            )
+            self._session.add(model)
+        else:
+            model.state = state
+            model.source = source
+            model.reason_code = reason_code
+            model.reason = reason
+            if due_at is not None or state is RecruiterActionState.REQUIRED:
+                model.due_at = _optional_utc(due_at)
+            model.resolved_at = resolved_at
+            model.updated_at = as_utc(changed_at)
+        self._session.flush()
+        return _message_action_record(model)
+
+    def dismiss_expired_message_actions(
+        self,
+        *,
+        account_id: int,
+        changed_at: datetime,
+    ) -> int:
+        selected_at = as_utc(changed_at)
+        models = tuple(
+            self._session.scalars(
+                select(RecruiterMessageActionModel)
+                .join(
+                    RecruiterMessageModel,
+                    RecruiterMessageModel.id == RecruiterMessageActionModel.message_id,
+                )
+                .join(
+                    ApplicationModel,
+                    ApplicationModel.id == RecruiterMessageModel.application_id,
+                )
+                .where(
+                    ApplicationModel.account_id == account_id,
+                    RecruiterMessageActionModel.state == RecruiterActionState.REQUIRED,
+                    RecruiterMessageActionModel.due_at.is_not(None),
+                    RecruiterMessageActionModel.due_at <= selected_at,
+                )
+                .with_for_update()
+            )
+        )
+        for model in models:
+            due_at = as_utc(model.due_at) if model.due_at is not None else selected_at
+            model.state = RecruiterActionState.DISMISSED
+            model.source = RecruiterActionSource.SYSTEM
+            model.reason_code = "ACTION_EXPIRED"
+            model.reason = f"Срок выполнения действия истёк {due_at.isoformat()}."
+            model.resolved_at = selected_at
+            model.updated_at = selected_at
+        if models:
+            self._session.flush()
+        return len(models)
+
+    def complete_reply_action_for_sent_outgoing(
+        self,
+        *,
+        account_id: int,
+        message_id: int,
+        completed_at: datetime,
+    ) -> RecruiterMessageActionRecord | None:
+        outgoing = self._message_model(account_id, message_id, for_update=True)
+        if (
+            outgoing.direction is not MessageDirection.OUTGOING
+            or outgoing.state is not RecruiterMessageState.SENT
+        ):
+            return None
+        incoming_id = self._session.scalar(
+            select(RecruiterMessageModel.id)
+            .where(
+                RecruiterMessageModel.application_id == outgoing.application_id,
+                RecruiterMessageModel.direction == MessageDirection.INCOMING,
+                RecruiterMessageModel.id < outgoing.id,
+            )
+            .order_by(RecruiterMessageModel.id.desc())
+            .limit(1)
+        )
+        if incoming_id is None:
+            return None
+        action = self._session.get(
+            RecruiterMessageActionModel,
+            (incoming_id, RecruiterActionKind.REPLY),
+            with_for_update=True,
+        )
+        if action is None or action.state is not RecruiterActionState.REQUIRED:
+            return _message_action_record(action) if action is not None else None
+        selected_at = as_utc(completed_at)
+        action.state = RecruiterActionState.COMPLETED
+        action.source = RecruiterActionSource.SYSTEM
+        action.reason_code = "REPLY_SENT"
+        action.reason = "Ответ на входящее сообщение подтверждённо отправлен в hh.ru."
+        action.resolved_at = selected_at
+        action.updated_at = selected_at
+        self._session.flush()
+        return _message_action_record(action)
 
     def create_outgoing_draft(
         self,

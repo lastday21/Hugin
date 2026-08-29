@@ -78,6 +78,27 @@ class RecruiterMessageState(StrEnum):
     UNKNOWN_RESULT = "UNKNOWN_RESULT"
 
 
+class RecruiterActionKind(StrEnum):
+    REPLY = "REPLY"
+    EXTERNAL_FORM = "EXTERNAL_FORM"
+    TEST_ASSIGNMENT = "TEST_ASSIGNMENT"
+    EXTERNAL_ACTION = "EXTERNAL_ACTION"
+
+
+class RecruiterActionState(StrEnum):
+    REQUIRED = "REQUIRED"
+    COMPLETED = "COMPLETED"
+    DISMISSED = "DISMISSED"
+    NOT_REQUIRED = "NOT_REQUIRED"
+
+
+class RecruiterActionSource(StrEnum):
+    RULE = "RULE"
+    MODEL = "MODEL"
+    USER = "USER"
+    SYSTEM = "SYSTEM"
+
+
 class InvitationState(StrEnum):
     RECEIVED = "RECEIVED"
     PREPARING = "PREPARING"

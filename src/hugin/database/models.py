@@ -40,6 +40,9 @@ from hugin.domain.content import (
     MessageDirection,
     NotificationChannel,
     ProfileQuestionState,
+    RecruiterActionKind,
+    RecruiterActionSource,
+    RecruiterActionState,
     RecruiterMessageState,
     ResumeMappingRole,
     ScreeningFormState,
@@ -783,8 +786,7 @@ class CoverLetterModel(Base):
             name="uq_cover_letters_application_instruction",
         ),
         CheckConstraint(
-            "router_confidence IS NULL OR "
-            "(router_confidence >= 0 AND router_confidence <= 1)",
+            "router_confidence IS NULL OR (router_confidence >= 0 AND router_confidence <= 1)",
             name="ck_cover_letters_router_confidence",
         ),
     )
@@ -1070,6 +1072,66 @@ class RecruiterMessageFactModel(Base):
     )
     fact_id: Mapped[int] = mapped_column(
         ForeignKey("verified_facts.id", ondelete="RESTRICT"), primary_key=True
+    )
+
+
+class RecruiterMessageActionModel(Base):
+    __tablename__ = "recruiter_message_actions"
+    __table_args__ = (
+        CheckConstraint(
+            "(state = 'REQUIRED' AND resolved_at IS NULL) OR "
+            "(state != 'REQUIRED' AND resolved_at IS NOT NULL)",
+            name="ck_recruiter_message_actions_resolution",
+        ),
+        Index("ix_recruiter_message_actions_due", "state", "due_at"),
+    )
+
+    message_id: Mapped[int] = mapped_column(
+        ForeignKey("recruiter_messages.id", ondelete="CASCADE"), primary_key=True
+    )
+    kind: Mapped[RecruiterActionKind] = mapped_column(
+        Enum(
+            RecruiterActionKind,
+            name="recruiter_action_kind",
+            native_enum=False,
+            create_constraint=True,
+            length=24,
+            values_callable=enum_values,
+        ),
+        primary_key=True,
+        nullable=False,
+    )
+    state: Mapped[RecruiterActionState] = mapped_column(
+        Enum(
+            RecruiterActionState,
+            name="recruiter_action_state",
+            native_enum=False,
+            create_constraint=True,
+            length=16,
+            values_callable=enum_values,
+        ),
+        nullable=False,
+    )
+    source: Mapped[RecruiterActionSource] = mapped_column(
+        Enum(
+            RecruiterActionSource,
+            name="recruiter_action_source",
+            native_enum=False,
+            create_constraint=True,
+            length=16,
+            values_callable=enum_values,
+        ),
+        nullable=False,
+    )
+    reason_code: Mapped[str] = mapped_column(String(64), nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
     )
 
 

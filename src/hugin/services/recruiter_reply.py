@@ -64,6 +64,7 @@ class RecruiterReplyService:
         *,
         account_id: int,
         application_id: int,
+        incoming_message_id: int | None = None,
     ) -> RecruiterMessageRecord:
         application_row = self._session.execute(
             select(ApplicationModel, VacancyModel)
@@ -84,18 +85,22 @@ class RecruiterReplyService:
                 .order_by(RecruiterMessageModel.created_at, RecruiterMessageModel.id)
             )
         )
-        latest_incoming = next(
+        incoming_position = next(
             (
-                message
-                for message in reversed(messages)
-                if message.direction is MessageDirection.INCOMING
+                position
+                for position in range(len(messages) - 1, -1, -1)
+                if messages[position].direction is MessageDirection.INCOMING
+                and (incoming_message_id is None or messages[position].id == incoming_message_id)
             ),
             None,
         )
-        if latest_incoming is None:
+        if incoming_position is None and incoming_message_id is not None:
+            raise CommunicationNotFoundError("Сообщение работодателя не найдено")
+        if incoming_position is None:
             raise CommunicationStateError(
                 "Сначала дождитесь сообщения работодателя или напишите ответ самостоятельно"
             )
+        latest_incoming = messages[incoming_position]
         if (
             classify_recruiter_reply(application.state, latest_incoming.body)
             is RecruiterReplyDisposition.NO_REPLY
@@ -133,7 +138,11 @@ class RecruiterReplyService:
         prompt_settings = AiPromptSettingsService(self._session).get()
         response = self._model.complete(
             with_user_prompt(SYSTEM_PROMPT, prompt_settings.recruiter_reply),
-            self._prompt(vacancy, messages[-MAX_MESSAGES:], facts),
+            self._prompt(
+                vacancy,
+                messages[: incoming_position + 1][-MAX_MESSAGES:],
+                facts,
+            ),
         )
         body = response.strip()
         if not body:

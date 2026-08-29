@@ -190,7 +190,7 @@ def _communication_error(error: Exception) -> HTTPException:
 
 @router.get("", response_model=CommunicationsResponse)
 def communications(
-    session: ReadSession,
+    session: WriteSession,
     account_id: int = Query(default=1, ge=1),
 ) -> CommunicationsResponse:
     try:

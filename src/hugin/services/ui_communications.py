@@ -12,12 +12,20 @@ from hugin.database.models import (
     ApplicationSettingsModel,
     HhAccountModel,
     InvitationModel,
+    RecruiterMessageActionModel,
     RecruiterMessageModel,
     VacancyModel,
 )
-from hugin.domain.content import InvitationState, MessageDirection, RecruiterMessageState
+from hugin.domain.content import (
+    InvitationState,
+    MessageDirection,
+    RecruiterActionKind,
+    RecruiterActionState,
+    RecruiterMessageState,
+)
 from hugin.domain.directions import ConfigPayload
 from hugin.domain.time import as_utc
+from hugin.repositories.communications import CommunicationRepository
 from hugin.services.ai_prompts import (
     AI_MODEL_OPTIONS,
     AI_REASONING_OPTIONS,
@@ -30,6 +38,8 @@ from hugin.services.ai_prompts import (
 from hugin.services.recruiter_reply_policy import (
     RecruiterReplyDisposition,
     classify_recruiter_reply,
+    repeated_incoming_already_answered,
+    unresolved_action_position_before_invitation_reminder,
 )
 
 WINDOWS_NOTIFICATION_EVENTS = (
@@ -131,6 +141,10 @@ class UiCommunicationService:
         settings = self._session.get(ApplicationSettingsModel, 1)
         if settings is None:
             raise LookupError("Настройки уведомлений не найдены")
+        CommunicationRepository(self._session).dismiss_expired_message_actions(
+            account_id=account_id,
+            changed_at=datetime.now(UTC),
+        )
 
         message_rows = tuple(
             self._session.execute(
@@ -159,16 +173,47 @@ class UiCommunicationService:
         for message, application, vacancy in message_rows:
             grouped[application.id].append((message, application, vacancy))
 
+        actions_by_message: dict[int, list[RecruiterMessageActionModel]] = defaultdict(list)
+        for action in self._session.scalars(
+            select(RecruiterMessageActionModel)
+            .join(
+                RecruiterMessageModel,
+                RecruiterMessageModel.id == RecruiterMessageActionModel.message_id,
+            )
+            .join(
+                ApplicationModel,
+                ApplicationModel.id == RecruiterMessageModel.application_id,
+            )
+            .where(ApplicationModel.account_id == account_id)
+        ):
+            actions_by_message[action.message_id].append(action)
+
         conversations: list[UiConversation] = []
         for rows in grouped.values():
             application = rows[0][1]
             vacancy = rows[0][2]
-            messages = tuple(self._message(message) for message, _application, _vacancy in rows)
+            message_models = tuple(message for message, _application, _vacancy in rows)
+            messages = tuple(self._message(message) for message in message_models)
             unread_count = sum(
                 message.direction is MessageDirection.INCOMING and message.read_at is None
                 for message, _application, _vacancy in rows
             )
             latest = rows[-1][0]
+            latest_incoming = next(
+                (
+                    message
+                    for message, _application, _vacancy in reversed(rows)
+                    if message.direction is MessageDirection.INCOMING
+                ),
+                None,
+            )
+            needs_reply = self._needs_reply(
+                application,
+                latest,
+                latest_incoming,
+                message_models,
+                actions_by_message,
+            )
             conversations.append(
                 UiConversation(
                     application_id=application.id,
@@ -176,8 +221,8 @@ class UiCommunicationService:
                     vacancy_title=vacancy.title,
                     company=vacancy.employer_name or "Компания не указана",
                     source_url=vacancy.source_url,
-                    unread_count=unread_count,
-                    needs_reply=self._needs_reply(application, latest),
+                    unread_count=max(unread_count, 1) if needs_reply else 0,
+                    needs_reply=needs_reply,
                     messages=messages,
                 )
             )
@@ -348,17 +393,83 @@ class UiCommunicationService:
     def _needs_reply(
         application: ApplicationModel,
         message: RecruiterMessageModel,
+        latest_incoming: RecruiterMessageModel | None,
+        messages: tuple[RecruiterMessageModel, ...],
+        actions_by_message: dict[int, list[RecruiterMessageActionModel]],
     ) -> bool:
-        if message.direction is MessageDirection.INCOMING:
-            return (
-                classify_recruiter_reply(application.state, message.body)
-                is not RecruiterReplyDisposition.NO_REPLY
+        if repeated_incoming_already_answered(messages):
+            return False
+        if latest_incoming is not None:
+            disposition = classify_recruiter_reply(application.state, latest_incoming.body)
+            action_decision = UiCommunicationService._action_decision(
+                actions_by_message.get(latest_incoming.id, []),
+                disposition,
             )
+            if action_decision is not None:
+                return action_decision
+        else:
+            disposition = RecruiterReplyDisposition.NO_REPLY
+        if latest_incoming is not None and disposition is RecruiterReplyDisposition.NO_REPLY:
+            action_position = unresolved_action_position_before_invitation_reminder(
+                application.state,
+                messages,
+            )
+            if action_position is None:
+                return False
+            action_message = messages[action_position]
+            action_disposition = classify_recruiter_reply(
+                application.state,
+                action_message.body,
+            )
+            action_decision = UiCommunicationService._action_decision(
+                actions_by_message.get(action_message.id, []),
+                action_disposition,
+            )
+            return True if action_decision is None else action_decision
+        if message.direction is MessageDirection.INCOMING:
+            return True
         return message.state in {
             RecruiterMessageState.DRAFT,
             RecruiterMessageState.REVIEW_REQUIRED,
             RecruiterMessageState.FAILED,
         }
+
+    @staticmethod
+    def _action_decision(
+        actions: list[RecruiterMessageActionModel],
+        disposition: RecruiterReplyDisposition,
+    ) -> bool | None:
+        if disposition is RecruiterReplyDisposition.MANUAL:
+            if any(
+                action.kind is RecruiterActionKind.REPLY
+                and action.state is RecruiterActionState.REQUIRED
+                for action in actions
+            ):
+                return True
+            relevant = tuple(
+                action for action in actions if action.kind is not RecruiterActionKind.REPLY
+            )
+        elif disposition is RecruiterReplyDisposition.NO_REPLY:
+            return None
+        elif disposition is RecruiterReplyDisposition.AMBIGUOUS:
+            relevant = tuple(
+                action for action in actions if action.kind is RecruiterActionKind.REPLY
+            )
+        else:
+            relevant = tuple(
+                action
+                for action in actions
+                if action.kind is RecruiterActionKind.REPLY
+                and action.state
+                in {
+                    RecruiterActionState.COMPLETED,
+                    RecruiterActionState.DISMISSED,
+                    RecruiterActionState.REQUIRED,
+                }
+            )
+        if not relevant:
+            return None
+        return any(action.state is RecruiterActionState.REQUIRED for action in relevant)
 
     def _ai_prompt_settings(self) -> UiAiPromptSettings:
         current = AiPromptSettingsService(self._session).get()

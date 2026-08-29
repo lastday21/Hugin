@@ -12,6 +12,7 @@ from hugin.database.models import (
     ApplicationModel,
     CandidateProfileModel,
     InvitationModel,
+    RecruiterMessageActionModel,
     RecruiterMessageModel,
     VacancyModel,
     VerifiedFactModel,
@@ -22,6 +23,9 @@ from hugin.domain.content import (
     ConfirmationState,
     InvitationState,
     MessageDirection,
+    RecruiterActionKind,
+    RecruiterActionSource,
+    RecruiterActionState,
     RecruiterMessageState,
 )
 from hugin.services.autonomy import AutonomyPolicyService
@@ -32,6 +36,14 @@ from hugin.services.recruiter_reply_policy import (
     classify_recruiter_reply,
     is_exact_120_net_salary_response,
     is_simple_salary_expectation_question,
+    repeated_incoming_already_answered,
+    requested_external_action_kind,
+    unresolved_action_position_before_invitation_reminder,
+)
+from hugin.services.recruiter_reply_requirement import (
+    ReplyRequirement,
+    ReplyRequirementModel,
+    classify_reply_requirement,
 )
 
 _BLOCKING_INVITATION_TITLES = (
@@ -69,6 +81,7 @@ class AutonomousReplyService:
         *,
         account_id: int,
         model_factory: Callable[[], RecruiterReplyTextModel] | None = None,
+        requirement_model_factory: Callable[[], ReplyRequirementModel] | None = None,
         incoming_message_ids: Collection[int] = (),
         include_backlog: bool = False,
         backlog_limit: int = 250,
@@ -123,7 +136,13 @@ class AutonomousReplyService:
         skipped_manual = 0
         failed = 0
         model: RecruiterReplyTextModel | None = None
+        requirement_model: ReplyRequirementModel | None = None
         communications = CommunicationService(self._session, RecordingMessageSender())
+        communications.dismiss_expired_actions(account_id=account_id)
+        actions_by_key = {
+            (action.message_id, action.kind): action
+            for action in communications.message_actions(account_id)
+        }
         salary_expectation_reply = self._confirmed_salary_expectation_reply(account_id)
         eligible_incoming_ids = set(incoming_message_ids)
         auto_send_incoming_ids = set(incoming_message_ids)
@@ -163,6 +182,8 @@ class AutonomousReplyService:
             )
             if incoming is None:
                 continue
+            if repeated_incoming_already_answered(conversation):
+                continue
             outgoing = next(
                 (
                     message
@@ -173,9 +194,7 @@ class AutonomousReplyService:
             )
             template = policy.matching_reply_template(incoming.body)
             simple_salary_question = is_simple_salary_expectation_question(incoming.body)
-            exact_salary_reply = (
-                salary_expectation_reply if simple_salary_question else None
-            )
+            exact_salary_reply = salary_expectation_reply if simple_salary_question else None
             details = application_details.get(application_id)
             if details is None:
                 continue
@@ -183,21 +202,86 @@ class AutonomousReplyService:
             disposition = classify_recruiter_reply(
                 application_state,
                 incoming.body,
-                (
-                    exact_salary_reply
-                    or (template.response_text if template is not None else "")
-                ),
+                (exact_salary_reply or (template.response_text if template is not None else "")),
             )
             if simple_salary_question and exact_salary_reply is None:
                 disposition = RecruiterReplyDisposition.REVIEW_DRAFT
+            recovered_before_reminder = False
             if disposition is RecruiterReplyDisposition.NO_REPLY:
-                continue
+                action_position = unresolved_action_position_before_invitation_reminder(
+                    application_state,
+                    conversation,
+                )
+                if action_position is None:
+                    continue
+                reminder_id = incoming.id
+                incoming = conversation[action_position]
+                if (
+                    reminder_id not in eligible_incoming_ids
+                    and incoming.id not in eligible_incoming_ids
+                ):
+                    continue
+                eligible_incoming_ids.add(incoming.id)
+                recovered_before_reminder = True
+                template = policy.matching_reply_template(incoming.body)
+                simple_salary_question = is_simple_salary_expectation_question(incoming.body)
+                exact_salary_reply = salary_expectation_reply if simple_salary_question else None
+                disposition = classify_recruiter_reply(
+                    application_state,
+                    incoming.body,
+                    (
+                        exact_salary_reply
+                        or (template.response_text if template is not None else "")
+                    ),
+                )
+                if simple_salary_question and exact_salary_reply is None:
+                    disposition = RecruiterReplyDisposition.REVIEW_DRAFT
+                if disposition is RecruiterReplyDisposition.NO_REPLY:
+                    continue
+            reply_action = actions_by_key.get((incoming.id, RecruiterActionKind.REPLY))
+            if disposition is RecruiterReplyDisposition.MANUAL:
+                external_kind = requested_external_action_kind(incoming.body)
+                external_action = (
+                    actions_by_key.get((incoming.id, external_kind))
+                    if external_kind is not None
+                    else None
+                )
+                if external_kind is not None and external_action is None:
+                    external_action = communications.require_external_action(
+                        account_id=account_id,
+                        message_id=incoming.id,
+                        kind=external_kind,
+                        source=RecruiterActionSource.RULE,
+                        reason_code="EMPLOYER_EXTERNAL_ACTION_REQUIRED",
+                        reason="Работодатель запросил действие вне переписки hh.ru.",
+                    )
+                    actions_by_key[(incoming.id, external_kind)] = external_action
+                if (
+                    external_action is not None
+                    and external_action.state is not RecruiterActionState.REQUIRED
+                    and not (
+                        reply_action is not None
+                        and reply_action.state is RecruiterActionState.REQUIRED
+                    )
+                ):
+                    continue
+            elif reply_action is not None:
+                terminal_reply_states = {
+                    RecruiterActionState.COMPLETED,
+                    RecruiterActionState.DISMISSED,
+                }
+                if disposition is RecruiterReplyDisposition.AMBIGUOUS:
+                    terminal_reply_states.add(RecruiterActionState.NOT_REQUIRED)
+                if reply_action.state in terminal_reply_states:
+                    continue
             automatic_send_blocked = (
-                application_id in blocked_applications
+                recovered_before_reminder
+                or application_id in blocked_applications
                 or disposition
                 in {
                     RecruiterReplyDisposition.REVIEW_DRAFT,
                     RecruiterReplyDisposition.MANUAL,
+                    RecruiterReplyDisposition.AMBIGUOUS,
                 }
             )
             if outgoing is not None and outgoing.id > incoming.id:
@@ -264,9 +348,7 @@ class AutonomousReplyService:
                     application_id=application_id,
                     body=exact_salary_reply,
                     auto_send_approved=auto_send,
-                    reply_template_key=(
-                        _SALARY_EXPECTATION_APPROVAL_KEY if auto_send else None
-                    ),
+                    reply_template_key=(_SALARY_EXPECTATION_APPROVAL_KEY if auto_send else None),
                 )
                 drafts_created += 1
                 if auto_send:
@@ -317,6 +399,65 @@ class AutonomousReplyService:
             if disposition is RecruiterReplyDisposition.MANUAL:
                 skipped_manual += 1
                 continue
+            if disposition is RecruiterReplyDisposition.AMBIGUOUS:
+                requirement = ReplyRequirement.REQUIRED
+                if reply_action is not None and reply_action.state is RecruiterActionState.REQUIRED:
+                    requirement = ReplyRequirement.REQUIRED
+                elif requirement_model_factory is not None:
+                    try:
+                        if requirement_model is None:
+                            requirement_model = requirement_model_factory()
+                        requirement = classify_reply_requirement(
+                            requirement_model,
+                            conversation,
+                        )
+                    except (CodexCliError, LookupError, ValueError, YandexAIError):
+                        failed += 1
+                        reply_action = communications.record_reply_requirement(
+                            account_id=account_id,
+                            message_id=incoming.id,
+                            required=True,
+                            source=RecruiterActionSource.SYSTEM,
+                            reason_code="CLASSIFIER_FAILED_SAFE_FALLBACK",
+                            reason=(
+                                "Проверка неоднозначного сообщения завершилась ошибкой; "
+                                "возможный вопрос оставлен для ответа."
+                            ),
+                        )
+                    else:
+                        reply_action = communications.record_reply_requirement(
+                            account_id=account_id,
+                            message_id=incoming.id,
+                            required=requirement is ReplyRequirement.REQUIRED,
+                            source=RecruiterActionSource.MODEL,
+                            reason_code=(
+                                "MODEL_REPLY_REQUIRED"
+                                if requirement is ReplyRequirement.REQUIRED
+                                else "MODEL_NO_REPLY_REQUIRED"
+                            ),
+                            reason=(
+                                "Неоднозначное сообщение требует ответа."
+                                if requirement is ReplyRequirement.REQUIRED
+                                else "Неоднозначное сообщение не требует ответа."
+                            ),
+                        )
+                    actions_by_key[(incoming.id, RecruiterActionKind.REPLY)] = reply_action
+                else:
+                    reply_action = communications.record_reply_requirement(
+                        account_id=account_id,
+                        message_id=incoming.id,
+                        required=True,
+                        source=RecruiterActionSource.SYSTEM,
+                        reason_code="CLASSIFIER_UNAVAILABLE_SAFE_FALLBACK",
+                        reason=(
+                            "Проверка неоднозначного сообщения недоступна; "
+                            "возможный вопрос оставлен для ответа."
+                        ),
+                    )
+                    actions_by_key[(incoming.id, RecruiterActionKind.REPLY)] = reply_action
+                if requirement is ReplyRequirement.NOT_REQUIRED:
+                    continue
+                disposition = RecruiterReplyDisposition.REVIEW_DRAFT
             if not policy.auto_prepare_replies or model_factory is None:
                 continue
             try:
@@ -325,6 +466,7 @@ class AutonomousReplyService:
                 draft = RecruiterReplyService(self._session, model).generate(
                     account_id=account_id,
                     application_id=application_id,
+                    incoming_message_id=incoming.id,
                 )
             except (
                 CodexCliError,
@@ -345,8 +487,7 @@ class AutonomousReplyService:
                     policy.auto_send_approved_replies
                     and incoming.id in auto_send_incoming_ids
                     and not automatic_send_blocked
-                    and generated_disposition
-                    is RecruiterReplyDisposition.AUTOMATIC_DRAFT
+                    and generated_disposition is RecruiterReplyDisposition.AUTOMATIC_DRAFT
                     and draft.content_hash is not None
                 ):
                     approved_draft = communications.approve_outgoing_for_automatic_send(
@@ -422,6 +563,23 @@ class AutonomousReplyService:
             .order_by(RecruiterMessageModel.id.desc())
             .limit(1)
         )
+        if incoming is not None:
+            action = self._session.get(
+                RecruiterMessageActionModel,
+                (incoming.id, RecruiterActionKind.REPLY),
+            )
+            if action is not None:
+                blocked_states = {
+                    RecruiterActionState.COMPLETED,
+                    RecruiterActionState.DISMISSED,
+                }
+                if (
+                    classify_recruiter_reply(application.state, incoming.body)
+                    is RecruiterReplyDisposition.AMBIGUOUS
+                ):
+                    blocked_states.add(RecruiterActionState.NOT_REQUIRED)
+                if action.state in blocked_states:
+                    return False
         latest_outgoing_id = self._session.scalar(
             select(RecruiterMessageModel.id)
             .where(
@@ -495,8 +653,7 @@ class AutonomousReplyService:
                 "120000" in digits
                 and "на руки" in normalized
                 and any(
-                    marker in normalized
-                    for marker in ("зарплат", "заработн", "оклад", "доход")
+                    marker in normalized for marker in ("зарплат", "заработн", "оклад", "доход")
                 )
             ):
                 return _SALARY_EXPECTATION_REPLY
