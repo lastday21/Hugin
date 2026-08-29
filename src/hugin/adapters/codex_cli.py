@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -42,7 +43,7 @@ class CodexCliClient:
         executable: Path,
         runtime_dir: Path,
         *,
-        model: str = "gpt-5.6-luna",
+        model: str = "gpt-5.6-terra",
         reasoning_effort: str = "low",
         timeout_seconds: int = 180,
         journal: OperationJournal | None = None,
@@ -68,11 +69,12 @@ class CodexCliClient:
 
     def complete(self, system_prompt: str, user_prompt: str) -> str:
         self._runtime_dir.mkdir(parents=True, exist_ok=True)
-        result_name = (
-            "итоговый ответ работодателю"
-            if self._operation == "recruiter_reply"
-            else "итоговое сопроводительное письмо"
-        )
+        if self._operation == "recruiter_reply":
+            result_name = "итоговый ответ работодателю"
+        elif self._operation == "recruiter_reply_requirement":
+            result_name = "решение REPLY_REQUIRED или NO_REPLY_REQUIRED"
+        else:
+            result_name = "итоговое сопроводительное письмо"
         prompt = (
             "Выполни только задачу создания текста. Не запускай команды и не читай файлы: "
             "все нужные данные уже приведены ниже.\n\n"
@@ -86,6 +88,7 @@ class CodexCliClient:
             "--ephemeral",
             "--ignore-user-config",
             "--ignore-rules",
+            "--json",
             "--skip-git-repo-check",
             "--sandbox",
             "read-only",
@@ -107,6 +110,9 @@ class CodexCliClient:
                 model=self._model,
                 model_calls=1,
                 input_characters=len(system_prompt) + len(user_prompt),
+                system_prompt_characters=len(system_prompt),
+                user_prompt_characters=len(user_prompt),
+                request_characters=len(prompt),
             )
             if self._journal is not None
             else None
@@ -139,7 +145,7 @@ class CodexCliClient:
             raise failure from error
 
         if result.returncode != 0:
-            detail = self._safe_error(result.stderr)
+            detail = self._safe_error(result.stderr or result.stdout)
             failure = CodexCliError(
                 "Создание сопроводительного письма завершилось ошибкой"
                 + (f": {detail}" if detail else "")
@@ -147,15 +153,78 @@ class CodexCliClient:
             if run is not None:
                 run.fail(failure, return_code=result.returncode)
             raise failure
-        text = result.stdout.strip()
+        text, usage = self._parse_output(result.stdout)
         if not text:
             failure = CodexCliError("Программа создания писем вернула пустой ответ")
             if run is not None:
                 run.fail(failure)
             raise failure
         if run is not None:
-            run.succeed(output_characters=len(text))
+            run.succeed(
+                output_characters=len(text),
+                token_usage_available=bool(usage),
+                **usage,
+            )
         return text
+
+    @classmethod
+    def _parse_output(cls, value: str) -> tuple[str, dict[str, int]]:
+        messages: list[str] = []
+        usage: dict[str, int] = {}
+        parsed_event = False
+        for line in value.splitlines():
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(event, dict):
+                continue
+            parsed_event = True
+            if event.get("type") == "item.completed":
+                item = event.get("item")
+                if isinstance(item, dict) and item.get("type") == "agent_message":
+                    text = item.get("text")
+                    if isinstance(text, str) and text.strip():
+                        messages.append(text.strip())
+            if event.get("type") == "turn.completed":
+                raw_usage = event.get("usage")
+                if isinstance(raw_usage, dict):
+                    usage = cls._token_usage(raw_usage)
+        if not parsed_event:
+            return value.strip(), {}
+        return (messages[-1] if messages else ""), usage
+
+    @staticmethod
+    def _token_usage(raw_usage: dict[str, object]) -> dict[str, int]:
+        def non_negative_int(value: object) -> int | None:
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                return None
+            return value
+
+        input_tokens = non_negative_int(raw_usage.get("input_tokens"))
+        output_tokens = non_negative_int(raw_usage.get("output_tokens"))
+        cached_input_tokens = non_negative_int(raw_usage.get("cached_input_tokens"))
+        reasoning_tokens = non_negative_int(raw_usage.get("reasoning_tokens"))
+
+        input_details = raw_usage.get("input_tokens_details")
+        if cached_input_tokens is None and isinstance(input_details, dict):
+            cached_input_tokens = non_negative_int(input_details.get("cached_tokens"))
+        output_details = raw_usage.get("output_tokens_details")
+        if reasoning_tokens is None and isinstance(output_details, dict):
+            reasoning_tokens = non_negative_int(output_details.get("reasoning_tokens"))
+
+        total_tokens = non_negative_int(raw_usage.get("total_tokens"))
+        if total_tokens is None and input_tokens is not None and output_tokens is not None:
+            total_tokens = input_tokens + output_tokens
+
+        values = {
+            "input_tokens": input_tokens,
+            "cached_input_tokens": cached_input_tokens,
+            "output_tokens": output_tokens,
+            "reasoning_tokens": reasoning_tokens,
+            "total_tokens": total_tokens,
+        }
+        return {key: value for key, value in values.items() if value is not None}
 
     @staticmethod
     def _safe_error(value: str) -> str:
@@ -167,13 +236,15 @@ def configured_codex_cli_client(
     settings: Settings,
     *,
     operation: str = "cover_letter",
+    model: str | None = None,
+    timeout_seconds: int | None = None,
 ) -> CodexCliClient:
     return CodexCliClient(
         find_codex_cli(settings.codex_cli_path),
         settings.data_dir / "codex-letter-runtime",
-        model=settings.codex_letter_model,
+        model=model or settings.codex_letter_model,
         reasoning_effort=settings.codex_letter_reasoning_effort,
-        timeout_seconds=settings.codex_letter_timeout_seconds,
+        timeout_seconds=timeout_seconds or settings.codex_letter_timeout_seconds,
         journal=OperationJournal(settings.data_dir),
         operation=operation,
     )

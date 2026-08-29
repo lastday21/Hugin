@@ -72,9 +72,11 @@ class Settings(BaseSettings):
     yandex_ai_source_ip: IPv4Address | None = None
     yandex_ai_timeout_seconds: int = Field(default=120, ge=1, le=300)
     codex_cli_path: Path | None = None
-    codex_letter_model: str = "gpt-5.6-luna"
+    codex_letter_model: str = "gpt-5.6-terra"
     codex_letter_reasoning_effort: Literal["low", "medium", "high"] = "low"
     codex_letter_timeout_seconds: int = Field(default=180, ge=30, le=300)
+    codex_reply_requirement_model: str = "gpt-5.6-luna"
+    codex_reply_requirement_timeout_seconds: int = Field(default=60, ge=30, le=300)
 
     @field_validator("hh_login_url", "hh_resumes_url")
     @classmethod

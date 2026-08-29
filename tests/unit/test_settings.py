@@ -23,9 +23,11 @@ def test_default_api_is_local_only() -> None:
     assert settings.notification_gateway_connection_timeout_seconds == 120
     assert settings.yandex_ai_model == "aliceai-llm/latest"
     assert settings.codex_cli_path is None
-    assert settings.codex_letter_model == "gpt-5.6-luna"
+    assert settings.codex_letter_model == "gpt-5.6-terra"
     assert settings.codex_letter_reasoning_effort == "low"
     assert settings.codex_letter_timeout_seconds == 180
+    assert settings.codex_reply_requirement_model == "gpt-5.6-luna"
+    assert settings.codex_reply_requirement_timeout_seconds == 60
     assert Settings.model_construct().yandex_ai_host_ip is None
     assert Settings.model_construct().yandex_ai_source_ip is None
     assert settings.data_dir.is_absolute()
