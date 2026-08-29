@@ -110,10 +110,13 @@ def test_not_found_reconciliation_requires_review_before_retry(settings: Setting
             application_id, task_id = create_unknown_task(session, "not-found")
             account_id = ApplicationRepository(session).get(application_id).account_id
             service = ApplicationAutomationService(session)
-            assert service.applied_since(
-                account_id,
-                datetime(2020, 1, 1, tzinfo=UTC),
-            ) == 1
+            assert (
+                service.applied_since(
+                    account_id,
+                    datetime(2020, 1, 1, tzinfo=UTC),
+                )
+                == 1
+            )
 
             outcome = ApplicationReconciliationService(session).reconcile(
                 task_id,
@@ -127,10 +130,13 @@ def test_not_found_reconciliation_requires_review_before_retry(settings: Setting
             assert outcome.application.state is ApplicationState.APPLYING
             assert outcome.task.state is TaskState.REVIEW_REQUIRED
             assert outcome.task.last_error_code == "RECONCILED_NOT_FOUND"
-            assert service.applied_since(
-                account_id,
-                datetime(2020, 1, 1, tzinfo=UTC),
-            ) == 0
+            assert (
+                service.applied_since(
+                    account_id,
+                    datetime(2020, 1, 1, tzinfo=UTC),
+                )
+                == 0
+            )
             assert QueueService(session).resume().state is SystemState.RUNNING
             event = ApplicationRepository(session).list_events(application_id)[-1]
             assert event.payload["reconciliation_status"] == "NOT_FOUND"

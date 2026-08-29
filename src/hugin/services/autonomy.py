@@ -181,9 +181,7 @@ def _integer(
     if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError(f"Настройка «{key}» должна быть целым числом")
     if not minimum <= value <= maximum:
-        raise ValueError(
-            f"Настройка «{key}» должна быть от {minimum} до {maximum}"
-        )
+        raise ValueError(f"Настройка «{key}» должна быть от {minimum} до {maximum}")
     return value
 
 

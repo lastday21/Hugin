@@ -421,9 +421,7 @@ class ResumeImportService:
         )
         desired = {(fact.category, fact.content): fact for fact in profile_data.facts}
         existing_keys = {(fact.category, fact.content) for fact in existing}
-        reuse_confirmed = AutonomyPolicyService(
-            self._session
-        ).get().reuse_confirmed_profile_facts
+        reuse_confirmed = AutonomyPolicyService(self._session).get().reuse_confirmed_profile_facts
         confirmed_by_content = (
             {
                 (fact.category, self._normalized_fact_content(fact.content)): fact

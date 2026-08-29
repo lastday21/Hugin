@@ -80,9 +80,7 @@ class FakeScheduler:
         self.failed: list[tuple[str, str, str, datetime | None]] = []
         self.retry_delays: list[int | None] = []
         self.completed: list[tuple[str, AutomationJobResult, datetime | None]] = []
-        self.deferred: list[
-            tuple[str, int, AutomationJobResult | None, datetime | None]
-        ] = []
+        self.deferred: list[tuple[str, int, AutomationJobResult | None, datetime | None]] = []
 
     def ensure_configured_jobs(
         self,
@@ -341,9 +339,7 @@ def test_worker_rejects_invalid_settings(
             account_id=account_id,
             poll_seconds=poll_seconds,
             heartbeat_seconds=heartbeat_seconds,
-            authentication_recovery_interval_seconds=(
-                authentication_recovery_interval_seconds
-            ),
+            authentication_recovery_interval_seconds=(authentication_recovery_interval_seconds),
         )
 
 
@@ -621,9 +617,7 @@ def test_worker_updates_heartbeat_from_a_separate_database(
     monkeypatch.setattr(
         worker_module,
         "SystemStateRepository",
-        lambda _session: SimpleNamespace(
-            get=lambda: SimpleNamespace(state=SystemState.RUNNING)
-        ),
+        lambda _session: SimpleNamespace(get=lambda: SimpleNamespace(state=SystemState.RUNNING)),
     )
 
     def complete(_job: AutomationJobRecord) -> AutomationJobResult:

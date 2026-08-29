@@ -157,13 +157,11 @@ class QueueTaskRepository:
         )
         category_priority = case(
             (
-                DirectionVacancyModel.rules_details["category"].as_string()
-                == "MATCH",
+                DirectionVacancyModel.rules_details["category"].as_string() == "MATCH",
                 0,
             ),
             (
-                DirectionVacancyModel.rules_details["category"].as_string()
-                == "STRETCH",
+                DirectionVacancyModel.rules_details["category"].as_string() == "STRETCH",
                 1,
             ),
             else_=2,
