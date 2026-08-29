@@ -64,6 +64,7 @@ class ApplicationReconciliationService:
                 {
                     "hh_status": ReconciliationStatus.APPLIED.value,
                     "source": "hugin_reconciliation",
+                    "task_id": task.id,
                     "reconciliation_status": result.status.value,
                     "checked_at": payload["checked_at"],
                     "confirmation": payload["confirmation"],

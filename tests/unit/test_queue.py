@@ -7,7 +7,12 @@ from sqlalchemy.orm import Session
 
 from hugin.core.settings import Settings
 from hugin.database import create_database, upgrade_database
-from hugin.database.models import ApplicationModel, SystemStateModel, VacancyModel
+from hugin.database.models import (
+    ApplicationModel,
+    CoverLetterModel,
+    SystemStateModel,
+    VacancyModel,
+)
 from hugin.domain import (
     ApplicationEventType,
     ApplicationNotFoundError,
@@ -23,6 +28,7 @@ from hugin.domain import (
     VacancyData,
     VacancyState,
 )
+from hugin.domain.content import CoverLetterState
 from hugin.repositories import (
     AccountRepository,
     ApplicationRepository,
@@ -257,7 +263,7 @@ def test_queue_prefers_rule_score_before_freshness(settings: Settings) -> None:
         database.close()
 
 
-def test_queue_prioritizes_backend_match_then_backend_stretch_then_adjacent(
+def test_queue_uses_four_automatic_match_steps_without_manual_list(
     settings: Settings,
 ) -> None:
     upgrade_database(settings)
@@ -350,6 +356,14 @@ def test_queue_prioritizes_backend_match_then_backend_stretch_then_adjacent(
                 location_priority=100,
                 priority_score=100,
             )
+            adjacent_stretch_task = enqueue(
+                adjacent.id,
+                "adjacent-stretch",
+                published_at=now + timedelta(hours=1),
+                location_priority=100,
+                category="STRETCH",
+                priority_score=100,
+            )
             inactive_task = enqueue(
                 inactive.id,
                 "inactive",
@@ -373,6 +387,8 @@ def test_queue_prioritizes_backend_match_then_backend_stretch_then_adjacent(
             tasks.transition(backend_stretch_task, TaskState.COMPLETED)
             assert claim() == adjacent_task
             tasks.transition(adjacent_task, TaskState.COMPLETED)
+            assert claim() == adjacent_stretch_task
+            tasks.transition(adjacent_stretch_task, TaskState.COMPLETED)
             assert (
                 tasks.claim_next(
                     now,
@@ -797,12 +813,208 @@ def test_application_transition_appends_event_and_rejects_invalid_path(
                 "confirmation": "history",
                 "previous_state": "APPLYING",
                 "state": "APPLIED",
+                "category": None,
+                "fit_score": None,
+                "rules_version": None,
+                "rules_details": {},
+                "direction_id": None,
+                "resume_id": applied.resume_id,
             }
 
             with pytest.raises(InvalidStateTransitionError):
                 repository.transition_state(application_id, ApplicationState.APPLYING)
             with pytest.raises(ApplicationNotFoundError):
                 repository.transition_state(-1, ApplicationState.APPLIED)
+    finally:
+        database.close()
+
+
+def test_applied_events_capture_selection_snapshot_and_cover_letter(
+    settings: Settings,
+) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+
+    try:
+        with database.sessions.begin() as session:
+            account = AccountRepository(session).create("Снимок отклика")
+            resume = ResumeRepository(session).upsert(
+                account.id,
+                "snapshot-resume",
+                "Python backend",
+            )
+            directions = DirectionRepository(session)
+            direction = directions.create(account.id, "Python backend")
+            directions.attach_resume(direction.id, resume.id)
+            vacancy = VacancyRepository(session).upsert(
+                VacancyData(
+                    "snapshot-vacancy",
+                    "Python-разработчик",
+                    "https://hh.ru/vacancy/snapshot-vacancy",
+                )
+            )
+            directions.track_vacancy(direction.id, vacancy.id)
+            initial_details = {
+                "accepted": True,
+                "category": "MATCH",
+                "reasons": ["совпали подтверждённые навыки"],
+                "components": [
+                    {
+                        "name": "skills",
+                        "score": 92.0,
+                        "weight": 25.0,
+                        "reason": "подходящие технологии",
+                    }
+                ],
+            }
+            directions.apply_rules(
+                direction.id,
+                vacancy.id,
+                state=VacancyState.QUEUED,
+                score=87.5,
+                details=initial_details,
+                rules_version="snapshot-rules-v1",
+            )
+            repository = ApplicationRepository(session)
+            application = repository.create_apply_intent(
+                account.id,
+                vacancy.id,
+                resume.id,
+                direction.id,
+            )
+            letter = CoverLetterModel(
+                application_id=application.id,
+                vacancy_id=vacancy.id,
+                direction_id=direction.id,
+                resume_id=resume.id,
+                text="Здравствуйте! Рассматриваю вакансию Python-разработчика.",
+                instruction_version="snapshot-letter-v1",
+                model_name="test-model",
+                state=CoverLetterState.READY,
+            )
+            session.add(letter)
+            session.flush()
+
+            repository.transition_state(
+                application.id,
+                ApplicationState.APPLIED,
+                {
+                    "hh_status": "APPLIED",
+                    "source": "hugin_send",
+                    "cover_letter_id": letter.id,
+                    "category": "REJECTED",
+                    "fit_score": 0,
+                    "selection_snapshot": {
+                        "category": "MATCH",
+                        "fit_score": 87.5,
+                        "rules_version": "snapshot-rules-v1",
+                        "rules_details": initial_details,
+                        "direction_id": direction.id,
+                        "resume_id": resume.id,
+                        "cover_letter_id": letter.id,
+                        "cover_letter_instruction_version": "snapshot-letter-v1",
+                    },
+                },
+            )
+
+            applied = repository.list_events(application.id)[-1]
+            assert applied.payload["category"] == "MATCH"
+            assert applied.payload["fit_score"] == 87.5
+            assert applied.payload["rules_version"] == "snapshot-rules-v1"
+            assert applied.payload["rules_details"] == initial_details
+            assert applied.payload["direction_id"] == direction.id
+            assert applied.payload["resume_id"] == resume.id
+            assert applied.payload["cover_letter_id"] == letter.id
+            assert applied.payload["cover_letter_instruction_version"] == "snapshot-letter-v1"
+
+            updated_details = {
+                "accepted": True,
+                "category": "STRETCH",
+                "reasons": ["потребуется дополнительная подготовка"],
+            }
+            directions.apply_rules(
+                direction.id,
+                vacancy.id,
+                state=VacancyState.QUEUED,
+                score=61.5,
+                details=updated_details,
+                rules_version="snapshot-rules-v2",
+            )
+
+            original = repository.list_events(application.id)[-1]
+            assert original.payload["category"] == "MATCH"
+            assert original.payload["rules_details"] == initial_details
+
+            missing = repository.append_event(
+                application.id,
+                ApplicationEventType.APPLIED,
+                {
+                    "hh_status": "APPLIED",
+                    "source": "hugin_reconciliation",
+                    "task_id": 700,
+                },
+            )
+            assert missing.payload["category"] is None
+            assert missing.payload["fit_score"] is None
+            assert missing.payload["rules_version"] is None
+            assert missing.payload["rules_details"] == {}
+            assert missing.payload["snapshot_missing"] is True
+            assert "cover_letter_id" not in missing.payload
+
+            unknown = repository.append_event(
+                application.id,
+                ApplicationEventType.UNKNOWN_RESULT,
+                {
+                    "task_id": 701,
+                    "selection_snapshot": {
+                        "category": "MATCH",
+                        "fit_score": 87.5,
+                        "rules_version": "snapshot-rules-v1",
+                        "rules_details": initial_details,
+                        "direction_id": direction.id,
+                        "resume_id": resume.id,
+                        "cover_letter_id": letter.id,
+                        "cover_letter_instruction_version": "snapshot-letter-v1",
+                    },
+                },
+            )
+            returned_snapshot = unknown.payload["selection_snapshot"]
+            assert isinstance(returned_snapshot, dict)
+            returned_rules_details = returned_snapshot["rules_details"]
+            assert isinstance(returned_rules_details, dict)
+            returned_snapshot["category"] = "REJECTED"
+            returned_rules_details["category"] = "REJECTED"
+            letter.instruction_version = "snapshot-letter-v2"
+            mismatched = repository.append_event(
+                application.id,
+                ApplicationEventType.APPLIED,
+                {
+                    "hh_status": "APPLIED",
+                    "source": "hugin_reconciliation",
+                    "task_id": 702,
+                },
+            )
+            assert mismatched.payload["category"] is None
+            assert mismatched.payload["rules_version"] is None
+            assert mismatched.payload["snapshot_missing"] is True
+            assert "cover_letter_id" not in mismatched.payload
+
+            reconciled = repository.append_event(
+                application.id,
+                ApplicationEventType.APPLIED,
+                {
+                    "hh_status": "APPLIED",
+                    "source": "hugin_reconciliation",
+                    "task_id": 701,
+                },
+            )
+            assert reconciled.payload["category"] == "MATCH"
+            assert reconciled.payload["fit_score"] == 87.5
+            assert reconciled.payload["rules_version"] == "snapshot-rules-v1"
+            assert reconciled.payload["rules_details"] == initial_details
+            assert reconciled.payload["snapshot_missing"] is False
+            assert reconciled.payload["cover_letter_id"] == letter.id
+            assert reconciled.payload["cover_letter_instruction_version"] == "snapshot-letter-v1"
     finally:
         database.close()
 

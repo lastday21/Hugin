@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
@@ -89,6 +90,7 @@ class ApplyJob:
     direction_vacancy: DirectionVacancyRecord
     cover_letter: str | None = None
     cover_letter_id: int | None = None
+    cover_letter_instruction_version: str | None = None
     cover_letter_sha256: str | None = None
 
 
@@ -184,9 +186,7 @@ class ApplicationAutomationService:
         allowed = self._allowed_categories(include_stretch)
         created = 0
         for vacancy_id in dict.fromkeys(vacancy_ids):
-            candidates: list[
-                tuple[DirectionRecord, ResumeRecord, DirectionVacancyRecord]
-            ] = []
+            candidates: list[tuple[DirectionRecord, ResumeRecord, DirectionVacancyRecord]] = []
             for direction in self._directions.list_for_account(account.id):
                 if not direction.is_active:
                     continue
@@ -365,7 +365,8 @@ class ApplicationAutomationService:
         source_category = source.rules_details.get("category")
         return (
             source.rules_version != RULES_VERSION
-            or source_category not in {
+            or source_category
+            not in {
                 RuleCategory.MATCH.value,
                 RuleCategory.STRETCH.value,
             }
@@ -742,6 +743,7 @@ class ApplicationAutomationService:
             ),
             cover_letter=letter.text,
             cover_letter_id=letter.id,
+            cover_letter_instruction_version=letter.instruction_version,
             cover_letter_sha256=actual_sha256,
         )
 
@@ -909,6 +911,9 @@ class ApplicationAutomationService:
             ),
             cover_letter=cover_letter,
             cover_letter_id=letter.id if letter is not None else None,
+            cover_letter_instruction_version=(
+                letter.instruction_version if letter is not None else None
+            ),
             cover_letter_sha256=cover_letter_sha256,
         )
 
@@ -1109,6 +1114,7 @@ class ApplicationAutomationService:
             direction_vacancy=tracked,
             cover_letter=letter.text,
             cover_letter_id=letter.id,
+            cover_letter_instruction_version=letter.instruction_version,
             cover_letter_sha256=hashlib.sha256(letter.text.encode("utf-8")).hexdigest(),
         )
 
@@ -1314,6 +1320,8 @@ class ApplicationAutomationService:
             "confirmation": result.confirmation[:1000],
             "final_url": result.final_url[:1000],
         }
+        if result.status in {HhApplyStatus.APPLIED, HhApplyStatus.UNKNOWN_RESULT}:
+            payload["selection_snapshot"] = self._selection_snapshot(job)
         if result.status is HhApplyStatus.APPLIED:
             payload["source"] = "hugin_send"
         elif result.status is HhApplyStatus.ALREADY_APPLIED:
@@ -1508,20 +1516,14 @@ class ApplicationAutomationService:
             HhApplyStatus.ACCOUNT_WARNING: SystemState.ACCOUNT_WARNING,
             HhApplyStatus.RESUME_MISMATCH: SystemState.PAUSED,
         }
-        if (
-            result.status is HhApplyStatus.RETRYABLE_ERROR
-            and job.task.attempts
-            >= (
-                MAX_SCHEDULED_RETRY_ATTEMPTS
-                if result.retry_after_seconds is not None
-                else MAX_AUTOMATIC_RETRY_ATTEMPTS
-            )
+        if result.status is HhApplyStatus.RETRYABLE_ERROR and job.task.attempts >= (
+            MAX_SCHEDULED_RETRY_ATTEMPTS
+            if result.retry_after_seconds is not None
+            else MAX_AUTOMATIC_RETRY_ATTEMPTS
         ):
             queue_retry_at = None
             if result.retry_after_seconds is not None and result.retry_blocks_queue:
-                queue_retry_at = selected_at + timedelta(
-                    seconds=result.retry_after_seconds
-                )
+                queue_retry_at = selected_at + timedelta(seconds=result.retry_after_seconds)
                 self._system.set_next_apply_at(queue_retry_at)
             payload["attempts"] = job.task.attempts
             self._tasks.transition(
@@ -1555,6 +1557,23 @@ class ApplicationAutomationService:
             retry_delay=retry_delay,
             target_state=system_states.get(result.status),
         )
+
+    @staticmethod
+    def _selection_snapshot(job: ApplyJob) -> EventPayload:
+        return {
+            "category": job.direction_vacancy.rules_details.get("category"),
+            "fit_score": (
+                job.direction_vacancy.fit_score
+                if job.direction_vacancy.fit_score is not None
+                else job.direction_vacancy.rules_score
+            ),
+            "rules_version": job.direction_vacancy.rules_version,
+            "rules_details": deepcopy(job.direction_vacancy.rules_details),
+            "direction_id": job.application.direction_id,
+            "resume_id": job.application.resume_id,
+            "cover_letter_id": job.cover_letter_id,
+            "cover_letter_instruction_version": job.cover_letter_instruction_version,
+        }
 
     def _record_retry_or_blocked_result(
         self,

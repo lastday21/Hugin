@@ -454,6 +454,18 @@ def test_automation_prepares_claims_and_records_results(settings: Settings) -> N
                 ),
             )
             assert QueueTaskRepository(session).get(second.task.id).state is TaskState.COMPLETED
+            directions.apply_rules(
+                direction.id,
+                second.vacancy.id,
+                state=VacancyState.QUEUED,
+                score=15,
+                details={
+                    "category": "MATCH",
+                    "accepted": True,
+                    "reasons": ["оценка изменилась после получения задания"],
+                },
+                rules_version="snapshot-rules-after-claim",
+            )
             recorded = service.record_result(
                 second,
                 HhApplyResult(HhApplyStatus.APPLIED, second.vacancy.source_url, "успешно"),
@@ -467,6 +479,24 @@ def test_automation_prepares_claims_and_records_results(settings: Settings) -> N
             )
             assert QueueTaskRepository(session).get(second.task.id).state is TaskState.COMPLETED
             assert service.applied_since(account.id, datetime(2026, 1, 1, tzinfo=UTC)) == 1
+            second_applied_events = [
+                event
+                for event in ApplicationRepository(session).list_events(second.application.id)
+                if event.event_type is ApplicationEventType.APPLIED
+            ]
+            assert len(second_applied_events) == 2
+            assert [event.payload["source"] for event in second_applied_events] == [
+                "hh.ru",
+                "hugin_send",
+            ]
+            assert all(
+                event.payload["category"] == "STRETCH"
+                and event.payload["fit_score"] == 60
+                and event.payload["rules_version"] == RULES_VERSION
+                and event.payload["direction_id"] == direction.id
+                and event.payload["resume_id"] == resume.id
+                for event in second_applied_events
+            )
             SystemStateRepository(session).set_next_apply_at(None)
 
             already_vacancy = vacancies.upsert(
@@ -495,6 +525,10 @@ def test_automation_prepares_claims_and_records_results(settings: Settings) -> N
                 HhApplyResult(HhApplyStatus.ALREADY_APPLIED, already_vacancy.source_url),
             )
             assert not already.sent
+            already_event = ApplicationRepository(session).list_events(already_application.id)[-1]
+            assert already_event.payload["source"] == "hh.ru"
+            assert "selection_snapshot" not in already_event.payload
+            assert "snapshot_missing" not in already_event.payload
             assert service.applied_since(account.id, datetime(2026, 1, 1, tzinfo=UTC)) == 1
 
             uncertain_vacancy = vacancies.upsert(
@@ -532,12 +566,37 @@ def test_automation_prepares_claims_and_records_results(settings: Settings) -> N
                 uncertain_job.application.id
             )[-1]
             assert unknown_event.payload["final_url"] == uncertain_vacancy.source_url
+            attempt_snapshot = unknown_event.payload["selection_snapshot"]
+            assert isinstance(attempt_snapshot, dict)
+            assert attempt_snapshot["category"] == "MATCH"
+            assert attempt_snapshot["fit_score"] == 50
+            assert attempt_snapshot["rules_version"] == RULES_VERSION
+            assert attempt_snapshot["rules_details"] == {
+                "category": "MATCH",
+                "accepted": True,
+            }
+            assert attempt_snapshot["direction_id"] == direction.id
+            assert attempt_snapshot["resume_id"] == resume.id
+            assert attempt_snapshot["cover_letter_id"] is None
             assert (
                 service.applied_since(
                     account.id,
                     datetime(2026, 1, 1, tzinfo=UTC),
                 )
                 == 2
+            )
+
+            directions.apply_rules(
+                direction.id,
+                uncertain_vacancy.id,
+                state=VacancyState.QUEUED,
+                score=25,
+                details={
+                    "category": "STRETCH",
+                    "accepted": True,
+                    "reasons": ["правила изменились после попытки"],
+                },
+                rules_version="snapshot-rules-v2",
             )
 
             confirmed = ApplicationReconciliationService(session).reconcile(
@@ -556,6 +615,21 @@ def test_automation_prepares_claims_and_records_results(settings: Settings) -> N
             assert (
                 QueueTaskRepository(session).get(uncertain_job.task.id).state is TaskState.COMPLETED
             )
+            reconciled_event = ApplicationRepository(session).list_events(
+                uncertain_job.application.id
+            )[-1]
+            assert reconciled_event.event_type is ApplicationEventType.APPLIED
+            assert reconciled_event.payload["category"] == "MATCH"
+            assert reconciled_event.payload["fit_score"] == 50
+            assert reconciled_event.payload["rules_version"] == RULES_VERSION
+            assert reconciled_event.payload["rules_details"] == {
+                "category": "MATCH",
+                "accepted": True,
+            }
+            assert reconciled_event.payload["direction_id"] == direction.id
+            assert reconciled_event.payload["resume_id"] == resume.id
+            assert reconciled_event.payload["task_id"] == uncertain_job.task.id
+            assert reconciled_event.payload["snapshot_missing"] is False
             assert SystemStateRepository(session).get().state is SystemState.RUNNING
             assert (
                 service.applied_since(
@@ -951,9 +1025,7 @@ def test_temporary_network_failure_stops_after_five_attempts(
             SystemStateRepository(session).transition(SystemState.RUNNING)
 
             recorded = None
-            for _attempt in range(
-                application_automation_module.MAX_SCHEDULED_RETRY_ATTEMPTS
-            ):
+            for _attempt in range(application_automation_module.MAX_SCHEDULED_RETRY_ATTEMPTS):
                 job = service.claim_next(direction.id, now=failed_at)
                 assert job is not None
                 recorded = service.record_result(
@@ -975,10 +1047,7 @@ def test_temporary_network_failure_stops_after_five_attempts(
             expected_next_apply_at = failed_at if retry_blocks_queue else None
             assert recorded is not None
             assert recorded.next_apply_at == expected_next_apply_at
-            assert (
-                SystemStateRepository(session).get().next_apply_at
-                == expected_next_apply_at
-            )
+            assert SystemStateRepository(session).get().next_apply_at == expected_next_apply_at
             incident = session.scalar(
                 select(IncidentModel).where(
                     IncidentModel.code == "APPLICATION_RETRY_EXHAUSTED",
@@ -1318,11 +1387,14 @@ def test_prepare_recovers_letter_task_stopped_for_missing_evidence(
                 rules_version=RULES_VERSION,
             )
             service = ApplicationAutomationService(session)
-            assert service.prepare_for_account_id(
-                account_id=account.id,
-                direction_name=direction.name,
-                include_stretch=False,
-            ).created == 1
+            assert (
+                service.prepare_for_account_id(
+                    account_id=account.id,
+                    direction_name=direction.name,
+                    include_stretch=False,
+                ).created
+                == 1
+            )
             application = ApplicationRepository(session).get_by_key(
                 account.id,
                 vacancy.id,

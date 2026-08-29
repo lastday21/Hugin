@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from datetime import datetime
 
 from sqlalchemy import and_, func, or_, select
@@ -10,6 +11,8 @@ from hugin.database.models import (
     ApplicationModel,
     ApplicationTaskModel,
     CareerDirectionModel,
+    CoverLetterModel,
+    DirectionVacancyModel,
     ResumeModel,
 )
 from hugin.domain.applications import (
@@ -44,7 +47,7 @@ def _event_record(model: ApplicationEventModel) -> ApplicationEventRecord:
         id=model.id,
         application_id=model.application_id,
         event_type=model.event_type,
-        payload=dict(model.payload),
+        payload=deepcopy(model.payload),
         created_at=as_utc(model.created_at),
     )
 
@@ -186,8 +189,7 @@ class ApplicationRepository:
                             != "hh.ru",
                         ),
                         and_(
-                            ApplicationEventModel.event_type
-                            == ApplicationEventType.UNKNOWN_RESULT,
+                            ApplicationEventModel.event_type == ApplicationEventType.UNKNOWN_RESULT,
                             ApplicationTaskModel.state == TaskState.UNKNOWN_RESULT,
                         ),
                     ),
@@ -218,12 +220,16 @@ class ApplicationRepository:
         event_type: ApplicationEventType,
         payload: EventPayload | None = None,
     ) -> ApplicationEventRecord:
-        if self._session.get(ApplicationModel, application_id) is None:
+        application = self._session.get(ApplicationModel, application_id)
+        if application is None:
             raise ApplicationNotFoundError(application_id)
+        event_payload = dict(payload or {})
+        if event_type is ApplicationEventType.APPLIED:
+            event_payload = self._applied_event_payload(application, event_payload)
         event = ApplicationEventModel(
             application_id=application_id,
             event_type=event_type,
-            payload=dict(payload or {}),
+            payload=event_payload,
         )
         self._session.add(event)
         self._session.flush()
@@ -254,8 +260,184 @@ class ApplicationRepository:
                 "state": target.value,
             }
         )
+        if event_type is ApplicationEventType.APPLIED:
+            event_payload = self._applied_event_payload(application, event_payload)
         application.events.append(
             ApplicationEventModel(event_type=event_type, payload=event_payload)
         )
         self._session.flush()
         return _application_record(application)
+
+    def _applied_event_payload(
+        self,
+        application: ApplicationModel,
+        payload: EventPayload,
+    ) -> EventPayload:
+        result = dict(payload)
+        result.pop("cover_letter_id", None)
+        result.pop("cover_letter_instruction_version", None)
+        result.pop("selection_snapshot", None)
+
+        source = payload.get("source")
+        snapshot_required = source in {"hugin_send", "hugin_reconciliation"}
+        attempt_snapshot = None
+        if source == "hugin_send":
+            attempt_snapshot = self._validated_selection_snapshot(payload.get("selection_snapshot"))
+        elif source == "hugin_reconciliation":
+            task_id = payload.get("task_id")
+            if isinstance(task_id, int) and not isinstance(task_id, bool):
+                attempt_snapshot = self._unknown_result_snapshot(application.id, task_id)
+
+        if snapshot_required and attempt_snapshot is None:
+            result.update(
+                {
+                    "category": None,
+                    "fit_score": None,
+                    "rules_version": None,
+                    "rules_details": {},
+                    "direction_id": application.direction_id,
+                    "resume_id": application.resume_id,
+                    "snapshot_missing": True,
+                }
+            )
+        elif attempt_snapshot is not None:
+            result.update(
+                {
+                    key: deepcopy(attempt_snapshot[key])
+                    for key in (
+                        "category",
+                        "fit_score",
+                        "rules_version",
+                        "rules_details",
+                        "direction_id",
+                        "resume_id",
+                    )
+                }
+            )
+            result["snapshot_missing"] = False
+        else:
+            tracked = None
+            if application.direction_id is not None:
+                tracked = self._session.get(
+                    DirectionVacancyModel,
+                    (application.direction_id, application.vacancy_id),
+                )
+            rules_details = deepcopy(tracked.rules_details) if tracked is not None else {}
+            category = rules_details.get("category")
+            fit_score = None
+            if tracked is not None:
+                fit_score = (
+                    tracked.fit_score if tracked.fit_score is not None else tracked.rules_score
+                )
+            result.update(
+                {
+                    "category": category if isinstance(category, str) else None,
+                    "fit_score": fit_score,
+                    "rules_version": tracked.rules_version if tracked is not None else None,
+                    "rules_details": rules_details,
+                    "direction_id": application.direction_id,
+                    "resume_id": application.resume_id,
+                }
+            )
+
+        if attempt_snapshot is not None:
+            requested_letter_id = attempt_snapshot.get("cover_letter_id")
+            instruction_version = attempt_snapshot.get("cover_letter_instruction_version")
+            if isinstance(requested_letter_id, int) and not isinstance(requested_letter_id, bool):
+                owned_letter_id = self._session.scalar(
+                    select(CoverLetterModel.id)
+                    .where(
+                        CoverLetterModel.id == requested_letter_id,
+                        CoverLetterModel.application_id == application.id,
+                    )
+                    .limit(1)
+                )
+                if owned_letter_id is not None:
+                    result["cover_letter_id"] = owned_letter_id
+                    if isinstance(instruction_version, str):
+                        result["cover_letter_instruction_version"] = instruction_version
+        elif not snapshot_required:
+            requested_letter_id = payload.get("cover_letter_id")
+            letter = None
+            if isinstance(requested_letter_id, int) and not isinstance(requested_letter_id, bool):
+                letter = self._session.scalar(
+                    select(CoverLetterModel)
+                    .where(
+                        CoverLetterModel.id == requested_letter_id,
+                        CoverLetterModel.application_id == application.id,
+                    )
+                    .limit(1)
+                )
+            if letter is not None:
+                result["cover_letter_id"] = letter.id
+                result["cover_letter_instruction_version"] = letter.instruction_version
+        return result
+
+    @staticmethod
+    def _validated_selection_snapshot(value: object) -> EventPayload | None:
+        if not isinstance(value, dict):
+            return None
+        snapshot = value
+        required = {
+            "category",
+            "fit_score",
+            "rules_version",
+            "rules_details",
+            "direction_id",
+            "resume_id",
+        }
+        if not required.issubset(snapshot) or not isinstance(snapshot["rules_details"], dict):
+            return None
+        category = snapshot["category"]
+        fit_score = snapshot["fit_score"]
+        rules_version = snapshot["rules_version"]
+        direction_id = snapshot["direction_id"]
+        resume_id = snapshot["resume_id"]
+        cover_letter_id = snapshot.get("cover_letter_id")
+        instruction_version = snapshot.get("cover_letter_instruction_version")
+        if category is not None and not isinstance(category, str):
+            return None
+        if fit_score is not None and (
+            not isinstance(fit_score, (int, float)) or isinstance(fit_score, bool)
+        ):
+            return None
+        if rules_version is not None and not isinstance(rules_version, str):
+            return None
+        if direction_id is not None and (
+            not isinstance(direction_id, int) or isinstance(direction_id, bool)
+        ):
+            return None
+        if not isinstance(resume_id, int) or isinstance(resume_id, bool):
+            return None
+        if cover_letter_id is not None and (
+            not isinstance(cover_letter_id, int) or isinstance(cover_letter_id, bool)
+        ):
+            return None
+        if instruction_version is not None and not isinstance(instruction_version, str):
+            return None
+        return deepcopy(snapshot)
+
+    def _unknown_result_snapshot(
+        self,
+        application_id: int,
+        task_id: int,
+    ) -> EventPayload | None:
+        events = self._session.scalars(
+            select(ApplicationEventModel)
+            .where(
+                ApplicationEventModel.application_id == application_id,
+                ApplicationEventModel.event_type == ApplicationEventType.UNKNOWN_RESULT,
+            )
+            .order_by(ApplicationEventModel.id.desc())
+        )
+        snapshot = None
+        for event in events:
+            event_task_id = event.payload.get("task_id")
+            if (
+                isinstance(event_task_id, int)
+                and not isinstance(event_task_id, bool)
+                and event_task_id == task_id
+            ):
+                snapshot = event.payload.get("selection_snapshot")
+                break
+        return self._validated_selection_snapshot(snapshot)

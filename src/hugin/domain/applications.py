@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
 
-type EventPayload = dict[str, str | int | float | bool | None]
+type EventPayload = dict[str, object]
 
 
 class ApplicationState(StrEnum):
