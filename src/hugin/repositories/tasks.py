@@ -138,6 +138,7 @@ class QueueTaskRepository:
         require_ready_cover_letter: bool = False,
         exclude_ready_cover_letter: bool = False,
         cover_letter_instruction_version: str | None = None,
+        cover_letter_quality_version: str | None = None,
         vacancy_rules_version: str | None = None,
         vacancy_rule_categories: frozenset[str] | None = None,
         running_error_code: str | None = None,
@@ -231,16 +232,18 @@ class QueueTaskRepository:
                     autoescape=True,
                 )
             )
-            ready_letter = (
-                select(CoverLetterModel.id)
-                .where(
-                    CoverLetterModel.application_id == ApplicationModel.id,
-                    CoverLetterModel.state == CoverLetterState.READY,
-                    CoverLetterModel.text.is_not(None),
-                    instruction_filter,
-                )
-                .exists()
+            ready_letter_statement = select(CoverLetterModel.id).where(
+                CoverLetterModel.application_id == ApplicationModel.id,
+                CoverLetterModel.state == CoverLetterState.READY,
+                CoverLetterModel.text.is_not(None),
+                instruction_filter,
             )
+            if cover_letter_quality_version is not None:
+                ready_letter_statement = ready_letter_statement.where(
+                    CoverLetterModel.quality_passed.is_(True),
+                    CoverLetterModel.quality_version == cover_letter_quality_version,
+                )
+            ready_letter = ready_letter_statement.exists()
             statement = statement.where(
                 ready_letter if require_ready_cover_letter else ~ready_letter
             )

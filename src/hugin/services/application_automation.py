@@ -61,6 +61,7 @@ from hugin.repositories.vacancies import VacancyRepository
 from hugin.services.ai_prompts import AiPromptSettingsService
 from hugin.services.autonomy import AutonomyPolicyService
 from hugin.services.cover_letter import CoverLetterService
+from hugin.services.cover_letter_quality import QUALITY_RUBRIC_VERSION
 from hugin.services.incidents import IncidentService
 from hugin.services.queue import QueueService
 from hugin.services.screening_forms import ScreeningDraft, ScreeningDraftService
@@ -486,6 +487,8 @@ class ApplicationAutomationService:
                 CoverLetterModel.text.is_not(None),
                 func.length(func.btrim(CoverLetterModel.text)) > 0,
                 CoverLetterModel.instruction_version == instruction_version,
+                CoverLetterModel.quality_passed.is_(True),
+                CoverLetterModel.quality_version == QUALITY_RUBRIC_VERSION,
                 CoverLetterModel.resume_id == ApplicationModel.resume_id,
                 CoverLetterModel.vacancy_id == ApplicationModel.vacancy_id,
                 ResumeModel.is_active.is_(True),
@@ -583,6 +586,8 @@ class ApplicationAutomationService:
                 CoverLetterModel.text.is_not(None),
                 func.length(func.btrim(CoverLetterModel.text)) > 0,
                 CoverLetterModel.instruction_version == instruction_version,
+                CoverLetterModel.quality_passed.is_(True),
+                CoverLetterModel.quality_version == QUALITY_RUBRIC_VERSION,
                 CoverLetterModel.resume_id == ApplicationModel.resume_id,
                 CoverLetterModel.vacancy_id == ApplicationModel.vacancy_id,
                 ResumeModel.is_active.is_(True),
@@ -668,6 +673,8 @@ class ApplicationAutomationService:
                 CoverLetterModel.text.is_not(None),
                 func.length(func.btrim(CoverLetterModel.text)) > 0,
                 CoverLetterModel.instruction_version == instruction_version,
+                CoverLetterModel.quality_passed.is_(True),
+                CoverLetterModel.quality_version == QUALITY_RUBRIC_VERSION,
                 CoverLetterModel.resume_id == ApplicationModel.resume_id,
                 CoverLetterModel.vacancy_id == ApplicationModel.vacancy_id,
                 ResumeModel.is_active.is_(True),
@@ -800,6 +807,7 @@ class ApplicationAutomationService:
         *,
         account_id: int | None = None,
         require_cover_letter: bool = False,
+        require_cover_letter_quality: bool = False,
         allow_paused_review: bool = False,
         include_stretch: bool = True,
         now: datetime | None = None,
@@ -820,6 +828,9 @@ class ApplicationAutomationService:
                 direction_id=direction_id,
                 require_ready_cover_letter=require_cover_letter,
                 cover_letter_instruction_version=instruction_version,
+                cover_letter_quality_version=(
+                    QUALITY_RUBRIC_VERSION if require_cover_letter_quality else None
+                ),
                 vacancy_rules_version=RULES_VERSION,
                 vacancy_rule_categories=(
                     frozenset(
@@ -839,6 +850,9 @@ class ApplicationAutomationService:
                 direction_id=direction_id,
                 require_ready_cover_letter=require_cover_letter,
                 cover_letter_instruction_version=instruction_version,
+                cover_letter_quality_version=(
+                    QUALITY_RUBRIC_VERSION if require_cover_letter_quality else None
+                ),
                 vacancy_rules_version=RULES_VERSION,
                 vacancy_rule_categories=(
                     frozenset(
@@ -858,16 +872,19 @@ class ApplicationAutomationService:
             raise RuntimeError("Задание отклика относится к другому аккаунту")
         if application.direction_id is None:
             raise RuntimeError("Направление отклика отсутствует")
-        letter = self._session.scalar(
-            select(CoverLetterModel)
-            .where(
-                CoverLetterModel.application_id == application.id,
-                CoverLetterModel.state == CoverLetterState.READY,
-                CoverLetterModel.text.is_not(None),
-                CoverLetterModel.instruction_version == instruction_version,
+        letter_statement = select(CoverLetterModel).where(
+            CoverLetterModel.application_id == application.id,
+            CoverLetterModel.state == CoverLetterState.READY,
+            CoverLetterModel.text.is_not(None),
+            CoverLetterModel.instruction_version == instruction_version,
+        )
+        if require_cover_letter_quality:
+            letter_statement = letter_statement.where(
+                CoverLetterModel.quality_passed.is_(True),
+                CoverLetterModel.quality_version == QUALITY_RUBRIC_VERSION,
             )
-            .order_by(CoverLetterModel.id.desc())
-            .limit(1)
+        letter = self._session.scalar(
+            letter_statement.order_by(CoverLetterModel.id.desc()).limit(1)
         )
         if require_cover_letter and (letter is None or not letter.text):
             raise RuntimeError("Готовое сопроводительное письмо отсутствует")
@@ -922,6 +939,7 @@ class ApplicationAutomationService:
         *,
         account_id: int,
         include_stretch: bool = True,
+        require_cover_letter_quality: bool = False,
         now: datetime | None = None,
     ) -> ApplyJob | None:
         selected_at = as_utc(now or datetime.now(UTC))
@@ -940,6 +958,9 @@ class ApplicationAutomationService:
             account_id=account_id,
             exclude_ready_cover_letter=True,
             cover_letter_instruction_version=instruction_version,
+            cover_letter_quality_version=(
+                QUALITY_RUBRIC_VERSION if require_cover_letter_quality else None
+            ),
             vacancy_rules_version=RULES_VERSION,
             vacancy_rule_categories=(
                 frozenset(
@@ -1025,6 +1046,7 @@ class ApplicationAutomationService:
         account_id: int,
         task_id: int,
         include_stretch: bool = True,
+        require_cover_letter_quality: bool = False,
         now: datetime | None = None,
     ) -> ApplyJob | None:
         selected_at = as_utc(now or datetime.now(UTC))
@@ -1071,16 +1093,19 @@ class ApplicationAutomationService:
         instruction_version = cover_letter_instruction_version(
             AiPromptSettingsService(self._session).get().cover_letter
         )
-        letter = self._session.scalar(
-            select(CoverLetterModel)
-            .where(
-                CoverLetterModel.application_id == application.id,
-                CoverLetterModel.state == CoverLetterState.READY,
-                CoverLetterModel.text.is_not(None),
-                CoverLetterModel.instruction_version == instruction_version,
+        letter_statement = select(CoverLetterModel).where(
+            CoverLetterModel.application_id == application.id,
+            CoverLetterModel.state == CoverLetterState.READY,
+            CoverLetterModel.text.is_not(None),
+            CoverLetterModel.instruction_version == instruction_version,
+        )
+        if require_cover_letter_quality:
+            letter_statement = letter_statement.where(
+                CoverLetterModel.quality_passed.is_(True),
+                CoverLetterModel.quality_version == QUALITY_RUBRIC_VERSION,
             )
-            .order_by(CoverLetterModel.id.desc())
-            .limit(1)
+        letter = self._session.scalar(
+            letter_statement.order_by(CoverLetterModel.id.desc()).limit(1)
         )
         if letter is None or not letter.text:
             return None

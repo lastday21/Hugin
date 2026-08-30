@@ -1025,11 +1025,13 @@ def test_apply_runs_queue_and_records_confirmed_result(
             direction_id: int,
             *,
             require_cover_letter: bool = False,
+            require_cover_letter_quality: bool = False,
             allow_paused_review: bool = False,
             include_stretch: bool = True,
         ) -> SimpleNamespace | None:
             assert direction_id == 3
             assert require_cover_letter
+            assert require_cover_letter_quality is send
             assert allow_paused_review is (not send)
             assert include_stretch is (not exclude_stretch)
             return self.jobs.pop(0) if self.jobs else None
@@ -1190,11 +1192,13 @@ def test_apply_limit_counts_only_confirmed_applications(
             direction_id: int,
             *,
             require_cover_letter: bool = False,
+            require_cover_letter_quality: bool = False,
             allow_paused_review: bool = False,
             include_stretch: bool = True,
         ) -> SimpleNamespace | None:
             assert direction_id == 3
             assert require_cover_letter
+            assert require_cover_letter_quality
             assert not allow_paused_review
             assert include_stretch
             return self.queued_jobs.pop(0) if self.queued_jobs else None
@@ -1296,10 +1300,12 @@ def test_apply_keeps_queue_available_when_one_result_is_unknown(
             direction_id: int,
             *,
             require_cover_letter: bool = False,
+            require_cover_letter_quality: bool = False,
             allow_paused_review: bool = False,
             include_stretch: bool = True,
         ) -> SimpleNamespace | None:
             assert require_cover_letter
+            assert require_cover_letter_quality
             assert not allow_paused_review
             assert include_stretch
             return self.jobs.pop(0) if self.jobs else None

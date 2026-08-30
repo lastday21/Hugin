@@ -409,6 +409,7 @@ class ApplicationWorker:
                     service.claim_next(
                         account_id=self._account_id,
                         require_cover_letter=True,
+                        require_cover_letter_quality=True,
                         include_stretch=include_stretch,
                     ),
                     True,
@@ -427,6 +428,7 @@ class ApplicationWorker:
                 return service.claim_next_form_preflight(
                     account_id=self._account_id,
                     include_stretch=include_stretch,
+                    require_cover_letter_quality=True,
                     now=now,
                 )
         finally:
@@ -443,6 +445,7 @@ class ApplicationWorker:
                     account_id=self._account_id,
                     task_id=task_id,
                     include_stretch=service.stretch_automation_enabled(),
+                    require_cover_letter_quality=True,
                     now=now,
                 )
         finally:
@@ -507,9 +510,17 @@ class ApplicationWorker:
                     self._settings,
                     operation="cover_letter",
                 )
+                quality_model = configured_codex_cli_client(
+                    self._settings,
+                    operation="cover_letter_quality_check",
+                )
                 if not automation.applications_enabled():
                     return 0
-                result = CoverLetterService(session, client).prepare(
+                result = CoverLetterService(
+                    session,
+                    client,
+                    quality_model=quality_model,
+                ).prepare(
                     account_id=job.application.account_id,
                     direction_name=direction_name,
                     vacancy_hh_id=job.vacancy.hh_id,
@@ -517,7 +528,7 @@ class ApplicationWorker:
                     limit=1,
                     include_stretch=include_stretch,
                 )
-                return result.generated + result.reused
+                return result.generated + result.reused + result.already_ready
         finally:
             database.close()
 

@@ -27,7 +27,11 @@ from hugin.services.ai_prompts import DEFAULT_COVER_LETTER_PROMPT
 from hugin.services.cover_letter import (
     CoverLetterPreparationItem,
     CoverLetterPreparationResult,
+    CoverLetterQualityTrialItem,
+    CoverLetterQualityTrialResult,
     CoverLetterStatus,
+    SentCoverLetterQualityItem,
+    SentCoverLetterQualityResult,
 )
 
 
@@ -200,6 +204,141 @@ def test_status_does_not_require_yandex_configuration(
     output = capsys.readouterr().out
     assert "Готово: 2" in output
     assert "Еще не подготовлено: 3" in output
+    assert database.closed
+
+
+def test_quality_trial_uses_separate_writer_and_judge_without_submission(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    database = FakeDatabase()
+    writer = object()
+    judge = object()
+    result = CoverLetterQualityTrialResult(
+        (
+            CoverLetterQualityTrialItem(
+                application_id=1,
+                hh_id="trial-1",
+                title="Python-разработчик",
+                category="MATCH",
+                action="corrected",
+                initial_score=8,
+                final_score=9,
+                text="Проверенное письмо",
+                reason="После одной правки письмо прошло контроль.",
+            ),
+        )
+    )
+
+    class FakeLetters:
+        def __init__(
+            self,
+            _session: object,
+            model: object | None = None,
+            router_model: object | None = None,
+            quality_model: object | None = None,
+        ) -> None:
+            assert model is writer
+            assert router_model is None
+            assert quality_model is judge
+
+        def trial_quality(self, **kwargs: object) -> CoverLetterQualityTrialResult:
+            assert kwargs == {
+                "account_id": 1,
+                "direction_name": "Python backend",
+                "limit": 10,
+                "include_stretch": True,
+                "completed": False,
+                "vacancy_hh_id": None,
+            }
+            return result
+
+    monkeypatch.setattr(cover_letter_cli, "get_settings", lambda: Settings())
+    monkeypatch.setattr(cover_letter_cli, "upgrade_database", lambda _settings: None)
+    monkeypatch.setattr(cover_letter_cli, "create_database", lambda _settings: database)
+    monkeypatch.setattr(
+        cover_letter_cli,
+        "configured_codex_cli_client",
+        lambda _settings, *, operation: {
+            "cover_letter_quality_trial_writer": writer,
+            "cover_letter_quality_trial_check": judge,
+        }[operation],
+    )
+    monkeypatch.setattr(cover_letter_cli, "CoverLetterService", FakeLetters)
+
+    assert (
+        cover_letter_cli.run(["quality-trial", "--direction", "Python backend", "--limit", "10"])
+        == 0
+    )
+    output = capsys.readouterr().out
+    assert "исправлено и прошло" in output
+    assert "первая оценка 8/10, итоговая 9/10" in output
+    assert "Проверено: 1. Прошло: 1" in output
+    assert "состояние очереди не изменено" in output
+    assert "на hh.ru ничего не отправлено" in output
+    assert database.closed
+
+
+def test_sent_quality_trial_prints_scores_without_submission(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    database = FakeDatabase()
+    judge = object()
+    result = SentCoverLetterQualityResult(
+        (
+            SentCoverLetterQualityItem(
+                letter_id=11,
+                hh_id="sent-1",
+                title="Python-разработчик",
+                category="MATCH",
+                score=9,
+                structure=3,
+                clarity=3,
+                individuality=1,
+                naturalness=2,
+                passed=True,
+                reason="Письмо ясное и естественное.",
+                text="Отправленное письмо",
+            ),
+        )
+    )
+
+    class FakeLetters:
+        def __init__(
+            self,
+            _session: object,
+            model: object | None = None,
+            router_model: object | None = None,
+            quality_model: object | None = None,
+        ) -> None:
+            assert model is None
+            assert router_model is None
+            assert quality_model is judge
+
+        def assess_sent_quality(self, **kwargs: object) -> SentCoverLetterQualityResult:
+            assert kwargs == {"account_id": 1, "limit": 25}
+            return result
+
+    monkeypatch.setattr(cover_letter_cli, "get_settings", lambda: Settings())
+    monkeypatch.setattr(cover_letter_cli, "upgrade_database", lambda _settings: None)
+    monkeypatch.setattr(cover_letter_cli, "create_database", lambda _settings: database)
+    monkeypatch.setattr(
+        cover_letter_cli,
+        "configured_codex_cli_client",
+        lambda _settings, *, operation: (
+            judge if operation == "cover_letter_quality_trial_check" else None
+        ),
+    )
+    monkeypatch.setattr(cover_letter_cli, "CoverLetterService", FakeLetters)
+
+    assert cover_letter_cli.run(["sent-quality-trial", "--limit", "25"]) == 0
+    output = capsys.readouterr().out
+    assert "9/10, прошло" in output
+    assert "Структура 3/3, ясность 3/3" in output
+    assert "Не ниже 9: 1" in output
+    assert "на hh.ru ничего не отправлено" in output
+    assert "Отправленное письмо" not in output
     assert database.closed
 
 

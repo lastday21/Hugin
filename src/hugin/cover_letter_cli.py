@@ -9,6 +9,7 @@ from pathlib import Path
 
 from sqlalchemy import select
 
+from hugin.adapters.codex_cli import CodexCliError, configured_codex_cli_client
 from hugin.adapters.yandex_ai import YandexAIClient, YandexAIError
 from hugin.adapters.yandex_credentials import (
     WindowsYandexAICredentialStore,
@@ -84,6 +85,37 @@ def build_parser() -> argparse.ArgumentParser:
     replace.add_argument("--account-id", type=positive_int, default=1)
     replace.add_argument("--letter-id", type=positive_int, required=True)
     replace.add_argument("--file", type=Path, required=True, help="текстовый файл UTF-8")
+
+    quality_trial = subparsers.add_parser(
+        "quality-trial",
+        help="проверить новый порядок создания писем без сохранения и отправки",
+    )
+    quality_trial.add_argument("--account-id", type=positive_int, default=1)
+    quality_trial.add_argument("--direction", required=True, help="точное название направления")
+    quality_trial.add_argument("--limit", type=positive_int, default=10)
+    quality_trial.add_argument("--vacancy-id", help="проверить только этот номер вакансии hh.ru")
+    quality_trial.add_argument(
+        "--exclude-stretch",
+        action="store_true",
+        help="не включать смежные вакансии",
+    )
+    quality_trial.add_argument(
+        "--completed",
+        action="store_true",
+        help="взять ранее завершённые отклики вместо текущей очереди",
+    )
+
+    sent_quality = subparsers.add_parser(
+        "sent-quality-trial",
+        help="оценить качество уже отправленных писем без изменения данных",
+    )
+    sent_quality.add_argument("--account-id", type=positive_int, default=1)
+    sent_quality.add_argument("--limit", type=positive_int, default=25)
+    sent_quality.add_argument(
+        "--show-text",
+        action="store_true",
+        help="показать полный текст каждого письма",
+    )
     return parser
 
 
@@ -113,6 +145,97 @@ def run(argv: Sequence[str] | None = None) -> int:
         upgrade_database(settings)
         database = create_database(settings)
         try:
+            if arguments.command == "sent-quality-trial":
+                quality_model = configured_codex_cli_client(
+                    settings,
+                    operation="cover_letter_quality_trial_check",
+                )
+                with database.sessions.begin() as session:
+                    sent_result = CoverLetterService(
+                        session,
+                        quality_model=quality_model,
+                    ).assess_sent_quality(
+                        account_id=arguments.account_id,
+                        limit=arguments.limit,
+                    )
+                for index, sent_item in enumerate(sent_result.items, start=1):
+                    score = f"{sent_item.score}/10" if sent_item.score is not None else "ошибка"
+                    verdict = "прошло" if sent_item.passed else "ниже порога"
+                    print(
+                        f"{index}. Письмо № {sent_item.letter_id}, вакансия № {sent_item.hh_id}, "
+                        f"{sent_item.title} [{sent_item.category}]: {score}, {verdict}."
+                    )
+                    if sent_item.score is not None:
+                        print(
+                            f"Структура {sent_item.structure}/3, ясность {sent_item.clarity}/3, "
+                            f"самостоятельность {sent_item.individuality}/2, "
+                            f"естественность {sent_item.naturalness}/2."
+                        )
+                    print(f"Причина: {sent_item.reason}")
+                    if arguments.show_text:
+                        print(sent_item.text)
+                    print("-----")
+                print(
+                    f"Проверено: {len(sent_result.items)}. Не ниже 9: {sent_result.passed}. "
+                    f"Ошибок: {sent_result.failed}."
+                )
+                print("Данные не изменены, на hh.ru ничего не отправлено.")
+                return 3 if sent_result.failed else 0
+            if arguments.command == "quality-trial":
+                writer = configured_codex_cli_client(
+                    settings,
+                    operation="cover_letter_quality_trial_writer",
+                )
+                quality_model = configured_codex_cli_client(
+                    settings,
+                    operation="cover_letter_quality_trial_check",
+                )
+                with database.sessions.begin() as session:
+                    trial_result = CoverLetterService(
+                        session,
+                        writer,
+                        quality_model=quality_model,
+                    ).trial_quality(
+                        account_id=arguments.account_id,
+                        direction_name=arguments.direction,
+                        limit=arguments.limit,
+                        include_stretch=not arguments.exclude_stretch,
+                        completed=arguments.completed,
+                        vacancy_hh_id=arguments.vacancy_id,
+                    )
+                action_labels = {
+                    "passed": "прошло сразу",
+                    "corrected": "исправлено и прошло",
+                    "blocked": "остановлено",
+                    "failed": "техническая ошибка",
+                }
+                for index, trial_item in enumerate(trial_result.items, start=1):
+                    scores = ""
+                    if trial_item.initial_score is not None:
+                        scores = f", первая оценка {trial_item.initial_score}/10"
+                    if (
+                        trial_item.final_score is not None
+                        and trial_item.final_score != trial_item.initial_score
+                    ):
+                        scores += f", итоговая {trial_item.final_score}/10"
+                    print(
+                        f"{index}. № {trial_item.hh_id}, {trial_item.title} "
+                        f"[{trial_item.category}]: {action_labels[trial_item.action]}{scores}."
+                    )
+                    if trial_item.reason:
+                        print(f"Причина: {trial_item.reason}")
+                    if trial_item.text:
+                        print(trial_item.text)
+                    print("-----")
+                print(
+                    f"Проверено: {len(trial_result.items)}. Прошло: {trial_result.passed}. "
+                    f"Остановлено: {trial_result.blocked}. Ошибок: {trial_result.failed}."
+                )
+                print(
+                    "Письма не сохранены, состояние очереди не изменено, "
+                    "на hh.ru ничего не отправлено."
+                )
+                return 3 if trial_result.failed else 0
             if arguments.command == "status":
                 with database.sessions.begin() as session:
                     status = CoverLetterService(session).status(
@@ -278,7 +401,7 @@ def run(argv: Sequence[str] | None = None) -> int:
         )
         print("На hh.ru ничего не отправлено.")
         return 3 if result.failed else 0
-    except (LookupError, RuntimeError, ValueError, YandexAIError) as error:
+    except (CodexCliError, LookupError, RuntimeError, ValueError, YandexAIError) as error:
         print(f"Ошибка: {error}", file=sys.stderr)
         return 2
     except KeyboardInterrupt:

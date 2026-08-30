@@ -40,6 +40,7 @@ class QueueService:
         direction_id: int | None = None,
         require_ready_cover_letter: bool = False,
         cover_letter_instruction_version: str | None = None,
+        cover_letter_quality_version: str | None = None,
         vacancy_rules_version: str | None = None,
         vacancy_rule_categories: frozenset[str] | None = None,
     ) -> TaskRecord | None:
@@ -55,6 +56,7 @@ class QueueService:
             direction_id=direction_id,
             require_ready_cover_letter=require_ready_cover_letter,
             cover_letter_instruction_version=cover_letter_instruction_version,
+            cover_letter_quality_version=cover_letter_quality_version,
             vacancy_rules_version=vacancy_rules_version,
             vacancy_rule_categories=vacancy_rule_categories,
         )

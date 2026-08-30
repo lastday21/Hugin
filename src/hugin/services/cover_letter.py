@@ -43,6 +43,15 @@ from hugin.services.ai_prompts import (
     AiPromptSettingsService,
     with_user_prompt,
 )
+from hugin.services.cover_letter_quality import (
+    QUALITY_RUBRIC_VERSION,
+    CoverLetterQuality,
+    CoverLetterQualityResponseError,
+    QualityFact,
+    QualityTextModel,
+    assess_cover_letter_quality,
+    build_quality_correction_prompt,
+)
 from hugin.services.cover_letter_routing import (
     ROUTER_SYSTEM_PROMPT,
     RoutingCandidate,
@@ -677,10 +686,12 @@ _PERMANENT_PREPARATION_FAILURES = frozenset(
 )
 _AUTO_RETRY_FAILURE_PREFIX = "COVER_LETTER_RETRY_FAILED:"
 _AUTO_RETRY_ERROR_CODE = "COVER_LETTER_RETRY_FAILED"
+_QUALITY_FAILURE_PREFIX = "COVER_LETTER_QUALITY_FAILED:"
+_QUALITY_ERROR_CODE = "COVER_LETTER_QUALITY_FAILED"
 _MAX_VALIDATION_CORRECTION_ATTEMPTS = 3
 _NON_PROGRESS_RETRY_CODES = frozenset({"NO_VACANCY_FOCUS"})
 _ACTION_LINE = re.compile(
-    r"\b(?:разработ|реализ|настро|интегр|автоматиз|созда|поддерж|проектир|тестир|"
+    r"\b(?:разработ|реализ|настр|интегр|автоматиз|созда|поддерж|проектир|тестир|"
     r"оптимиз|анализир|внедр)",
     re.IGNORECASE,
 )
@@ -825,6 +836,65 @@ class CoverLetterStatus:
 
 
 @dataclass(frozen=True, slots=True)
+class CoverLetterQualityTrialItem:
+    application_id: int
+    hh_id: str
+    title: str
+    category: str
+    action: str
+    initial_score: int | None = None
+    final_score: int | None = None
+    text: str | None = None
+    reason: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CoverLetterQualityTrialResult:
+    items: tuple[CoverLetterQualityTrialItem, ...]
+
+    @property
+    def passed(self) -> int:
+        return sum(item.action in {"passed", "corrected"} for item in self.items)
+
+    @property
+    def blocked(self) -> int:
+        return sum(item.action == "blocked" for item in self.items)
+
+    @property
+    def failed(self) -> int:
+        return sum(item.action == "failed" for item in self.items)
+
+
+@dataclass(frozen=True, slots=True)
+class SentCoverLetterQualityItem:
+    letter_id: int
+    hh_id: str
+    title: str
+    category: str
+    score: int | None
+    structure: int | None
+    clarity: int | None
+    individuality: int | None
+    naturalness: int | None
+    passed: bool
+    reason: str
+    text: str
+
+
+@dataclass(frozen=True, slots=True)
+class SentCoverLetterQualityResult:
+    items: tuple[SentCoverLetterQualityItem, ...]
+
+    @property
+    def passed(self) -> int:
+        return sum(item.passed for item in self.items)
+
+    @property
+    def failed(self) -> int:
+        return sum(item.score is None for item in self.items)
+
+
+@dataclass(frozen=True, slots=True)
 class _SelectedFact:
     id: int
     category: str
@@ -861,10 +931,12 @@ class CoverLetterService:
         session: Session,
         model: CoverLetterTextModel | None = None,
         router_model: CoverLetterTextModel | None = None,
+        quality_model: QualityTextModel | None = None,
     ) -> None:
         self._session = session
         self._model = model
         self._router_model = router_model
+        self._quality_model = quality_model
 
     def prepare(
         self,
@@ -917,6 +989,14 @@ class CoverLetterService:
                 user_instruction,
                 instruction_version,
             )
+            if self._quality_model is not None and item.state is CoverLetterState.READY:
+                item = self._ensure_quality(
+                    candidate,
+                    direction,
+                    user_instruction,
+                    instruction_version,
+                    item,
+                )
             if item.action == "existing":
                 already_ready += 1
                 continue
@@ -934,6 +1014,511 @@ class CoverLetterService:
             already_ready=already_ready,
             failed=sum(item.action == "failed" for item in prepared_items),
             items=prepared_items,
+        )
+
+    def trial_quality(
+        self,
+        *,
+        account_id: int,
+        direction_name: str,
+        limit: int = 10,
+        include_stretch: bool = True,
+        completed: bool = False,
+        vacancy_hh_id: str | None = None,
+    ) -> CoverLetterQualityTrialResult:
+        if limit < 1:
+            raise ValueError("Количество контрольных вакансий должно быть положительным")
+        model = self._require_model()
+        quality_model = self._quality_model
+        if quality_model is None:
+            raise RuntimeError("Для пробной проверки нужно настроить модель оценки качества")
+        direction = self._direction(account_id, direction_name)
+        user_instruction = AiPromptSettingsService(self._session).get().cover_letter
+        candidates = self._candidates(
+            account_id,
+            direction.id,
+            vacancy_hh_id,
+            include_stretch=include_stretch,
+            require_current_rules=False,
+            application_states=(
+                (
+                    ApplicationState.APPLIED,
+                    ApplicationState.VIEWED,
+                    ApplicationState.INVITED,
+                    ApplicationState.REJECTED,
+                )
+                if completed
+                else (ApplicationState.APPLYING,)
+            ),
+            task_states=(TaskState.COMPLETED,) if completed else _READY_TASK_STATES,
+        )[:limit]
+        if not candidates:
+            raise LookupError("В готовой очереди нет вакансий для пробной проверки")
+
+        items: list[CoverLetterQualityTrialItem] = []
+        for candidate in candidates:
+            category = str(candidate.direction_vacancy.rules_details.get("category") or "")
+            try:
+                facts = self._select_facts(candidate, direction.id)
+            except CoverLetterValidationError as error:
+                items.append(
+                    self._quality_trial_item(
+                        candidate,
+                        category,
+                        "blocked",
+                        reason=str(error),
+                    )
+                )
+                continue
+            user_prompt = _cover_letter_prompt_variants(
+                build_cover_letter_prompt(
+                    candidate.vacancy,
+                    direction.name,
+                    candidate.direction_vacancy.rules_details.get("reasons", []),
+                    facts,
+                ),
+                user_instruction,
+            )[0]
+            try:
+                text, used_facts = self._generate_trial_letter(
+                    model,
+                    user_prompt,
+                    candidate,
+                    facts,
+                )
+                initial_quality = self._assess_quality(
+                    quality_model,
+                    candidate.vacancy,
+                    used_facts,
+                    text,
+                )
+            except CoverLetterValidationError as error:
+                items.append(
+                    self._quality_trial_item(
+                        candidate,
+                        category,
+                        "blocked",
+                        reason=str(error),
+                    )
+                )
+                continue
+            except (CoverLetterQualityResponseError, RuntimeError) as error:
+                items.append(
+                    self._quality_trial_item(
+                        candidate,
+                        category,
+                        "failed",
+                        reason=str(error),
+                    )
+                )
+                continue
+
+            if initial_quality.passed:
+                items.append(
+                    self._quality_trial_item(
+                        candidate,
+                        category,
+                        "passed",
+                        initial_score=initial_quality.score,
+                        final_score=initial_quality.score,
+                        text=text,
+                        reason=self._quality_reason(initial_quality),
+                    )
+                )
+                continue
+
+            correction_prompt = build_quality_correction_prompt(
+                user_prompt,
+                text,
+                initial_quality,
+            )
+            try:
+                corrected_text, corrected_facts = self._generate_validated_letter(
+                    model,
+                    correction_prompt,
+                    candidate,
+                    facts,
+                )
+                final_quality = self._assess_quality(
+                    quality_model,
+                    candidate.vacancy,
+                    corrected_facts,
+                    corrected_text,
+                )
+            except (
+                CoverLetterValidationError,
+                CoverLetterQualityResponseError,
+                RuntimeError,
+            ) as error:
+                items.append(
+                    self._quality_trial_item(
+                        candidate,
+                        category,
+                        "blocked",
+                        initial_score=initial_quality.score,
+                        reason=f"Исправление не прошло проверку: {error}",
+                    )
+                )
+                continue
+            items.append(
+                self._quality_trial_item(
+                    candidate,
+                    category,
+                    "corrected" if final_quality.passed else "blocked",
+                    initial_score=initial_quality.score,
+                    final_score=final_quality.score,
+                    text=corrected_text,
+                    reason=self._quality_reason(final_quality),
+                )
+            )
+        return CoverLetterQualityTrialResult(tuple(items))
+
+    def assess_sent_quality(
+        self,
+        *,
+        account_id: int,
+        limit: int = 25,
+    ) -> SentCoverLetterQualityResult:
+        if limit < 1:
+            raise ValueError("Количество проверяемых писем должно быть положительным")
+        quality_model = self._quality_model
+        if quality_model is None:
+            raise RuntimeError("Для проверки отправленных писем нужна модель оценки качества")
+        rows = tuple(
+            self._session.execute(
+                select(
+                    CoverLetterModel,
+                    VacancyModel,
+                    DirectionVacancyModel.rules_details,
+                )
+                .join(
+                    ApplicationModel,
+                    ApplicationModel.id == CoverLetterModel.application_id,
+                )
+                .join(VacancyModel, VacancyModel.id == CoverLetterModel.vacancy_id)
+                .outerjoin(
+                    DirectionVacancyModel,
+                    (DirectionVacancyModel.direction_id == ApplicationModel.direction_id)
+                    & (DirectionVacancyModel.vacancy_id == ApplicationModel.vacancy_id),
+                )
+                .where(
+                    ApplicationModel.account_id == account_id,
+                    CoverLetterModel.state == CoverLetterState.SENT,
+                    CoverLetterModel.text.is_not(None),
+                )
+                .order_by(
+                    CoverLetterModel.sent_at.desc().nulls_last(),
+                    CoverLetterModel.id.desc(),
+                )
+                .limit(limit)
+            )
+        )
+        items: list[SentCoverLetterQualityItem] = []
+        for letter, vacancy, rules_details in rows:
+            text = letter.text or ""
+            raw_category = rules_details.get("category") if rules_details else None
+            category = str(raw_category or "")
+            facts = tuple(
+                QualityFact(fact.id, fact.category, fact.content)
+                for fact in self._session.scalars(
+                    select(VerifiedFactModel)
+                    .join(
+                        CoverLetterFactModel,
+                        CoverLetterFactModel.fact_id == VerifiedFactModel.id,
+                    )
+                    .where(CoverLetterFactModel.cover_letter_id == letter.id)
+                    .order_by(VerifiedFactModel.id)
+                )
+            )
+            if not facts:
+                items.append(
+                    SentCoverLetterQualityItem(
+                        letter.id,
+                        vacancy.hh_id,
+                        vacancy.title,
+                        category,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        False,
+                        "У письма нет связанных подтверждённых фактов",
+                        text,
+                    )
+                )
+                continue
+            try:
+                quality = assess_cover_letter_quality(quality_model, vacancy, facts, text)
+            except (CoverLetterQualityResponseError, RuntimeError) as error:
+                items.append(
+                    SentCoverLetterQualityItem(
+                        letter.id,
+                        vacancy.hh_id,
+                        vacancy.title,
+                        category,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        False,
+                        str(error),
+                        text,
+                    )
+                )
+                continue
+            items.append(
+                SentCoverLetterQualityItem(
+                    letter.id,
+                    vacancy.hh_id,
+                    vacancy.title,
+                    category,
+                    quality.score,
+                    quality.structure,
+                    quality.clarity,
+                    quality.individuality,
+                    quality.naturalness,
+                    quality.passed,
+                    self._quality_reason(quality),
+                    text,
+                )
+            )
+        return SentCoverLetterQualityResult(tuple(items))
+
+    def _generate_trial_letter(
+        self,
+        model: CoverLetterTextModel,
+        user_prompt: str,
+        candidate: _Candidate,
+        facts: tuple[_SelectedFact, ...],
+    ) -> tuple[str, tuple[_SelectedFact, ...]]:
+        validation_errors: list[CoverLetterValidationError] = []
+        for attempt in range(_MAX_VALIDATION_CORRECTION_ATTEMPTS + 1):
+            prompt = (
+                user_prompt
+                if attempt == 0
+                else _validation_correction_prompt(user_prompt, tuple(validation_errors))
+            )
+            try:
+                return self._generate_validated_letter(model, prompt, candidate, facts)
+            except CoverLetterValidationError as error:
+                validation_errors.append(error)
+                if (
+                    error.code in _NON_PROGRESS_RETRY_CODES
+                    and len(validation_errors) >= 2
+                    and validation_errors[-2].code == error.code
+                ):
+                    break
+        raise validation_errors[-1]
+
+    @staticmethod
+    def _assess_quality(
+        model: QualityTextModel,
+        vacancy: VacancyModel,
+        facts: tuple[_SelectedFact, ...],
+        text: str,
+    ) -> CoverLetterQuality:
+        return assess_cover_letter_quality(
+            model,
+            vacancy,
+            tuple(QualityFact(fact.id, fact.category, fact.content) for fact in facts),
+            text,
+        )
+
+    def _ensure_quality(
+        self,
+        candidate: _Candidate,
+        direction: CareerDirectionModel,
+        user_instruction: str,
+        instruction_version: str,
+        item: CoverLetterPreparationItem,
+    ) -> CoverLetterPreparationItem:
+        quality_model = self._quality_model
+        if quality_model is None:
+            return item
+        letter = self._current_letter(candidate.application.id, instruction_version)
+        if letter is None or letter.state is not CoverLetterState.READY or not letter.text:
+            return self._item(
+                candidate,
+                CoverLetterState.FAILED,
+                "failed",
+                "Готовое письмо исчезло перед проверкой качества",
+            )
+        if (
+            letter.quality_passed is True
+            and letter.quality_version == QUALITY_RUBRIC_VERSION
+            and letter.quality_score is not None
+        ):
+            return item
+
+        facts = self._select_facts(candidate, direction.id)
+        text = letter.text
+        try:
+            initial_quality = self._assess_quality(
+                quality_model,
+                candidate.vacancy,
+                facts,
+                text,
+            )
+        except (CoverLetterQualityResponseError, RuntimeError) as error:
+            self._clear_quality(letter)
+            return self._item(
+                candidate,
+                CoverLetterState.FAILED,
+                "failed",
+                f"Проверка качества не завершилась: {error}",
+            )
+        self._save_quality(letter, initial_quality, quality_model.model_name)
+        if initial_quality.passed:
+            return item
+
+        self._record_quality_rejection(letter, text, initial_quality)
+        base_prompt = _cover_letter_prompt_variants(
+            build_cover_letter_prompt(
+                candidate.vacancy,
+                direction.name,
+                candidate.direction_vacancy.rules_details.get("reasons", []),
+                facts,
+            ),
+            user_instruction,
+        )[0]
+        correction_prompt = build_quality_correction_prompt(
+            base_prompt,
+            text,
+            initial_quality,
+        )
+        try:
+            corrected_text, corrected_facts = self._generate_validated_letter(
+                self._require_model(),
+                correction_prompt,
+                candidate,
+                facts,
+            )
+            final_quality = self._assess_quality(
+                quality_model,
+                candidate.vacancy,
+                corrected_facts,
+                corrected_text,
+            )
+        except (
+            CoverLetterValidationError,
+            CoverLetterQualityResponseError,
+            RuntimeError,
+            YandexAIError,
+        ) as error:
+            return self._item(
+                candidate,
+                CoverLetterState.FAILED,
+                "failed",
+                f"Исправление качества не завершилось: {error}",
+            )
+
+        if not final_quality.passed:
+            self._record_quality_rejection(letter, corrected_text, final_quality)
+            failure_reason = f"{_QUALITY_FAILURE_PREFIX}{final_quality.score}"
+            self._save_failed(letter, failure_reason)
+            self._save_quality(letter, final_quality, quality_model.model_name)
+            self._mark_preparation_blocked(candidate.application.id, failure_reason)
+            return self._item(
+                candidate,
+                CoverLetterState.FAILED,
+                "failed",
+                (
+                    f"Письмо не прошло проверку после одного исправления: "
+                    f"{final_quality.score} из 10; {self._quality_reason(final_quality)}"
+                ),
+            )
+
+        self._save_ready(
+            letter,
+            corrected_text,
+            tuple(fact.id for fact in corrected_facts),
+            generation_mode=CoverLetterGenerationMode.MODEL_NEW,
+            model_name=self._require_model().model_name,
+        )
+        self._save_quality(letter, final_quality, quality_model.model_name)
+        return self._item(
+            candidate,
+            CoverLetterState.READY,
+            "generated" if item.action == "existing" else item.action,
+            (f"Качество исправлено с {initial_quality.score} до {final_quality.score} из 10"),
+        )
+
+    def _save_quality(
+        self,
+        letter: CoverLetterModel,
+        quality: CoverLetterQuality,
+        model_name: str,
+    ) -> None:
+        letter.quality_score = quality.score
+        letter.quality_passed = quality.passed
+        letter.quality_version = QUALITY_RUBRIC_VERSION
+        letter.quality_model_name = model_name
+        letter.quality_details = {
+            "structure": quality.structure,
+            "clarity": quality.clarity,
+            "individuality": quality.individuality,
+            "naturalness": quality.naturalness,
+            "hard_failure": quality.hard_failure,
+            "reasons": list(quality.reasons),
+            "revision_instruction": quality.revision_instruction,
+        }
+        letter.quality_checked_at = datetime.now(UTC)
+        self._session.flush()
+
+    def _clear_quality(self, letter: CoverLetterModel) -> None:
+        letter.quality_score = None
+        letter.quality_passed = None
+        letter.quality_version = None
+        letter.quality_model_name = None
+        letter.quality_details = None
+        letter.quality_checked_at = None
+        self._session.flush()
+
+    def _record_quality_rejection(
+        self,
+        letter: CoverLetterModel,
+        text: str,
+        quality: CoverLetterQuality,
+    ) -> None:
+        self._record_rejection(
+            letter,
+            CoverLetterValidationError(
+                f"QUALITY_SCORE_{quality.score}",
+                self._quality_reason(quality),
+                rejected_text=text,
+            ),
+        )
+
+    @staticmethod
+    def _quality_reason(quality: CoverLetterQuality) -> str:
+        reason = "; ".join(quality.reasons)
+        if quality.hard_failure:
+            reason = f"{quality.hard_failure}; {reason}"
+        return reason
+
+    @staticmethod
+    def _quality_trial_item(
+        candidate: _Candidate,
+        category: str,
+        action: str,
+        *,
+        initial_score: int | None = None,
+        final_score: int | None = None,
+        text: str | None = None,
+        reason: str | None = None,
+    ) -> CoverLetterQualityTrialItem:
+        return CoverLetterQualityTrialItem(
+            candidate.application.id,
+            candidate.vacancy.hh_id,
+            candidate.vacancy.title,
+            category,
+            action,
+            initial_score,
+            final_score,
+            text,
+            reason,
         )
 
     def _requeue_stale_letter_failures(
@@ -1873,6 +2458,8 @@ class CoverLetterService:
         *,
         include_stretch: bool = True,
         task_states: tuple[TaskState, ...] = _READY_TASK_STATES,
+        require_current_rules: bool = True,
+        application_states: tuple[ApplicationState, ...] = (ApplicationState.APPLYING,),
     ) -> tuple[_Candidate, ...]:
         statement = (
             select(
@@ -1892,13 +2479,14 @@ class CoverLetterService:
             .where(
                 ApplicationModel.account_id == account_id,
                 ApplicationModel.direction_id == direction_id,
-                ApplicationModel.state == ApplicationState.APPLYING,
+                ApplicationModel.state.in_(application_states),
                 ApplicationTaskModel.state.in_(task_states),
                 VacancyModel.availability == VacancyAvailability.ACTIVE,
                 DirectionVacancyModel.state == VacancyState.QUEUED,
-                DirectionVacancyModel.rules_version == RULES_VERSION,
             )
         )
+        if require_current_rules:
+            statement = statement.where(DirectionVacancyModel.rules_version == RULES_VERSION)
         if vacancy_hh_id is not None:
             statement = statement.where(VacancyModel.hh_id == vacancy_hh_id)
         if application_id is not None:
@@ -2263,6 +2851,7 @@ class CoverLetterService:
         letter.router_model_name = router_model_name
         letter.router_confidence = router_confidence
         letter.router_reason = router_reason[:512] if router_reason else None
+        self._clear_quality(letter)
         self._session.flush()
 
     def _record_rejection(
@@ -2313,24 +2902,33 @@ class CoverLetterService:
         letter.failure_reason = reason[:512]
         letter.reused_from_id = None
         letter.generation_mode = CoverLetterGenerationMode.MODEL_NEW
+        self._clear_quality(letter)
         self._session.flush()
 
     def _mark_preparation_blocked(self, application_id: int, reason: str) -> None:
-        if not _is_permanent_preparation_failure(reason):
+        if not _is_permanent_preparation_failure(reason) and not reason.startswith(
+            _QUALITY_FAILURE_PREFIX
+        ):
             return
         tasks = QueueTaskRepository(self._session)
         task = tasks.get_by_application_id(application_id)
         if task is None or task.state not in _READY_TASK_STATES:
             return
-        requires_review = reason == "MANUAL_INPUT_REQUIRED" or reason.startswith(
-            _AUTO_RETRY_FAILURE_PREFIX
+        requires_review = (
+            reason == "MANUAL_INPUT_REQUIRED"
+            or reason.startswith(_AUTO_RETRY_FAILURE_PREFIX)
+            or reason.startswith(_QUALITY_FAILURE_PREFIX)
         )
         tasks.transition(
             task.id,
             TaskState.REVIEW_REQUIRED if requires_review else TaskState.SKIPPED,
-            error_code=_AUTO_RETRY_ERROR_CODE
-            if reason.startswith(_AUTO_RETRY_FAILURE_PREFIX)
-            else reason,
+            error_code=(
+                _AUTO_RETRY_ERROR_CODE
+                if reason.startswith(_AUTO_RETRY_FAILURE_PREFIX)
+                else _QUALITY_ERROR_CODE
+                if reason.startswith(_QUALITY_FAILURE_PREFIX)
+                else reason
+            ),
         )
 
     def _require_model(self) -> CoverLetterTextModel:

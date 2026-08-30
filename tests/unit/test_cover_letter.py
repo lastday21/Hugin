@@ -20,6 +20,7 @@ from hugin.database.models import (
     VacancyModel,
     VerifiedFactModel,
 )
+from hugin.domain.applications import ApplicationState
 from hugin.domain.content import (
     ConfirmationState,
     CoverLetterGenerationMode,
@@ -121,6 +122,28 @@ def _alternative_letter() -> str:
         "оценить до выпуска. Такой подход использовал при развитии серверной части и "
         "связанных с ней интеграций.\n\n"
         "Готов рассказать, как организовывал проверки и работу с данными в серверном приложении."
+    )
+
+
+def _quality_response(
+    *,
+    structure: int = 3,
+    clarity: int = 3,
+    individuality: int = 2,
+    naturalness: int = 2,
+    hard_failure: str | None = None,
+) -> str:
+    return json.dumps(
+        {
+            "structure": structure,
+            "clarity": clarity,
+            "individuality": individuality,
+            "naturalness": naturalness,
+            "hard_failure": hard_failure,
+            "reasons": ["Контрольная причина оценки."],
+            "revision_instruction": "Добавить конкретный подтверждённый пример.",
+        },
+        ensure_ascii=False,
     )
 
 
@@ -271,6 +294,225 @@ def _prepare_routing_target(
         include_stretch=True,
     )
     return account_id, direction_id, source_letter, vacancy.hh_id
+
+
+def test_quality_trial_corrects_once_without_saving_or_changing_queue(
+    settings: Settings,
+) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    writer = FakeModel([_letter(), _alternative_letter()])
+    judge = FakeModel(
+        [
+            _quality_response(structure=3, clarity=2, individuality=1, naturalness=2),
+            _quality_response(structure=3, clarity=3, individuality=1, naturalness=2),
+        ]
+    )
+    try:
+        with database.sessions.begin() as session:
+            account_id, _, _, _ = _prepare_data(session)
+            task = session.scalar(select(ApplicationTaskModel))
+            assert task is not None
+            original_task_state = task.state
+
+            result = CoverLetterService(session, writer, quality_model=judge).trial_quality(
+                account_id=account_id,
+                direction_name="Python backend",
+                limit=10,
+            )
+
+            assert result.passed == 1
+            assert result.blocked == 0
+            assert result.failed == 0
+            assert len(result.items) == 1
+            assert result.items[0].action == "corrected"
+            assert result.items[0].initial_score == 8
+            assert result.items[0].final_score == 9
+            assert result.items[0].text is not None
+            assert "автоматическим проверкам" in result.items[0].text
+            assert len(writer.prompts) == 2
+            assert len(judge.prompts) == 2
+            assert session.scalars(select(CoverLetterModel)).all() == []
+            assert task.state is original_task_state
+    finally:
+        database.close()
+
+
+def test_quality_trial_can_use_completed_match_vacancies(settings: Settings) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    writer = FakeModel([_letter()])
+    judge = FakeModel([_quality_response(naturalness=1)])
+    try:
+        with database.sessions.begin() as session:
+            account_id, _, _, _ = _prepare_data(session)
+            application = session.scalar(select(ApplicationModel))
+            task = session.scalar(select(ApplicationTaskModel))
+            assert application is not None
+            assert task is not None
+            application.state = ApplicationState.APPLIED
+            task.state = TaskState.COMPLETED
+            session.flush()
+
+            result = CoverLetterService(session, writer, quality_model=judge).trial_quality(
+                account_id=account_id,
+                direction_name="Python backend",
+                limit=1,
+                include_stretch=False,
+                completed=True,
+            )
+
+            assert result.passed == 1
+            assert result.items[0].action == "passed"
+            assert result.items[0].final_score == 9
+            assert application.state is ApplicationState.APPLIED
+            assert task.state is TaskState.COMPLETED
+            assert session.scalars(select(CoverLetterModel)).all() == []
+    finally:
+        database.close()
+
+
+def test_quality_trial_retries_existing_local_validation_before_scoring(
+    settings: Settings,
+) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    writer = FakeModel([_gap_dominated_letter(), _letter()])
+    judge = FakeModel([_quality_response(naturalness=1)])
+    try:
+        with database.sessions.begin() as session:
+            account_id, _, _, _ = _prepare_data(session)
+
+            result = CoverLetterService(session, writer, quality_model=judge).trial_quality(
+                account_id=account_id,
+                direction_name="Python backend",
+                limit=1,
+            )
+
+            assert result.passed == 1
+            assert result.items[0].action == "passed"
+            assert result.items[0].initial_score == 9
+            assert len(writer.prompts) == 2
+            assert "<local_validation_correction>" in writer.prompts[1][1]
+            assert len(judge.prompts) == 1
+            assert session.scalars(select(CoverLetterModel)).all() == []
+    finally:
+        database.close()
+
+
+def test_prepare_saves_quality_score_and_corrects_letter_once(settings: Settings) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    writer = FakeModel([_letter(), _alternative_letter()])
+    judge = FakeModel(
+        [
+            _quality_response(structure=3, clarity=2, individuality=1, naturalness=2),
+            _quality_response(structure=3, clarity=3, individuality=1, naturalness=2),
+        ]
+    )
+    try:
+        with database.sessions.begin() as session:
+            account_id, _, _, _ = _prepare_data(session)
+
+            result = CoverLetterService(session, writer, quality_model=judge).prepare(
+                account_id=account_id,
+                direction_name="Python backend",
+                limit=1,
+            )
+
+            letter = session.scalar(select(CoverLetterModel))
+            assert letter is not None
+            assert result.generated == 1
+            assert result.failed == 0
+            assert letter.text == _without_generic_closing(_alternative_letter())
+            assert letter.quality_score == 9
+            assert letter.quality_passed is True
+            assert letter.quality_version == "cover_letter_quality_v1"
+            assert letter.quality_model_name == judge.model_name
+            assert letter.quality_checked_at is not None
+            assert letter.quality_details is not None
+            assert letter.quality_details["structure"] == 3
+            assert len(writer.prompts) == 2
+            assert len(judge.prompts) == 2
+            assert session.scalar(select(CoverLetterRejectionModel)) is not None
+    finally:
+        database.close()
+
+
+def test_prepare_blocks_letter_that_stays_below_quality_threshold(settings: Settings) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    writer = FakeModel([_letter(), _alternative_letter()])
+    judge = FakeModel(
+        [
+            _quality_response(structure=3, clarity=2, individuality=1, naturalness=2),
+            _quality_response(structure=3, clarity=2, individuality=1, naturalness=2),
+        ]
+    )
+    try:
+        with database.sessions.begin() as session:
+            account_id, _, _, _ = _prepare_data(session)
+
+            result = CoverLetterService(session, writer, quality_model=judge).prepare(
+                account_id=account_id,
+                direction_name="Python backend",
+                limit=1,
+            )
+
+            letter = session.scalar(select(CoverLetterModel))
+            task = session.scalar(select(ApplicationTaskModel))
+            assert letter is not None
+            assert task is not None
+            assert result.generated == 0
+            assert result.failed == 1
+            assert letter.state is CoverLetterState.FAILED
+            assert letter.text is None
+            assert letter.quality_score == 8
+            assert letter.quality_passed is False
+            assert letter.failure_reason == "COVER_LETTER_QUALITY_FAILED:8"
+            assert task.state is TaskState.REVIEW_REQUIRED
+            assert task.last_error_code == "COVER_LETTER_QUALITY_FAILED"
+            assert len(session.scalars(select(CoverLetterRejectionModel)).all()) == 2
+    finally:
+        database.close()
+
+
+def test_sent_quality_assessment_reads_saved_letter_without_changes(settings: Settings) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    try:
+        with database.sessions.begin() as session:
+            account_id, _, _, _ = _prepare_data(session)
+            CoverLetterService(session, FakeModel([_letter()])).prepare(
+                account_id=account_id,
+                direction_name="Python backend",
+                limit=1,
+            )
+            letter = session.scalar(select(CoverLetterModel))
+            assert letter is not None
+            letter.state = CoverLetterState.SENT
+            letter.sent_at = datetime(2026, 8, 30, tzinfo=UTC)
+            session.flush()
+            saved_text = letter.text
+
+            judge = FakeModel([_quality_response(naturalness=1)])
+            result = CoverLetterService(session, quality_model=judge).assess_sent_quality(
+                account_id=account_id,
+                limit=25,
+            )
+
+            assert result.passed == 1
+            assert result.failed == 0
+            assert len(result.items) == 1
+            assert result.items[0].letter_id == letter.id
+            assert result.items[0].score == 9
+            assert result.items[0].structure == 3
+            assert result.items[0].text == saved_text
+            assert letter.state is CoverLetterState.SENT
+            assert letter.text == saved_text
+            assert len(judge.prompts) == 1
+    finally:
+        database.close()
 
 
 def test_yandex_letter_uses_only_confirmed_facts_and_is_saved(settings: Settings) -> None:

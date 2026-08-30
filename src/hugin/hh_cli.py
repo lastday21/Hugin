@@ -952,6 +952,7 @@ def _run_applications(
                 job = runtime_service.claim_next(
                     prepared.direction_id,
                     require_cover_letter=True,
+                    require_cover_letter_quality=arguments.send,
                     allow_paused_review=not arguments.send,
                     include_stretch=not arguments.exclude_stretch,
                 )

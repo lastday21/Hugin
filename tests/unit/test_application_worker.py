@@ -91,6 +91,7 @@ class FakeApplicationService:
         assert kwargs == {
             "account_id": 1,
             "require_cover_letter": True,
+            "require_cover_letter_quality": True,
             "include_stretch": True,
         }
         selected = type(self).job
@@ -98,9 +99,15 @@ class FakeApplicationService:
         return selected
 
     def claim_next_form_preflight(self, **kwargs: object) -> object | None:
-        assert set(kwargs) == {"account_id", "include_stretch", "now"}
+        assert set(kwargs) == {
+            "account_id",
+            "include_stretch",
+            "require_cover_letter_quality",
+            "now",
+        }
         assert kwargs["account_id"] == 1
         assert kwargs["include_stretch"] is True
+        assert kwargs["require_cover_letter_quality"] is True
         assert isinstance(kwargs["now"], datetime)
         selected = type(self).preflight_job
         type(self).preflight_job = None
@@ -110,9 +117,16 @@ class FakeApplicationService:
         type(self).released_preflights.append((job, now))
 
     def claim_exact_prepared(self, **kwargs: object) -> object | None:
-        assert set(kwargs) == {"account_id", "task_id", "include_stretch", "now"}
+        assert set(kwargs) == {
+            "account_id",
+            "task_id",
+            "include_stretch",
+            "require_cover_letter_quality",
+            "now",
+        }
         assert kwargs["account_id"] == 1
         assert kwargs["include_stretch"] is True
+        assert kwargs["require_cover_letter_quality"] is True
         selected = type(self).prepared_job
         type(self).prepared_job = None
         return selected
@@ -980,8 +994,10 @@ def test_worker_prepares_one_letter_for_active_direction(
             self,
             _session: object,
             _client: object,
+            *,
+            quality_model: object,
         ) -> None:
-            pass
+            assert quality_model is judge
 
         def prepare(self, **values: object) -> SimpleNamespace:
             assert values == {
@@ -992,7 +1008,7 @@ def test_worker_prepares_one_letter_for_active_direction(
                 "limit": 1,
                 "include_stretch": True,
             }
-            return SimpleNamespace(generated=1, reused=0)
+            return SimpleNamespace(generated=1, reused=0, already_ready=0)
 
     class FakeAutomation:
         def __init__(self, _session: object) -> None:
@@ -1007,10 +1023,11 @@ def test_worker_prepares_one_letter_for_active_direction(
     monkeypatch.setattr(applications, "create_database", lambda _settings: LetterDatabase())
     monkeypatch.setattr(applications, "ApplicationAutomationService", FakeAutomation)
     client = object()
+    judge = object()
     monkeypatch.setattr(
         applications,
         "configured_codex_cli_client",
-        lambda _settings, *, operation: client if operation == "cover_letter" else None,
+        lambda _settings, *, operation: client if operation == "cover_letter" else judge,
     )
 
     monkeypatch.setattr(applications, "CoverLetterService", FakeLetterService)

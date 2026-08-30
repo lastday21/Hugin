@@ -1713,6 +1713,9 @@ def test_background_claim_and_submit_guard_require_the_same_current_letter(
             letter.state = CoverLetterState.READY
             letter.text = text
             letter.failure_reason = None
+            letter.quality_score = 10
+            letter.quality_passed = True
+            letter.quality_version = "cover_letter_quality_v1"
             letter.context_hash = CoverLetterService(session).current_context_hash(application.id)
             session.flush()
             job = service.claim_exact_prepared(
@@ -1875,6 +1878,9 @@ def test_supervised_claim_requires_exact_letter_and_excludes_worker(
                     DEFAULT_AI_PROMPTS.cover_letter
                 ),
                 model_name=MANUAL_REVIEW_MODEL,
+                quality_score=10,
+                quality_passed=True,
+                quality_version="cover_letter_quality_v1",
                 state=CoverLetterState.READY,
             )
             session.add(letter)

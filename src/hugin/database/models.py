@@ -789,6 +789,10 @@ class CoverLetterModel(Base):
             "router_confidence IS NULL OR (router_confidence >= 0 AND router_confidence <= 1)",
             name="ck_cover_letters_router_confidence",
         ),
+        CheckConstraint(
+            "quality_score IS NULL OR (quality_score >= 0 AND quality_score <= 10)",
+            name="ck_cover_letters_quality_score",
+        ),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -825,6 +829,12 @@ class CoverLetterModel(Base):
     router_model_name: Mapped[str | None] = mapped_column(String(128))
     router_confidence: Mapped[float | None] = mapped_column(Float)
     router_reason: Mapped[str | None] = mapped_column(String(512))
+    quality_score: Mapped[int | None] = mapped_column(Integer)
+    quality_passed: Mapped[bool | None] = mapped_column(Boolean)
+    quality_version: Mapped[str | None] = mapped_column(String(64))
+    quality_model_name: Mapped[str | None] = mapped_column(String(128))
+    quality_details: Mapped[ConfigPayload | None] = mapped_column(JSON)
+    quality_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     text: Mapped[str | None] = mapped_column(Text)
     instruction_version: Mapped[str] = mapped_column(String(64), nullable=False)
     model_name: Mapped[str] = mapped_column(String(128), nullable=False)

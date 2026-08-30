@@ -73,6 +73,11 @@ class CodexCliClient:
             result_name = "итоговый ответ работодателю"
         elif self._operation == "recruiter_reply_requirement":
             result_name = "решение REPLY_REQUIRED или NO_REPLY_REQUIRED"
+        elif self._operation in {
+            "cover_letter_quality_check",
+            "cover_letter_quality_trial_check",
+        }:
+            result_name = "оценку качества сопроводительного письма в формате JSON"
         else:
             result_name = "итоговое сопроводительное письмо"
         prompt = (
