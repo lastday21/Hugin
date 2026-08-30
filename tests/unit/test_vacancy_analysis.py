@@ -17,8 +17,8 @@ from hugin.services.vacancy_analysis import (
 )
 
 
-def test_rules_version_is_python_it_v54() -> None:
-    assert RULES_VERSION == "python_it_v54"
+def test_rules_version_is_python_it_v55() -> None:
+    assert RULES_VERSION == "python_it_v55"
 
 
 @pytest.mark.parametrize(
@@ -213,7 +213,7 @@ def test_v46_rejects_foreign_primary_work_from_control_set(
     assert any(reason in item for item in result.reasons)
 
 
-def test_v54_low_exact_salary_is_rejected_but_keeps_score_component() -> None:
+def test_v55_low_exact_salary_only_lowers_score() -> None:
     result = AdjacentItRules().evaluate(
         VacancyData(
             "control-low-salary",
@@ -233,9 +233,9 @@ def test_v54_low_exact_salary_is_rejected_but_keeps_score_component() -> None:
         component for component in result.components if component.name == "salary"
     )
 
-    assert result.category is RuleCategory.REJECTED
+    assert result.accepted
     assert salary_component.score == 25
-    assert any("ниже 120 000" in reason for reason in result.reasons)
+    assert not any("ниже 120 000" in reason for reason in result.reasons)
 
 
 def test_v46_rejects_technical_lead_with_primary_architecture_duties() -> None:
@@ -2739,27 +2739,31 @@ def test_rule_components_use_known_settings_without_zero_for_unknown_values() ->
     assert all(component.score > 0 for component in result.components)
 
 
-def test_salary_maximum_below_120_thousand_is_rejected() -> None:
+@pytest.mark.parametrize(
+    "employment", ("Полная занятость", "Частичная занятость", "Проектная работа")
+)
+def test_salary_below_target_only_lowers_priority(employment: str) -> None:
     result = PythonBackendRules().evaluate(
         VacancyData(
             "low-salary",
             "Python backend разработчик",
             "https://hh.ru/vacancy/low-salary",
             description="Разработка API на FastAPI и PostgreSQL.",
-            salary_from=Decimal("50000"),
-            salary_to=Decimal("100000"),
+            employment=employment,
+            salary_from=Decimal("60000"),
+            salary_to=Decimal("60000"),
             salary_currency="RUR",
         ),
-        RuleContext(minimum_salary=120000, desired_salary=150000),
+        RuleContext(minimum_salary=120000),
     )
 
     salary_component = next(
         component for component in result.components if component.name == "salary"
     )
 
-    assert result.category is RuleCategory.REJECTED
-    assert salary_component.score == pytest.approx(83.33, abs=0.01)
-    assert any("ниже 120 000" in reason for reason in result.reasons)
+    assert result.accepted
+    assert salary_component.score == 50
+    assert not any("ниже 120 000" in reason for reason in result.reasons)
 
 
 def test_salary_at_120_thousand_is_not_rejected() -> None:
@@ -2801,12 +2805,12 @@ def test_lower_salary_bound_below_120_thousand_is_not_a_hard_rejection() -> None
 
 
 @pytest.mark.parametrize(
-    ("salary_to", "accepted"),
-    (("130000", False), ("137932", True)),
+    ("salary_to", "expected_score"),
+    (("130000", 94.25), ("137932", 100.0)),
 )
-def test_gross_salary_is_compared_with_net_target(
+def test_gross_salary_is_converted_to_net_for_priority(
     salary_to: str,
-    accepted: bool,
+    expected_score: float,
 ) -> None:
     result = PythonBackendRules().evaluate(
         VacancyData(
@@ -2818,11 +2822,15 @@ def test_gross_salary_is_compared_with_net_target(
             salary_to=Decimal(salary_to),
             salary_currency="RUR",
             salary_gross=True,
-        )
+        ),
+        RuleContext(desired_salary=120000),
     )
 
-    assert result.accepted is accepted
-    assert any("до вычета налога" in reason for reason in result.reasons) is (not accepted)
+    salary_component = next(
+        component for component in result.components if component.name == "salary"
+    )
+    assert result.accepted
+    assert salary_component.score == pytest.approx(expected_score, abs=0.01)
 
 
 def test_unknown_or_foreign_salary_does_not_trigger_ruble_minimum() -> None:

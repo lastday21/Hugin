@@ -27,10 +27,9 @@ from hugin.repositories.vacancies import VacancyRepository
 from hugin.services.career_directions import CareerDirectionService
 from hugin.services.vacancy_duplicates import VacancyDuplicateDetector
 
-RULES_VERSION = "python_it_v54"
+RULES_VERSION = "python_it_v55"
 MAX_VACANCY_AGE = timedelta(days=30)
-MINIMUM_ACCEPTABLE_NET_SALARY = 120_000
-MINIMUM_ACCEPTABLE_GROSS_SALARY = 137_932
+NET_SALARY_FACTOR = 0.87
 
 
 def _normalize_rule_text(value: str | None) -> str:
@@ -1084,9 +1083,6 @@ class PythonBackendRules:
             rejected.append("обязательный переезд противоречит подтверждённым настройкам")
         if self._location_conflicts(vacancy, context):
             rejected.append("офис или гибрид находится вне выбранных регионов")
-        salary_rejection = self._salary_rejection(vacancy)
-        if salary_rejection is not None:
-            rejected.append(salary_rejection)
         format_score = self._work_format_score(vacancy, context)
         if format_score is not None:
             if format_score == 0:
@@ -2435,24 +2431,11 @@ class PythonBackendRules:
         offered = vacancy.salary_to or vacancy.salary_from
         if target is None or offered is None or vacancy.salary_currency not in {None, "RUR", "RUB"}:
             return None
-        ratio = float(offered) / target
-        return min(max(ratio * 100, 0), 100)
-
-    @staticmethod
-    def _salary_rejection(vacancy: VacancyData) -> str | None:
-        upper_bound = vacancy.salary_to
-        if upper_bound is None or vacancy.salary_currency not in {None, "RUR", "RUB"}:
-            return None
+        offered_value = float(offered)
         if vacancy.salary_gross is True:
-            if upper_bound >= MINIMUM_ACCEPTABLE_GROSS_SALARY:
-                return None
-            return (
-                "верхняя зарплата до вычета налога ниже 137 932 рублей — "
-                "эквивалента 120 000 рублей на руки при ставке 13%"
-            )
-        if upper_bound < MINIMUM_ACCEPTABLE_NET_SALARY:
-            return "верхняя зарплата ниже 120 000 рублей на руки"
-        return None
+            offered_value *= NET_SALARY_FACTOR
+        ratio = offered_value / target
+        return min(max(ratio * 100, 0), 100)
 
     @staticmethod
     def _region_score(vacancy: VacancyData, context: RuleContext) -> float | None:
