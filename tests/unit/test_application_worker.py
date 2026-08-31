@@ -460,7 +460,7 @@ def test_clean_form_is_checked_then_letter_is_prepared_and_sent_in_one_cycle(
     assert FakeApplicationService.recorded[0][1].status is HhApplyStatus.APPLIED
 
 
-def test_automatic_queue_prepares_letter_without_second_browser_pass(
+def test_automatic_queue_checks_form_before_preparing_letter(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -473,15 +473,22 @@ def test_automatic_queue_prepares_letter_without_second_browser_pass(
     )
     send_job = cast(ApplyJob, SimpleNamespace(**send_values))
     FakeApplicationService.preflight_job = preparation_job
+    events: list[str] = []
     prepared: list[ApplyJob] = []
     sent: list[ApplyJob] = []
 
     def prepare_letter(job: ApplyJob) -> int:
+        events.append("letter")
         prepared.append(job)
         FakeApplicationService.prepared_job = send_job
         return 1
 
+    def check_form(job: ApplyJob) -> HhApplyResult:
+        events.append("form")
+        return HhApplyResult(HhApplyStatus.MANUAL_REVIEW_REQUIRED, job.vacancy.source_url)
+
     def send(job: ApplyJob) -> HhApplyResult:
+        events.append("send")
         sent.append(job)
         return HhApplyResult(HhApplyStatus.APPLIED, job.vacancy.source_url)
 
@@ -489,14 +496,13 @@ def test_automatic_queue_prepares_letter_without_second_browser_pass(
         monkeypatch,
         tmp_path,
         job_handler=send,
+        form_preflight_handler=check_form,
         letter_preparer=prepare_letter,
-    )
-    worker._form_preflight_handler = lambda _job: pytest.fail(
-        "автоматическая очередь не должна открывать форму дважды"
     )
     now = datetime(2026, 7, 27, 10, 0, tzinfo=UTC)
 
     assert worker.run_once(now)
+    assert events == ["form", "letter", "send"]
     assert FakeApplicationService.released_preflights == [(preparation_job, now)]
     assert prepared == [preparation_job]
     assert sent == [send_job]
@@ -525,6 +531,28 @@ def test_form_with_questions_is_recorded_without_model_call(
         FakeApplicationService.recorded_preflights[0][1].status is HhApplyStatus.QUESTIONS_REQUIRED
     )
     assert FakeApplicationService.recorded == []
+
+
+def test_dangerous_form_is_not_treated_as_plain_preflight(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    job = fake_job()
+    FakeApplicationService.preflight_job = job
+    worker = prepare_worker(
+        monkeypatch,
+        tmp_path,
+        form_preflight_handler=lambda selected: HhApplyResult(
+            HhApplyStatus.MANUAL_REVIEW_REQUIRED,
+            selected.vacancy.source_url,
+            questions=("Укажите паспортные данные",),
+        ),
+        letter_preparer=lambda _job: pytest.fail("модель не должна вызываться"),
+    )
+
+    assert worker.run_once(datetime(2026, 7, 27, 10, 0, tzinfo=UTC))
+    assert FakeApplicationService.released_preflights == []
+    assert FakeApplicationService.recorded[0][1].status is HhApplyStatus.MANUAL_REVIEW_REQUIRED
 
 
 def test_safe_form_preflight_prepares_letter_for_automatic_submission(

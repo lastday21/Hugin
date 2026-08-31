@@ -2813,13 +2813,17 @@ def test_prompt_normalization_and_context_selection() -> None:
     )
     assert "Причины совпадения отдельно не выделены" in prompt
     assert "Полное описание" not in prompt
-    assert "не повторяй название вакансии и компании" in prompt
+    assert "название должности можно естественно упомянуть один раз" in prompt
+    assert "не используй одинаковое общее вступление" in prompt
     assert "1–2 наиболее подходящих проекта" in prompt
     assert "не смешивай сведения разных должностей и проектов" in prompt
     assert "нет требуемой технологии" in prompt
     assert "Прямого опыта с ..." in prompt
-    assert "ближайший подтвержденный опыт" in prompt
+    assert "подтвержденный пример" in prompt
+    assert "не ставь эту фразу в начало или конец письма" in prompt
     assert "не заменяй прямой ответ" in prompt
+    assert "Особенность структуры именно этого письма" in prompt
+    assert "Перед ответом молча проверь готовый текст" in prompt
     assert "при отсутствии Airflow, Kafka или ClickHouse" in prompt
     assert "список навыков подтверждает знание технологии" in prompt
     assert "один конкретный акцент из обязанностей вакансии" in prompt

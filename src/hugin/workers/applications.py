@@ -53,7 +53,6 @@ class ApplicationWorker:
         self._poll_seconds = poll_seconds
         self._job_handler = job_handler or self._run_job
         self._form_preflight_handler = form_preflight_handler or self._run_form_preflight
-        self._automatic_form_preflight = form_preflight_handler is not None
         self._letter_preparer = letter_preparer or self._prepare_letter
         self._journal = journal or OperationJournal(settings.data_dir)
         self._stop = threading.Event()
@@ -125,18 +124,11 @@ class ApplicationWorker:
                     if not self.has_pending_work(selected_at):
                         self._close_browser()
                     return False
-                if self._automatic_form_preflight:
-                    self._process_form_preflight(
-                        preparation_job,
-                        selected_at,
-                        now_is_fixed=now is not None,
-                    )
-                else:
-                    self._prepare_and_process_application(
-                        preparation_job,
-                        selected_at,
-                        now_is_fixed=now is not None,
-                    )
+                self._process_form_preflight(
+                    preparation_job,
+                    selected_at,
+                    now_is_fixed=now is not None,
+                )
                 return True
 
             self._process_application(job, selected_at, now_is_fixed=now is not None)
@@ -236,49 +228,6 @@ class ApplicationWorker:
                 final_url=result.final_url[:1000],
             )
 
-    def _prepare_and_process_application(
-        self,
-        job: ApplyJob,
-        selected_at: datetime,
-        *,
-        now_is_fixed: bool,
-    ) -> None:
-        run = self._journal.start(
-            "applications",
-            "cover_letters.prepare_candidate",
-            account_id=self._account_id,
-            task_id=job.task.id,
-            application_id=job.application.id,
-            vacancy_id=job.vacancy.hh_id,
-            resume_id=job.resume.id,
-        )
-        database = create_database(self._settings)
-        try:
-            with database.sessions.begin() as session:
-                ApplicationAutomationService(session).release_form_preflight(
-                    job,
-                    now=selected_at,
-                )
-        except Exception as error:
-            run.fail(error, stage="release_for_letter")
-            raise
-        finally:
-            database.close()
-
-        if not self._prepare_exact_letter(job, selected_at):
-            run.succeed(prepared=False)
-            return
-        prepared_job = self._claim_exact_prepared(job.task.id, selected_at)
-        if prepared_job is None:
-            run.succeed(prepared=True, claimed=False)
-            return
-        run.succeed(prepared=True, claimed=True)
-        self._process_application(
-            prepared_job,
-            selected_at,
-            now_is_fixed=now_is_fixed,
-        )
-
     def _process_form_preflight(
         self,
         job: ApplyJob,
@@ -337,11 +286,14 @@ class ApplicationWorker:
 
         finished_at = selected_at if now_is_fixed else datetime.now(UTC)
         automatic_form_ready = False
+        plain_form_ready = (
+            result.status is HhApplyStatus.MANUAL_REVIEW_REQUIRED and not result.questions
+        )
         database = create_database(self._settings)
         try:
             with database.sessions.begin() as session:
                 service = ApplicationAutomationService(session)
-                if result.status is HhApplyStatus.MANUAL_REVIEW_REQUIRED:
+                if plain_form_ready:
                     service.release_form_preflight(job, now=finished_at)
                 elif result.status is HhApplyStatus.QUESTIONS_REQUIRED:
                     automatic_form_ready = service.record_form_preflight(
@@ -363,7 +315,7 @@ class ApplicationWorker:
         finally:
             database.close()
 
-        if result.status is not HhApplyStatus.MANUAL_REVIEW_REQUIRED and not automatic_form_ready:
+        if not plain_form_ready and not automatic_form_ready:
             if handler_error is None:
                 run.succeed(
                     result_status=result.status.value,
@@ -379,13 +331,38 @@ class ApplicationWorker:
             warnings=len(result.warnings),
         )
         prepared_at = selected_at if now_is_fixed else datetime.now(UTC)
-        if not self._prepare_exact_letter(job, prepared_at):
+        self._prepare_after_form_preflight(
+            job,
+            prepared_at,
+            now_is_fixed=now_is_fixed,
+        )
+
+    def _prepare_after_form_preflight(
+        self,
+        job: ApplyJob,
+        selected_at: datetime,
+        *,
+        now_is_fixed: bool,
+    ) -> None:
+        run = self._journal.start(
+            "applications",
+            "cover_letters.prepare_candidate",
+            account_id=self._account_id,
+            task_id=job.task.id,
+            application_id=job.application.id,
+            vacancy_id=job.vacancy.hh_id,
+            resume_id=job.resume.id,
+        )
+        if not self._prepare_exact_letter(job, selected_at):
+            run.succeed(prepared=False)
             return
-        prepared_job = self._claim_exact_prepared(job.task.id, prepared_at)
+        claim_at = selected_at if now_is_fixed else datetime.now(UTC)
+        prepared_job = self._claim_exact_prepared(job.task.id, claim_at)
+        run.succeed(prepared=True, claimed=prepared_job is not None)
         if prepared_job is not None:
             self._process_application(
                 prepared_job,
-                prepared_at,
+                claim_at,
                 now_is_fixed=now_is_fixed,
             )
 

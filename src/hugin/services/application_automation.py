@@ -944,10 +944,8 @@ class ApplicationAutomationService:
     ) -> ApplyJob | None:
         selected_at = as_utc(now or datetime.now(UTC))
         system = self._system.lock()
-        if (
-            system.state is not SystemState.RUNNING
-            or self._system.supervised_lease_active(selected_at)
-            or (system.next_apply_at is not None and as_utc(system.next_apply_at) > selected_at)
+        if system.state is not SystemState.RUNNING or self._system.supervised_lease_active(
+            selected_at
         ):
             return None
         instruction_version = cover_letter_instruction_version(

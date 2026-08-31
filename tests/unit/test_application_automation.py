@@ -204,9 +204,16 @@ def test_form_preflight_claims_only_task_without_current_letter(
                 direction.id,
             )
             task = QueueTaskRepository(session).enqueue(application.id, 90, now)
-            SystemStateRepository(session).transition(SystemState.RUNNING)
+            system = SystemStateRepository(session)
+            system.transition(SystemState.RUNNING)
+            system.set_next_apply_at(now + timedelta(seconds=60))
             service = ApplicationAutomationService(session)
 
+            assert service.has_pending_application_work(
+                account_id=account.id,
+                include_scheduled=True,
+                now=now,
+            )
             job = service.claim_next_form_preflight(account_id=account.id, now=now)
 
             assert job is not None
