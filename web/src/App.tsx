@@ -44,6 +44,9 @@ import {
   loadCommunications,
   loadVacancy,
   loadWorkspace,
+  reconcileForms,
+  workspaceSectionNames,
+  type WorkspaceSection,
   markConversationRead,
   markInvitationSeen,
   previewResume,
@@ -69,6 +72,9 @@ import {
   saveDashboardWidgets,
   type DashboardWidget,
 } from "./dashboardPreferences";
+import { DevelopmentView } from "./development/DevelopmentView";
+import { OutcomeSummary } from "./outcomes/OutcomeSummary";
+import { OutcomeEditor } from "./outcomes/OutcomeEditor";
 import type {
   AiModelSettings,
   AiPromptSettings,
@@ -79,6 +85,8 @@ import type {
   Communications,
   Conversation,
   Dashboard,
+  Development,
+  SearchOutcomes,
   DirectionOptions,
   DirectionSettings,
   DirectionSummary,
@@ -106,6 +114,7 @@ type View =
   | "attention"
   | "communications"
   | "profile"
+  | "development"
   | "settings";
 type VacancyTab = "queue" | "sent" | "rejected";
 type AttentionTab = "input" | "review";
@@ -113,16 +122,24 @@ type CommunicationsTab = "messages" | "invitations";
 type Toast = { kind: "success" | "error"; message: string };
 
 interface Workspace {
-  dashboard: Dashboard;
-  autonomy: AutonomyPolicy;
-  directionOptions: DirectionOptions;
-  profile: Profile;
+  dashboard: Dashboard | null;
+  autonomy: AutonomyPolicy | null;
+  directionOptions: DirectionOptions | null;
+  profile: Profile | null;
   queue: QueueItem[];
   forms: FormDraft[];
   rejected: RejectedVacancy[];
   sent: SentApplication[];
-  communications: Communications;
+  communications: Communications | null;
+  development: Development | null;
+  outcomes: SearchOutcomes | null;
 }
+
+const emptyWorkspace: Workspace = {
+  dashboard: null, autonomy: null, directionOptions: null, profile: null,
+  queue: [], forms: [], rejected: [], sent: [], communications: null, development: null,
+  outcomes: null,
+};
 
 const navigation: {
   id: View;
@@ -134,6 +151,7 @@ const navigation: {
   { id: "attention", label: "Требует внимания", icon: Bell },
   { id: "communications", label: "Общение", icon: MessageSquare },
   { id: "profile", label: "Профиль", icon: UserRound },
+  { id: "development", label: "Развитие", icon: Gauge },
   { id: "settings", label: "Настройки", icon: Settings },
 ];
 
@@ -157,6 +175,10 @@ const viewTitles: Record<View, { title: string; description: string }> = {
   profile: {
     title: "Профиль",
     description: "Резюме, подтверждённые сведения и частые ответы",
+  },
+  development: {
+    title: "Развитие",
+    description: "Оценки, узкие места, задачи и гипотезы",
   },
   settings: {
     title: "Настройки",
@@ -318,6 +340,7 @@ function useDialog(
 
 export default function App() {
   const [view, setView] = useState<View>("dashboard");
+  useEffect(() => { window.scrollTo({ top: 0, left: 0, behavior: "instant" }); }, [view]);
   const [vacancyTab, setVacancyTab] = useState<VacancyTab>("queue");
   const [attentionTab, setAttentionTab] = useState<AttentionTab>("input");
   const [communicationsTab, setCommunicationsTab] =
@@ -328,7 +351,11 @@ export default function App() {
   const [workspace, setWorkspace] = useState<Workspace | null>(null);
   const [initialLoading, setInitialLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [sectionErrors, setSectionErrors] = useState<Partial<Record<WorkspaceSection, string>>>({});
+  const [loadedSections, setLoadedSections] = useState<Partial<Record<WorkspaceSection, boolean>>>({});
+  const [formCheckFailed, setFormCheckFailed] = useState(false);
+  const refreshController = useRef<AbortController | null>(null);
+  const sectionRevisions = useRef<Partial<Record<WorkspaceSection, number>>>({});
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
   const [selectedVacancy, setSelectedVacancy] = useState<VacancyCard | null>(null);
   const [vacancyLoading, setVacancyLoading] = useState(false);
@@ -338,17 +365,32 @@ export default function App() {
   const pageTitleRef = useRef<HTMLHeadingElement>(null);
   const vacancyOpenerRef = useRef<HTMLElement>(null);
 
+  const applyWorkspaceChange = useCallback((
+    section: WorkspaceSection,
+    update: (current: Workspace) => Workspace,
+  ) => {
+    sectionRevisions.current[section] = (sectionRevisions.current[section] ?? 0) + 1;
+    setWorkspace((current) => current ? update(current) : current);
+  }, []);
+
   const refresh = useCallback(async (initial = false) => {
+    refreshController.current?.abort();
+    const controller = new AbortController();
+    refreshController.current = controller;
+    const revisions = { ...sectionRevisions.current };
     if (initial) setInitialLoading(true);
-    else setRefreshing(true);
-    try {
-      const nextWorkspace = await loadWorkspace();
-      setWorkspace(nextWorkspace);
-      setLastUpdated(new Date());
-      setError(null);
-    } catch (reason) {
-      setError(readableError(reason));
-    } finally {
+    setRefreshing(true);
+    await loadWorkspace((section, update, failure) => {
+      if ((revisions[section] ?? 0) !== (sectionRevisions.current[section] ?? 0)) return;
+      setSectionErrors((current) => ({ ...current, [section]: failure }));
+      if (!failure) {
+        setWorkspace((current) => ({ ...(current ?? emptyWorkspace), ...update }));
+        setLoadedSections((current) => ({ ...current, [section]: true }));
+        setLastUpdated(new Date());
+        setInitialLoading(false);
+      }
+    }, controller.signal);
+    if (!controller.signal.aborted) {
       setInitialLoading(false);
       setRefreshing(false);
     }
@@ -357,7 +399,33 @@ export default function App() {
   useEffect(() => {
     void refresh(true);
     const timer = window.setInterval(() => void refresh(false), 30_000);
-    return () => window.clearInterval(timer);
+    return () => {
+      window.clearInterval(timer);
+      refreshController.current?.abort();
+    };
+  }, [refresh]);
+
+  useEffect(() => {
+    let disposed = false;
+    let running = false;
+    const reconcile = async () => {
+      if (running) return;
+      running = true;
+      try {
+        await reconcileForms();
+        if (!disposed) {
+          setFormCheckFailed(false);
+          void refresh(false);
+        }
+      } catch {
+        if (!disposed) setFormCheckFailed(true);
+      } finally {
+        running = false;
+      }
+    };
+    void reconcile();
+    const timer = window.setInterval(() => void reconcile(), 60_000);
+    return () => { disposed = true; window.clearInterval(timer); };
   }, [refresh]);
 
   useEffect(() => {
@@ -374,8 +442,8 @@ export default function App() {
 
   const applyQueueSettings = useCallback(
     (settings: QueueSettings) => {
-      setWorkspace((current) =>
-        current
+      applyWorkspaceChange("dashboard", (current) =>
+        current?.dashboard
           ? {
               ...current,
               dashboard: {
@@ -391,13 +459,13 @@ export default function App() {
       );
       void refresh(false);
     },
-    [refresh],
+    [applyWorkspaceChange, refresh],
   );
 
   const applyDirectionSettings = useCallback(
     (direction: DirectionSummary) => {
-      setWorkspace((current) =>
-        current
+      applyWorkspaceChange("dashboard", (current) =>
+        current?.dashboard
           ? {
               ...current,
               dashboard: {
@@ -411,12 +479,12 @@ export default function App() {
       );
       void refresh(false);
     },
-    [refresh],
+    [applyWorkspaceChange, refresh],
   );
 
   const applyProfile = useCallback((profile: Profile) => {
-    setWorkspace((current) => (current ? { ...current, profile } : current));
-  }, []);
+    applyWorkspaceChange("profile", (current) => ({ ...current, profile }));
+  }, [applyWorkspaceChange]);
 
   const reconcileUnknown = useCallback(
     async (taskId: number, status: "APPLIED" | "NOT_FOUND") => {
@@ -474,11 +542,26 @@ export default function App() {
   );
 
   const formsCount = workspace?.forms.length ?? 0;
-  const profileAttentionCount = workspace
+  const profileAttentionCount = workspace?.profile
     ? workspace.profile.facts.filter((fact) => fact.state === "PENDING").length +
       workspace.profile.questions.filter((question) => question.state === "PENDING").length
     : 0;
-  const accountLabel = workspace?.dashboard.account_label ?? "Аккаунт hh.ru";
+  const accountLabel = workspace?.dashboard?.account_label ?? "Аккаунт hh.ru";
+  const neededSections: Record<View, WorkspaceSection[]> = {
+    dashboard: ["dashboard", "queue", "forms", "outcomes"],
+    vacancies: [vacancyTab === "queue" ? "queue" : vacancyTab === "sent" ? "sent" : "rejected"],
+    attention: ["forms"], communications: ["communications", "autonomy"],
+    profile: ["profile", "autonomy"], development: ["development"],
+    settings: ["dashboard", "autonomy", "directionOptions", "communications"],
+  };
+  const error = neededSections[view]
+    .filter((section) => sectionErrors[section])
+    .map((section) => `${workspaceSectionNames[section]}: ${sectionErrors[section]}`)
+    .join("; ") || null;
+  const ready = neededSections[view].every((section) => loadedSections[section]);
+  const workspaceHasErrors = Object.values(sectionErrors).some(Boolean);
+  const workspaceLoaded = (Object.keys(workspaceSectionNames) as WorkspaceSection[])
+    .every((section) => loadedSections[section]);
   const currentTitle = viewTitles[view];
 
   return (
@@ -503,8 +586,8 @@ export default function App() {
                 : item.id === "attention"
                   ? formsCount
                   : item.id === "communications"
-                    ? (workspace?.communications.unread_messages ?? 0) +
-                      (workspace?.communications.unseen_invitations ?? 0)
+                    ? (workspace?.communications?.unread_messages ?? 0) +
+                      (workspace?.communications?.unseen_invitations ?? 0)
                   : item.id === "profile"
                     ? profileAttentionCount
                   : undefined;
@@ -539,12 +622,12 @@ export default function App() {
 
         <div className="sidebar-account">
           <span
-            className={workspace && !error ? "connection-dot online" : "connection-dot"}
+            className={workspaceLoaded && !workspaceHasErrors ? "connection-dot online" : "connection-dot"}
             aria-hidden="true"
           />
           <div>
             <strong>{accountLabel}</strong>
-            <span>{workspace && !error ? "Данные актуальны" : "Нет обновления"}</span>
+            <span>{workspaceHasErrors ? "Часть разделов недоступна" : workspaceLoaded ? "Сведения загружены" : "Загружаем сведения"}</span>
           </div>
         </div>
       </aside>
@@ -604,9 +687,13 @@ export default function App() {
             <LoadingState />
           ) : workspace ? (
             <>
-              {view === "dashboard" && (
+              {!ready && view !== "dashboard" && !error && <LoadingState />}
+              {view === "dashboard" && !workspace.dashboard && !error && <LoadingState />}
+              {view === "dashboard" && workspace.dashboard && (
                 <DashboardView
-                  workspace={workspace}
+                  workspace={{ ...workspace, dashboard: workspace.dashboard }}
+                  queueLoaded={Boolean(loadedSections.queue)}
+                  formsLoaded={Boolean(loadedSections.forms)}
                   widgets={widgets}
                   onOpenVacancy={openVacancy}
                   onOpenAttention={(tab) => {
@@ -617,11 +704,13 @@ export default function App() {
                     setVacancyTab("queue");
                     setView("vacancies");
                   }}
+                  onOpenCommunications={() => setView("communications")}
+                  onOpenSettings={() => setView("settings")}
                   onRefresh={() => void refresh(false)}
                   onToast={showToast}
                 />
               )}
-              {view === "vacancies" && (
+              {view === "vacancies" && ready && (
                 <VacanciesView
                   queue={workspace.queue}
                   sent={workspace.sent}
@@ -633,13 +722,15 @@ export default function App() {
                   onReconcile={reconcileUnknown}
                 />
               )}
-              {view === "attention" && (
+              {view === "attention" && ready && (
+                <>
+                {formCheckFailed && <p role="status">Не удалось проверить актуальность анкет на hh.ru. Показаны сохранённые данные; проверка повторится автоматически.</p>}
                 <AttentionView
                   forms={workspace.forms}
                   tab={attentionTab}
                   onTabChanged={setAttentionTab}
                   onFormChanged={(form) =>
-                    setWorkspace((current) =>
+                    applyWorkspaceChange("forms", (current) =>
                       current
                         ? {
                             ...current,
@@ -653,24 +744,26 @@ export default function App() {
                   onRefresh={() => refresh(false)}
                   onToast={showToast}
                 />
+                </>
               )}
-              {view === "communications" && (
+              {view === "communications" && workspace.communications && workspace.autonomy && (
                 <CommunicationsView
                   communications={workspace.communications}
                   autonomy={workspace.autonomy}
                   tab={communicationsTab}
+                  onOutcomeSaved={() => void refresh(false)}
                   onTabChanged={setCommunicationsTab}
                   selectedApplicationId={selectedConversationId}
                   onSelectedApplicationChanged={setSelectedConversationId}
                   onChanged={(communications) =>
-                    setWorkspace((current) =>
+                    applyWorkspaceChange("communications", (current) =>
                       current ? { ...current, communications } : current,
                     )
                   }
                   onToast={showToast}
                 />
               )}
-              {view === "profile" && (
+              {view === "profile" && workspace.profile && workspace.autonomy && (
                 <ProfileView
                   profile={workspace.profile}
                   reuseConfirmedFacts={workspace.autonomy.reuse_confirmed_profile_facts}
@@ -678,7 +771,18 @@ export default function App() {
                   onToast={showToast}
                 />
               )}
-              {view === "settings" && (
+              {view === "development" && workspace.development && (
+                <DevelopmentView
+                  development={workspace.development}
+                  onChanged={(development) =>
+                    applyWorkspaceChange("development", (current) =>
+                      current ? { ...current, development } : current,
+                    )
+                  }
+                  onToast={showToast}
+                />
+              )}
+              {view === "settings" && workspace.dashboard && workspace.autonomy && workspace.directionOptions && workspace.communications && (
                 <SettingsView
                   dashboard={workspace.dashboard}
                   autonomy={workspace.autonomy}
@@ -691,14 +795,14 @@ export default function App() {
                   onResetWidgets={resetWidgets}
                   onSettingsSaved={applyQueueSettings}
                   onAutonomySaved={(autonomy) =>
-                    setWorkspace((current) =>
+                    applyWorkspaceChange("autonomy", (current) =>
                       current ? { ...current, autonomy } : current,
                     )
                   }
                   onDirectionSaved={applyDirectionSettings}
                   onRefresh={() => void refresh(false)}
                   onNotificationsSaved={(communications) =>
-                    setWorkspace((current) =>
+                    applyWorkspaceChange("communications", (current) =>
                       current ? { ...current, communications } : current,
                     )
                   }
@@ -773,23 +877,32 @@ function EmptyState({
 
 function DashboardView({
   workspace,
+  queueLoaded,
+  formsLoaded,
   widgets,
   onOpenVacancy,
   onOpenAttention,
   onOpenVacancies,
+  onOpenCommunications,
+  onOpenSettings,
   onRefresh,
   onToast,
 }: {
-  workspace: Workspace;
+  workspace: Workspace & { dashboard: Dashboard };
+  queueLoaded: boolean;
+  formsLoaded: boolean;
   widgets: DashboardWidget[];
   onOpenVacancy: (vacancyId: string) => Promise<void>;
   onOpenAttention: (tab: AttentionTab) => void;
   onOpenVacancies: () => void;
+  onOpenCommunications: () => void;
+  onOpenSettings: () => void;
   onRefresh: () => void;
   onToast: (toast: Toast) => void;
 }) {
   const { dashboard, queue, forms } = workspace;
   const [changingHugin, setChangingHugin] = useState(false);
+  const [signingInToHh, setSigningInToHh] = useState(false);
   const huginRunning =
     dashboard.system_state === "RUNNING" && dashboard.search_enabled;
 
@@ -828,6 +941,28 @@ function DashboardView({
     }
   }
 
+  async function loginToHh(): Promise<void> {
+    if (signingInToHh) return;
+    if (!window.pywebview?.api) {
+      onToast({
+        kind: "error",
+        message: "Вход доступен только в оконной программе Hugin",
+      });
+      return;
+    }
+    setSigningInToHh(true);
+    try {
+      const result = await window.pywebview.api.login_hh();
+      if (result.status !== "READY") throw new Error(result.message);
+      onToast({ kind: "success", message: result.message });
+    } catch (reason) {
+      onToast({ kind: "error", message: readableError(reason) });
+    } finally {
+      setSigningInToHh(false);
+      onRefresh();
+    }
+  }
+
   const automaticQueue = queue.filter((item) =>
     ["PENDING", "RUNNING", "RETRY_SCHEDULED"].includes(item.state),
   );
@@ -836,6 +971,9 @@ function DashboardView({
     (dashboard.task_counts.RUNNING ?? 0) +
     (dashboard.task_counts.RETRY_SCHEDULED ?? 0);
   const dashboardIncidents = compactDashboardIncidents(dashboard.incidents);
+  const secondaryCodes = new Set(["NOTIFICATION_DELIVERY_FAILED", "RECRUITER_MESSAGE_SEND_FAILED"]);
+  const actionableIncidents = dashboardIncidents.filter((incident) => incident.requires_action !== false && !secondaryCodes.has(incident.code));
+  const secondaryIncidents = dashboardIncidents.filter((incident) => incident.requires_action === false || secondaryCodes.has(incident.code));
   const system = systemPresentation(dashboard, automaticQueueCount);
   const SystemIcon = system.icon;
 
@@ -883,29 +1021,47 @@ function DashboardView({
                   : "Запустить Hugin"}
             </button>
           )}
+          {(dashboard.system_state === "AUTH_REQUIRED" ||
+            dashboard.system_state === "CAPTCHA_REQUIRED") && (
+            <button
+              type="button"
+              className="primary-button"
+              disabled={signingInToHh}
+              onClick={() => void loginToHh()}
+            >
+              <ExternalLink size={18} aria-hidden="true" />
+              {signingInToHh
+                ? "Ожидаем вход…"
+                : dashboard.system_state === "CAPTCHA_REQUIRED"
+                  ? "Продолжить на hh.ru"
+                  : "Войти на hh.ru"}
+            </button>
+          )}
           {dashboard.system_state !== "RUNNING" &&
             dashboard.system_state !== "PAUSED" && (
-              <button type="button" className="secondary-button" onClick={onRefresh}>
+              <button
+                type="button"
+                className="secondary-button system-refresh-button"
+                aria-label="Обновить состояние"
+                title="Обновить состояние"
+                disabled={signingInToHh}
+                onClick={onRefresh}
+              >
                 <RefreshCw size={18} aria-hidden="true" />
-                Проверить снова
               </button>
             )}
         </div>
       </section>
 
-      <DailyWidget dashboard={dashboard} queueLength={automaticQueueCount} />
-
-      <BackgroundStatusBar dashboard={dashboard} />
-
-      {dashboardIncidents.length > 0 && (
+      {actionableIncidents.length > 0 && (
         <section className="incident-list" aria-labelledby="incident-title">
           <div className="section-heading">
             <div>
               <span className="eyebrow">Важно</span>
-              <h2 id="incident-title">Ошибки и предупреждения</h2>
+              <h2 id="incident-title">Нужно проверить</h2>
             </div>
           </div>
-          {dashboardIncidents.map((incident) => (
+          {actionableIncidents.map((incident) => (
             <div
               className={`incident-row ${incident.severity.toLowerCase()}`}
               key={incident.id}
@@ -915,10 +1071,40 @@ function DashboardView({
                 <strong>{incident.message}</strong>
                 <span>{formatDate(incident.created_at, true)}</span>
               </div>
+              {incident.code.startsWith("RECRUITER_") && (
+                <button type="button" className="text-button" onClick={onOpenCommunications}>
+                  Открыть общение
+                </button>
+              )}
+              {incident.code.startsWith("APPLICATION_") && (
+                <button type="button" className="text-button" onClick={onOpenVacancies}>Открыть вакансии</button>
+              )}
             </div>
           ))}
         </section>
       )}
+
+      {workspace.outcomes && <OutcomeSummary outcomes={workspace.outcomes} />}
+
+      <details className="background-details">
+        <summary>Сегодня: отправлено {dashboard.applied_today}, в очереди {automaticQueueCount}</summary>
+        <DailyWidget dashboard={dashboard} queueLength={automaticQueueCount} />
+      </details>
+
+      <details className="background-details">
+        <summary>Последние проверки и уведомления{secondaryIncidents.length ? ` · ${secondaryIncidents.length}` : ""}</summary>
+        <BackgroundStatusBar dashboard={dashboard} />
+        {secondaryIncidents.map((incident) => (
+          <div className="secondary-incident" key={incident.id}>
+            <p>{incident.message}</p>
+            <small>{formatDate(incident.created_at, true)}</small>
+            <button type="button" className="text-button"
+              onClick={incident.code === "NOTIFICATION_DELIVERY_FAILED" ? onOpenSettings : incident.code.startsWith("APPLICATION_") ? onOpenVacancies : onOpenCommunications}>
+              {incident.code === "NOTIFICATION_DELIVERY_FAILED" ? "Настройки уведомлений" : incident.code.startsWith("APPLICATION_") ? "Открыть вакансии" : "Открыть общение"}
+            </button>
+          </div>
+        ))}
+      </details>
 
       <div className="dashboard-toolbar">
         <h2>На контроле</h2>
@@ -928,12 +1114,14 @@ function DashboardView({
         <div className="dashboard-grid">
           {widgets.includes("attention") && (
             <div className="dashboard-column">
-              <AttentionWidget forms={forms} onOpen={onOpenAttention} />
+              {formsLoaded ? <AttentionWidget forms={forms} onOpen={onOpenAttention} /> :
+                <p role="status">Сведения об анкетах ещё не получены</p>}
             </div>
           )}
           {(widgets.includes("queue") || widgets.includes("directions")) && (
             <div className="dashboard-column">
-              {widgets.includes("queue") && (
+              {widgets.includes("queue") && !queueLoaded && <p role="status">Сведения об очереди ещё не получены</p>}
+              {widgets.includes("queue") && queueLoaded && (
                 <QueueWidget
                   queue={automaticQueue}
                   onOpenVacancy={onOpenVacancy}
@@ -957,6 +1145,19 @@ function DashboardView({
 }
 
 function compactDashboardIncidents(incidents: Incident[]): Incident[] {
+  incidents = incidents.map((incident) => incident.code === "APPLICATION_RETRY_EXHAUSTED"
+    ? { ...incident, message: incident.requires_action === false
+      ? "В истории есть отклик, подготовка которого остановилась после повторных ошибок. Это задание уже не требует решения."
+      : "Подготовка отклика остановилась после повторных ошибок. Проверьте задание в разделе «Вакансии»." }
+    : incident);
+  const notificationFailures = incidents.filter((incident) => incident.code === "NOTIFICATION_DELIVERY_FAILED");
+  if (notificationFailures.length) {
+    incidents = [
+      ...incidents.filter((incident) => incident.code !== "NOTIFICATION_DELIVERY_FAILED"),
+      { ...notificationFailures[0], severity: "WARNING",
+        message: "Последние уведомления не доставлены. Результаты работы можно посмотреть в Hugin; состояние каналов — в настройках." },
+    ];
+  }
   const messageFailures = incidents.filter(
     (incident) => incident.code === "RECRUITER_MESSAGE_SEND_FAILED",
   );
@@ -968,8 +1169,8 @@ function compactDashboardIncidents(incidents: Incident[]): Incident[] {
     severity: "WARNING",
     message:
       messageFailures.length === 1
-        ? "Ответ работодателю не отправлен. Если он уже разрешён, Hugin повторит отправку; иначе ответ ждёт решения в разделе «Общение»."
-        : `Не отправлены ${messageFailures.length} ответов работодателям. Уже разрешённые Hugin повторит; остальные ждут решения в разделе «Общение».`,
+        ? "Сохранена ошибка отправки ответа работодателю. Текущее состояние ответа доступно в разделе «Общение»."
+        : `Сохранены ошибки отправки ${messageFailures.length} ответов. Текущее состояние ответов доступно в разделе «Общение».`,
   };
   return [
     groupedFailure,
@@ -1105,14 +1306,14 @@ function systemPresentation(dashboard: Dashboard, queueLength: number) {
     case "AUTH_REQUIRED":
       return {
         title: "Нужно войти на hh.ru",
-        description: "После входа вернитесь сюда и проверьте состояние",
+        description: "Нажмите «Войти на hh.ru» и завершите вход в открывшемся окне",
         tone: "warning",
         icon: AlertTriangle,
       };
     case "CAPTCHA_REQUIRED":
       return {
         title: "Нужно подтверждение на hh.ru",
-        description: "Пройдите проверку в открытом окне браузера",
+        description: "Откройте hh.ru и пройдите проверку — Hugin продолжит работу сам",
         tone: "warning",
         icon: AlertTriangle,
       };
@@ -1179,7 +1380,7 @@ function AttentionWidget({
       ) : (
         <div className="calm-state">
           <CheckCircle2 size={21} aria-hidden="true" />
-          <span>Сейчас от вас ничего не требуется</span>
+          <span>Анкет для заполнения и проверки нет</span>
         </div>
       )}
     </section>
@@ -1223,6 +1424,7 @@ function QueueWidget({
                   <small>
                     {item.company} · {item.region}
                   </small>
+                  <small title={item.fit_reason ?? undefined}>{fitTierLabel(item.fit_tier)}</small>
                 </span>
                 <span className="queue-time">{formatDate(item.scheduled_at)}</span>
                 <ChevronRight size={19} aria-hidden="true" />
@@ -1238,6 +1440,15 @@ function QueueWidget({
       )}
     </section>
   );
+}
+
+function fitTierLabel(tier: number | null) {
+  switch (tier) {
+    case 1: return "1 · Прямое соответствие";
+    case 2: return "2 · Близкая работа";
+    case 3: return "3 · Возможная работа";
+    default: return "Соответствие ещё не пересчитано";
+  }
 }
 
 function DailyWidget({
@@ -1510,6 +1721,11 @@ function VacanciesView({
           aria-labelledby="queue-tab"
           className="vacancy-panel"
         >
+          <p className="section-description">
+            Сначала — прямое соответствие, затем близкая и возможная работа.
+            Внутри ступени учитываются навыки, опыт и зарплата. Оценка не является
+            вероятностью собеседования.
+          </p>
           {filteredQueue.length ? (
             <ul className="vacancy-list">
               {filteredQueue.map((item) => (
@@ -1519,6 +1735,9 @@ function VacanciesView({
                     <span>
                       {item.company} · {item.region}
                     </span>
+                    <small title={item.fit_reason ?? undefined}>
+                      {fitTierLabel(item.fit_tier)} · Оценка {Math.round(item.priority)}
+                    </small>
                     {item.last_error && (
                       <small className="row-error">Ошибка: {item.last_error}</small>
                     )}
@@ -1961,6 +2180,7 @@ function CommunicationsView({
   onSelectedApplicationChanged,
   onChanged,
   onToast,
+  onOutcomeSaved,
 }: {
   communications: Communications;
   autonomy: AutonomyPolicy;
@@ -1970,9 +2190,11 @@ function CommunicationsView({
   onSelectedApplicationChanged: (applicationId: number | null) => void;
   onChanged: (communications: Communications) => void;
   onToast: (toast: Toast) => void;
+  onOutcomeSaved: () => void;
 }) {
   const [draft, setDraft] = useState("");
   const [replyMode, setReplyMode] = useState<"manual" | "ai">("manual");
+  const [outcomeApplicationId, setOutcomeApplicationId] = useState<number | null>(null);
   const [busy, setBusy] = useState(false);
   const [draftSaveState, setDraftSaveState] = useState<
     "idle" | "saving" | "saved" | "error"
@@ -1990,6 +2212,9 @@ function CommunicationsView({
   const reply = selected ? latestEditableReply(selected) : undefined;
   const hasIncoming = selected?.messages.some(
     (message) => message.direction === "INCOMING",
+  );
+  const outcomeApplication = communications.sent_applications.find(
+    (application) => application.application_id === outcomeApplicationId,
   );
 
   useEffect(() => {
@@ -2263,6 +2488,45 @@ function CommunicationsView({
         </p>
       </div>
 
+      <details className="settings-card settings-details" aria-label="Результат любого отправленного отклика">
+        <summary>Записать результат по отклику</summary>
+        <p>Выберите отклик, даже если в Hugin ещё нет переписки или приглашения.</p>
+        <div className="form-answer-editor">
+          <label htmlFor="outcome-application">Отправленный отклик</label>
+          <select
+          id="outcome-application"
+          style={{ width: "100%", minWidth: 0 }}
+          value={outcomeApplication?.application_id ?? ""}
+          onChange={(event) => setOutcomeApplicationId(
+            event.target.value ? Number(event.target.value) : null,
+          )}
+          disabled={!communications.sent_applications.length}
+        >
+          <option value="">{communications.sent_applications.length ? "Выберите отклик" : "Отправленных откликов пока нет"}</option>
+          {communications.sent_applications.map((application) => (
+            <option key={application.application_id} value={application.application_id}>
+              {application.vacancy_title} · {application.company} · {formatDate(application.confirmed_at)}
+            </option>
+          ))}
+          </select>
+        </div>
+        {outcomeApplication && (
+          <>
+            <p><strong>{outcomeApplication.vacancy_title}</strong> · {outcomeApplication.company}</p>
+            <p>
+              Подтверждение отправки: {formatDate(outcomeApplication.confirmed_at, true)}.
+              Состояние: {stateNames[outcomeApplication.state] ?? outcomeApplication.state}.
+            </p>
+            <OutcomeEditor
+              key={outcomeApplication.application_id}
+              applicationId={outcomeApplication.application_id}
+              outcome={communications.outcomes[outcomeApplication.application_id]}
+              onSaved={(result) => { onChanged(result); onOutcomeSaved(); }}
+            />
+          </>
+        )}
+      </details>
+
       {tab === "messages" ? (
         <section
           id="messages-panel"
@@ -2331,7 +2595,9 @@ function CommunicationsView({
                         key={message.id}
                       >
                         <span>
-                          {message.direction === "INCOMING" ? "Работодатель" : "Вы"}
+                          {message.sender_review_required
+                            ? "Отправитель требует проверки"
+                            : message.direction === "INCOMING" ? "Работодатель" : "Вы"}
                         </span>
                         <p>{message.body}</p>
                         <small>
@@ -2343,6 +2609,9 @@ function CommunicationsView({
                       </li>
                     ))}
                   </ol>
+                  <OutcomeEditor key={selected.application_id} applicationId={selected.application_id}
+                    outcome={communications.outcomes[selected.application_id]}
+                    onSaved={(result) => { onChanged(result); onOutcomeSaved(); }} />
                   <div className="reply-editor">
                     <div className="reply-mode" role="group" aria-label="Способ ответа">
                       <button
@@ -2468,15 +2737,15 @@ function CommunicationsView({
                   <h2>{invitation.title}</h2>
                   <p>{invitation.vacancy_title}</p>
                   {invitation.details && <div>{invitation.details}</div>}
-                  {invitation.interview_at && (
+                  {(communications.outcomes[invitation.application_id]?.interview_at || invitation.interview_at) && (
                     <strong>
-                      Встреча: {formatDate(invitation.interview_at, true)}
+                      Встреча: {formatDate(communications.outcomes[invitation.application_id]?.interview_at || invitation.interview_at || "", true)}
                     </strong>
                   )}
                 </div>
                 <div className="invitation-actions">
-                  <span className={`status-pill ${stateTone(invitation.state)}`}>
-                    {stateNames[invitation.state] ?? "Получено"}
+                  <span className={`status-pill ${stateTone(communications.outcomes[invitation.application_id]?.interview_at ? "SCHEDULED" : invitation.state)}`}>
+                    {communications.outcomes[invitation.application_id]?.interview_at ? "Дата согласована" : stateNames[invitation.state] ?? "Получено"}
                   </span>
                   <button
                     type="button"
@@ -2494,6 +2763,9 @@ function CommunicationsView({
                     {invitation.booking_url ? "Открыть запись" : "Открыть на hh.ru"}
                   </button>
                 </div>
+                <OutcomeEditor applicationId={invitation.application_id}
+                  outcome={communications.outcomes[invitation.application_id]}
+                  onSaved={(result) => { onChanged(result); onOutcomeSaved(); }} />
               </article>
             ))
           ) : (
@@ -2547,6 +2819,10 @@ const profileCategoryNames: Record<string, string> = {
   portfolio: "Портфолио",
   job_search_reason: "Причина поиска",
   test_assignment: "Проверочное задание",
+  project: "Проект",
+  experience: "Опыт",
+  technology: "Технологии",
+  screening_answer: "Ответ работодателю",
 };
 
 function profileCategoryName(category: string): string {
@@ -2556,6 +2832,7 @@ function profileCategoryName(category: string): string {
 function profileFactSource(fact: ProfileFact): string {
   if (fact.source_type === "hh_live") return "Получено с hh.ru";
   if (fact.source_type === "resume") return "Из импортированного резюме";
+  if (fact.source_type === "project") return "Подтверждённый проект";
   if (fact.source_reference?.startsWith("profile-fact:")) return "Исправлено вами";
   return "Введено вами";
 }
@@ -2596,7 +2873,12 @@ function ProfileView({
   const [batchError, setBatchError] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const pendingFacts = profile.facts.filter((fact) => fact.state === "PENDING");
-  const confirmedFacts = profile.facts.filter((fact) => fact.state === "CONFIRMED");
+  const confirmedFacts = profile.facts.filter(
+    (fact) => fact.state === "CONFIRMED" && fact.category !== "project",
+  );
+  const projectFacts = profile.facts.filter(
+    (fact) => fact.state === "CONFIRMED" && fact.category === "project",
+  );
   const rejectedFacts = profile.facts.filter((fact) => fact.state === "REJECTED");
   const pendingQuestions = profile.questions.filter((question) => question.state === "PENDING");
   const dismissedQuestions = profile.questions.filter(
@@ -2838,7 +3120,7 @@ function ProfileView({
         <div className="section-heading">
           <div>
             <span className="eyebrow">Проверка</span>
-            <h2 id="facts-title">Сведения из резюме</h2>
+            <h2 id="facts-title">Сведения о кандидате</h2>
             <p>
               {reuseConfirmedFacts
                 ? "Неизменившиеся подтверждённые сведения используются дальше. "
@@ -2939,6 +3221,30 @@ function ProfileView({
             </div>
           </div>
         )}
+        {projectFacts.length > 0 && (
+          <div className="profile-current-facts">
+            <div className="profile-subheading">
+              <div>
+                <h3>Проекты</h3>
+                <p>Подтверждённые примеры для резюме и сопроводительных писем.</p>
+              </div>
+              <span className="count-badge">
+                {plural(projectFacts.length, "проект", "проекта", "проектов")}
+              </span>
+            </div>
+            <div className="profile-reviewed-grid">
+              {projectFacts.map((fact) => (
+                <ProfileFactEditor
+                  key={fact.id}
+                  fact={fact}
+                  permissionTemplate={fact}
+                  onProfileChanged={onProfileChanged}
+                  onToast={onToast}
+                />
+              ))}
+            </div>
+          </div>
+        )}
         {rejectedFacts.length > 0 && (
           <details className="profile-history-details">
             <summary>
@@ -2968,8 +3274,8 @@ function ProfileView({
             <span className="eyebrow">Частые вопросы</span>
             <h2 id="answers-title">Сохранённые ответы</h2>
             <p>
-              Подтверждённый ответ можно автоматически подставлять в безопасные простые
-              анкеты.
+              Ответ подставляется только при точном совпадении вопроса. Ответы не считаются
+              общими сведениями об опыте или навыках.
             </p>
           </div>
           <span className={pendingQuestions.length ? "count-badge warning" : "count-badge"}>
@@ -3491,7 +3797,8 @@ function SettingsView({
         />
       </section>
 
-      <section className="settings-card wide" aria-labelledby="autonomy-title">
+      <details className="settings-card wide settings-details">
+        <summary>Самостоятельная работа</summary>
         <div className="section-heading">
           <div>
             <span className="eyebrow">Самостоятельная работа</span>
@@ -3507,7 +3814,7 @@ function SettingsView({
           onSaved={onAutonomySaved}
           onToast={onToast}
         />
-      </section>
+            </details>
 
       <section className="settings-card wide" aria-labelledby="directions-title">
         <div className="section-heading">
@@ -3545,7 +3852,8 @@ function SettingsView({
         />
       </section>
 
-      <section className="settings-card wide" aria-labelledby="ai-prompts-title">
+      <details className="settings-card wide settings-details">
+        <summary>Модель и инструкции</summary>
         <div className="section-heading">
           <div>
             <span className="eyebrow">Нейросеть</span>
@@ -3563,9 +3871,10 @@ function SettingsView({
           onSaved={onNotificationsSaved}
           onToast={onToast}
         />
-      </section>
+            </details>
 
-      <section className="settings-card wide" aria-labelledby="notifications-title">
+      <details className="settings-card wide settings-details">
+        <summary>Уведомления</summary>
         <div className="section-heading">
           <div>
             <span className="eyebrow">Важные события</span>
@@ -3578,7 +3887,7 @@ function SettingsView({
           onSaved={onNotificationsSaved}
           onToast={onToast}
         />
-      </section>
+            </details>
     </div>
   );
 }

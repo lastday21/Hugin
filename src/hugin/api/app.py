@@ -11,6 +11,8 @@ from starlette.middleware.base import RequestResponseEndpoint
 
 from hugin import __version__
 from hugin.api.routes.communications import router as communications_router
+from hugin.api.routes.development import router as development_router
+from hugin.api.routes.diagnostics import router as diagnostics_router
 from hugin.api.routes.health import router as health_router
 from hugin.api.routes.profile import router as profile_router
 from hugin.api.routes.workspace import router as workspace_router
@@ -106,6 +108,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return response
 
     application.include_router(communications_router)
+    application.include_router(development_router)
+    application.include_router(diagnostics_router)
     application.include_router(health_router)
     application.include_router(profile_router)
     application.include_router(workspace_router)

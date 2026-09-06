@@ -1,9 +1,13 @@
 import type {
+  ApplicationOutcome,
   AiPromptValues,
   AutonomyPolicy,
   AutonomyPolicyValues,
   Communications,
   Dashboard,
+  Development,
+  DevelopmentAssessmentInput,
+  DevelopmentItemInput,
   DirectionOptions,
   DirectionSettings,
   DirectionSummary,
@@ -15,6 +19,7 @@ import type {
   RejectedVacancy,
   ResumePreview,
   SentApplication,
+  SearchOutcomes,
   VacancyCard,
 } from "./types";
 
@@ -30,7 +35,9 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     }
     const response = await fetch(path, {
       ...init,
-      signal: init?.signal ?? controller.signal,
+      signal: init?.signal
+        ? AbortSignal.any([init.signal, controller.signal])
+        : controller.signal,
       headers,
     });
     if (!response.ok) {
@@ -48,7 +55,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   }
 }
 
-export async function loadWorkspace(): Promise<{
+export interface WorkspaceData {
   dashboard: Dashboard;
   autonomy: AutonomyPolicy;
   directionOptions: DirectionOptions;
@@ -58,42 +65,103 @@ export async function loadWorkspace(): Promise<{
   rejected: RejectedVacancy[];
   sent: SentApplication[];
   communications: Communications;
-}> {
-  const forms = await reconcileForms();
-  const [
-    dashboard,
-    autonomy,
-    directionOptions,
-    profile,
-    queue,
-    rejected,
-    sent,
-    communications,
-  ] =
-    await Promise.all([
-      request<Dashboard>(`/api/dashboard?account_id=${ACCOUNT_ID}`),
-      request<AutonomyPolicy>("/api/autonomy"),
-      request<DirectionOptions>("/api/directions/options"),
-      request<Profile>(`/api/profile?account_id=${ACCOUNT_ID}`),
-      request<QueueItem[]>(`/api/queue?account_id=${ACCOUNT_ID}`),
-      request<RejectedVacancy[]>(`/api/rejected?account_id=${ACCOUNT_ID}&limit=1000`),
-      request<SentApplication[]>(`/api/sent?account_id=${ACCOUNT_ID}&limit=1000`),
-      request<Communications>(`/api/communications?account_id=${ACCOUNT_ID}`),
-    ]);
-  return {
-    dashboard,
-    autonomy,
-    directionOptions,
-    profile,
-    queue,
-    forms,
-    rejected,
-    sent,
-    communications,
-  };
+  development: Development;
+  outcomes: SearchOutcomes;
 }
 
-async function reconcileForms(): Promise<FormDraft[]> {
+export type WorkspaceSection = keyof WorkspaceData;
+
+export const workspaceSectionNames: Record<WorkspaceSection, string> = {
+  dashboard: "Состояние программы", autonomy: "Порядок работы",
+  directionOptions: "Настройки направлений", profile: "Профиль", queue: "Очередь",
+  forms: "Анкеты", rejected: "Отклонённые вакансии", sent: "Отправленные отклики",
+  communications: "Общение", development: "Развитие",
+  outcomes: "Результат поиска",
+};
+
+const workspacePaths: Record<WorkspaceSection, string> = {
+  dashboard: `/api/dashboard?account_id=${ACCOUNT_ID}`,
+  autonomy: "/api/autonomy",
+  directionOptions: "/api/directions/options",
+  profile: `/api/profile?account_id=${ACCOUNT_ID}`,
+  queue: `/api/queue?account_id=${ACCOUNT_ID}`,
+  forms: `/api/forms?account_id=${ACCOUNT_ID}`,
+  rejected: `/api/rejected?account_id=${ACCOUNT_ID}&limit=1000`,
+  sent: `/api/sent?account_id=${ACCOUNT_ID}&limit=1000`,
+  communications: `/api/communications?account_id=${ACCOUNT_ID}`,
+  development: "/api/development",
+  outcomes: `/api/outcomes?account_id=${ACCOUNT_ID}`,
+};
+
+export async function loadWorkspace(
+  onSection: (section: WorkspaceSection, update: Partial<WorkspaceData>, error?: string) => void,
+  signal: AbortSignal,
+): Promise<void> {
+  await Promise.all(
+    (Object.keys(workspacePaths) as WorkspaceSection[]).map(async (section) => {
+      try {
+        const value = await request<WorkspaceData[typeof section]>(workspacePaths[section], { signal });
+        if (!signal.aborted) onSection(section, { [section]: value });
+      } catch (reason) {
+        if (!signal.aborted) {
+          onSection(section, {}, reason instanceof Error ? reason.message : "Не удалось получить данные");
+        }
+      }
+    }),
+  );
+}
+
+export async function saveApplicationOutcome(
+  applicationId: number,
+  values: Omit<ApplicationOutcome, "recorded_at">,
+): Promise<Communications> {
+  const session = await request<{ key: string }>("/api/session");
+  return request<Communications>(`/api/communications/applications/${applicationId}/outcome?account_id=${ACCOUNT_ID}`, {
+    method: "PUT",
+    headers: { "X-Hugin-Session": session.key },
+    body: JSON.stringify(values),
+  });
+}
+
+export async function assessDevelopmentDirection(
+  directionKey: string,
+  values: DevelopmentAssessmentInput,
+): Promise<Development> {
+  const session = await request<{ key: string }>("/api/session");
+  return request<Development>(
+    `/api/development/directions/${encodeURIComponent(directionKey)}/assessments`,
+    {
+      method: "POST",
+      headers: { "X-Hugin-Session": session.key },
+      body: JSON.stringify(values),
+    },
+  );
+}
+
+export async function createDevelopmentItem(
+  values: DevelopmentItemInput,
+): Promise<Development> {
+  const session = await request<{ key: string }>("/api/session");
+  return request<Development>("/api/development/items", {
+    method: "POST",
+    headers: { "X-Hugin-Session": session.key },
+    body: JSON.stringify(values),
+  });
+}
+
+export async function updateDevelopmentItem(
+  itemId: number,
+  values: DevelopmentItemInput,
+): Promise<Development> {
+  const session = await request<{ key: string }>("/api/session");
+  return request<Development>(`/api/development/items/${itemId}`, {
+    method: "PUT",
+    headers: { "X-Hugin-Session": session.key },
+    body: JSON.stringify(values),
+  });
+}
+
+export async function reconcileForms(): Promise<FormDraft[]> {
   const session = await request<{ key: string }>("/api/session");
   return request<FormDraft[]>(`/api/forms/reconcile?account_id=${ACCOUNT_ID}`, {
     method: "POST",

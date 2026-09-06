@@ -8,6 +8,113 @@ export type SystemState =
 export type WorkFormat = "REMOTE" | "ON_SITE" | "HYBRID";
 export type EmploymentForm = "FULL" | "PART" | "PROJECT" | "FLY_IN_FLY_OUT";
 
+export type QualityLevel = "LOW" | "MEDIUM" | "HIGH";
+export type DevelopmentItemKind =
+  | "PROBLEM"
+  | "TASK"
+  | "HYPOTHESIS"
+  | "MEASUREMENT"
+  | "CHECK"
+  | "IMPROVEMENT";
+export type DevelopmentItemStatus =
+  | "IDEA"
+  | "PLANNED"
+  | "IN_PROGRESS"
+  | "VERIFYING"
+  | "DONE"
+  | "REJECTED"
+  | "WAITING_EXTERNAL";
+export type DevelopmentPriority =
+  | "UNASSIGNED"
+  | "LOW"
+  | "MEDIUM"
+  | "HIGH"
+  | "CRITICAL";
+
+export interface DevelopmentAssessment {
+  id: number;
+  direction_key: string;
+  score: number;
+  confidence: QualityLevel;
+  evidence: string;
+  next_step: string;
+  author: string;
+  created_at: string;
+}
+
+export interface DevelopmentDirection {
+  key: string;
+  block_key: string;
+  block_name: string;
+  block_position: number;
+  name: string;
+  position: number;
+  rule: string;
+  metric: string;
+  criticality: QualityLevel;
+  current_assessment: DevelopmentAssessment;
+  assessment_count: number;
+}
+
+export interface DevelopmentBlock {
+  key: string;
+  name: string;
+  position: number;
+  score: number;
+  confidence: QualityLevel;
+  bottleneck_key: string;
+  bottleneck_name: string;
+  directions: DevelopmentDirection[];
+}
+
+export interface DevelopmentItem {
+  id: number;
+  external_key: string | null;
+  kind: DevelopmentItemKind;
+  title: string;
+  direction_key: string;
+  status: DevelopmentItemStatus;
+  priority: DevelopmentPriority;
+  expected_metric: string;
+  evidence: string;
+  verification_method: string;
+  next_step: string;
+  actual_result: string;
+  reference_codes: string[];
+  author: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface Development {
+  blocks: DevelopmentBlock[];
+  items: DevelopmentItem[];
+  assessments: DevelopmentAssessment[];
+}
+
+export interface DevelopmentAssessmentInput {
+  score: number;
+  confidence: QualityLevel;
+  evidence: string;
+  next_step: string;
+  author: string;
+}
+
+export interface DevelopmentItemInput {
+  kind: DevelopmentItemKind;
+  title: string;
+  direction_key: string;
+  status: DevelopmentItemStatus;
+  priority: DevelopmentPriority;
+  expected_metric: string;
+  evidence: string;
+  verification_method: string;
+  next_step: string;
+  actual_result: string;
+  reference_codes: string[];
+  author: string;
+}
+
 export interface SearchRegion {
   area: string;
   name: string;
@@ -53,6 +160,7 @@ export interface Incident {
   severity: string;
   message: string;
   created_at: string;
+  requires_action?: boolean;
 }
 
 export interface BackgroundStatus {
@@ -195,10 +303,51 @@ export interface QueueItem {
   direction: string;
   state: string;
   priority: number;
+  fit_tier: number | null;
+  fit_reason: string | null;
   scheduled_at: string;
   last_error: string | null;
   letter_state: string | null;
   form_state: string | null;
+}
+
+export interface SearchOutcomes {
+  measured_at: string;
+  sent_by_hugin: number;
+  imported_or_unattributed: number;
+  invitations: number;
+  confirmed_interview_invitations: number;
+  scheduled_interviews: number;
+  confirmed_rejection_reasons: Record<string, number>;
+  cohorts: {
+    age_days: number;
+    applications: number;
+    invitations: number;
+    confirmed_interview_invitations: number;
+    scheduled_interviews: number;
+    rejections: number;
+    without_decision: number;
+    checked_after_window: number;
+    with_selection_snapshot: number;
+    checked_last_48_hours: number;
+  }[];
+  limitations: string[];
+  versions: {
+    age_days: number;
+    rules_version: string | null;
+    applications: number;
+    invitations: number;
+    invitations_per_100: number | null;
+    confirmed_interview_invitations: number;
+    confirmed_interview_invitations_per_100: number | null;
+    with_outcome_context: number;
+    checked_after_window: number;
+    first_sent_at: string;
+    last_sent_at: string;
+    youngest_days: number;
+    oldest_days: number;
+  }[];
+  comparison_limitations: string[];
 }
 
 export interface FormQuestion {
@@ -264,6 +413,7 @@ export interface RecruiterMessage {
   read_at: string | null;
   content_hash: string | null;
   content_version: number;
+  sender_review_required: boolean;
 }
 
 export interface Conversation {
@@ -293,6 +443,15 @@ export interface CommunicationInvitation {
   created_at: string;
 }
 
+export interface SentOutcomeApplication {
+  application_id: number;
+  vacancy_title: string;
+  company: string;
+  source_url: string;
+  state: string;
+  confirmed_at: string;
+}
+
 export interface Communications {
   conversations: Conversation[];
   invitations: CommunicationInvitation[];
@@ -301,6 +460,17 @@ export interface Communications {
   notification_settings: NotificationSettings;
   ai_model_settings: AiModelSettings;
   ai_prompt_settings: AiPromptSettings;
+  outcomes: Record<number, ApplicationOutcome>;
+  sent_applications: SentOutcomeApplication[];
+}
+
+export interface ApplicationOutcome {
+  revision: number;
+  interview_at: string | null;
+  interview_evidence: string;
+  rejection_reason: string;
+  rejection_evidence: string;
+  recorded_at: string | null;
 }
 
 export interface NotificationSettings {
@@ -388,6 +558,7 @@ declare global {
   interface Window {
     pywebview?: {
       api: {
+        login_hh: () => Promise<BridgeResult>;
         open_form: (vacancyId: string) => Promise<BridgeResult>;
         open_invitation: (invitationId: number) => Promise<BridgeResult>;
         open_url: (url: string) => Promise<BridgeResult>;
