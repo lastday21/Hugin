@@ -2,6 +2,7 @@
 
 from hugin.repositories.applications import ApplicationRepository
 from hugin.repositories.automation import AutomationJobRepository
+from hugin.repositories.development import DevelopmentRepository
 from hugin.repositories.directions import AccountRepository, DirectionRepository, ResumeRepository
 from hugin.repositories.tasks import (
     ApplicationSettingsRepository,
@@ -15,6 +16,7 @@ __all__ = [
     "ApplicationRepository",
     "ApplicationSettingsRepository",
     "AutomationJobRepository",
+    "DevelopmentRepository",
     "DirectionRepository",
     "QueueTaskRepository",
     "ResumeRepository",

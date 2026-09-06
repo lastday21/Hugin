@@ -7,8 +7,18 @@ from uuid import uuid4
 import pytest
 from sqlalchemy import Engine, create_engine, text
 
-from hugin.core.settings import Settings
+from hugin.core.settings import Settings, get_settings
 from hugin.database import postgresql_url, upgrade_database
+
+
+@pytest.fixture(autouse=True)
+def isolated_runtime_data(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    monkeypatch.setenv("HUGIN_DATA_DIR", str(tmp_path / "runtime"))
+    get_settings.cache_clear()
+    try:
+        yield
+    finally:
+        get_settings.cache_clear()
 
 
 def _drop_test_database(admin: Engine, database_name: str) -> None:

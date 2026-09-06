@@ -104,8 +104,14 @@ jobs:
       - name: Установить зависимости
         run: uv sync --locked --all-groups
 
+      - name: Установить браузер для проверки интерфейса
+        run: uv run --no-sync playwright install --with-deps chromium
+
       - name: Выполнить проверки
-        run: uv run --no-sync pytest --cov=hugin --cov-branch --cov-report=term-missing
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb xauth tk8.6
+          xvfb-run -a uv run --no-sync pytest --cov=hugin --cov-branch --cov-report=term-missing
 
   frontend:
     name: Оконный интерфейс

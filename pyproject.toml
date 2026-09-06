@@ -23,6 +23,7 @@ browser = [
 ]
 desktop = [
     "pywebview>=5.4,<7",
+    "pystray>=0.19,<1",
 ]
 
 [project.scripts]
@@ -35,6 +36,7 @@ hugin-letters = "hugin.cover_letter_cli:main"
 hugin-forms = "hugin.screening_cli:main"
 hugin-backup = "hugin.backup_cli:main"
 hugin-journal = "hugin.journal_cli:main"
+hugin-diagnose = "hugin.diagnostic_cli:main"
 hugin-desktop = "hugin.desktop:launch"
 
 [dependency-groups]
@@ -80,6 +82,9 @@ target-version = "py312"
 select = ["B", "E", "F", "I", "RUF", "SIM", "UP"]
 
 [tool.ruff.lint.per-file-ignores]
+"src/hugin/services/hh_sync.py" = ["RUF001"]
+"tests/unit/test_message_sender_evidence.py" = ["RUF001"]
+"tests/ui/*.py" = ["RUF001"]
 "src/hugin/adapters/resume_documents.py" = ["RUF001"]
 "src/hugin/adapters/hh_browser.py" = ["RUF001"]
 "src/hugin/adapters/yandex_ai.py" = ["RUF001"]
@@ -88,18 +93,27 @@ select = ["B", "E", "F", "I", "RUF", "SIM", "UP"]
 "src/hugin/hh_cli.py" = ["RUF001"]
 "src/hugin/cover_letter_cli.py" = ["RUF001"]
 "src/hugin/resume_cli.py" = ["RUF001"]
+"src/hugin/repositories/development.py" = ["RUF001"]
 "src/hugin/resume_improvement_cli.py" = ["RUF001"]
 "src/hugin/services/resume_improvement.py" = ["RUF001"]
 "src/hugin/services/resume_prompts.py" = ["RUF001"]
 "src/hugin/services/resume_profile.py" = ["RUF001"]
 "src/hugin/services/career_directions.py" = ["RUF001"]
 "src/hugin/services/cover_letter.py" = ["RUF001"]
+"src/hugin/services/numeric_claims.py" = ["RUF001"]
+"tests/unit/test_numeric_claims.py" = ["RUF001"]
 "src/hugin/services/vacancy_analysis.py" = ["RUF001"]
+"src/hugin/services/vacancy_fit.py" = ["RUF001"]
+"src/hugin/services/search_outcomes.py" = ["RUF001"]
+"src/hugin/services/application_outcomes.py" = ["RUF001"]
+"src/hugin/services/requirement_sections.py" = ["RUF001"]
 "src/hugin/services/vacancy_duplicates.py" = ["RUF001"]
 "src/hugin/services/vacancy_review.py" = ["RUF001"]
 "src/hugin/services/screening_forms.py" = ["RUF001"]
 "src/hugin/screening_cli.py" = ["RUF001"]
 "src/hugin/desktop.py" = ["RUF001"]
+"src/hugin/desktop_runtime.py" = ["RUF001", "RUF002"]
+"src/hugin/startup_status.py" = ["RUF001"]
 "src/hugin/adapters/postgres_backup.py" = ["RUF001"]
 "src/hugin/services/backups.py" = ["RUF001"]
 "src/hugin/workers/backups.py" = ["RUF001"]
@@ -114,6 +128,9 @@ select = ["B", "E", "F", "I", "RUF", "SIM", "UP"]
 "tests/unit/test_cover_letter_cli.py" = ["RUF001"]
 "tests/unit/test_codex_cli.py" = ["RUF001"]
 "tests/unit/test_vacancy_*.py" = ["RUF001"]
+"tests/unit/test_requirement_sections.py" = ["RUF001"]
+"tests/unit/test_candidate_skills.py" = ["RUF001"]
+"tests/unit/test_career_directions.py" = ["RUF001"]
 
 [tool.ruff.format]
 line-ending = "lf"
