@@ -16,6 +16,9 @@ class RecordingRun:
     def succeed(self, **details: object) -> None:
         self.completed = details
 
+    def save_evidence(self, stage: str, **payload: object) -> bool:
+        return True
+
     def fail(self, _error: Exception, **_details: object) -> None:
         return None
 
@@ -91,6 +94,8 @@ def test_client_reads_text_and_token_usage_from_json_events(
     assert journal.run.completed == {
         "output_characters": len(result),
         "token_usage_available": True,
+        "cost": None,
+        "cost_available": False,
         "input_tokens": 1200,
         "cached_input_tokens": 800,
         "output_tokens": 150,

@@ -5,6 +5,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from sqlalchemy import func, select
 
+from hugin.adapters.hh_browser import VisibleHhBrowser
 from hugin.core.settings import Settings
 from hugin.database import create_database, upgrade_database
 from hugin.database.models import (
@@ -13,7 +14,9 @@ from hugin.database.models import (
     ApplicationTaskModel,
     CandidateProfileModel,
     CoverLetterModel,
+    ScreeningAnswerModel,
     ScreeningFormModel,
+    ScreeningQuestionModel,
     VacancyModel,
     VerifiedFactModel,
 )
@@ -38,6 +41,39 @@ from hugin.repositories import (
 from hugin.repositories.vacancies import VacancyRepository
 from hugin.services.autonomy import AutonomyPolicyService
 from hugin.services.screening_forms import ScreeningDraftService
+
+
+@pytest.mark.parametrize(
+    ("question", "prohibited"),
+    [
+        (
+            "Есть ли сферы деятельности, которые не рассматриваете для себя "
+            "(геймдев/букмекерские конторы/банки/другие)? Пожалуйста, укажите эти сферы",
+            False,
+        ),
+        ("Какие сферы не рассматриваете: банки? Укажите номер банковской карты", True),
+        ("Какие сферы не рассматриваете: банки? Пришлите паспорт", True),
+        ("Укажите ваши банки и реквизиты", True),
+    ],
+)
+def test_industry_preferences_do_not_hide_requests_for_personal_documents(
+    question: str, prohibited: bool
+) -> None:
+    field = HhScreeningField("industries", question, "textarea", is_required=True)
+    assert ScreeningDraftService._prohibited(field) is prohibited
+    assert VisibleHhBrowser._screening_form_is_dangerous(HhScreeningForm((field,))) is prohibited
+    if not prohibited:
+        assert ScreeningDraftService._simple_field(field)
+
+
+def test_separate_words_for_salary_use_existing_salary_fact() -> None:
+    assert (
+        ScreeningDraftService._question_key(
+            "Укажите, пожалуйста, примерные ожидания по заработной плате"
+        )
+        == "salary_expectation"
+    )
+
 
 pytestmark = pytest.mark.integration
 
@@ -100,13 +136,22 @@ def test_draft_uses_only_confirmed_safe_answers_and_replaces_changed_form(
             )
             session.add_all((telegram, salary))
             session.flush()
-            session.add(
-                AnswerTemplateModel(
-                    profile_id=profile.id,
-                    key="salary_expectation",
-                    question_pattern="Какие зарплатные ожидания?",
-                    answer_text="120000 рублей на руки",
-                    verified_fact_id=salary.id,
+            session.add_all(
+                (
+                    AnswerTemplateModel(
+                        profile_id=profile.id,
+                        key="salary_expectation",
+                        question_pattern="Какие зарплатные ожидания?",
+                        answer_text="120000 рублей на руки",
+                        verified_fact_id=salary.id,
+                    ),
+                    AnswerTemplateModel(
+                        profile_id=profile.id,
+                        key="salary_gross",
+                        question_pattern=("Какие зарплатные ожидания до вычета налогов (gross)?"),
+                        answer_text="120000 рублей на руки",
+                        verified_fact_id=salary.id,
+                    ),
                 )
             )
             session.flush()
@@ -124,6 +169,12 @@ def test_draft_uses_only_confirmed_safe_answers_and_replaces_changed_form(
                         HhScreeningField(
                             "name:salary",
                             "Какие зарплатные ожидания?",
+                            "text",
+                            is_required=True,
+                        ),
+                        HhScreeningField(
+                            "name:salary-gross",
+                            "Какие зарплатные ожидания до вычета налогов (gross)?",
                             "text",
                             is_required=True,
                         ),
@@ -150,7 +201,7 @@ def test_draft_uses_only_confirmed_safe_answers_and_replaces_changed_form(
             }
             assert draft.questions[0].source is AnswerSource.PROFILE
             assert draft.questions[1].source is AnswerSource.BANK
-            assert draft.unanswered_count == 2
+            assert draft.unanswered_count == 3
             assert draft.cover_letter is None
             pending = ScreeningDraftService(session).list_pending(account.id)
             assert len(pending) == 1
@@ -505,6 +556,7 @@ def test_pending_forms_hide_inactive_vacancies_and_finished_applications(
         "Укажите Telegram после теста",
         "Выполните домашнее задание и укажите Telegram",
         "Домашняя работа: укажите Telegram",
+        "Напишите скрипт на Python для обработки системных файлов",
     ),
 )
 def test_explicit_assignment_is_never_a_simple_form(question: str) -> None:
@@ -582,7 +634,7 @@ def test_confirmed_form_answer_is_scoped_reused_and_requeues_application(
             fact = session.get(VerifiedFactModel, template.verified_fact_id)
             assert fact is not None
             assert fact.resume_id == resume.id
-            assert fact.category == "work_format"
+            assert fact.category == "screening_answer"
             assert fact.actual_at is not None
             assert fact.allow_in_forms
             assert fact.state is ConfirmationState.CONFIRMED
@@ -590,9 +642,55 @@ def test_confirmed_form_answer_is_scoped_reused_and_requeues_application(
             submission = service.get_auto_submission(application.id)
             assert submission is not None
             assert service.auto_submission_allowed(submission)
+            stored_answer = session.scalar(
+                select(ScreeningAnswerModel)
+                .join(
+                    ScreeningQuestionModel,
+                    ScreeningQuestionModel.id == ScreeningAnswerModel.question_id,
+                )
+                .where(ScreeningQuestionModel.form_id == draft.form_id)
+            )
+            assert stored_answer is not None
+            stored_answer.source = AnswerSource.PROFILE
+            session.flush()
+            assert not service.auto_submission_allowed(submission)
+            stored_answer.source = AnswerSource.USER
+            session.flush()
             fact.actual_at = datetime.now(UTC) - timedelta(days=31)
             session.flush()
             assert service.get_auto_submission(application.id) is None
+
+            # Старые версии Hugin сохраняли ответ анкеты как общий факт формата работы.
+            fact.category = "work_format"
+            session.flush()
+            other_vacancy = VacancyRepository(session).upsert(
+                VacancyData(
+                    "vacancy-other-format",
+                    "Python",
+                    "https://hh.ru/vacancy/vacancy-other-format",
+                )
+            )
+            other_application = ApplicationRepository(session).create_apply_intent(
+                account.id,
+                other_vacancy.id,
+                resume.id,
+            )
+            unrelated = service.capture(
+                other_application.id,
+                HhScreeningForm(
+                    fields=(
+                        HhScreeningField(
+                            "name:other-format",
+                            "Какой формат работы вам не подходит?",
+                            "radio",
+                            is_required=True,
+                            options=("Офис", "Удалённо"),
+                        ),
+                    )
+                ),
+            )
+            assert unrelated.state is ScreeningFormState.INPUT_REQUIRED
+            assert unrelated.questions[0].answer is None
             assert not service.auto_submission_allowed(submission)
             autonomy = AutonomyPolicyService(session)
             extended_validity = autonomy.get().as_payload()

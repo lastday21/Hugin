@@ -25,6 +25,7 @@ from hugin.database.models import (
     VacancyModel,
 )
 from hugin.services.ai_prompts import DEFAULT_AI_PROMPTS, with_user_prompt
+from hugin.services.numeric_claims import unsupported_numeric_claim
 from hugin.services.resume_prompts import (
     QUESTION_PROMPT_VERSION,
     REWRITE_PROMPT_VERSION,
@@ -425,17 +426,14 @@ class ResumeImprovementService:
             answers = tuple(
                 self._answer(block, question, answer_provider) for question in questions
             )
-            rewrite_response = self._model.complete(
-                self._system_prompt,
-                build_rewrite_prompt(
-                    context,
-                    tuple(
-                        ResumeQuestionAnswer(question, answer)
-                        for question, answer in zip(questions, answers, strict=True)
-                    ),
+            improved_text = self._rewrite(
+                context,
+                tuple(
+                    ResumeQuestionAnswer(question, answer)
+                    for question, answer in zip(questions, answers, strict=True)
                 ),
+                project_label=block.label if block.kind is ResumeBlockKind.PROJECT else None,
             )
-            improved_text = self._normalize_model_text(rewrite_response)
             improved.append(
                 ImprovedResumeBlock(
                     index=block.index,
@@ -471,6 +469,39 @@ class ResumeImprovementService:
             blocks=improved_blocks,
             source_unchanged=source_unchanged,
         )
+
+    def _rewrite(
+        self,
+        context: ResumePromptContext,
+        answers: tuple[ResumeQuestionAnswer, ...],
+        *,
+        project_label: str | None = None,
+    ) -> str:
+        prompt = build_rewrite_prompt(context, answers)
+        project_context = f"Проект «{project_label}»:\n" if project_label else ""
+        sources = tuple(
+            project_context + source
+            for source in (context.source_block, *(answer.answer for answer in answers))
+        )
+        for attempt in range(2):
+            text = self._normalize_model_text(self._model.complete(self._system_prompt, prompt))
+            unsupported = unsupported_numeric_claim(project_context + text, sources)
+            if unsupported is None:
+                return text
+            if attempt:
+                raise ValueError(
+                    "Число не подтверждено для этого показателя, единицы, периода или проекта. "
+                    "Черновик резюме не создан."
+                )
+            prompt = (
+                f"{build_rewrite_prompt(context, answers)}\n\n"
+                "В предыдущем варианте обнаружено неподтверждённое числовое утверждение. "
+                "Исправь его по исходному блоку и ответам кандидата. Числа в вопросах, "
+                "названии искомой роли и требованиях вакансий не подтверждают прошлый опыт. "
+                "Сохрани показатель, единицу, период, проект и условия проверки результата.\n"
+                f"Отклонённый фрагмент, только для исправления:\n{unsupported}"
+            )
+        raise AssertionError("Не завершена проверка блока резюме")
 
     def _assess_questions(
         self,
@@ -619,6 +650,7 @@ class ResumeImprovementService:
             "model_name": self._model.model_name,
             "question_prompt_version": QUESTION_PROMPT_VERSION,
             "rewrite_prompt_version": REWRITE_PROMPT_VERSION,
+            "numeric_validation_version": "resume_numeric_v1",
             "created_at": datetime.now(UTC).isoformat(),
             "blocks": [asdict(block) for block in blocks],
         }

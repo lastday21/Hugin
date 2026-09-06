@@ -160,6 +160,7 @@ class YandexAIClient:
             method="POST",
         )
         chunks: list[str] = []
+        raw_lines: list[str] = []
         usage: dict[str, int] = {}
         run = (
             self._journal.start(
@@ -173,10 +174,15 @@ class YandexAIClient:
             if self._journal is not None
             else None
         )
+        if run is not None:
+            run.save_evidence(
+                "request", system_prompt=system_prompt, user_prompt=user_prompt, model=self._model
+            )
         try:
             open_request = self._opener.open if self._opener is not None else urllib.request.urlopen
             with open_request(request, timeout=self._timeout_seconds) as response:
                 for raw_line in self._response_lines(response):
+                    raw_lines.append(raw_line.decode("utf-8", errors="replace"))
                     line = raw_line.decode("utf-8", errors="replace").strip()
                     if not line.startswith("data:"):
                         continue
@@ -190,24 +196,54 @@ class YandexAIClient:
                     if chunk:
                         chunks.append(chunk)
         except urllib.error.HTTPError as error:
-            detail = error.read().decode("utf-8", errors="replace")[:1000]
-            failure = YandexAIError(f"Yandex AI Studio вернул ошибку HTTP {error.code}: {detail}")
+            detail = error.read().decode("utf-8", errors="replace")
+            failure = YandexAIError(
+                f"Yandex AI Studio вернул ошибку HTTP {error.code}: {detail[:1000]}"
+            )
             if run is not None:
+                run.save_evidence(
+                    "response",
+                    raw_lines=raw_lines,
+                    error_type=type(error).__name__,
+                    http_status=error.code,
+                    body=detail,
+                )
                 run.fail(failure)
             raise failure from error
         except urllib.error.URLError as error:
             failure = YandexAIError(f"Yandex AI Studio недоступен: {error.reason}")
             if run is not None:
+                run.save_evidence(
+                    "response",
+                    raw_lines=raw_lines,
+                    error_type=type(error).__name__,
+                    detail=str(error.reason),
+                )
                 run.fail(failure)
             raise failure from error
         except TimeoutError as error:
             failure = YandexAIError("Истекло время ожидания ответа YandexGPT")
             if run is not None:
+                run.save_evidence(
+                    "response",
+                    raw_lines=raw_lines,
+                    text="".join(chunks),
+                    usage=usage,
+                    error_type=type(error).__name__,
+                )
                 run.fail(failure)
             raise failure from error
         except OSError as error:
             failure = YandexAIError(f"Ошибка запроса к YandexGPT: {error}")
             if run is not None:
+                run.save_evidence(
+                    "response",
+                    raw_lines=raw_lines,
+                    text="".join(chunks),
+                    usage=usage,
+                    error_type=type(error).__name__,
+                    detail=str(error),
+                )
                 run.fail(failure)
             raise failure from error
 
@@ -215,12 +251,24 @@ class YandexAIClient:
         if not result:
             failure = YandexAIError("YandexGPT вернул пустой ответ")
             if run is not None:
+                run.save_evidence("response", raw_lines=raw_lines, text=result, usage=usage)
                 run.fail(failure)
             raise failure
         if run is not None:
+            run.save_evidence("response", text=result, usage=usage, raw_lines=raw_lines)
             usage_details: dict[str, object] = {
                 "usage_reported": bool(usage),
+                "token_usage_available": bool(usage),
+                "cost": None,
+                "cost_available": False,
             }
+            for legacy, canonical in (
+                ("prompt_units", "input_tokens"),
+                ("completion_units", "output_tokens"),
+                ("total_units", "total_tokens"),
+            ):
+                if legacy in usage:
+                    usage_details[canonical] = usage[legacy]
             if usage:
                 usage_details["usage_unit"] = "tokens"
             run.succeed(
@@ -280,6 +328,8 @@ class YandexAIClient:
             data = json.loads(payload)
         except json.JSONDecodeError:
             return ""
+        if not isinstance(data, dict):
+            return ""
         choices = data.get("choices")
         if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
             return ""
@@ -296,6 +346,8 @@ class YandexAIClient:
         try:
             data = json.loads(payload)
         except json.JSONDecodeError:
+            return {}
+        if not isinstance(data, dict):
             return {}
         raw = data.get("usage")
         if not isinstance(raw, dict):

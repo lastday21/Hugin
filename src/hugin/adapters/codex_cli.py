@@ -122,6 +122,14 @@ class CodexCliClient:
             if self._journal is not None
             else None
         )
+        if run is not None:
+            run.save_evidence(
+                "request",
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                model=self._model,
+                reasoning_effort=self._reasoning_effort,
+            )
         environment = os.environ.copy()
         environment.pop("OPENAI_API_KEY", None)
         environment.pop("CODEX_API_KEY", None)
@@ -143,11 +151,18 @@ class CodexCliClient:
         except subprocess.TimeoutExpired as error:
             failure = CodexCliError("Истекло время ожидания сопроводительного письма")
             if run is not None:
+                run.save_evidence(
+                    "response",
+                    error_type=type(error).__name__,
+                    stdout=self._captured_text(error.stdout),
+                    stderr=self._captured_text(error.stderr),
+                )
                 run.fail(failure)
             raise failure from error
         except OSError as error:
             failure = CodexCliError("Не удалось запустить создание сопроводительного письма")
             if run is not None:
+                run.save_evidence("response", error_type=type(error).__name__, detail=str(error))
                 run.fail(failure)
             raise failure from error
 
@@ -158,21 +173,47 @@ class CodexCliClient:
                 + (f": {detail}" if detail else "")
             )
             if run is not None:
+                run.save_evidence(
+                    "response",
+                    stdout=result.stdout,
+                    stderr=result.stderr,
+                    return_code=result.returncode,
+                )
                 run.fail(failure, return_code=result.returncode)
             raise failure
         text, usage = self._parse_output(result.stdout)
         if not text:
             failure = CodexCliError("Программа создания писем вернула пустой ответ")
             if run is not None:
+                run.save_evidence(
+                    "response",
+                    stdout=result.stdout,
+                    stderr=result.stderr,
+                    return_code=result.returncode,
+                )
                 run.fail(failure)
             raise failure
         if run is not None:
+            run.save_evidence(
+                "response",
+                text=text,
+                usage=usage,
+                stdout=result.stdout,
+                stderr=result.stderr,
+                return_code=result.returncode,
+            )
             run.succeed(
                 output_characters=len(text),
                 token_usage_available=bool(usage),
+                cost=None,
+                cost_available=False,
                 **usage,
             )
         return text
+
+    @staticmethod
+    def _captured_text(value: str | bytes | None) -> str:
+        return value.decode("utf-8", errors="replace") if isinstance(value, bytes) else value or ""
 
     @classmethod
     def _parse_output(cls, value: str) -> tuple[str, dict[str, int]]:

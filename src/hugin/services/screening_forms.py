@@ -36,6 +36,7 @@ from hugin.domain.hh import (
     HhScreeningSubmission,
     screening_form_hash,
 )
+from hugin.domain.screening_questions import INDUSTRY_EXCLUSIONS, sensitive_question_text
 from hugin.domain.tasks import TaskState
 from hugin.domain.time import as_utc
 from hugin.domain.vacancies import VacancyAvailability
@@ -109,8 +110,9 @@ class ScreeningAvailabilityCheck:
 QUESTION_KEYS: tuple[tuple[str, tuple[re.Pattern[str], ...]], ...] = (
     (
         "salary_expectation",
-        (re.compile(r"зарплат|оклад|доход|вознагражден", re.IGNORECASE),),
+        (re.compile(r"зарплат|заработн\w*\s+плат|оклад|доход|вознагражден", re.IGNORECASE),),
     ),
+    ("industry_exclusions", (INDUSTRY_EXCLUSIONS,)),
     (
         "available_from",
         (
@@ -181,7 +183,14 @@ DANGEROUS_QUESTION = re.compile(
     r"\bтест(?:ы|а|е|ом|у|ами|ах|ов)?\b|\bтестов\w*\b|\bтестирован\w*\b|"
     r"домашн[\s\S]{0,80}(?:задан|работ|проект|тест)|"
     r"(?:прой(?:д|т)|проход|выполн|сдела|реши)[\s\S]{0,120}(?:\bтест\w*|задан)|"
+    r"(?:напиш|разработ|реализ|созда)[\s\S]{0,120}(?:\bкод\w*|скрипт|программ)|"
     r"видео",
+    re.IGNORECASE,
+)
+
+GROSS_COMPENSATION = re.compile(r"до\s+вычета|\bgross\b|гросс", re.IGNORECASE)
+NET_COMPENSATION = re.compile(
+    r"после\s+вычета|на\s+руки|\bnet\b|нетто",
     re.IGNORECASE,
 )
 
@@ -867,12 +876,21 @@ class ScreeningDraftService:
                 and cls._normalize(answer.answer_text) == "да"
                 and DATA_ACCURACY_CONFIRMATION.search(question.question_text)
             )
+        if cls._is_screening_fact(fact) and answer.source is AnswerSource.PROFILE:
+            return False
+        compatible_answer = (
+            cls._compatible_answer(cls._stored_field(question), answer.answer_text)
+            if answer.answer_text is not None
+            else None
+        )
         return bool(
             fact.state is ConfirmationState.CONFIRMED
             and fact.allow_in_forms
             and (fact.resume_id is None or fact.resume_id == application.resume_id)
             and (fact.direction_id is None or fact.direction_id == application.direction_id)
             and answer.answer_text is not None
+            and compatible_answer is not None
+            and compatible_answer == answer.answer_text.strip()
             and answer.answer_text.strip() == fact.content.strip()
             and cls._fact_is_current(
                 fact,
@@ -1012,6 +1030,10 @@ class ScreeningDraftService:
                     VerifiedFactModel.profile_id == profile_id,
                     VerifiedFactModel.state == ConfirmationState.CONFIRMED,
                     VerifiedFactModel.allow_in_forms.is_(True),
+                    or_(
+                        VerifiedFactModel.source_reference.is_(None),
+                        VerifiedFactModel.source_reference.not_like("screening:%"),
+                    ),
                     (
                         (VerifiedFactModel.resume_id.is_(None))
                         | (VerifiedFactModel.resume_id == application.resume_id)
@@ -1034,12 +1056,7 @@ class ScreeningDraftService:
         policy: AutonomyPolicy,
         now: datetime,
     ) -> _ResolvedAnswer | None:
-        if (
-            field.has_attachment
-            or field.has_external_action
-            or field.has_test_assignment
-            or DANGEROUS_QUESTION.search(field.question)
-        ):
+        if self._prohibited(field):
             return None
         if DATA_ACCURACY_CONFIRMATION.search(field.question):
             answer = self._compatible_answer(field, "Да")
@@ -1109,6 +1126,10 @@ class ScreeningDraftService:
         threshold = as_utc(now) - timedelta(days=policy.mutable_fact_validity_days)
         return as_utc(fact.actual_at) >= threshold
 
+    @staticmethod
+    def _is_screening_fact(fact: VerifiedFactModel) -> bool:
+        return bool(fact.source_reference and fact.source_reference.startswith("screening:"))
+
     def _form_for_account(self, account_id: int, form_id: int) -> ScreeningFormModel:
         form = self._session.scalar(
             select(ScreeningFormModel)
@@ -1138,9 +1159,7 @@ class ScreeningDraftService:
         digest = hashlib.sha256(self._normalize(question).encode("utf-8")).hexdigest()[:24]
         scope = f"{application.direction_id or 0}:{application.resume_id}"
         key = f"screening:{scope}:{digest}"
-        category = (
-            self._question_key(question) or self._fact_category(question) or "screening_answer"
-        )
+        category = "screening_answer"
         fact = self._session.scalar(
             select(VerifiedFactModel).where(
                 VerifiedFactModel.profile_id == profile.id,
@@ -1244,11 +1263,12 @@ class ScreeningDraftService:
 
     @staticmethod
     def _prohibited(field: HhScreeningField) -> bool:
+        question = sensitive_question_text(field.question)
         return bool(
             field.has_attachment
             or field.has_external_action
             or field.has_test_assignment
-            or DANGEROUS_QUESTION.search(field.question)
+            or DANGEROUS_QUESTION.search(question)
             or SERIOUS_OBLIGATION.search(field.question)
         )
 
@@ -1267,27 +1287,27 @@ class ScreeningDraftService:
             has_test_assignment=question.has_test_assignment,
         )
 
-    @staticmethod
-    def _compatible_answer(field: HhScreeningField, value: str) -> str | None:
+    @classmethod
+    def _compatible_answer(cls, field: HhScreeningField, value: str) -> str | None:
         answer = value.strip()
         if not answer or (field.max_length is not None and len(answer) > field.max_length):
             return None
+        if (GROSS_COMPENSATION.search(field.question) and NET_COMPENSATION.search(answer)) or (
+            NET_COMPENSATION.search(field.question) and GROSS_COMPENSATION.search(answer)
+        ):
+            return None
         field_type = field.field_type.casefold()
         if field_type == "checkbox":
-            normalized = ScreeningDraftService._normalize(answer)
+            normalized = cls._normalize(answer)
             if normalized in {"да", "true", "1", "согласен"}:
                 return "Да"
             if normalized in {"нет", "false", "0", "не согласен"}:
                 return "Нет"
             return None
         if field.options:
-            normalized = ScreeningDraftService._normalize(answer)
+            normalized = cls._normalize(answer)
             return next(
-                (
-                    option
-                    for option in field.options
-                    if ScreeningDraftService._normalize(option) == normalized
-                ),
+                (option for option in field.options if cls._normalize(option) == normalized),
                 None,
             )
         if (

@@ -9,10 +9,66 @@ from httpx import ASGITransport, AsyncClient
 from hugin.api.app import create_app
 from hugin.core.settings import Settings
 from hugin.database import create_database, upgrade_database
+from hugin.database.models import (
+    AnswerTemplateModel,
+    CandidateProfileModel,
+    VerifiedFactModel,
+)
+from hugin.domain.content import ConfirmationState
 from hugin.repositories import AccountRepository, ResumeRepository
+from hugin.services.ui_profile import UiProfileService
 from tests.unit.test_resume_documents import write_resume
 
 pytestmark = pytest.mark.integration
+
+
+def test_profile_separates_saved_screening_answers_from_candidate_facts(
+    settings: Settings,
+) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    try:
+        with database.sessions.begin() as session:
+            account = AccountRepository(session).create("Иван", "screening-profile")
+            resume = ResumeRepository(session).upsert(account.id, "resume-screening", "Python")
+            profile = CandidateProfileModel(
+                account_id=account.id,
+                active_resume_id=resume.id,
+                display_name="Иван",
+            )
+            session.add(profile)
+            session.flush()
+            fact = VerifiedFactModel(
+                profile_id=profile.id,
+                category="experience",
+                content="Нет",
+                source_type="user",
+                source_reference="screening:0:1:example",
+                resume_id=resume.id,
+                state=ConfirmationState.CONFIRMED,
+                allow_in_forms=True,
+            )
+            session.add(fact)
+            session.flush()
+            session.add(
+                AnswerTemplateModel(
+                    profile_id=profile.id,
+                    key="screening:0:1:example",
+                    question_pattern="Имеется ли опыт промышленной автоматизации?",
+                    answer_text="Нет",
+                    verified_fact_id=fact.id,
+                )
+            )
+            session.flush()
+
+            result = UiProfileService(session).get(account.id)
+
+            assert result.facts == ()
+            assert len(result.answers) == 1
+            assert result.answers[0].question == "Имеется ли опыт промышленной автоматизации?"
+            assert result.answers[0].answer == "Нет"
+    finally:
+        database.close()
 
 
 def test_profile_api_previews_imports_and_reviews_resume(

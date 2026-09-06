@@ -5,6 +5,7 @@ import re
 from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from decimal import Decimal
 from html import escape
 from typing import Protocol
 
@@ -26,6 +27,7 @@ from hugin.database.models import (
     VacancyModel,
     VerifiedFactModel,
 )
+from hugin.diagnostics import operation_context
 from hugin.domain.applications import ApplicationState
 from hugin.domain.content import (
     CURRENT_COVER_LETTER_INSTRUCTION,
@@ -38,6 +40,7 @@ from hugin.domain.directions import VacancyState
 from hugin.domain.tasks import TaskState
 from hugin.domain.vacancies import VacancyAvailability
 from hugin.repositories.tasks import QueueTaskRepository
+from hugin.repositories.vacancy_priority import vacancy_ordering
 from hugin.services.ai_prompts import (
     DEFAULT_COVER_LETTER_PROMPT,
     AiPromptSettingsService,
@@ -61,11 +64,12 @@ from hugin.services.cover_letter_routing import (
     build_routing_prompt,
     parse_routing_decision,
 )
+from hugin.services.numeric_claims import normalize_written_quantities, unsupported_numeric_claim
 from hugin.services.resume_improvement import ResumeBlockExtractor
 from hugin.services.vacancy_analysis import RULES_VERSION, RuleCategory
 
 PROMPT_PURPOSE = "cover_letter"
-PROMPT_VERSION = 30
+PROMPT_VERSION = 32
 INSTRUCTION_VERSION = CURRENT_COVER_LETTER_INSTRUCTION
 MANUAL_REVIEW_MODEL = "manual-review"
 MIN_LETTER_LENGTH = 350
@@ -109,6 +113,12 @@ category="project" — личный проект, а не место работ�
 Сохраняй статус и время действия из источника: «разрабатываю», «интегрирую» и «добавляю»
 нельзя превращать в «разработал», «интегрировал» и «добавил». Планы, будущие и необязательные
 возможности не являются опытом и не должны попадать в письмо.
+Число подтверждается только вместе с показателем, единицей, периодом и проектом из источника.
+Не переноси количество заявок на выручку или стаж. Сохраняй условия измерения: результат
+открытой или внутренней выборки нельзя объявлять общей точностью продукта. Если связь
+числа с утверждением неочевидна, опиши выполненную работу без числа. Сохраняй ограничения
+«до», «не менее», «около», отрицания и состав доли: число правильных ответов и размер
+проверочной выборки нельзя менять местами. Версия программы не подтверждает срок опыта.
 Не называй предыдущих работодателей кандидата. Верни только готовое письмо без заголовка,
 пояснений и разметки."""
 
@@ -309,7 +319,7 @@ _CONTACT_LINE = re.compile(
     re.IGNORECASE,
 )
 _PHONE = re.compile(r"(?<!\d)(?:\+7|8)[\s()-]*\d{3}[\s()-]*\d{3}[\s()-]*\d{2}")
-_NUMBER = re.compile(r"\d+(?:[.,]\d+)?")
+_NUMBER = re.compile(r"\d+(?:[ \u00a0\u202f]\d{3})*(?:[.,]\d+)?")
 _ALPHANUMERIC_NUMBER_TOKEN = re.compile(
     r"(?<![\w.+#-])(?=[\w.+#-]*\d)(?=[\w.+#-]*[^\W\d_])[\w.+#-]+(?![\w.+#-])"
 )
@@ -992,21 +1002,22 @@ class CoverLetterService:
             )
             raise LookupError(f"{target.capitalize()} не найден в готовой очереди")
         for candidate in candidates:
-            item = self._prepare_one(
-                candidate,
-                direction,
-                prompt_version,
-                user_instruction,
-                instruction_version,
-            )
-            if self._quality_model is not None and item.state is CoverLetterState.READY:
-                item = self._ensure_quality(
+            with operation_context(account_id=account_id, application_id=candidate.application.id):
+                item = self._prepare_one(
                     candidate,
                     direction,
+                    prompt_version,
                     user_instruction,
                     instruction_version,
-                    item,
                 )
+                if self._quality_model is not None and item.state is CoverLetterState.READY:
+                    item = self._ensure_quality(
+                        candidate,
+                        direction,
+                        user_instruction,
+                        instruction_version,
+                        item,
+                    )
             if item.action == "existing":
                 already_ready += 1
                 continue
@@ -2512,16 +2523,7 @@ class CoverLetterService:
         rows = self._session.execute(
             statement.order_by(
                 case((VacancyModel.duplicate_of_id.is_(None), 0), else_=1),
-                case(
-                    (
-                        DirectionVacancyModel.rules_details["category"].as_string()
-                        == RuleCategory.MATCH.value,
-                        0,
-                    ),
-                    else_=1,
-                ),
-                ApplicationTaskModel.priority_score.desc(),
-                VacancyModel.published_at.desc().nulls_last(),
+                *vacancy_ordering(),
                 ApplicationTaskModel.id,
             )
         )
@@ -3366,18 +3368,37 @@ def validate_cover_letter(
                     else technology
                 ),
             )
-    allowed_numbers = set(_NUMBER.findall(fact_text))
-    allowed_numbers.update(_NUMBER.findall(vacancy.title))
-    allowed_numbers.update(_NUMBER.findall(vacancy.employer_name or ""))
+
+    normalized_fact_text = normalize_written_quantities(fact_text)
+    for match in _WORD_NUMBER_YEARS.finditer(claim_text):
+        if (
+            normalize_written_quantities(match.group(0)).casefold()
+            not in normalized_fact_text.casefold()
+        ):
+            raise CoverLetterValidationError(
+                "UNCONFIRMED_EXPERIENCE",
+                "В письме появился неподтвержденный срок опыта",
+                rejected_fragment=_fragment_around_match(claim_text, match),
+            )
+
+    def numeric_value(raw: str) -> Decimal:
+        return Decimal(re.sub(r"\s+", "", raw).replace(",", "."))
+
+    allowed_numbers = {
+        numeric_value(raw)
+        for content in (fact_text, vacancy.title, vacancy.employer_name or "")
+        for raw in _NUMBER.findall(normalize_written_quantities(content))
+    }
     vacancy_number_tokens = {
         match.group(0).strip(".+#-").casefold()
         for match in _ALPHANUMERIC_NUMBER_TOKEN.finditer(_vacancy_text(vacancy))
     }
-    text_number_tokens = tuple(_ALPHANUMERIC_NUMBER_TOKEN.finditer(text))
+    numeric_text = normalize_written_quantities(text)
+    text_number_tokens = tuple(_ALPHANUMERIC_NUMBER_TOKEN.finditer(numeric_text))
     unexpected_numbers: set[str] = set()
     first_unexpected_number: re.Match[str] | None = None
-    for number in _NUMBER.finditer(text):
-        if number.group(0) in allowed_numbers:
+    for number in _NUMBER.finditer(numeric_text):
+        if numeric_value(number.group(0)) in allowed_numbers:
             continue
         containing_token = next(
             (
@@ -3400,18 +3421,20 @@ def validate_cover_letter(
             "UNCONFIRMED_NUMBER",
             "В письме появилась цифра, которой нет в подтвержденных фактах",
             rejected_fragment=(
-                _fragment_around_match(text, first_unexpected_number)
+                _fragment_around_match(numeric_text, first_unexpected_number)
                 if first_unexpected_number is not None
                 else None
             ),
         )
-    for match in _WORD_NUMBER_YEARS.finditer(claim_text):
-        if match.group(0).casefold() not in fact_text.casefold():
-            raise CoverLetterValidationError(
-                "UNCONFIRMED_EXPERIENCE",
-                "В письме появился неподтвержденный срок опыта",
-                rejected_fragment=_fragment_around_match(claim_text, match),
-            )
+    unconfirmed_claim = unsupported_numeric_claim(
+        claim_text, tuple(fact.content for fact in facts), identifier_context=_vacancy_text(vacancy)
+    )
+    if unconfirmed_claim is not None:
+        raise CoverLetterValidationError(
+            "UNCONFIRMED_NUMERIC_CLAIM",
+            "Число не подтверждено для этого показателя, единицы, периода или проекта",
+            rejected_fragment=unconfirmed_claim,
+        )
 
     employer = (vacancy.employer_name or "").casefold()
     for match in _COMPANY_REFERENCE.finditer(claim_text):

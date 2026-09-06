@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import UTC, datetime, timedelta
 
@@ -40,7 +41,7 @@ from hugin.repositories import (
 )
 from hugin.repositories.vacancies import VacancyRepository
 from hugin.services.ai_prompts import DEFAULT_COVER_LETTER_PROMPT
-from hugin.services.application_automation import ApplicationAutomationService
+from hugin.services.application_automation import ApplicationAutomationService, ApplyJob
 from hugin.services.cover_letter import (
     MANUAL_REVIEW_MODEL,
     MAX_LETTER_LENGTH,
@@ -1315,6 +1316,172 @@ def test_library_name_does_not_allow_same_digit_as_experience_claim() -> None:
         validate_cover_letter(text, vacancy, _fact())
 
     assert error.value.code == "UNCONFIRMED_NUMBER"
+
+
+@pytest.mark.parametrize(
+    ("source", "claim"),
+    [
+        ("Обработал 100 заявок.", "Увеличил выручку на 100 процентов."),
+        ("Обработал до 100 заявок.", "Обработал более 100 заявок."),
+        ("Не обработал 100 заявок.", "Обработал 100 заявок."),
+        (
+            "В проекте Alpha обработал 100 заявок, а в проекте Beta — 20 заявок.",
+            "В проекте Beta обработал 100 заявок.",
+        ),
+        (
+            "Проект Alpha. Обработал 100 заявок.",
+            "Проект Alpha. Проект beta. Обработал 100 заявок.",
+        ),
+        ("Получил 53 точных ответа из 54.", "Получил 54 точных ответа из 53."),
+        ("Использовал Python 2 и обработал 100 заявок.", "Работал с Python 2 года."),
+        (
+            "В проекте Alpha обработал 100 заявок.",
+            "В проекте Beta обработал сотню заявок.",
+        ),
+    ],
+)
+def test_numeric_meaning_is_corrected_and_checked_again_before_submission(
+    settings: Settings, source: str, claim: str
+) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    invalid = _letter().replace("В одном из проектов", f"{claim} В одном из проектов")
+    model = FakeModel([invalid, _letter()])
+    try:
+        with database.sessions.begin() as session:
+            account_id, _, _, _ = _prepare_data(session)
+            fact = session.scalar(
+                select(VerifiedFactModel).where(
+                    VerifiedFactModel.state == ConfirmationState.CONFIRMED
+                )
+            )
+            assert fact is not None
+            fact.content = fact.content.replace("на Python.", f"на Python. {source}")
+            session.flush()
+            service = CoverLetterService(session, model)
+            result = service.prepare(
+                account_id=account_id, direction_name="Python backend", limit=1
+            )
+            assert result.generated == 1 and result.failed == 0
+            assert len(model.prompts) == 2
+            assert "UNCONFIRMED_NUMERIC_CLAIM" in model.prompts[1][1]
+            rejection = session.scalar(select(CoverLetterRejectionModel))
+            assert rejection is not None
+            assert rejection.reason_code == "UNCONFIRMED_NUMERIC_CLAIM"
+            assert rejection.rejected_fragment
+            letter = session.scalar(select(CoverLetterModel))
+            assert letter is not None and letter.text
+            service.validate_for_submission(
+                application_id=letter.application_id, letter_id=letter.id
+            )
+            letter.text = invalid
+            session.flush()
+            with pytest.raises(CoverLetterValidationError) as error:
+                service.validate_for_submission(
+                    application_id=letter.application_id, letter_id=letter.id
+                )
+            assert error.value.code == "UNCONFIRMED_NUMERIC_CLAIM"
+            job = ApplicationAutomationService(session).claim_next(
+                require_cover_letter=True, allow_paused_review=True
+            )
+            assert job is None
+            task = session.scalar(select(ApplicationTaskModel))
+            assert task is not None and task.last_error_code == "COVER_LETTER_STALE"
+            assert letter.state is CoverLetterState.FAILED
+    finally:
+        database.close()
+
+
+@pytest.mark.parametrize("mode", ["background", "supervised"])
+def test_numeric_mutation_blocks_final_submission_guard(settings: Settings, mode: str) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    invalid = _letter().replace(
+        "В одном из проектов", "Обработал более 100 заявок. В одном из проектов"
+    )
+    try:
+        with database.sessions.begin() as session:
+            account_id, _, resume_id, _ = _prepare_data(session)
+            fact = session.scalar(
+                select(VerifiedFactModel).where(
+                    VerifiedFactModel.state == ConfirmationState.CONFIRMED
+                )
+            )
+            assert fact is not None
+            fact.content += " Обработал до 100 заявок."
+            session.flush()
+            writer = FakeModel([_letter()])
+            judge = FakeModel([_quality_response()])
+            service = CoverLetterService(session, writer, quality_model=judge)
+            assert (
+                service.prepare(account_id=account_id, direction_name="Python backend").generated
+                == 1
+            )
+            letter = session.scalar(select(CoverLetterModel))
+            resume = session.get(ResumeModel, resume_id)
+            assert letter is not None and letter.text and resume is not None
+            automation = ApplicationAutomationService(session)
+            job: ApplyJob | None
+            if mode == "supervised":
+                automation.acquire_supervised_lease("numeric-check")
+                task_id = session.scalar(select(ApplicationTaskModel.id))
+                assert task_id is not None
+                job = automation.claim_supervised(
+                    lease_token="numeric-check",
+                    task_id=task_id,
+                    letter_id=letter.id,
+                    letter_sha256=hashlib.sha256(letter.text.encode("utf-8")).hexdigest(),
+                )
+            else:
+                SystemStateRepository(session).transition(SystemState.RUNNING)
+                job = automation.claim_next(
+                    require_cover_letter=True, require_cover_letter_quality=True
+                )
+            assert job is not None
+
+            def allowed() -> bool:
+                assert letter is not None and letter.text and resume is not None and job is not None
+                digest = hashlib.sha256(letter.text.encode("utf-8")).hexdigest()
+                if mode == "supervised":
+                    return automation.supervised_submission_is_allowed(
+                        "numeric-check",
+                        job.task.id,
+                        letter_id=letter.id,
+                        letter_sha256=digest,
+                        resume_hh_id=resume.hh_id,
+                        resume_title=resume.title,
+                    )
+                return automation.background_submission_is_allowed(
+                    job.task.id,
+                    letter_id=letter.id,
+                    letter_sha256=digest,
+                    resume_hh_id=resume.hh_id,
+                    resume_title=resume.title,
+                )
+
+            assert allowed()
+            letter.text = invalid
+            session.flush()
+            assert not allowed()
+            assert job.task.state is TaskState.RUNNING
+            assert job.application.state is ApplicationState.APPLYING
+    finally:
+        database.close()
+
+
+@pytest.mark.parametrize(
+    ("source", "claim"),
+    [
+        ("Обработал 100000 заявок.", "Обработал 100 тысяч заявок."),
+        ("Работал с Python 2 года.", "Работал с Python два года."),
+        ("Обработал не более 100 заявок.", "Обработал до 100 заявок."),
+    ],
+)
+def test_supported_quantity_passes_full_letter_validation(source: str, claim: str) -> None:
+    original = _fact()[0]
+    fact = _SelectedFact(original.id, original.category, f"{original.content} {source}")
+    text = _letter().replace("В одном из проектов", f"{claim} В одном из проектов")
+    assert validate_cover_letter(text, _vacancy(), (fact,)) == (fact,)
 
 
 def test_template_phrase_is_corrected_once_with_specific_reason(
