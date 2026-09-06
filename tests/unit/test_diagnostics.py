@@ -42,7 +42,11 @@ def test_journal_records_duration_error_trace_and_redacts_secrets(tmp_path: Path
     assert entries[1]["status"] == "failed"
     assert entries[1]["details"]["duration_ms"] == 125
     assert entries[1]["details"]["error_type"] == "RuntimeError"
-    assert "Traceback" in entries[1]["details"]["traceback"]
+    assert "sha256" in entries[1]["details"]["traceback"]
+    saved = json.loads(
+        (tmp_path / f"evidence/models/{run.run_id}-failure.json").read_text(encoding="utf-8")
+    )
+    assert "Traceback" in saved["payload"]["traceback"]
 
 
 def test_journal_reader_filters_and_ignores_broken_lines(tmp_path: Path) -> None:

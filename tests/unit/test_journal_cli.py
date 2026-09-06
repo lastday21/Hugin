@@ -36,7 +36,8 @@ def test_show_summary_and_export(
     assert journal_cli.main(["show", "--hours", "1", "--limit", "10"]) == 0
     shown = capsys.readouterr().out
     assert "notifications | send | failed" in shown
-    assert "RuntimeError: Нет подключения" in shown
+    assert "RuntimeError" in shown
+    assert "Нет подключения" not in shown
 
     assert journal_cli.main(["summary", "--hours", "1"]) == 0
     summary = capsys.readouterr().out

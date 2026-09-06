@@ -57,6 +57,16 @@ class BackupWorker:
         thread = self._thread
         if thread is not None and thread.is_alive():
             thread.join(timeout_seconds)
+        if thread is not None and thread.is_alive():
+            self._journal.record(
+                "backups",
+                "worker.lifecycle",
+                status="blocked",
+                level="WARNING",
+                action="stop",
+                reason="WORKER_STOP_TIMEOUT",
+            )
+            return
         self._thread = None
         self._journal.record(
             "backups",

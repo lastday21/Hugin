@@ -6,6 +6,8 @@ import re
 import threading
 import traceback
 from collections.abc import Callable, Iterable, Iterator, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from time import monotonic
@@ -20,12 +22,54 @@ _SENSITIVE_KEY = re.compile(
 _TELEGRAM_TOKEN = re.compile(r"\b\d{5,20}:[A-Za-z0-9_-]{20,100}\b")
 _AUTHORIZATION = re.compile(r"\b(?:Api-Key|Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+", re.IGNORECASE)
 _SECRET_ASSIGNMENT = re.compile(
-    r"(?i)\b(api[_-]?key|authorization|cookie|password|secret|token)\b(\s*[:=]\s*)([^\s,;]+)"
+    r"(?i)([\"']?\b(?:api[_-]?key|authorization|cookie|password|secret|token)\b[\"']?)"
+    r"(\s*[:=]\s*)(?:\"(?:\\.|[^\"\\\n])*(?:\"|(?=\n|$))|"
+    r"'(?:\\.|[^'\\\n])*(?:'|(?=\n|$))|[^\s,;&#]+)"
 )
-_URL_SECRET = re.compile(r"(?i)([?&](?:code|key|password|secret|start|token)=)[^&#\s]+")
+_URL_SECRET = re.compile(
+    r"(?i)([?&](?:code|key|password|secret|start|token|api[_-]?key|"
+    r"(?:access|refresh|id)[_-]?token|client[_-]?secret|session[_-]?(?:id|key))=)[^&#\s]+"
+)
+_URL_CREDENTIALS = re.compile(r"(?i)(\b[a-z][a-z0-9+.-]*://)[^/\s:@]*:[^/\s]+@")
 _MAX_TEXT = 8_000
 _MAX_ITEMS = 100
+_TOKEN_COUNTS = frozenset(
+    {"input_tokens", "cached_input_tokens", "output_tokens", "reasoning_tokens", "total_tokens"}
+)
+_SOURCE_TEXT_KEYS = frozenset(
+    {
+        "error_message",
+        "traceback",
+        "result_message",
+        "text",
+        "body",
+        "content",
+        "description",
+        "title",
+        "stdout",
+        "stderr",
+        "prompt",
+        "user_prompt",
+        "system_prompt",
+        "response_text",
+        "answer",
+        "question",
+        "resume_content",
+        "letter_text",
+        "cover_letter",
+    }
+)
 _WRITE_LOCK = threading.RLock()
+_OPERATION: ContextVar[dict[str, object] | None] = ContextVar("journal_operation", default=None)
+
+
+@contextmanager
+def operation_context(**identifiers: object) -> Iterator[None]:
+    token = _OPERATION.set({**(_OPERATION.get() or {}), **identifiers})
+    try:
+        yield
+    finally:
+        _OPERATION.reset(token)
 
 
 def _utc_now() -> datetime:
@@ -40,17 +84,32 @@ def _clean_label(value: str, *, maximum: int) -> str:
 
 
 def _redact_text(value: str) -> str:
-    selected = _TELEGRAM_TOKEN.sub("***", value)
+    selected = _URL_CREDENTIALS.sub(r"\1***@", value)
+    selected = _TELEGRAM_TOKEN.sub("***", selected)
     selected = _AUTHORIZATION.sub("***", selected)
+    selected = _URL_SECRET.sub(lambda match: f"{match.group(1)}***", selected)
     selected = _SECRET_ASSIGNMENT.sub(
         lambda match: f"{match.group(1)}{match.group(2)}***",
         selected,
     )
-    selected = _URL_SECRET.sub(lambda match: f"{match.group(1)}***", selected)
     return selected[:_MAX_TEXT]
 
 
 def _safe_value(value: object, *, key: str = "", depth: int = 0) -> object:
+    if key in _SOURCE_TEXT_KEYS and value is not None:
+        from hugin.services.decision_evidence import fingerprint
+
+        text = _redact_text(str(value))
+        return {"characters": len(text), "sha256": fingerprint(text)}
+    if key == "token_usage_available" and isinstance(value, bool):
+        return value
+    if (
+        key in _TOKEN_COUNTS
+        and isinstance(value, int)
+        and not isinstance(value, bool)
+        and value >= 0
+    ):
+        return value
     if _SENSITIVE_KEY.search(key):
         return "***"
     if depth >= 6:
@@ -121,6 +180,44 @@ class OperationJournal:
     def log_dir(self) -> Path:
         return self._log_dir
 
+    def save_evidence(self, run_id: str, stage: str, payload: Mapping[str, object]) -> bool:
+        from hugin.services.decision_evidence import fingerprint, source_fingerprint
+
+        if re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", run_id) is None or stage not in {
+            "request",
+            "response",
+            "failure",
+        }:
+            raise ValueError("Invalid evidence identifier")
+        record = {
+            "schema_version": 1,
+            "run_id": run_id,
+            "stage": stage,
+            "captured_at": self._clock().astimezone(UTC).isoformat(),
+            "source_sha256": source_fingerprint(),
+            "payload": dict(payload),
+        }
+        record["sha256"] = fingerprint(record)
+        directory = self._log_dir.parent / "evidence" / "models"
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            descriptor = os.open(
+                directory / f"{run_id}-{stage}.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+            )
+            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                json.dump(record, stream, ensure_ascii=False)
+        except OSError as error:
+            self.record(
+                "diagnostics",
+                "evidence.write",
+                status="failed",
+                run_id=run_id,
+                stage=stage,
+                error_type=type(error).__name__,
+            )
+            return False
+        return True
+
     def start(
         self,
         component: str,
@@ -131,6 +228,7 @@ class OperationJournal:
         **details: object,
     ) -> JournalRun:
         selected_run_id = run_id or uuid4().hex
+        details = {**(_OPERATION.get() or {}), **details}
         started_at = self._timer()
         self.record(
             component,
@@ -146,6 +244,7 @@ class OperationJournal:
             event,
             selected_run_id,
             started_at,
+            details,
         )
 
     def record(
@@ -158,8 +257,12 @@ class OperationJournal:
         run_id: str | None = None,
         **details: object,
     ) -> bool:
+        from hugin.services.decision_evidence import source_fingerprint
+
         timestamp = self._clock().astimezone(UTC)
         payload: dict[str, object] = {
+            "schema_version": 1,
+            "source_sha256": source_fingerprint(),
             "timestamp": timestamp.isoformat(),
             "level": _clean_label(level.upper(), maximum=16),
             "component": _clean_label(component, maximum=64),
@@ -170,7 +273,7 @@ class OperationJournal:
         }
         if run_id:
             payload["run_id"] = _clean_label(run_id, maximum=64)
-        safe_details = _safe_value(details)
+        safe_details = _safe_value({**(_OPERATION.get() or {}), **details})
         if isinstance(safe_details, dict) and safe_details:
             payload["details"] = safe_details
         try:
@@ -195,7 +298,10 @@ class OperationJournal:
             matched = _FILE_NAME.fullmatch(path.name)
             if not matched or not path.is_file():
                 continue
-            file_day = date.fromisoformat(matched.group("day"))
+            try:
+                file_day = date.fromisoformat(matched.group("day"))
+            except ValueError:
+                continue
             if file_day >= threshold:
                 continue
             resolved_path = path.resolve()
@@ -211,6 +317,7 @@ class OperationJournal:
         since: datetime | None = None,
         component: str | None = None,
         status: str | None = None,
+        issues: list[dict[str, Any]] | None = None,
     ) -> Iterator[dict[str, Any]]:
         if not self._log_dir.is_dir():
             return
@@ -219,15 +326,27 @@ class OperationJournal:
             if not _FILE_NAME.fullmatch(path.name):
                 continue
             try:
-                lines = path.read_text(encoding="utf-8").splitlines()
+                lines = path.read_text(encoding="utf-8", errors="replace").split("\n")
             except OSError:
+                if issues is not None:
+                    issues.append({"file": path.name, "reason": "unreadable"})
                 continue
-            for line in lines:
+            for line_number, line in enumerate(lines, 1):
+                if not line.strip():
+                    continue
                 try:
                     entry = json.loads(line)
                 except json.JSONDecodeError:
+                    if issues is not None:
+                        issues.append(
+                            {"file": path.name, "line": line_number, "reason": "invalid_json"}
+                        )
                     continue
                 if not isinstance(entry, dict):
+                    if issues is not None:
+                        issues.append(
+                            {"file": path.name, "line": line_number, "reason": "invalid_record"}
+                        )
                     continue
                 if component is not None and entry.get("component") != component:
                     continue
@@ -239,7 +358,7 @@ class OperationJournal:
                         continue
                     try:
                         occurred_at = datetime.fromisoformat(timestamp).astimezone(UTC)
-                    except ValueError:
+                    except (ValueError, OverflowError):
                         continue
                     if occurred_at < selected_since:
                         continue
@@ -264,6 +383,26 @@ class OperationJournal:
         if self._last_pruned_on == today:
             return
         self.prune(now=datetime.combine(today, datetime.min.time(), tzinfo=UTC))
+        directory = self._log_dir.parent / "evidence" / "models"
+        if directory.is_dir():
+            threshold = datetime.combine(today, datetime.min.time(), tzinfo=UTC) - timedelta(
+                days=self._retention_days
+            )
+            resolved = directory.resolve()
+            for path in directory.iterdir():
+                if (
+                    re.fullmatch(
+                        r"[a-zA-Z0-9_-]{1,64}-(?:request|response|failure)\.json", path.name
+                    )
+                    is None
+                ):
+                    continue
+                if (
+                    path.is_file()
+                    and path.resolve().parent == resolved
+                    and path.stat().st_mtime < threshold.timestamp()
+                ):
+                    path.unlink()
         self._last_pruned_on = today
 
 
@@ -275,6 +414,7 @@ class JournalRun:
         event: str,
         run_id: str,
         started_at: float,
+        details: Mapping[str, object] | None = None,
     ) -> None:
         self._journal = journal
         self._component = component
@@ -282,10 +422,55 @@ class JournalRun:
         self._run_id = run_id
         self._started_at = started_at
         self._finished = False
+        self._details = {
+            key: value for key, value in (details or {}).items() if key != "model_calls"
+        }
 
     @property
     def run_id(self) -> str:
         return self._run_id
+
+    @contextmanager
+    def step(self, name: str, **details: object) -> Iterator[JournalRun]:
+        child = self._journal.start(
+            self._component,
+            name,
+            run_id=None,
+            level="INFO",
+            **{
+                **self._details,
+                "parent_run_id": self._run_id,
+                "step_name": name,
+                "required_steps": [],
+                **details,
+            },
+        )
+        try:
+            identifiers = {
+                key: value
+                for key, value in self._details.items()
+                if key
+                in {
+                    "account_id",
+                    "application_id",
+                    "task_id",
+                    "attempt_number",
+                    "job_key",
+                    "job_kind",
+                }
+            }
+            with operation_context(**identifiers, parent_run_id=child.run_id):
+                yield child
+        except Exception as error:
+            child.fail(error)
+            raise
+        else:
+            child.succeed()
+
+    def save_evidence(self, stage: str, **payload: object) -> bool:
+        saved = self._journal.save_evidence(self._run_id, stage, payload)
+        self._details[f"{stage}_evidence_saved"] = saved
+        return saved
 
     def succeed(self, **details: object) -> None:
         self._finish("completed", "INFO", details)
@@ -297,7 +482,10 @@ class JournalRun:
         self._finish("blocked", "WARNING", details)
 
     def fail(self, error: BaseException, **details: object) -> None:
+        if self._finished:
+            return
         selected = {**details, **error_details(error)}
+        self.save_evidence("failure", **selected)
         self._finish("failed", "ERROR", selected)
 
     def _finish(self, status: str, level: str, details: Mapping[str, object]) -> None:
@@ -311,6 +499,5 @@ class JournalRun:
             status=status,
             level=level,
             run_id=self._run_id,
-            duration_ms=duration_ms,
-            **details,
+            **{**self._details, **details, "duration_ms": duration_ms},
         )

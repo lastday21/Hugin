@@ -60,8 +60,17 @@ def background_browser_access(
     timeout_seconds: float,
     message: str,
     retry_after_seconds: int,
+    journal: OperationJournal | None = None,
 ) -> Iterator[None]:
-    if not browser_lock.acquire(timeout=timeout_seconds):
+    run = (
+        journal.start("automation", "browser.wait", timing_kind="wait", reason="BROWSER_BUSY")
+        if journal
+        else None
+    )
+    acquired = browser_lock.acquire(timeout=timeout_seconds)
+    if run is not None:
+        run.succeed(acquired=acquired)
+    if not acquired:
         raise AutomationJobDeferred(
             "BROWSER_PROFILE_BUSY",
             message,
@@ -220,6 +229,7 @@ class AutomationWorker:
                 search_query_id=job.search_query_id,
                 interval_seconds=job.interval_seconds,
                 previous_failures=job.consecutive_failures,
+                required_steps=["execute"] if job.kind in self._handlers else [],
             )
             handler = self._handlers.get(job.kind)
             if handler is None:
@@ -234,7 +244,8 @@ class AutomationWorker:
                 return True
 
             try:
-                result = self._run_handler(job, handler)
+                with run.step("execute"):
+                    result = self._run_handler(job, handler)
             except AutomationJobDeferred as error:
                 deferred_result: AutomationJobResult = {
                     **job.last_result,
