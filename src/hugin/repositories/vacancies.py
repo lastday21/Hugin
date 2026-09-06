@@ -354,6 +354,30 @@ class VacancyRepository:
         self._session.flush()
         return _to_record(model)
 
+    def unlink_duplicate(
+        self, vacancy_id: int, *, reason: str, rules_version: str
+    ) -> VacancyRecord:
+        model = self._session.get(VacancyModel, vacancy_id)
+        if model is None:
+            raise LookupError("vacancy was not found")
+        if model.duplicate_of_id is None:
+            return _to_record(model)
+        previous = model.duplicate_of_id
+        model.duplicate_of_id = None
+        self._session.add(
+            VacancyChangeModel(
+                vacancy_id=model.id,
+                event_type="DUPLICATE_UNLINKED",
+                changes={
+                    "duplicate_of_id": {"before": previous, "after": None},
+                    "reason": reason,
+                    "rules_version": rules_version,
+                },
+            )
+        )
+        self._session.flush()
+        return _to_record(model)
+
     def duplicate_family_ids(self, vacancy_id: int) -> tuple[int, ...]:
         model = self._session.get(VacancyModel, vacancy_id)
         if model is None:
@@ -376,6 +400,8 @@ class VacancyRepository:
         self,
         account_id: int,
         vacancy_id: int,
+        *,
+        exclude_application_id: int | None = None,
     ) -> bool:
         family_ids = self.duplicate_family_ids(vacancy_id)
         live_task_states = (
@@ -401,6 +427,7 @@ class VacancyRepository:
                 )
                 .where(
                     ApplicationModel.account_id == account_id,
+                    ApplicationModel.id != exclude_application_id,
                     ApplicationModel.vacancy_id.in_(family_ids),
                     or_(
                         ApplicationModel.state.in_(sent_states),
@@ -453,6 +480,7 @@ class VacancyRepository:
         models = self._session.scalars(
             select(VacancyChangeModel)
             .where(VacancyChangeModel.vacancy_id == vacancy_id)
+            .where(VacancyChangeModel.event_type != "RULES_EVALUATED")
             .order_by(VacancyChangeModel.created_at, VacancyChangeModel.id)
         )
         return [_change_record(model) for model in models]

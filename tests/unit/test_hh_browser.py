@@ -19,6 +19,7 @@ from playwright.sync_api import Error, Frame, Locator, Page, Response, TimeoutEr
 
 from hugin.adapters import hh_browser as browser_module
 from hugin.adapters.hh_browser import VisibleHhBrowser
+from hugin.diagnostics import OperationJournal
 from hugin.domain.communications import MessageSendFailureCode, MessageSendOutcome
 from hugin.domain.content import MessageDirection
 from hugin.domain.hh import (
@@ -1270,7 +1271,16 @@ def test_recruiter_messages_open_negotiations_once_for_all_chats(
     close = FakeLocator()
     page.locators['[data-qa="chatik-close-chatik"]'] = close
 
-    result = make_browser(page, tmp_path).read_recruiter_messages(("101", "202"))
+    browser = make_browser(page, tmp_path)
+    browser._journal = OperationJournal(tmp_path)
+    result = browser.read_recruiter_messages(("101", "202"))
+    rows = list(browser._journal.entries())
+    assert [(row["details"].get("vacancy_id"), row["status"]) for row in rows] == [
+        ("101", "started"),
+        ("101", "completed"),
+        ("202", "started"),
+        ("202", "completed"),
+    ]
 
     assert [message.vacancy_id for message in result.messages] == ["101", "202"]
     assert page.goto_calls == [("https://hh.ru/applicant/negotiations", "domcontentloaded")]
@@ -1516,7 +1526,11 @@ def test_recruiter_message_read_fails_if_advertised_chat_does_not_open(
     ]
     page.opened_chat = False
 
-    result = make_browser(page, tmp_path).read_recruiter_messages(("101",))
+    browser = make_browser(page, tmp_path)
+    browser._journal = OperationJournal(tmp_path)
+    result = browser.read_recruiter_messages(("101",))
+    rows = [row for row in browser._journal.entries() if row["event"] == "chat.read"]
+    assert [row["status"] for row in rows] == ["started", "failed"]
 
     assert result.messages == ()
     assert [(failure.vacancy_id, failure.code) for failure in result.failures] == [

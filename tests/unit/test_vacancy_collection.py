@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
 
@@ -8,9 +9,15 @@ from sqlalchemy import func, select
 
 from hugin.core.settings import Settings
 from hugin.database import create_database, upgrade_database
-from hugin.database.models import ApplicationModel, DirectionVacancyModel
+from hugin.database.models import (
+    ApplicationModel,
+    CandidateProfileModel,
+    DirectionVacancyModel,
+    VerifiedFactModel,
+)
 from hugin.domain import VacancyAvailability, VacancyData, VacancyState
 from hugin.domain.applications import ApplicationState
+from hugin.domain.content import ConfirmationState
 from hugin.domain.directions import DirectionScope
 from hugin.repositories import (
     AccountRepository,
@@ -56,6 +63,93 @@ def detailed_vacancy(
     )
 
 
+@pytest.mark.parametrize("sent_on", [None, "root", "member"])
+def test_reanalysis_separates_wrong_duplicate_family_and_preserves_real_send_history(
+    settings: Settings, sent_on: str | None
+) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    try:
+        with database.sessions.begin() as session:
+            account = AccountRepository(session).create("Тест", "wrong-family")
+            assert account.external_id is not None
+            resume = ResumeRepository(session).upsert(account.id, "family-resume", "Python")
+            directions = DirectionRepository(session)
+            direction = directions.create(account.id, "Python backend")
+            directions.attach_resume(direction.id, resume.id)
+            repository = VacancyRepository(session)
+            root = repository.upsert(
+                replace(
+                    detailed_vacancy("java-root", "Java-разработчик"),
+                    description="Обязанности:\nРазрабатывать API на Java и Spring.",
+                    responsibilities="Конкурентная зарплата.",
+                    required_qualifications="Java, Spring",
+                )
+            )
+            first = repository.upsert(detailed_vacancy("python-first", "Python-разработчик"))
+            second = repository.upsert(detailed_vacancy("python-second", "Python-разработчик"))
+            for member in (root, first, second):
+                directions.track_vacancy(direction.id, member.id)
+            for member in (first, second):
+                repository.mark_duplicate(member.id, root.id, 0.99)
+            sent = None
+            if sent_on:
+                sent = ApplicationRepository(session).create_apply_intent(
+                    account_id=account.id,
+                    vacancy_id=root.id if sent_on == "root" else first.id,
+                    direction_id=direction.id,
+                    resume_id=resume.id,
+                )
+                model = session.get(ApplicationModel, sent.id)
+                assert model is not None
+                model.state = ApplicationState.APPLIED
+                session.flush()
+            service = VacancyAnalysisService(session)
+            results = service.reanalyze(
+                account_external_id=account.external_id,
+                direction_name=direction.name,
+            )
+            eligible = [item for item in results if item.evaluation.accepted]
+            assert len(eligible) == 1
+            assert eligible[0].vacancy.id in {first.id, second.id}
+            assert repository.duplicate_family_ids(first.id) == (first.id, second.id)
+            assert repository.duplicate_family_ids(root.id) == (root.id,)
+            for member in (first, second):
+                changes = [
+                    change
+                    for change in repository.list_changes(member.id)
+                    if change.event_type == "DUPLICATE_UNLINKED"
+                ]
+                assert len(changes) == 1
+                assert changes[0].changes["duplicate_of_id"] == {"before": root.id, "after": None}
+                assert changes[0].changes["rules_version"] == RULES_VERSION
+            before = {
+                member.id: repository.list_changes(member.id) for member in (root, first, second)
+            }
+            service.reanalyze(
+                account_external_id=account.external_id, direction_name=direction.name
+            )
+            assert before == {
+                member.id: repository.list_changes(member.id) for member in (root, first, second)
+            }
+            if sent is not None:
+                restored = session.get(ApplicationModel, sent.id)
+                assert restored is not None
+                assert restored.state is ApplicationState.APPLIED
+                assert restored.vacancy_id == sent.vacancy_id
+            assert repository.duplicate_family_has_sent_or_live_application(
+                account.id, first.id
+            ) is (sent_on == "member")
+            prepared = ApplicationAutomationService(session).prepare_for_account_id(
+                account_id=account.id,
+                direction_name=direction.name,
+                include_stretch=False,
+            )
+            assert prepared.created == (0 if sent_on == "member" else 1)
+    finally:
+        database.close()
+
+
 def test_collection_tracks_changes_discoveries_duplicates_and_rejected(
     settings: Settings,
 ) -> None:
@@ -77,11 +171,15 @@ def test_collection_tracks_changes_discoveries_duplicates_and_rejected(
                 vacancies=(
                     detailed_vacancy("100", "Python backend разработчик"),
                     detailed_vacancy("101", "Python backend-разработчик"),
-                    detailed_vacancy(
-                        "102",
-                        "Продуктовый аналитик",
-                        employer="Другая компания",
-                        description="Требования\nPython и SQL для продуктовой аналитики.",
+                    replace(
+                        detailed_vacancy(
+                            "102",
+                            "Продуктовый аналитик",
+                            employer="Другая компания",
+                            description="Требования\nPython и SQL для продуктовой аналитики.",
+                        ),
+                        responsibilities=None,
+                        required_qualifications="Python и SQL для продуктовой аналитики.",
                     ),
                 ),
             )
@@ -230,6 +328,85 @@ def test_review_can_accept_queued_stretch_vacancy(settings: Settings) -> None:
         database.close()
 
 
+def test_manual_acceptance_recalculates_priority_after_vacancy_and_profile_changes(
+    settings: Settings,
+) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    try:
+        with database.sessions.begin() as session:
+            account = AccountRepository(session).create("Тест", "manual-priority")
+            resume = ResumeRepository(session).upsert(account.id, "manual-resume", "Python")
+            profile = CandidateProfileModel(
+                account_id=account.id, active_resume_id=resume.id, display_name="Тест"
+            )
+            session.add(profile)
+            session.flush()
+            fact = VerifiedFactModel(
+                profile_id=profile.id,
+                resume_id=resume.id,
+                category="skills",
+                content="Python, FastAPI, PostgreSQL, Docker",
+                source_type="manual",
+                state=ConfirmationState.CONFIRMED,
+            )
+            session.add(fact)
+            directions = DirectionRepository(session)
+            direction = directions.create(account.id, "Python backend")
+            data = detailed_vacancy("manual-priority", "Python backend разработчик")
+            vacancy = VacancyRepository(session).upsert(data)
+            directions.track_vacancy(direction.id, vacancy.id)
+            directions.apply_rules(
+                direction.id,
+                vacancy.id,
+                state=VacancyState.QUEUED,
+                score=1,
+                details={
+                    "accepted": True,
+                    "category": "MATCH",
+                    "manual_override": "ACCEPT",
+                    "fit_tier": 3,
+                    "fit_reason": "старое объяснение",
+                    "matched_capabilities": ["old"],
+                    "experience_priority": 1,
+                    "location_priority": 1,
+                },
+                rules_version=RULES_VERSION,
+            )
+            service = VacancyAnalysisService(session)
+
+            def recheck(changed: VacancyData, tier: int) -> None:
+                (result,) = service.synchronize(
+                    account_external_id="manual-priority",
+                    direction_name=direction.name,
+                    vacancies=(changed,),
+                )
+                assert result.evaluation.category is RuleCategory.MATCH
+                assert result.state is VacancyState.QUEUED
+                assert result.evaluation.fit is not None
+                assert result.evaluation.fit.tier == tier
+                tracked = directions.get_tracked_vacancy(direction.id, vacancy.id)
+                assert tracked.rules_details["manual_override"] == "ACCEPT"
+                assert tracked.rules_details["fit_tier"] == tier
+                assert tracked.rules_details["fit_reason"] == result.evaluation.fit.reason
+                assert tracked.rules_details["matched_capabilities"] == list(
+                    result.evaluation.fit.matched_capabilities
+                )
+                assert tracked.rules_score == result.evaluation.score > 1
+                assert tracked.rules_details["experience_priority"] != 1
+                assert tracked.rules_details["location_priority"] != 1
+                assert result.evaluation.reasons.count("решение изменено пользователем") == 1
+
+            recheck(data, 1)
+            recheck(replace(data, experience="От 3 до 6 лет"), 2)
+            fact.state = ConfirmationState.PENDING
+            session.flush()
+            recheck(data, 3)
+            recheck(replace(data, required_qualifications="Обязателен опыт разработки на Java."), 3)
+    finally:
+        database.close()
+
+
 def test_exact_body_repost_with_changed_title_is_not_queued_twice(
     settings: Settings,
 ) -> None:
@@ -261,7 +438,7 @@ def test_exact_body_repost_with_changed_title_is_not_queued_twice(
             prepared = ApplicationAutomationService(session).prepare(
                 account_external_id=account.external_id,
                 direction_name=direction.name,
-                include_stretch=False,
+                include_stretch=True,
             )
             assert prepared.created == 1
             assert session.scalar(select(func.count(ApplicationModel.id))) == 1

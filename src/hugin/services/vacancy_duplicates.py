@@ -6,6 +6,35 @@ from decimal import Decimal
 from difflib import SequenceMatcher
 
 from hugin.domain.vacancies import VacancyRecord
+from hugin.services.requirement_sections import (
+    RequirementKind,
+    mandatory_text,
+    primary_duties,
+    requirement_sections,
+)
+
+_LANGUAGES = {
+    "python": r"\bpython\b",
+    "java": r"\bjava\b",
+    "javascript": r"\b(?:javascript|typescript|node\.?js)\b",
+    "go": r"\b(?:go|golang)\b",
+    "php": r"\bphp\b",
+    "ruby": r"\bruby\b",
+    "rust": r"\brust\b",
+    "scala": r"\bscala\b",
+    "cpp": r"(?<!\w)[cс]\+\+(?!\w)",
+    "csharp": r"(?<!\w)c#(?!\w)",
+    "c": r"(?<!\w)c(?![\w+#])",
+    "1c": r"(?<!\w)1[сc](?!\w)",
+}
+_PROFESSIONS = (
+    ("teaching", r"преподавател|наставник|учитель|\binstructor\b"),
+    ("testing", r"тестиров|тестирован|\b(?:qa|aqa|sdet)\b|автотест"),
+    ("operations", r"\b(?:devops|sre|администратор)\b|инженер инфраструктуры"),
+    ("analysis", r"аналитик|\banalyst\b"),
+    ("support", r"поддержк|сопровожден|\bsupport\b"),
+    ("development", r"разработ|программист|\bdeveloper\b|software engineer"),
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -15,6 +44,19 @@ class DuplicateMatch:
 
 
 class VacancyDuplicateDetector:
+    def conflict_reason(self, left: VacancyRecord, right: VacancyRecord) -> str | None:
+        left_employer = self._normalized(left.employer_name)
+        right_employer = self._normalized(right.employer_name)
+        if left_employer and right_employer and left_employer != right_employer:
+            return "different_employers"
+        if not self._compatible_profession(left, right):
+            return "different_profession_or_required_language"
+        left_duties = primary_duties(left.description, left.responsibilities)
+        right_duties = primary_duties(right.description, right.responsibilities)
+        if left_duties and right_duties and self._text_similarity(left_duties, right_duties) < 0.78:
+            return "different_responsibilities"
+        return None
+
     def find(
         self,
         vacancy: VacancyRecord,
@@ -31,9 +73,11 @@ class VacancyDuplicateDetector:
     def _similarity(self, left: VacancyRecord, right: VacancyRecord) -> float | None:
         if self._normalized(left.employer_name) != self._normalized(right.employer_name):
             return None
+        if not self._compatible_profession(left, right):
+            return None
         title = self._text_similarity(left.title, right.title)
-        left_body = left.responsibilities or left.description or ""
-        right_body = right.responsibilities or right.description or ""
+        left_body = primary_duties(left.description, left.responsibilities)
+        right_body = primary_duties(right.description, right.responsibilities)
         body = self._text_similarity(left_body, right_body)
         if not self._salary_compatible(left, right):
             return None
@@ -44,6 +88,58 @@ class VacancyDuplicateDetector:
             return None
         combined = title * 0.35 + body * 0.5 + salary * 0.15
         return combined if combined >= 0.82 else None
+
+    @staticmethod
+    def _compatible_profession(left: VacancyRecord, right: VacancyRecord) -> bool:
+        def profession(vacancy: VacancyRecord) -> str | None:
+            return next(
+                (name for name, pattern in _PROFESSIONS if re.search(pattern, vacancy.title, re.I)),
+                None,
+            )
+
+        left_profession, right_profession = profession(left), profession(right)
+        if left_profession and right_profession and left_profession != right_profession:
+            return False
+
+        def languages(text: str) -> set[str]:
+            return {name for name, pattern in _LANGUAGES.items() if re.search(pattern, text, re.I)}
+
+        left_title, right_title = languages(left.title), languages(right.title)
+        if left_title and right_title and not left_title & right_title:
+            return False
+
+        def requirements(vacancy: VacancyRecord) -> tuple[set[str], list[set[str]]]:
+            required: set[str] = set()
+            alternatives: list[set[str]] = []
+            for text, unlabelled in (
+                (vacancy.required_qualifications or "", True),
+                (vacancy.description or "", False),
+            ):
+                for section in requirement_sections(text):
+                    if section.kind is not RequirementKind.REQUIRED and not (
+                        unlabelled and section.kind is RequirementKind.UNLABELLED
+                    ):
+                        continue
+                    for clause in re.split(r"[\n;]+|(?<=[.!?])\s+", section.text):
+                        clause = mandatory_text(clause, include_unlabelled=True)
+                        found = languages(clause)
+                        choice = re.search(r"\b(?:одном|одного|один|любом|любого)\s+из\b", clause)
+                        if choice and not languages(clause[: choice.start()]):
+                            if found:
+                                alternatives.append(found)
+                        else:
+                            required.update(found)
+            return required, alternatives
+
+        left_required, left_options = requirements(left)
+        right_required, right_options = requirements(right)
+        if left_required and right_required and left_required != right_required:
+            return False
+        if any(left_required and not left_required & option for option in right_options):
+            return False
+        if any(right_required and not right_required & option for option in left_options):
+            return False
+        return all(a & b for a in left_options for b in right_options)
 
     @staticmethod
     def _normalized(value: str | None) -> str:

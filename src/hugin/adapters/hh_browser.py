@@ -22,6 +22,9 @@ from types import TracebackType
 from typing import BinaryIO
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
+from hugin.diagnostics import OperationJournal
+from hugin.domain.screening_questions import sensitive_question_text
+
 if sys.platform == "win32":
     import msvcrt
 else:
@@ -82,6 +85,7 @@ from hugin.domain.vacancies import (
     VacancyUnavailableError,
 )
 from hugin.services.hh_login import HhCredentials, LoginStatus
+from hugin.services.requirement_sections import description_sections
 
 _PROFILE_LOCK_FILENAME = ".hugin-browser.lock"
 _PROFILE_LOCK_TIMEOUT_SECONDS = 180.0
@@ -1215,6 +1219,7 @@ CHAT_MESSAGES_SCRIPT = """
         vacancyId,
         messageId: qa.replace('chatik-chat-message-', ''),
         direction: own ? 'OUTGOING' : 'INCOMING',
+        directionInferred: !own,
         body: (
             message.querySelector('[data-qa="chat-bubble-text"]')?.textContent || ''
         ).trim(),
@@ -1601,8 +1606,10 @@ class VisibleHhBrowser:
         start_minimized: bool = False,
         browser_source_ip: str | None = None,
         profile_lock_timeout_seconds: float | None = None,
+        journal: OperationJournal | None = None,
     ) -> None:
         self._profile_dir = profile_dir
+        self._journal = journal
         self._login_url = login_url
         self._resumes_url = resumes_url
         self._search_url = search_url
@@ -2044,9 +2051,13 @@ class VisibleHhBrowser:
                 if vacancy_id not in selected_ids or vacancy_id in read_ids:
                     continue
                 read_ids.add(vacancy_id)
+                journal = getattr(self, "_journal", None)
+                run = journal.start("hh", "chat.read", vacancy_id=vacancy_id) if journal else None
                 try:
                     messages.extend(self._read_recruiter_chat(page, vacancy_id))
                 except _HhChatReadError as error:
+                    if run is not None:
+                        run.fail(error)
                     failures.append(
                         HhChatReadFailure(
                             vacancy_id=vacancy_id,
@@ -2054,6 +2065,13 @@ class VisibleHhBrowser:
                             message=str(error),
                         )
                     )
+                except Exception as error:
+                    if run is not None:
+                        run.fail(error)
+                    raise
+                else:
+                    if run is not None:
+                        run.succeed()
         return HhRecruiterMessagesReadResult(
             messages=tuple(messages),
             failures=tuple(failures),
@@ -2122,6 +2140,10 @@ class VisibleHhBrowser:
                         direction=direction,
                         body=self._required_string(item, "body", "текста сообщения"),
                         displayed_time=self._optional_string(item, "displayedTime"),
+                        direction_inferred=(
+                            direction is MessageDirection.INCOMING
+                            and item.get("directionInferred") is not False
+                        ),
                     )
                 )
         except (HhSyncBlockedError, HhSyncRetryableError):
@@ -2509,22 +2531,34 @@ class VisibleHhBrowser:
                 "Перед нажатием кнопка отправки исчезла или стала недоступна",
                 warnings=ready.warnings,
             )
-        try:
-            submission_allowed = submit_guard()
-        except Exception as error:
+
+        def permission_error(*, request_intercepted: bool = False) -> HhApplyResult | None:
+            try:
+                submission_allowed = submit_guard()
+            except Exception as error:
+                return HhApplyResult(
+                    HhApplyStatus.UNKNOWN_RESULT
+                    if attempt.started
+                    else HhApplyStatus.RETRYABLE_ERROR,
+                    page.url,
+                    f"Не удалось повторно проверить данные перед отправкой: {type(error).__name__}",
+                    warnings=ready.warnings,
+                )
+            if submission_allowed:
+                return None
+            action = "запрос заблокирован" if request_intercepted else "кнопка не нажата"
             return HhApplyResult(
-                HhApplyStatus.RETRYABLE_ERROR,
+                HhApplyStatus.UNKNOWN_RESULT
+                if attempt.started
+                else HhApplyStatus.MANUAL_REVIEW_REQUIRED,
                 page.url,
-                (f"Не удалось повторно проверить данные перед отправкой: {type(error).__name__}"),
+                f"Перед отправкой изменились проверенные данные; {action}",
                 warnings=ready.warnings,
             )
-        if not submission_allowed:
-            return HhApplyResult(
-                HhApplyStatus.MANUAL_REVIEW_REQUIRED,
-                page.url,
-                "Перед отправкой изменились проверенные данные; кнопка не нажата",
-                warnings=ready.warnings,
-            )
+
+        guard_error = permission_error()
+        if guard_error is not None:
+            return guard_error
 
         parsed = urlparse(self._resumes_url)
         response: Response | None = None
@@ -2547,10 +2581,14 @@ class VisibleHhBrowser:
         )
         if click_ready_error is not None:
             return click_ready_error
+        guard_error = permission_error()
+        if guard_error is not None:
+            return guard_error
 
         route_pattern = "**/*vacancy_response*"
 
         def guard_submission_request(route: Route, request: Request) -> None:
+            nonlocal guard_error
             if not self._is_application_submission_request(request):
                 route.continue_()
                 return
@@ -2559,6 +2597,10 @@ class VisibleHhBrowser:
                 expected_vacancy_id=vacancy_id,
                 expected_resume_hh_id=expected_resume_hh_id,
             ):
+                guard_error = permission_error(request_intercepted=True)
+                if guard_error is not None:
+                    route.abort("blockedbyclient")
+                    return
                 attempt.started = True
                 route.continue_()
                 return
@@ -2590,6 +2632,8 @@ class VisibleHhBrowser:
             except PlaywrightTimeoutError:
                 pass
             except PlaywrightError as error:
+                if guard_error is not None:
+                    return guard_error
                 return HhApplyResult(
                     HhApplyStatus.UNKNOWN_RESULT,
                     page.url,
@@ -2600,7 +2644,9 @@ class VisibleHhBrowser:
             with suppress(PlaywrightError):
                 page.unroute(route_pattern, guard_submission_request)
 
-        if attempt.blocked:
+        if guard_error is not None and not attempt.started:
+            return guard_error
+        if attempt.blocked and not attempt.started:
             return HhApplyResult(
                 HhApplyStatus.MANUAL_REVIEW_REQUIRED,
                 page.url,
@@ -2640,10 +2686,18 @@ class VisibleHhBrowser:
                     screening_submission.version_hash if screening_submission is not None else None
                 ),
             )
+        if guard_error is not None:
+            return guard_error
+        unknown_confirmation = "Кнопка нажата один раз, но hh.ru не подтвердил результат"
+        if attempt.blocked:
+            unknown_confirmation = (
+                "Первый запрос отправлен без подтверждённого результата; "
+                "следующий запрос с другими номерами вакансии или резюме заблокирован"
+            )
         return HhApplyResult(
             HhApplyStatus.UNKNOWN_RESULT,
             page.url,
-            "Кнопка нажата один раз, но hh.ru не подтвердил результат",
+            unknown_confirmation,
             warnings=initial.warnings,
             screening_form_version_hash=(
                 screening_submission.version_hash if screening_submission is not None else None
@@ -2738,7 +2792,7 @@ class VisibleHhBrowser:
                 field.has_attachment
                 or field.has_external_action
                 or field.has_test_assignment
-                or _DANGEROUS_SCREENING_QUESTION.search(field.question)
+                or _DANGEROUS_SCREENING_QUESTION.search(sensitive_question_text(field.question))
                 for field in form.fields
             )
         )
@@ -3569,34 +3623,29 @@ class VisibleHhBrowser:
 
     def _application_confirmation(
         self,
-        page: Page,
+        _page: Page,
         response: Response | None,
     ) -> str:
-        body_text = ""
-        with suppress(PlaywrightError):
-            body_text = page.locator("body").inner_text()
-        if self._contains_any(
-            body_text,
-            "отклик отправлен",
-            "отклик успешно отправлен",
-            "вы откликнулись",
-            "отклик принят",
-        ):
-            return "hh.ru подтвердил отправку отклика"
         if response is None or not 200 <= response.status < 300:
             return ""
         try:
-            response_text = response.text()
-        except PlaywrightError:
+            payload = json.loads(response.text())
+        except (PlaywrightError, ValueError):
             return ""
-        compact = re.sub(r"\s+", "", response_text).casefold()
-        if (
-            '"success":true' in compact
-            or '"status":"success"' in compact
-            or '"result":"success"' in compact
+        if not isinstance(payload, dict):
+            return ""
+        if payload.get("error") or payload.get("errors"):
+            return ""
+        outcomes = {key: payload[key] for key in ("success", "status", "result") if key in payload}
+        if not outcomes or ("success" in outcomes and outcomes["success"] is not True):
+            return ""
+        if any(
+            not isinstance(value, str) or value.strip().casefold() != "success"
+            for key, value in outcomes.items()
+            if key != "success"
         ):
-            return "hh.ru подтвердил отправку отклика"
-        return ""
+            return ""
+        return "hh.ru подтвердил отправку отклика"
 
     def _application_submission_error(
         self,
@@ -4330,44 +4379,7 @@ class VisibleHhBrowser:
 
     @staticmethod
     def _description_sections(description: str) -> tuple[str | None, str | None, str | None]:
-        if not description:
-            return None, None, None
-        groups: dict[str, list[str]] = {"responsibilities": [], "required": [], "preferred": []}
-        current: str | None = None
-        headings = (
-            (
-                "responsibilities",
-                ("обязанности", "задачи", "что предстоит", "чем предстоит заниматься"),
-            ),
-            (
-                "required",
-                ("требования", "мы ожидаем", "что требуется", "что ждём", "нам важно"),
-            ),
-            ("preferred", ("будет плюсом", "желательно", "преимуществом будет")),
-        )
-        for raw_line in description.splitlines():
-            line = raw_line.strip(" \t•-–—")
-            if not line:
-                continue
-            folded = line.casefold().rstrip(":")
-            matched = next(
-                (
-                    name
-                    for name, markers in headings
-                    if any(folded.startswith(marker) for marker in markers)
-                ),
-                None,
-            )
-            if matched is not None:
-                current = matched
-                continue
-            if current is not None:
-                groups[current].append(line)
-        return (
-            "\n".join(groups["responsibilities"]) or None,
-            "\n".join(groups["required"]) or None,
-            "\n".join(groups["preferred"]) or None,
-        )
+        return description_sections(description)
 
     @staticmethod
     def _contains_any(text: str, *needles: str) -> bool:

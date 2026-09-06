@@ -42,6 +42,7 @@ class HhChatMessageData:
     direction: MessageDirection
     body: str
     displayed_time: str = ""
+    direction_inferred: bool = False
 
     def __post_init__(self) -> None:
         if not self.vacancy_id or len(self.vacancy_id) > 64:

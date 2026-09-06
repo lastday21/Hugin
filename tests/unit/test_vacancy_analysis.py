@@ -7,7 +7,7 @@ import pytest
 
 from hugin.domain.directions import DirectionScope, SearchRegion, WorkFormat
 from hugin.domain.vacancies import VacancyAvailability, VacancyData
-from hugin.services import vacancy_analysis as vacancy_analysis_module
+from hugin.services import decision_evidence as decision_evidence_module
 from hugin.services.vacancy_analysis import (
     RULES_VERSION,
     AdjacentItRules,
@@ -17,8 +17,8 @@ from hugin.services.vacancy_analysis import (
 )
 
 
-def test_rules_version_is_python_it_v55() -> None:
-    assert RULES_VERSION == "python_it_v55"
+def test_rules_version_is_python_it_v69() -> None:
+    assert RULES_VERSION == "python_it_v69"
 
 
 @pytest.mark.parametrize(
@@ -41,7 +41,7 @@ def test_rules_reject_only_vacancies_older_than_thirty_days(
             fixed = cls.fromtimestamp(evaluated_at.timestamp(), UTC)
             return fixed.astimezone(tz) if tz is not None else fixed.replace(tzinfo=None)
 
-    monkeypatch.setattr(vacancy_analysis_module, "datetime", FixedDateTime)
+    monkeypatch.setattr(decision_evidence_module, "datetime", FixedDateTime)
     result = PythonBackendRules().evaluate(
         VacancyData(
             f"age-{published_days_ago}",
@@ -238,7 +238,7 @@ def test_v55_low_exact_salary_only_lowers_score() -> None:
     assert not any("ниже 120 000" in reason for reason in result.reasons)
 
 
-def test_v46_rejects_technical_lead_with_primary_architecture_duties() -> None:
+def test_v56_keeps_technical_lead_with_hands_on_architecture_duties() -> None:
     result = PythonBackendRules().evaluate(
         VacancyData(
             "control-tech-lead",
@@ -252,8 +252,8 @@ def test_v46_rejects_technical_lead_with_primary_architecture_duties() -> None:
         )
     )
 
-    assert result.category is RuleCategory.REJECTED
-    assert any("руководящая" in reason or "существенно выше" in reason for reason in result.reasons)
+    assert result.category in {RuleCategory.MATCH, RuleCategory.STRETCH}
+    assert not any("существенно выше" in reason for reason in result.reasons)
 
 
 def test_v46_keeps_python_fullstack_when_foreign_stack_is_only_optional() -> None:
@@ -321,6 +321,25 @@ def test_v50_stops_requirements_before_employer_offer_section() -> None:
     assert not any("обязательный основной стек" in reason for reason in result.reasons)
 
 
+def test_v56_stops_requirements_before_personalized_offer_section() -> None:
+    result = AdjacentItRules().evaluate(
+        VacancyData(
+            "900000002",
+            "AI-разработчик (Python) Junior / Middle",
+            "https://hh.ru/vacancy/900000002",
+            description=(
+                "Что мы ждем от тебя:\nPython, LLM API и MCP.\n"
+                "Что мы можем тебе гарантировать:\n"
+                "Ежедневную работу над backend-проектами на Python, Go и PHP."
+            ),
+            key_skills=("Python", "REST API"),
+        )
+    )
+
+    assert result.category in {RuleCategory.MATCH, RuleCategory.STRETCH}
+    assert not any("Go" in reason or "PHP" in reason for reason in result.reasons)
+
+
 def test_v50_keeps_coding_heavy_python_analyst_role_for_review() -> None:
     vacancy = VacancyData(
         "coding-analyst",
@@ -361,6 +380,287 @@ def test_v51_keeps_python_analyst_who_writes_programs_and_scripts() -> None:
     assert adjacent.category is RuleCategory.ROUTED
     assert adjacent.target_scope is DirectionScope.PYTHON_BACKEND
     assert not any("аналитика без разработки" in reason for reason in backend.reasons)
+
+
+@pytest.mark.parametrize(
+    "title",
+    (
+        "Prompt-инженер GigaChat",
+        "Вайб-кодер / AI-assisted Developer — Middle",
+        "Разработчик AI-продуктов / Software Engineer",
+        "Инженер сервисов ИИ",
+        "Аналитик/Разработчик AI",
+    ),
+)
+def test_v56_recognizes_applied_ai_and_prompt_roles(title: str) -> None:
+    vacancy = VacancyData(
+        f"recognized-{title}",
+        title,
+        "https://hh.ru/vacancy/recognized-ai-role",
+        responsibilities=(
+            "Разрабатывать на Python внутренние сервисы, API, интеграции с LLM "
+            "и автоматизацию бизнес-процессов."
+        ),
+        required_qualifications="Python, REST API, SQL и Git.",
+        key_skills=("Python", "REST API", "SQL", "Git"),
+    )
+
+    results = (PythonBackendRules().evaluate(vacancy), AdjacentItRules().evaluate(vacancy))
+
+    assert any(result.category in {RuleCategory.MATCH, RuleCategory.STRETCH} for result in results)
+    assert not any(
+        "название вакансии не относится" in reason
+        for result in results
+        for reason in result.reasons
+        if result.category in {RuleCategory.MATCH, RuleCategory.STRETCH}
+    )
+
+
+def test_v58_ranks_agent_assisted_product_development_above_operations_roles() -> None:
+    result = AdjacentItRules().evaluate(
+        VacancyData(
+            "900000003",
+            "Вайб-кодер / AI-assisted Developer — Middle",
+            "https://hh.ru/vacancy/900000003",
+            responsibilities=(
+                "Создавать внутренние приложения, автоматизации, интеграции и небольшие "
+                "информационные системы с помощью помощников разработки. Самостоятельно "
+                "проходить путь от бизнес-задачи до работающего результата."
+            ),
+            required_qualifications=(
+                "Практический опыт создания приложений. Знание Python, backend-разработки, "
+                "PostgreSQL, REST API и Docker будет преимуществом."
+            ),
+            key_skills=("Python", "PostgreSQL", "REST API", "Docker"),
+        )
+    )
+
+    assert result.category is RuleCategory.MATCH
+    assert not any("DevOps/SRE" in reason for reason in result.reasons)
+
+
+def test_v58_keeps_ai_service_engineer_with_python_modules_and_integrations() -> None:
+    result = AdjacentItRules().evaluate(
+        VacancyData(
+            "900000004",
+            "Инженер сервисов ИИ",
+            "https://hh.ru/vacancy/900000004",
+            responsibilities=(
+                "Анализировать процессы заказчиков, разрабатывать на Python модули, "
+                "REST и gRPC API, интеграционные слои, RAG и агентные системы."
+            ),
+            required_qualifications=(
+                "Коммерческая разработка от одного года, Python, SQL, Git, "
+                "микросервисная архитектура и интеграции."
+            ),
+            key_skills=("Python", "PostgreSQL", "SQL", "Git", "REST API"),
+        )
+    )
+
+    assert result.category is RuleCategory.MATCH
+
+
+def test_v59_rejects_embedded_c_and_cpp_signal_processing_role() -> None:
+    vacancy = VacancyData(
+        "900000005",
+        "Инженер-программист",
+        "https://hh.ru/vacancy/900000005",
+        responsibilities=(
+            "Разработка инфраструктуры цифровой обработки сигналов для DSP и SoC TI C66x. "
+            "Работа с ARM/Zynq, Embedded Linux, RTOS SysBios, драйверами, Buildroot и Yocto."
+        ),
+        required_qualifications=(
+            "Знание C/C++14, многопоточности, CMake, SPI, I2C, PCIe, RapidIO и AXI."
+        ),
+        key_skills=("C", "C++", "Linux", "CMake"),
+    )
+
+    assert PythonBackendRules().evaluate(vacancy).category is RuleCategory.ROUTED
+    result = AdjacentItRules().evaluate(vacancy)
+
+    assert result.category is RuleCategory.REJECTED
+    assert any("системные компоненты" in reason for reason in result.reasons)
+
+
+def test_v60_reads_what_is_important_for_us_as_mandatory_requirements() -> None:
+    result = AdjacentItRules().evaluate(
+        VacancyData(
+            "900000006",
+            "Data Engineer — Hadoop / Spark / Python / SQL",
+            "https://hh.ru/vacancy/900000006",
+            responsibilities=(
+                "Разрабатывать и поддерживать процессы ETL/ELT. Работать с Hadoop.\n"
+                "ЧТО ВАЖНО ДЛЯ НАС\n"
+                "От 3 лет опыта в роли Data Engineer. Практический опыт работы с "
+                "Hadoop, HDFS, Apache Hive и Spark SQL. Опыт работы с Apache Kafka.\n"
+                "БУДЕТ ПРЕИМУЩЕСТВОМ\n"
+                "Опыт работы с высоконагруженными системами."
+            ),
+        ),
+        RuleContext(
+            skills=("Python, SQL, FastAPI, PostgreSQL, Redis, SQLAlchemy, Docker, Git, ETL",)
+        ),
+    )
+
+    assert result.category is RuleCategory.REJECTED
+    assert any("промышленный стек обработки данных" in reason for reason in result.reasons)
+
+
+def test_v61_ranks_python_test_automation_below_backend_development() -> None:
+    result = AdjacentItRules().evaluate(
+        VacancyData(
+            "900000007",
+            "Инженер по автоматизации тестирования, Брокерская платформа",
+            "https://hh.ru/vacancy/900000007",
+            responsibilities=("Разрабатывать и поддерживать API-автотесты на Python и pytest."),
+            key_skills=("Python", "pytest", "REST API", "Docker"),
+        ),
+        RuleContext(skills=("Python, pytest, REST API, Docker",)),
+    )
+
+    assert result.category is RuleCategory.STRETCH
+    assert any("после целевой серверной разработки" in reason for reason in result.reasons)
+
+
+def test_v61_ranks_etl_with_applicable_stack_below_backend_development() -> None:
+    result = AdjacentItRules().evaluate(
+        VacancyData(
+            "900000008",
+            "ETL разработчик (Python)",
+            "https://hh.ru/vacancy/900000008",
+            responsibilities="Разрабатывать ETL-процессы на Python, SQL и PostgreSQL.",
+            key_skills=("Python", "SQL", "PostgreSQL", "ETL"),
+        ),
+        RuleContext(skills=("Python, SQL, PostgreSQL, ETL",)),
+    )
+
+    assert result.category is RuleCategory.STRETCH
+    assert any("после целевой серверной разработки" in reason for reason in result.reasons)
+
+
+def test_v56_keeps_prompt_engineering_without_model_training_duties() -> None:
+    vacancy = VacancyData(
+        "900000009",
+        "Prompt-инженер GigaChat",
+        "https://hh.ru/vacancy/900000009",
+        responsibilities=(
+            "Разрабатывать и оптимизировать системные промпты, интегрировать LLM через API, "
+            "проводить оценку качества и фактчекинг ответов."
+        ),
+        required_qualifications=(
+            "Python, pandas, API LLM, RAG и tool-calling. "
+            "Понимание принципов работы LLM, этапов обучения моделей и базовых метрик ML."
+        ),
+        key_skills=("Python", "pandas", "REST API"),
+    )
+
+    result = AdjacentItRules().evaluate(vacancy)
+
+    assert result.category in {RuleCategory.MATCH, RuleCategory.STRETCH}
+    assert not any("обучение моделей" in reason for reason in result.reasons)
+
+
+def test_v56_keeps_basic_awareness_of_model_adaptation() -> None:
+    result = AdjacentItRules().evaluate(
+        VacancyData(
+            "ai-agent-awareness",
+            "AI-разработчик автономных агентов",
+            "https://hh.ru/vacancy/ai-agent-awareness",
+            responsibilities=(
+                "Разрабатывать на Python API и агентные системы, интегрировать готовые LLM."
+            ),
+            required_qualifications=(
+                "Python и REST API. Базовое понимание fine-tuning, LoRA, QLoRA и квантизации."
+            ),
+            key_skills=("Python", "REST API"),
+        )
+    )
+
+    assert result.category in {RuleCategory.MATCH, RuleCategory.STRETCH}
+    assert not any("обучение моделей" in reason for reason in result.reasons)
+
+
+def test_v56_keeps_foreign_languages_needed_only_for_reading_code() -> None:
+    vacancy = VacancyData(
+        "900000010",
+        "Python-разработчик для ИИ-агентов (автоматизация и интеграции)",
+        "https://hh.ru/vacancy/900000010",
+        responsibilities=(
+            "Разрабатывать на Python скрипты для API, интеграции и обработку данных."
+        ),
+        required_qualifications=(
+            "Уверенное владение Python. Понимание кода на Java, C# и JavaScript. "
+            "Docker и PostgreSQL."
+        ),
+        key_skills=("Python", "REST API", "PostgreSQL", "Docker"),
+    )
+
+    results = (PythonBackendRules().evaluate(vacancy), AdjacentItRules().evaluate(vacancy))
+
+    assert any(result.category in {RuleCategory.MATCH, RuleCategory.STRETCH} for result in results)
+    assert not any(
+        "другой обязательный основной стек" in reason
+        for result in results
+        for reason in result.reasons
+    )
+
+
+def test_v56_keeps_basic_frontend_reading_in_python_backend_role() -> None:
+    result = PythonBackendRules().evaluate(
+        VacancyData(
+            "900000011",
+            "Python Backend Developer / AI Engineer",
+            "https://hh.ru/vacancy/900000011",
+            responsibilities=(
+                "Разрабатывать backend на Python и FastAPI, интегрировать AI API и PostgreSQL."
+            ),
+            required_qualifications=(
+                "Python, FastAPI, PostgreSQL и Docker. Frontend может быть на базовом уровне: "
+                "читать React/TypeScript и делать небольшие правки."
+            ),
+            key_skills=("Python", "FastAPI", "PostgreSQL", "Docker"),
+        )
+    )
+
+    assert result.category in {RuleCategory.MATCH, RuleCategory.STRETCH}
+    assert not any("TypeScript" in reason for reason in result.reasons)
+
+
+def test_v56_keeps_one_of_several_acceptable_languages() -> None:
+    result = AdjacentItRules().evaluate(
+        VacancyData(
+            "900000012",
+            "Разработчик AI-продуктов / Software Engineer",
+            "https://hh.ru/vacancy/900000012",
+            responsibilities=("Разрабатывать программные продукты, интеграции и бизнес-логику."),
+            required_qualifications=(
+                "Хорошо программировать хотя бы на одном языке: Python, Go, Java, C# или "
+                "TypeScript. Важнее инженерное мышление, а не конкретный стек."
+            ),
+            key_skills=("Python", "REST API", "SQL", "Docker"),
+        )
+    )
+
+    assert result.category in {RuleCategory.MATCH, RuleCategory.STRETCH}
+    assert not any("вспомогательный язык" in reason for reason in result.reasons)
+
+
+def test_v56_keeps_python_business_automation_with_substantial_development() -> None:
+    result = AdjacentItRules().evaluate(
+        VacancyData(
+            "900000013",
+            "Python-разработчик / бизнес-аналитик по автоматизации бизнес-процессов",
+            "https://hh.ru/vacancy/900000013",
+            responsibilities=(
+                "Разобраться в процессе и самостоятельно разработать на Python внутренний "
+                "сервис, интегрировать REST API, Excel и SQL."
+            ),
+            key_skills=("Python", "REST API", "SQL", "Excel"),
+        )
+    )
+
+    assert result.category in {RuleCategory.MATCH, RuleCategory.STRETCH}
+    assert not any("аналитика без разработки" in reason for reason in result.reasons)
 
 
 def test_v51_rejects_python_tech_lead_who_leads_team() -> None:
@@ -1257,7 +1557,8 @@ def test_senior_without_team_management_is_not_rejected() -> None:
         )
     )
 
-    assert result.category is RuleCategory.MATCH
+    assert result.category is RuleCategory.STRETCH
+    assert result.accepted
     assert not any("обязанностями, существенно выше" in reason for reason in result.reasons)
 
 
@@ -1276,7 +1577,8 @@ def test_senior_role_not_assuming_team_management_is_not_rejected() -> None:
         )
     )
 
-    assert result.category is RuleCategory.MATCH
+    assert result.category is RuleCategory.STRETCH
+    assert result.accepted
     assert not any("обязанностями, существенно выше" in reason for reason in result.reasons)
 
 
@@ -1294,7 +1596,8 @@ def test_senior_without_architecture_responsibility_is_not_rejected() -> None:
         )
     )
 
-    assert result.category is RuleCategory.MATCH
+    assert result.category is RuleCategory.STRETCH
+    assert result.accepted
     assert not any("обязанностями, существенно выше" in reason for reason in result.reasons)
 
 
@@ -1770,7 +2073,8 @@ def test_marketplace_experience_request_does_not_block_application() -> None:
         RuleContext(skills=("Python, REST API, PostgreSQL",)),
     )
 
-    assert result.category is RuleCategory.MATCH
+    assert result.category is RuleCategory.STRETCH
+    assert any("стажировка" in reason for reason in result.reasons)
     assert not any("ручн" in reason for reason in result.reasons)
 
 
@@ -2256,7 +2560,7 @@ def test_no_code_role_with_incidental_python_stays_at_lower_priority() -> None:
     assert adjacent_result.category is RuleCategory.STRETCH
 
 
-def test_sql_primary_role_is_accepted_in_adjacent_direction() -> None:
+def test_sql_primary_role_is_kept_below_backend_in_adjacent_direction() -> None:
     vacancy = VacancyData(
         "sql-role",
         "Стажёр SQL-разработчик",
@@ -2268,7 +2572,9 @@ def test_sql_primary_role_is_accepted_in_adjacent_direction() -> None:
     adjacent = AdjacentItRules().evaluate(vacancy)
 
     assert not backend.accepted
-    assert adjacent.category is RuleCategory.MATCH
+    assert adjacent.category is RuleCategory.STRETCH
+    assert adjacent.accepted
+    assert any("после целевой серверной разработки" in reason for reason in adjacent.reasons)
 
 
 def test_bitrix_primary_role_is_not_accepted() -> None:
@@ -2492,7 +2798,8 @@ def test_more_than_six_years_hh_experience_lowers_priority_without_blocking() ->
         )
     )
 
-    assert result.category is RuleCategory.MATCH
+    assert result.category is RuleCategory.STRETCH
+    assert result.accepted
     experience = next(
         component for component in result.components if component.name == "experience"
     )
@@ -2527,7 +2834,7 @@ def test_python_desktop_application_is_processed_after_backend_roles() -> None:
         "Backend development experience: 4+ years.",
     ],
 )
-def test_four_plus_year_requirement_does_not_require_manual_review(
+def test_four_plus_year_requirement_is_lower_priority_without_rejection(
     required_qualifications: str,
 ) -> None:
     result = PythonBackendRules().evaluate(
@@ -2541,7 +2848,8 @@ def test_four_plus_year_requirement_does_not_require_manual_review(
         )
     )
 
-    assert result.category is RuleCategory.MATCH
+    assert result.category is RuleCategory.STRETCH
+    assert result.accepted
     assert any("обязательный стаж от трёх лет" in reason for reason in result.reasons)
 
 
@@ -2570,16 +2878,17 @@ def test_mandatory_two_plus_years_of_development_is_match(
 
 
 @pytest.mark.parametrize(
-    "required_qualifications",
+    ("required_qualifications", "expected_category"),
     [
-        "Опыт разработки на Python от 3 лет.",
-        "Опыт промышленной разработки на Python от трех лет.",
-        "Опыт разработки backend-сервисов минимум 5 лет.",
-        "Python development experience: 3+ years.",
+        ("Опыт разработки на Python от 3 лет.", RuleCategory.MATCH),
+        ("Опыт промышленной разработки на Python от трех лет.", RuleCategory.MATCH),
+        ("Опыт разработки backend-сервисов минимум 5 лет.", RuleCategory.STRETCH),
+        ("Python development experience: 3+ years.", RuleCategory.MATCH),
     ],
 )
-def test_mandatory_three_plus_years_of_development_does_not_require_manual_review(
+def test_mandatory_experience_only_lowers_category_from_four_years(
     required_qualifications: str,
+    expected_category: RuleCategory,
 ) -> None:
     result = PythonBackendRules().evaluate(
         VacancyData(
@@ -2591,7 +2900,8 @@ def test_mandatory_three_plus_years_of_development_does_not_require_manual_revie
         )
     )
 
-    assert result.category is RuleCategory.MATCH
+    assert result.category is expected_category
+    assert result.accepted
     assert any("обязательный стаж от трёх лет" in reason for reason in result.reasons)
 
 
@@ -3336,6 +3646,43 @@ def test_machine_learning_model_training_is_rejected() -> None:
     assert accepted.category is RuleCategory.REJECTED
 
 
+def test_v57_rejects_model_selection_and_training_as_primary_work() -> None:
+    result = AdjacentItRules().evaluate(
+        VacancyData(
+            "900000014",
+            "AI / Data Python Developer",
+            "https://hh.ru/vacancy/900000014",
+            responsibilities=(
+                "Подготовка данных. ML-модели: подбор и обучение, эксперименты, "
+                "подготовка к промышленной эксплуатации."
+            ),
+            required_qualifications="Python, SQL, pandas и понимание полного ML-конвейера.",
+            key_skills=("Python", "SQL", "pandas"),
+        )
+    )
+
+    assert result.category is RuleCategory.REJECTED
+    assert any("обучение моделей" in reason for reason in result.reasons)
+
+
+def test_v57_rejects_leading_pytorch_deep_learning_role() -> None:
+    result = AdjacentItRules().evaluate(
+        VacancyData(
+            "900000015",
+            "Ведущий Python (PyTorch) разработчик",
+            "https://hh.ru/vacancy/900000015",
+            responsibilities="Разрабатывать сервисы на Python и проектировать API.",
+            required_qualifications=(
+                "Глубокие знания PyTorch и опыт работы с deep learning, PostgreSQL и Docker."
+            ),
+            key_skills=("Python", "PyTorch", "PostgreSQL"),
+        )
+    )
+
+    assert result.category is RuleCategory.REJECTED
+    assert any("Data Science/ML" in reason for reason in result.reasons)
+
+
 def test_unrelated_mandatory_dotnet_stack_is_rejected_in_it() -> None:
     result = AdjacentItRules().evaluate(
         VacancyData(
@@ -3694,3 +4041,60 @@ def test_data_role_with_two_missing_mandatory_platforms_is_rejected() -> None:
 
     assert result.category is RuleCategory.REJECTED
     assert any("промышленный стек обработки данных" in reason for reason in result.reasons)
+
+
+@pytest.mark.parametrize(
+    ("hh_id", "title", "required_qualifications"),
+    [
+        (
+            "135471865",
+            "Ведущий Python-разработчик",
+            "Уверенное владение Python, PostgreSQL, Django и SQLAlchemy.",
+        ),
+        (
+            "135737145",
+            "Senior Python developer/разработчик Python",
+            "Опыт разработки с помощью Python3 от 5 лет.",
+        ),
+    ],
+)
+def test_v62_keeps_senior_roles_with_high_experience_below_target_level(
+    hh_id: str,
+    title: str,
+    required_qualifications: str,
+) -> None:
+    result = PythonBackendRules().evaluate(
+        VacancyData(
+            hh_id,
+            title,
+            f"https://hh.ru/vacancy/{hh_id}",
+            description="Разработка серверных сервисов на Python.",
+            required_qualifications=required_qualifications,
+            experience="более 6 лет",
+            key_skills=("Python", "PostgreSQL", "Django"),
+        ),
+        RuleContext(skills=("Python, FastAPI, PostgreSQL, SQLAlchemy",)),
+    )
+
+    assert result.category is RuleCategory.STRETCH
+    assert result.accepted
+    assert any("высоким требованием к стажу" in reason for reason in result.reasons)
+
+
+def test_v62_keeps_python_internship_below_regular_target_roles() -> None:
+    result = AdjacentItRules().evaluate(
+        VacancyData(
+            "900000016",
+            "Стажер Python разработчик / разработка ИИ помощника",
+            "https://hh.ru/vacancy/900000016",
+            description="Разработка веб-сервиса для RAG-системы на Python.",
+            required_qualifications="Опыт Python-разработки от 1 года.",
+            experience="1–3 года",
+            key_skills=("Python", "PostgreSQL"),
+        ),
+        RuleContext(skills=("Python, FastAPI, PostgreSQL, RAG",)),
+    )
+
+    assert result.category is RuleCategory.STRETCH
+    assert result.accepted
+    assert any("стажировка" in reason for reason in result.reasons)

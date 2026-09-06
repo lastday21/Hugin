@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import re
 from contextlib import suppress
-from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from dataclasses import dataclass, replace
+from datetime import datetime, timedelta
 from enum import StrEnum
+from time import monotonic
 from typing import ClassVar
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from hugin.database.models import CandidateProfileModel, VerifiedFactModel
@@ -22,12 +23,19 @@ from hugin.domain.directions import (
 )
 from hugin.domain.time import as_utc
 from hugin.domain.vacancies import VacancyAvailability, VacancyData, VacancyRecord
+from hugin.domain.vacancy_priority import FIT_TIER_LABELS, FitTier
 from hugin.repositories.directions import AccountRepository, DirectionRepository
 from hugin.repositories.vacancies import VacancyRepository
+from hugin.services.candidate_skills import confirmed_skill_texts
 from hugin.services.career_directions import CareerDirectionService
+from hugin.services.decision_evidence import decision_now, decision_time, save_ranking_evidence
+from hugin.services.requirement_sections import mandatory_text, primary_duties, primary_requirements
 from hugin.services.vacancy_duplicates import VacancyDuplicateDetector
+from hugin.services.vacancy_duties import TechnicalDuty, technical_duty_evidence
+from hugin.services.vacancy_fit import FitAssessment, assess_fit, unsupported_administration
+from hugin.services.vacancy_skills import skill_terms
 
-RULES_VERSION = "python_it_v55"
+RULES_VERSION = "python_it_v69"
 MAX_VACANCY_AGE = timedelta(days=30)
 NET_SALARY_FACTOR = 0.87
 
@@ -76,6 +84,7 @@ class RuleEvaluation:
     reasons: tuple[str, ...]
     components: tuple[RuleComponent, ...] = ()
     target_scope: DirectionScope | None = None
+    fit: FitAssessment | None = None
 
     @property
     def accepted(self) -> bool:
@@ -149,6 +158,7 @@ class VacancyRoleRouter:
         "low-code",
         "lowcode",
         "вайбкод",
+        "вайб-код",
         "vibe coding",
         "power bi",
         "bi-разработчик",
@@ -166,6 +176,7 @@ class VacancyRoleRouter:
         "support engineer",
         "technical support",
         "техническая поддержка",
+        "технической поддержки",
         "инженер поддержки",
         "специалист поддержки",
         "инженер внедрения",
@@ -233,6 +244,7 @@ class VacancyRoleRouter:
         "ai developer",
         "ai-разработчик",
         "ai разработчик",
+        "разработчик ai",
         "ai-инженер",
         "ai инженер",
         "инженер по ai",
@@ -243,6 +255,21 @@ class VacancyRoleRouter:
         "инженер по ии",
         "инженер ии",
         "разработчик ии",
+        "ai-продукт",
+        "ai продукт",
+        "ии-продукт",
+        "ии продукт",
+        "сервисов ии",
+        "ai services",
+        "ai-сервис",
+        "ai сервис",
+        "ai-enabled",
+        "genai",
+        "prompt engineer",
+        "prompt-инженер",
+        "prompt инженер",
+        "промпт-инженер",
+        "промпт инженер",
         "ai-агент",
         "ai агент",
         "искусственный интеллект",
@@ -331,6 +358,20 @@ class VacancyRoleRouter:
             return DirectionScope.IT_ADJACENT
         if "python" in title and any(marker in title for marker in ("rpa", "роботизац")):
             return DirectionScope.IT_ADJACENT
+        ai_title = re.search(r"(?:^|\W)(?:ai|ии)(?:\W|$)", title) is not None or any(
+            marker in title for marker in ("llm", "rag", "искусственн", "genai")
+        )
+        if (
+            ai_title
+            and "python" in title
+            and any(marker in title for marker in cls._developer_markers)
+            and any(marker in complete_text for marker in cls._backend_markers)
+            and (
+                any(marker in title for marker in cls._backend_markers)
+                or any(marker in title for marker in ("ai-продукт", "ai продукт", "ии-продукт"))
+            )
+        ):
+            return DirectionScope.PYTHON_BACKEND
         if any(marker in title for marker in cls._adjacent_title_markers):
             return DirectionScope.IT_ADJACENT
         if (
@@ -357,6 +398,8 @@ class VacancyRoleRouter:
         if any(marker in title for marker in ("веб-разработчик", "web developer")):
             return DirectionScope.IT_ADJACENT
         if "python" in title and any(marker in title for marker in cls._developer_markers):
+            return DirectionScope.IT_ADJACENT
+        if technical_duty_evidence(vacancy):
             return DirectionScope.IT_ADJACENT
         return None
 
@@ -502,8 +545,13 @@ class PythonBackendRules:
     )
     _model_training_pattern: ClassVar[re.Pattern[str]] = re.compile(
         r"(?:"
-        r"(?:создани|обучени|дообучени|переобучени|тонк\w*\s+настройк)\w*\s+модел\w*|"
-        r"(?:обучать|дообучать|переобучать|оптимизировать)\s+(?:llm|модел\w*)|"
+        r"(?:создани|обучени|дообучени|переобучени|тонк\w*\s+настройк)\w*\s+"
+        r"(?:(?:предобученн|языков|современн|нейросетев|трансформерн)\w*\s+){0,3}"
+        r"(?:llm|модел\w*|нейронн\w*\s+сет\w*)|"
+        r"\bмодел\w*[^.!?;\n]{0,80}"
+        r"(?:подбор\w*\s+и\s+)?(?:обучени|дообучени|переобучени)\w*|"
+        r"(?:обучать|дообучать|переобучать|оптимизировать)\s+"
+        r"(?:llm|модел\w*|нейронн\w*\s+сет\w*)|"
         r"\bfine[ -]?tun(?:e|ing)\b|\bfinetun(?:e|ing)\b|"
         r"\blora\b|\bqlora\b|\bdistillation\b|\bквантизац\w*"
         r")"
@@ -511,6 +559,18 @@ class PythonBackendRules:
     _model_training_stack_pattern: ClassVar[re.Pattern[str]] = re.compile(
         r"(?:\bpytorch\b|\btransformers\b|\bcuda\b|\btensorrt\b|"
         r"\bopencv\b|\byolo\w*\b|\bvllm\b|\bsglang\b|\bmulti[ -]?gpu\b)"
+    )
+    _model_training_awareness_pattern: ClassVar[re.Pattern[str]] = re.compile(
+        r"(?:"
+        r"(?:базов\w*\s+)?(?:понимани|знани|представлени)\w*"
+        r"[^.!?;\n]{0,180}(?:"
+        r"(?:этап\w*|принцип\w*|процесс\w*)[^.!?;\n]{0,80}"
+        r")?(?:обучени\w*\s+(?:модел\w*|нейронн\w*\s+сет\w*)|fine[ -]?tun\w*|"
+        r"\blora\b|\bqlora\b|квантизац\w*)|"
+        r"(?:формирован|подготовк|разметк)\w*[^.!?;\n]{0,100}"
+        r"(?:данн\w*|датасет\w*)[^.!?;\n]{0,80}"
+        r"(?:для\s+)?обучени\w*\s+(?:модел\w*|нейронн\w*\s+сет\w*)"
+        r")"
     )
     _ml_science_title_pattern: ClassVar[re.Pattern[str]] = re.compile(
         r"(?:\b(?:ai|ml)[ /-]?(?:engineer|scientist)\b|"
@@ -522,10 +582,14 @@ class PythonBackendRules:
         r"\bсетев\w*\s+ос\b|\bnetwork\s+operating\s+system\b|"
         r"\bнизкоуровнев\w*\s+компонент\w*\b|"
         r"\b(?:user[ -]?space|userspace)\s+(?:ос\s+)?linux\b|"
+        r"\bembedded\s+linux\b|\brtos\b|\bsoc\b|\bdsp\b|"
+        r"\bцифров\w*\s+обработк\w*\s+сигнал\w*\b|"
         r"\bоперационн\w*\s+систем\w*\b)"
     )
     _system_software_duty_pattern: ClassVar[re.Pattern[str]] = re.compile(
         r"(?:\bsystemd\b|\bjournald\b|\bnetlink\b|\bnetworking\b|"
+        r"\bbuildroot\b|\byocto\b|\bдрайвер\w*\b|"
+        r"\b(?:spi|i2c|pcie|rapidio|axi)\b|"
         r"\b(?:системн\w*|конфигурационн\w*)\s+(?:сервис\w*|демон\w*)\b|"
         r"\bсетев\w*\s+подсистем\w*\b|\bдемон\w*\s+уровн\w*\b)"
         r"|(?:разрабатыв\w*|проектир\w*)\s+пакет\w*\s+для\s+ос\b|"
@@ -537,6 +601,7 @@ class PythonBackendRules:
         r"\b(?:user[ -]?space|userspace)\b[^.!?]{0,50}\blinux\b"
     )
     _excluded_roles: ClassVar[tuple[tuple[str, str], ...]] = (
+        (r"\bбухгалтер\b", "основная роль: бухгалтерия"),
         (
             r"\bфинансов\w*\s+директор\w*\b|\bfinancial\s+director\b|\bcfo\b|"
             r"\bглавн\w*\s+бухгалтер\w*\b",
@@ -672,6 +737,9 @@ class PythonBackendRules:
         r"\bглавн"
         r")"
     )
+    _internship_title_pattern: ClassVar[re.Pattern[str]] = re.compile(
+        r"\b(?:стаж[её]р\w*|intern(?:ship)?)\b"
+    )
     _candidate_level_description_pattern: ClassVar[re.Pattern[str]] = re.compile(
         r"(?:"
         r"(?:^|[.!?]\s+)(?:ищем|требуется|нужен|нужна|приглашаем)"
@@ -692,10 +760,7 @@ class PythonBackendRules:
         r"\b(?:лид\w*|вести)\s+команд\w*|"
         r"\bв\s+подчинени\w*\s+\d+\s+(?:разработ|инженер|сотрудник)|"
         r"\bформирован\w+\s+(?:команд|техническ\w+\s+стратег)|"
-        r"\bответствен\w+\s+за\s+(?:архитектур|техническ\w+\s+стратег|найм|команд)|"
-        r"\bпроектир\w*(?:\s+и\s+\w+)?\s+архитектур\w*|"
-        r"\bвыбор\w*\s+(?:фреймворк\w*|технолог\w*|архитектурн\w*\s+паттерн\w*)|"
-        r"\barchitectural\s+decision\s+records\b|"
+        r"\bответствен\w+\s+за\s+(?:техническ\w+\s+стратег|найм|команд)|"
         r"\b(?:manage|lead)\s+(?:an?\s+)?(?:engineering\s+)?team\b|"
         r"\b(?:people management|technical strategy|hiring)\b"
         r")"
@@ -839,6 +904,24 @@ class PythonBackendRules:
             rejected.append("название вакансии не относится к Python backend-разработке")
         if not rejected and self.scope is DirectionScope.IT_ADJACENT and destination is None:
             rejected.append("название вакансии не относится к распознанному ИТ-направлению")
+        if (
+            self.scope is DirectionScope.IT_ADJACENT
+            and re.search(r"поддержк|support", title)
+            and not re.search(
+                r"\b(?:python|sql|api|linux|windows|software|it|ит)\b|"
+                r"программ\w* обеспечени|информационн\w* систем|"
+                r"сопровожд\w* приложен|настройк\w* (?:по|сервер)|"
+                r"диагностик\w* (?:по|сет\w*|сервер)",
+                " ".join(
+                    (
+                        responsibilities,
+                        self._mandatory_requirements(vacancy),
+                        self._without_optional_requirements(description),
+                    )
+                ),
+            )
+        ):
+            rejected.append("техническая поддержка без подтверждённых задач в ИТ")
         if not rejected and destination is not None and destination is not self.scope:
             return RuleEvaluation(
                 score=0,
@@ -892,13 +975,12 @@ class PythonBackendRules:
                 " ".join((requirements, description))
             )
         minimum_required_experience = self._minimum_required_experience(vacancy)
+        hh_experience_minimum = self._experience_minimum(experience)
         if minimum_required_experience is not None and minimum_required_experience >= 3:
             reasons.append(
                 "обязательный стаж от трёх лет снижает приоритет, но не блокирует отклик"
             )
-        elif (
-            hh_experience_minimum := self._experience_minimum(experience)
-        ) is not None and hh_experience_minimum >= 3:
+        elif hh_experience_minimum is not None and hh_experience_minimum >= 3:
             reasons.append(
                 "диапазон опыта hh.ru начинается от трёх лет; это снижает приоритет, "
                 "но не блокирует отклик"
@@ -923,8 +1005,26 @@ class PythonBackendRules:
         )
         if level_reason is not None:
             reasons.append(level_reason)
+            if (
+                self._more_than_six_years(experience)
+                or (minimum_required_experience is not None and minimum_required_experience >= 4)
+                or (
+                    hh_experience_minimum is not None
+                    and hh_experience_minimum >= 3
+                    and self._elevated_level_pattern.search(title) is not None
+                    and self._described_level_pattern.search(title) is None
+                )
+            ):
+                stretch_reasons.append(
+                    "старший или ведущий уровень вместе с высоким требованием к стажу "
+                    "идёт после вакансий текущего уровня"
+                )
         if level_rejection is not None:
             rejected.append(level_rejection)
+        if self._internship_title_pattern.search(title):
+            stretch_reasons.append(
+                "стажировка допустима, но идёт после штатных вакансий целевого уровня"
+            )
         if self._founding_engineer_pattern.search(complete_text):
             stretch_reasons.append(
                 "роль первого инженера идёт после более точных совпадений из-за масштаба "
@@ -936,6 +1036,13 @@ class PythonBackendRules:
             reasons.append(
                 "hh.ru указывает требуемый опыт более 6 лет; это снижает приоритет, "
                 "но само по себе не блокирует отклик"
+            )
+        if self._more_than_six_years(experience) or (
+            minimum_required_experience is not None and minimum_required_experience >= 4
+        ):
+            stretch_reasons.append(
+                "требуемый стаж от четырёх лет заметно выше подтверждённого опыта; "
+                "вакансия допустима, но идёт после более достижимых вариантов"
             )
         if minimum_required_experience is None and self._four_plus_experience_pattern.search(
             " ".join((requirements, description))
@@ -958,7 +1065,13 @@ class PythonBackendRules:
                 if (
                     self.scope is DirectionScope.IT_ADJACENT
                     and marker in {"аналитик", "analyst"}
-                    and VacancyRoleRouter.is_other_it_role(title)
+                    and (
+                        VacancyRoleRouter.is_other_it_role(title)
+                        or any(
+                            evidence.kind is TechnicalDuty.DATA
+                            for evidence in technical_duty_evidence(vacancy)
+                        )
+                    )
                 ):
                     reasons.append("смежная ИТ-роль без обязательного ежедневного написания кода")
                     continue
@@ -1008,7 +1121,9 @@ class PythonBackendRules:
         mandatory_other_stack = self._mandatory_other_stack(experience_requirements)
         if mandatory_other_stack is not None:
             rejected.append(f"другой обязательный основной стек: {mandatory_other_stack}")
-        primary_duty_text = self._without_optional_requirements(responsibilities or description)
+        primary_duty_text = self._without_optional_requirements(
+            primary_duties(vacancy.description, vacancy.responsibilities)
+        )
         primary_duty_other_stack = self._primary_duty_other_stack(
             primary_duty_text,
             profile_tokens,
@@ -1019,6 +1134,14 @@ class PythonBackendRules:
         if described_other_stack is not None:
             rejected.append(f"основной стек вакансии — {described_other_stack}")
         mandatory_skill_gaps = self._mandatory_skill_gaps(vacancy, profile_tokens)
+        administration_gaps = unsupported_administration(
+            vacancy, experience_requirements, context.skills
+        )
+        if administration_gaps:
+            rejected.append(
+                "основная работа требует неподтверждённой специализации администрирования: "
+                + "; ".join(administration_gaps)
+            )
         if self._mandatory_fullstack_client_stack(
             title,
             " ".join((experience_requirements, responsibilities)),
@@ -1027,7 +1150,13 @@ class PythonBackendRules:
             rejected.append("обязательный клиентский стек полной разработки не подтверждён")
         if self._unsupported_sql_specialization(title, experience_requirements):
             rejected.append("основной специализированный стек SQL не подтверждён")
-        if self._unsupported_data_specialization(title, mandatory_skill_gaps):
+        if self._unsupported_data_specialization(
+            title,
+            mandatory_skill_gaps,
+            has_data_duties=any(
+                evidence.kind is TechnicalDuty.DATA for evidence in technical_duty_evidence(vacancy)
+            ),
+        ):
             rejected.append("обязательный промышленный стек обработки данных не подтверждён")
         if self._unsupported_ml_science_role(
             title,
@@ -1043,7 +1172,11 @@ class PythonBackendRules:
             experience_requirements,
         ):
             rejected.append("основная работа — системные компоненты или сетевая ОС")
-        model_training_context = " ".join((title, responsibilities, experience_requirements))
+        model_training_context = " ".join((title, primary_duty_text, experience_requirements))
+        model_training_context = self._model_training_awareness_pattern.sub(
+            " ",
+            model_training_context,
+        )
         if self._model_training_pattern.search(model_training_context):
             rejected.append(
                 "основная работа — обучение моделей на неподтверждённом промышленном ML-стеке"
@@ -1056,7 +1189,7 @@ class PythonBackendRules:
             if adjacent_priority_reason is not None:
                 stretch_reasons.append(adjacent_priority_reason)
 
-        vacancy_tokens = self._tokens(" ".join((complete_text, skills)))
+        vacancy_tokens = skill_terms(" ".join((primary_duty_text, experience_requirements, skills)))
         skill_overlap = sorted(profile_tokens & vacancy_tokens)
         if len(mandatory_skill_gaps) >= 2:
             stretch_reasons.append(
@@ -1158,7 +1291,19 @@ class PythonBackendRules:
             )
 
         score = self._weighted_score(components)
-        specialization_stretch = any(marker in title for marker in self._stretch_specializations)
+        fit = None
+        if not rejected:
+            fit = assess_fit(
+                vacancy,
+                scope=self.scope,
+                confirmed_skills=context.skills,
+                mandatory_gaps=tuple(mandatory_skill_gaps),
+                minimum_years=max(minimum_required_experience or 0, hh_experience_minimum or 0)
+                or None,
+            )
+        specialization_stretch = (fit is None or fit.tier != 1) and any(
+            marker in title for marker in self._stretch_specializations
+        )
         if rejected:
             category = RuleCategory.REJECTED
         elif specialization_stretch or stretch_reasons:
@@ -1177,7 +1322,11 @@ class PythonBackendRules:
                 )
         reasons.extend(stretch_reasons)
         reasons.extend(rejected)
-        return RuleEvaluation(score, category, tuple(dict.fromkeys(reasons)), tuple(components))
+        if fit is not None:
+            reasons.append(f"{FIT_TIER_LABELS[fit.tier]}: {fit.reason}")
+        return RuleEvaluation(
+            score, category, tuple(dict.fromkeys(reasons)), tuple(components), fit=fit
+        )
 
     @staticmethod
     def _component(
@@ -1203,6 +1352,33 @@ class PythonBackendRules:
     def _has_secondary_development_role(title: str) -> bool:
         markers = ("разработ", "developer", "automation", "автоматизац")
         return any(marker in title for marker in markers)
+
+    @staticmethod
+    def _is_agent_assisted_development_role(title: str, complete_text: str) -> bool:
+        title_markers = (
+            "ai-assisted developer",
+            "ai assisted developer",
+            "vibe coder",
+            "vibe-coder",
+            "вайб-кодер",
+            "вайб кодер",
+            "вайбкодер",
+        )
+        if not any(marker in title for marker in title_markers):
+            return False
+        development_markers = (
+            "создавать внутренние прилож",
+            "разрабатывать прилож",
+            "автоматизац",
+            "интеграц",
+            "веб-сервис",
+            "информационн",
+        )
+        has_development_work = any(marker in complete_text for marker in development_markers)
+        has_applicable_stack = "python" in complete_text or any(
+            marker in complete_text for marker in ("backend", "бэкенд", "rest api")
+        )
+        return has_development_work and has_applicable_stack
 
     @staticmethod
     def _is_python_test_automation_role(title: str, complete_text: str) -> bool:
@@ -1297,6 +1473,11 @@ class PythonBackendRules:
     @classmethod
     def _adjacent_role_priority_reason(cls, title: str, complete_text: str) -> str | None:
         if cls._is_python_test_automation_role(title, complete_text):
+            return (
+                "автоматизация тестирования на Python допустима, но идёт после "
+                "целевой серверной разработки"
+            )
+        if cls._is_agent_assisted_development_role(title, complete_text):
             return None
         if VacancyRoleRouter.is_operations_role(title, complete_text):
             return (
@@ -1335,11 +1516,9 @@ class PythonBackendRules:
                 "разработчик баз данных",
             )
         ):
-            if "python" in complete_text or "sql" in complete_text:
-                return None
             return (
-                "роль обработки данных без подтверждённого Python или SQL "
-                "имеет пониженный приоритет"
+                "смежная роль обработки данных допустима, но идёт после "
+                "целевой серверной разработки"
             )
         if any(marker in title for marker in ("fullstack", "full-stack", "full stack", "фулстек")):
             if "python" in complete_text and any(
@@ -1496,8 +1675,20 @@ class PythonBackendRules:
             r"(?:будет\s+(?:плюсом|преимуществом)|желательно|необязательно|"
             r"приветству\w*|optional|preferred|nice\s+to\s+have)"
         )
+        auxiliary_language_clause = re.compile(
+            r"(?:"
+            r"(?:понимани|чтени)\w*\s+(?:чуж\w*\s+)?код\w*|"
+            r"(?:читать|понимать)\s+(?:чуж\w*\s+)?код\w*|"
+            r"(?:frontend|фронтенд)\w*[^.!?;\n]{0,80}"
+            r"(?:базов\w*\s+уровн\w*|читать|небольш\w*\s+правк\w*)"
+            r")"
+        )
         for clause in re.split(r"[.!?;\n]+", text):
-            if not clause or optional_clause.search(clause):
+            if (
+                not clause
+                or optional_clause.search(clause)
+                or auxiliary_language_clause.search(clause)
+            ):
                 continue
             if "python" in clause and re.search(
                 r"\b(?:или|либо|одн\w+\s+из|на\s+выбор|any\s+of)\b",
@@ -1516,7 +1707,7 @@ class PythonBackendRules:
                 return foreign_stack
         if (
             re.search(
-                r"\bpython\b.{0,60}(?:(?<!не\s)только|лишь|legacy|вспомогательн|"
+                r"\bpython\b.{0,60}(?:(?<!не\s)\bтолько\b|\bлишь\b|legacy|вспомогательн|"
                 r"втор\w*\s+язык|границ\w*\s+(?:ml|ai)|"
                 r"пример\w*\s+базов\w+\s+язык)",
                 text,
@@ -1601,9 +1792,14 @@ class PythonBackendRules:
             marker in title
             for marker in ("computer vision", "компьютерного зрения", "компьютерное зрение")
         )
+        text = " ".join((responsibilities, requirements))
+        if (
+            re.search(r"\bpytorch\b", title) is not None
+            and re.search(r"\b(?:deep\s+learning|глубок\w*\s+обучени\w*)\b", text) is not None
+        ):
+            return True
         if cls._ml_science_title_pattern.search(title) is None and not computer_vision_title:
             return False
-        text = " ".join((responsibilities, requirements))
         science_signals = sum(
             re.search(pattern, text) is not None
             for pattern in (
@@ -1686,8 +1882,13 @@ class PythonBackendRules:
     def _unsupported_data_specialization(
         title: str,
         mandatory_skill_gaps: tuple[str, ...],
+        *,
+        has_data_duties: bool = False,
     ) -> bool:
-        data_role = any(
+        analytical_data_role = has_data_duties and any(
+            marker in title for marker in ("аналитик", "analyst")
+        )
+        data_role = analytical_data_role or any(
             marker in title
             for marker in (
                 "etl",
@@ -2034,107 +2235,14 @@ class PythonBackendRules:
 
     @classmethod
     def _mandatory_requirements(cls, vacancy: VacancyData) -> str:
-        if vacancy.required_qualifications and vacancy.required_qualifications.strip():
-            return cls._without_optional_requirements(vacancy.required_qualifications)
-        description = "\n".join(
-            value
-            for value in (vacancy.responsibilities, vacancy.description)
-            if value and value.strip()
+        return primary_requirements(
+            vacancy.description or vacancy.responsibilities,
+            vacancy.required_qualifications,
         )
-        heading_expression = (
-            r"(?:"
-            r"(?:основные\s+)?требования|"
-            r"что\s+мы\s+жд[её]м[^:\n]*|"
-            r"что\s+мы\s+ожидаем(?:\s+от\s+кандидат\w*)?|"
-            r"жд[её]м\s+от\s+тебя|"
-            r"мы\s+ожидаем\s+от\s+тебя|"
-            r"мы\s+жд[её]м\s+от\s+вас|"
-            r"что\s+ожидаем\s+от\s+кандидата|"
-            r"будем\s+рады\s+видеть[^:\n]*|"
-            r"для\s+нас\s+важно|"
-            r"чего\s+мы\s+ожидаем|"
-            r"ожидания|"
-            r"наши\s+ожидания|"
-            r"наш[и]\s+пожелания\s+к\s+кандидатам|"
-            r"опыт\s+и\s+навыки|"
-            r"кого\s+мы\s+ищем|"
-            r"что\s+для\s+этого\s+необходимо|"
-            r"технические\s+требования|"
-            r"какой\s+опыт\s+и\s+знания\s+нужны|"
-            r"что\s+нужно\s+уметь|"
-            r"мы\s+ищем\s+(?:разработчика|кандидата)[^:\n]*|"
-            r"ты\s*[-–—]?\s*(?:тот|та)\s+сам\w*[^:\n]*|"
-            r"пожелания\s+к\s+кандидат\w*|"
-            r"обязательн\w*\s+требован\w*(?:\s*\(\s*must\s+have\s*\))?|"
-            r"обязательно(?:\s*\(\s*must\s+have\s*\))?|"
-            r"стек\s*\(?(?:обязательно|обязательный)\)?|"
-            r"(?:тот|та|кандидат)[^:\n]{0,160}\bимеет"
-            r")"
-        )
-        line_heading = re.search(
-            rf"(?im)^\s*{heading_expression}\s*:?\s*$",
-            description,
-        )
-        inline_heading = re.search(
-            rf"(?i)(?<!\w){heading_expression}\s*:\s*",
-            description,
-        )
-        headings = tuple(match for match in (line_heading, inline_heading) if match is not None)
-        heading = min(headings, key=lambda match: match.start()) if headings else None
-        if heading is None:
-            return ""
-        requirements = description[heading.end() :]
-        return cls._without_optional_requirements(requirements)
 
     @staticmethod
     def _without_optional_requirements(value: str) -> str:
-        value = re.sub(
-            r"(?is)(?<!\w)ст[еэ]к\s+желательн\w*\s*:\s*.*?"
-            r"(?=\s*\d+[.)]\s*(?:опыт\w*|знан\w*|умени\w*|понимани\w*|"
-            r"владени\w*|навык\w*|способност\w*))",
-            " ",
-            value,
-        )
-        optional_section = (
-            r"(?:"
-            r"будет\s+(?:плюсом|преимуществом)"
-            r"(?:\s+и\s+[^:.\n]{1,60})?|"
-            r"желательн\w*\s+навык\w*(?:\s*\(будет\s+плюсом\))?|"
-            r"желательно|"
-            r"ст[еэ]к\s+желательн\w*|"
-            r"необязательно|"
-            r"приветству\w*|"
-            r"optional|"
-            r"preferred|"
-            r"nice\s+to\s+have|"
-            r"условия|"
-            r"мы\s+предлагаем|"
-            r"что\s+мы\s+предлагаем|"
-            r"что\s+мы\s+можем\s+гарантировать|"
-            r"что\s+мы\s+гарантируем|"
-            r"предлагаем"
-            r")"
-        )
-        ending = re.search(
-            rf"(?im)^\s*{optional_section}\s*:?\s*$",
-            value,
-        )
-        inline_ending = re.search(
-            rf"(?i)(?<!\w){optional_section}\s*:\s*",
-            value,
-        )
-        endings = tuple(match for match in (ending, inline_ending) if match is not None)
-        if endings:
-            value = value[: min(endings, key=lambda match: match.start()).start()]
-        lines = value.splitlines()
-        if len(lines) > 1:
-            optional_clause = re.compile(
-                r"\b(?:будет\s+(?:плюсом|преимуществом)|"
-                r"желательно|необязательно|приветству\w*)\b",
-                re.IGNORECASE,
-            )
-            value = "\n".join(line for line in lines if not optional_clause.search(line))
-        return _normalize_rule_text(value)
+        return mandatory_text(value, include_unlabelled=True)
 
     @staticmethod
     def _substantial_coding_evidence(text: str) -> bool:
@@ -2158,7 +2266,7 @@ class PythonBackendRules:
             "pytest",
         )
         return any(
-            re.search(r"\b(?:разрабатыв\w*|develop\w*)\b", section) is not None
+            re.search(r"\b(?:разработ\w*|develop\w*)\b", section) is not None
             and any(marker in section for marker in stack_markers)
             for section in sections
         )
@@ -2192,20 +2300,8 @@ class PythonBackendRules:
             return "уровень Senior/Lead снижает приоритет, но сам по себе не блокирует", None
         return None, None
 
-    @staticmethod
-    def _tokens(text: str) -> set[str]:
-        return {
-            token
-            for token in re.findall(
-                r"[a-zа-яё][a-zа-яё0-9+#.-]{1,}",
-                _normalize_rule_text(text),
-            )
-            if len(token) > 1
-        }
-
     def _profile_skill_tokens(self, values: tuple[str, ...]) -> set[str]:
-        text = re.sub(r"(?i)\bpl\s*/\s*sql\b", " plsql ", " ".join(values))
-        return self._tokens(text)
+        return skill_terms(" ".join(values))
 
     @classmethod
     def _minimum_required_experience(
@@ -2454,7 +2550,7 @@ class PythonBackendRules:
     def _freshness_score(published_at: datetime | None) -> float | None:
         if published_at is None:
             return None
-        age_seconds = (datetime.now(UTC) - as_utc(published_at)).total_seconds()
+        age_seconds = (decision_now() - as_utc(published_at)).total_seconds()
         age_days = max(age_seconds / 86400, 0)
         if age_days <= 2:
             return 100
@@ -2468,7 +2564,7 @@ class PythonBackendRules:
     def _is_too_old(published_at: datetime | None) -> bool:
         if published_at is None:
             return False
-        return datetime.now(UTC) - as_utc(published_at) > MAX_VACANCY_AGE
+        return decision_now() - as_utc(published_at) > MAX_VACANCY_AGE
 
     @staticmethod
     def _description_score(vacancy: VacancyData) -> float | None:
@@ -2561,6 +2657,8 @@ class AdjacentItRules(PythonBackendRules):
     def _role_score(title: str, text: str) -> float:
         if PythonBackendRules._is_python_test_automation_role(title, text):
             return 90
+        if PythonBackendRules._is_agent_assisted_development_role(title, text):
+            return 90
         if VacancyRoleRouter.is_operations_role(title, text):
             return 35
         if VacancyRoleRouter.is_other_it_role(title):
@@ -2652,7 +2750,7 @@ class VacancyAnalysisService:
         vacancy: VacancyData,
         context: RuleContext,
     ) -> VacancyAnalysisResult:
-        stored = self._vacancies.get(stored.id)
+        stored = self._refresh_duplicate_family(self._vacancies.get(stored.id))
         tracked = self._directions.get_tracked_vacancy(direction.id, stored.id)
         rules = self._rules[direction.scope]
         if stored.duplicate_of_id is not None and stored.availability is VacancyAvailability.ACTIVE:
@@ -2669,57 +2767,43 @@ class VacancyAnalysisService:
         candidates = self._vacancies.list_duplicate_candidates(stored)
         duplicate = self._duplicates.find(stored, candidates)
         if duplicate is not None:
+            self._refresh_duplicate_family(duplicate.canonical)
             stored = self._vacancies.mark_duplicate(
                 stored.id,
                 duplicate.canonical.id,
                 duplicate.similarity,
             )
+            stored = self._refresh_duplicate_family(stored)
         canonical_hh_id = duplicate.canonical.hh_id if duplicate is not None else None
         if stored.duplicate_of_id is not None and canonical_hh_id is None:
             with suppress(LookupError):
                 canonical_hh_id = self._vacancies.get(stored.duplicate_of_id).hh_id
         is_duplicate = stored.duplicate_of_id is not None
-        if (
+        manual_accept = (
             vacancy.availability is VacancyAvailability.ACTIVE
             and not is_duplicate
             and tracked.rules_details.get("manual_override") == "ACCEPT"
             and tracked.rules_version == RULES_VERSION
             and not rules._is_too_old(vacancy.published_at)
-        ):
-            raw_reasons = tracked.rules_details.get("reasons", [])
-            reason_values = raw_reasons if isinstance(raw_reasons, list) else []
-            reasons = tuple(str(item) for item in reason_values)
-            evaluation = RuleEvaluation(
-                tracked.rules_score or 50,
-                RuleCategory.MATCH,
-                reasons or ("решение изменено пользователем",),
+        )
+        observed_at = decision_now()
+        started = monotonic()
+        with decision_time(observed_at):
+            evaluation = rules.evaluate(vacancy, context)
+        rule_evaluation = evaluation
+        if manual_accept:
+            evaluation = replace(
+                evaluation,
+                category=RuleCategory.MATCH,
+                reasons=(*evaluation.reasons, "решение изменено пользователем"),
+                target_scope=None,
+                fit=evaluation.fit
+                or FitAssessment(
+                    FitTier.POSSIBLE,
+                    "вакансия возвращена вручную; соответствие задачам требует проверки",
+                    (),
+                ),
             )
-            state = (
-                VacancyState.QUEUED
-                if tracked.state is VacancyState.QUEUED
-                else VacancyState.ANALYZED
-            )
-            experience_priority = tracked.rules_details.get("experience_priority")
-            if not isinstance(experience_priority, int | float):
-                experience_priority = (
-                    rules._experience_score(_normalize_rule_text(vacancy.experience)) or 80
-                )
-            self._directions.apply_rules(
-                direction.id,
-                stored.id,
-                state=state,
-                score=evaluation.score,
-                details={
-                    **tracked.rules_details,
-                    "category": RuleCategory.MATCH.value,
-                    "accepted": True,
-                    "experience_priority": experience_priority,
-                },
-                rules_version=RULES_VERSION,
-            )
-            return VacancyAnalysisResult(stored, evaluation, state)
-
-        evaluation = rules.evaluate(vacancy, context)
         if is_duplicate:
             duplicate_reasons = ["дубликат вакансии"]
             if canonical_hh_id is not None:
@@ -2747,14 +2831,40 @@ class VacancyAnalysisService:
         else:
             state = VacancyState.FILTERED_OUT
 
+        evidence_id = save_ranking_evidence(
+            self._session,
+            vacancy_id=stored.id,
+            account_id=direction.account_id,
+            direction_id=direction.id,
+            scope=direction.scope.value,
+            vacancy=vacancy,
+            context=context,
+            evaluation=rule_evaluation,
+            rules_version=RULES_VERSION,
+            observed_at=observed_at,
+            duration_ms=(monotonic() - started) * 1000,
+            applied={
+                "evaluation": evaluation,
+                "state": state,
+                "manual_accept": manual_accept,
+                "duplicate_of_id": stored.duplicate_of_id,
+            },
+        )
         self._directions.apply_rules(
             direction.id,
             stored.id,
             state=state,
             score=evaluation.score,
             details={
+                "evidence_id": evidence_id,
+                **({"manual_override": "ACCEPT"} if manual_accept else {}),
                 "accepted": evaluation.accepted,
                 "category": evaluation.category.value,
+                "fit_tier": int(evaluation.fit.tier) if evaluation.fit else None,
+                "fit_reason": evaluation.fit.reason if evaluation.fit else None,
+                "matched_capabilities": (
+                    list(evaluation.fit.matched_capabilities) if evaluation.fit else []
+                ),
                 "reasons": list(evaluation.reasons),
                 "components": [
                     {
@@ -2790,6 +2900,23 @@ class VacancyAnalysisService:
             rules_version=RULES_VERSION,
         )
         return VacancyAnalysisResult(stored, evaluation, state)
+
+    def _refresh_duplicate_family(self, vacancy: VacancyRecord) -> VacancyRecord:
+        canonical = self._vacancies.get(vacancy.duplicate_of_id or vacancy.id)
+        if canonical.details_fetched_at is None:
+            return self._vacancies.get(vacancy.id)
+        for member_id in self._vacancies.duplicate_family_ids(canonical.id):
+            if member_id == canonical.id:
+                continue
+            member = self._vacancies.get(member_id)
+            if member.details_fetched_at is None:
+                continue
+            reason = self._duplicates.conflict_reason(member, canonical)
+            if reason is not None:
+                self._vacancies.unlink_duplicate(
+                    member.id, reason=reason, rules_version=RULES_VERSION
+                )
+        return self._vacancies.get(vacancy.id)
 
     def _route(
         self,
@@ -2832,21 +2959,51 @@ class VacancyAnalysisService:
         return account, direction
 
     def _context(self, account_id: int, direction_name: str) -> RuleContext:
+        confirmed_skills = self._candidate_skills(account_id)
         try:
             settings = CareerDirectionService(self._session).get(account_id, direction_name)
         except LookupError:
-            return RuleContext()
+            return RuleContext(
+                skills=confirmed_skills,
+                candidate_locations=self._candidate_locations(account_id),
+                relocation_allowed=self._relocation_allowed(account_id),
+            )
         regions = tuple(
             {region.area: region for query in settings.queries for region in query.regions}.values()
         )
         return RuleContext(
-            skills=settings.skills_from_resume,
+            skills=confirmed_skills,
             work_formats=settings.work_formats,
             regions=regions,
             candidate_locations=self._candidate_locations(account_id),
             minimum_salary=settings.minimum_salary,
             desired_salary=settings.desired_salary,
             relocation_allowed=self._relocation_allowed(account_id),
+        )
+
+    def _candidate_skills(self, account_id: int) -> tuple[str, ...]:
+        return confirmed_skill_texts(
+            (category, content)
+            for category, content in self._session.execute(
+                select(VerifiedFactModel.category, VerifiedFactModel.content)
+                .join(
+                    CandidateProfileModel,
+                    CandidateProfileModel.id == VerifiedFactModel.profile_id,
+                )
+                .where(
+                    CandidateProfileModel.account_id == account_id,
+                    CandidateProfileModel.active_resume_id.is_not(None),
+                    VerifiedFactModel.category.in_(
+                        ("skills", "technology", "project", "work_experience")
+                    ),
+                    VerifiedFactModel.state == ConfirmationState.CONFIRMED,
+                    or_(
+                        VerifiedFactModel.resume_id == CandidateProfileModel.active_resume_id,
+                        VerifiedFactModel.resume_id.is_(None),
+                    ),
+                )
+                .order_by(VerifiedFactModel.id)
+            )
         )
 
     def _candidate_locations(self, account_id: int) -> tuple[str, ...]:

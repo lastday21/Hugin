@@ -227,12 +227,11 @@ class ResumeRepository:
             .where(
                 CandidateProfileModel.account_id == account_id,
                 ResumeModel.account_id == account_id,
-                ResumeModel.is_active.is_(True),
             )
         )
         if model is None:
             raise LookupError(
-                "Активное ИТ-резюме не найдено; сначала импортируйте и подтвердите резюме"
+                "Резюме профиля не выбрано; сначала импортируйте и подтвердите резюме"
             )
         return _resume_record(model)
 

@@ -1,19 +1,21 @@
 from __future__ import annotations
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 
 from hugin.core.settings import Settings
 from hugin.database import create_database, upgrade_database
 from hugin.database.models import (
     CandidateProfileModel,
     DirectionSearchQueryModel,
+    ResumeModel,
     VacancyDiscoveryModel,
     VerifiedFactModel,
 )
 from hugin.domain.content import ConfirmationState
 from hugin.domain.directions import DirectionScope, EmploymentForm, SearchRegion, WorkFormat
 from hugin.domain.vacancies import VacancyData
+from hugin.domain.vacancy_priority import FitTier
 from hugin.repositories.directions import AccountRepository, ResumeRepository
 from hugin.services.career_directions import (
     DEFAULT_DIRECTION_QUERIES,
@@ -21,8 +23,95 @@ from hugin.services.career_directions import (
     CareerDirectionService,
 )
 from hugin.services.job_search import JobSearchSyncService
+from hugin.services.vacancy_analysis import VacancyAnalysisService
+from hugin.services.vacancy_fit import assess_fit
 
 pytestmark = pytest.mark.integration
+
+
+def test_ranking_uses_confirmed_active_profile_projects_and_technology(settings: Settings) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    try:
+        with database.sessions.begin() as session:
+            account = AccountRepository(session).create("Тест", "profile-evidence")
+            resumes = ResumeRepository(session)
+            active = resumes.upsert(account.id, "evidence-active", "Python")
+            previous = resumes.upsert(account.id, "evidence-previous", "Java")
+            profile = CandidateProfileModel(
+                account_id=account.id,
+                active_resume_id=active.id,
+                display_name="Тест",
+            )
+            session.add(profile)
+            session.flush()
+            for category, content, resume_id, state in (
+                ("skills", "Python, FastAPI, PostgreSQL", active.id, ConfirmationState.CONFIRMED),
+                ("technology", "YandexGPT", active.id, ConfirmationState.CONFIRMED),
+                (
+                    "project",
+                    "Hugin\nТехнологии: React, TypeScript",
+                    active.id,
+                    ConfirmationState.CONFIRMED,
+                ),
+                (
+                    "work_experience",
+                    "Команда с Java.\nСтек: Docker, pytest",
+                    active.id,
+                    ConfirmationState.CONFIRMED,
+                ),
+                ("experience", "С PyQt и QML не работал", active.id, ConfirmationState.CONFIRMED),
+                ("technology", "Redis", None, ConfirmationState.CONFIRMED),
+                ("technology", "Spring", previous.id, ConfirmationState.CONFIRMED),
+                ("technology", "Rust", active.id, ConfirmationState.PENDING),
+            ):
+                session.add(
+                    VerifiedFactModel(
+                        profile_id=profile.id,
+                        resume_id=resume_id,
+                        category=category,
+                        content=content,
+                        source_type="manual",
+                        state=state,
+                    )
+                )
+            CareerDirectionService(session).configure(
+                account_id=account.id,
+                direction_name="ИТ",
+                queries=("Python AI",),
+                regions=(SearchRegion("2", "Санкт-Петербург"),),
+            )
+            session.flush()
+            service = VacancyAnalysisService(session)
+            context = service._context(account.id, "ИТ")
+            assert context.skills == (
+                "Python, FastAPI, PostgreSQL",
+                "YandexGPT",
+                "React, TypeScript",
+                "Docker, pytest",
+                "Redis",
+            )
+            assert service._candidate_skills(account.id + 1000) == ()
+            vacancy = VacancyData(
+                "profile-ai",
+                "Разработчик интеграций с ИИ",
+                "https://hh.ru/vacancy/profile-ai",
+                description=(
+                    "Задачи:\nРазрабатывать API на Python с YandexGPT.\n"
+                    "Требования:\nPython, FastAPI."
+                ),
+            )
+            fit = assess_fit(
+                vacancy,
+                scope=DirectionScope.IT_ADJACENT,
+                confirmed_skills=context.skills,
+                mandatory_gaps=(),
+                minimum_years=2,
+            )
+            assert fit.tier is FitTier.DIRECT
+            assert "llm" in fit.matched_capabilities
+    finally:
+        database.close()
 
 
 def test_direction_settings_use_active_resume_and_build_city_searches(
@@ -225,5 +314,62 @@ def test_direction_without_cities_searches_all_russia(settings: Settings) -> Non
                 ("113", "Россия"),
             ] * len(DEFAULT_DIRECTION_QUERIES[DirectionScope.IT_ADJACENT])
             assert tasks[0].filters == {"order_by": "publication_time"}
+    finally:
+        database.close()
+
+
+def test_search_uses_selected_profile_resume_when_hh_resume_is_inactive(
+    settings: Settings,
+) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+
+    try:
+        with database.sessions.begin() as session:
+            account = AccountRepository(session).create("Пользователь", "inactive-resume-account")
+            resume = ResumeRepository(session).upsert(
+                account.id,
+                "inactive-resume",
+                "Python backend-разработчик",
+            )
+            profile = CandidateProfileModel(
+                account_id=account.id,
+                active_resume_id=resume.id,
+                display_name="Пользователь",
+            )
+            session.add(profile)
+            session.flush()
+            session.add(
+                VerifiedFactModel(
+                    profile_id=profile.id,
+                    resume_id=resume.id,
+                    category="skills",
+                    content="Python, FastAPI, PostgreSQL, Docker",
+                    source_type="resume",
+                    state=ConfirmationState.CONFIRMED,
+                )
+            )
+            CareerDirectionService(session).configure(
+                account_id=account.id,
+                direction_name="Python backend",
+                queries=("Python backend разработчик",),
+                regions=(SearchRegion("2", "Санкт-Петербург"),),
+            )
+            session.execute(
+                update(ResumeModel).where(ResumeModel.id == resume.id).values(is_active=False)
+            )
+            session.flush()
+
+            tasks = CareerDirectionService(session).build_search_tasks(
+                account.id,
+                "Python backend",
+            )
+            context = VacancyAnalysisService(session)._context(
+                account.id,
+                "Python backend",
+            )
+
+            assert tasks
+            assert context.skills == ("Python, FastAPI, PostgreSQL, Docker",)
     finally:
         database.close()
