@@ -35,12 +35,20 @@ from hugin.adapters.postgres_backup import DockerPostgresBackupAdapter
 from hugin.core.settings import Settings, get_settings
 from hugin.database import create_database, upgrade_database
 from hugin.database.models import ApplicationModel, VacancyModel
+from hugin.desktop_runtime import (
+    DesktopTray,
+    StartupStatusWindow,
+    TrayWindow,
+    ensure_docker_desktop_running,
+)
 from hugin.diagnostics import OperationJournal, error_details
-from hugin.domain.automation import AutomationJobKind
+from hugin.domain.automation import AutomationJobKind, AutomationJobState
 from hugin.domain.communications import CommunicationNotFoundError, CommunicationStateError
 from hugin.domain.content import RecruiterMessageState
 from hugin.domain.hh import HhFormReviewStatus
 from hugin.domain.vacancies import VacancyAvailability
+from hugin.services.application_automation import ApplicationAutomationService
+from hugin.services.automation import AutomationSchedulerService
 from hugin.services.backups import BackupService
 from hugin.services.communications import CommunicationService, RecordingMessageSender
 from hugin.services.hh_login import HhLoginService, LoginStatus
@@ -55,9 +63,20 @@ from hugin.workers.notifications import NotificationWorker
 
 APP_ICON = Path(__file__).with_name("assets") / "hugin.ico"
 
+_HH_LOGIN_BLOCK_CODES = frozenset(
+    {
+        "AUTH_REQUIRED",
+        "CAPTCHA_REQUIRED",
+        "CREDENTIALS_REQUIRED",
+        "CONFIRMATION_REQUIRED",
+        "INVALID_CREDENTIALS",
+        "MANUAL_ACTION_REQUIRED",
+    }
+)
 
-class WebviewWindow(Protocol):
-    def destroy(self) -> None: ...
+
+class WebviewWindow(TrayWindow, Protocol):
+    pass
 
 
 class BackgroundWorker(Protocol):
@@ -148,6 +167,56 @@ class DesktopBridge:
 
     def open_url(self, url: str) -> dict[str, object]:
         return self._record_action("hh_link.open", lambda: self._open_url(url))
+
+    def login_hh(self) -> dict[str, object]:
+        return self._record_action("hh_login.open", self._login_hh)
+
+    def _login_hh(self) -> dict[str, object]:
+        with (
+            self._lock,
+            VisibleHhBrowser(
+                self._settings.browser_profile_dir(self._account_id),
+                self._settings.hh_login_url,
+                self._settings.hh_resumes_url,
+                self._settings.hh_search_url,
+                self._settings.hh_browser_timeout_ms,
+                start_minimized=False,
+                browser_source_ip=(
+                    str(self._settings.hh_browser_source_ip)
+                    if self._settings.hh_browser_source_ip is not None
+                    else None
+                ),
+            ) as browser,
+        ):
+            browser.open_login()
+            while browser.is_open():
+                status = browser.authentication_status()
+                if status is LoginStatus.AUTHENTICATED:
+                    self._resume_after_hh_login()
+                    return self._result("READY", "Вход в hh.ru выполнен")
+                if status is LoginStatus.ACCOUNT_WARNING:
+                    return self._result(
+                        "ACCOUNT_WARNING",
+                        "hh.ru показал предупреждение безопасности аккаунта",
+                    )
+                browser.wait_for_authentication()
+        return self._result("CANCELLED", "Окно hh.ru закрыто до завершения входа")
+
+    def _resume_after_hh_login(self) -> None:
+        upgrade_database(self._settings)
+        database = create_database(self._settings)
+        try:
+            with database.sessions.begin() as session:
+                ApplicationAutomationService(session).resume_after_authentication()
+                scheduler = AutomationSchedulerService(session)
+                for job in scheduler.list_for_account(self._account_id):
+                    if (
+                        job.state is AutomationJobState.BLOCKED
+                        and (job.last_error_code or "").strip().upper() in _HH_LOGIN_BLOCK_CODES
+                    ):
+                        scheduler.unblock(job.key)
+        finally:
+            database.close()
 
     def _open_url(self, url: str) -> dict[str, object]:
         value = url.strip()
@@ -768,9 +837,19 @@ def api_is_ready(url: str) -> bool:
         return False
 
 
-def ensure_services(settings: Settings, *, timeout_seconds: int = 90) -> None:
+def ensure_services(
+    settings: Settings,
+    *,
+    timeout_seconds: int = 90,
+    status: Callable[[str], None] | None = None,
+) -> None:
     if api_is_ready(settings.desktop_api_url):
         return
+    if status is not None:
+        status("Погодите, проверяется Docker Desktop…")
+    ensure_docker_desktop_running(status=status)
+    if status is not None:
+        status("Погодите, запускаются контейнеры Hugin…")
     root = project_directory()
     database = subprocess.run(
         ["docker", "compose", "up", "--detach", "--wait", "db"],
@@ -781,11 +860,15 @@ def ensure_services(settings: Settings, *, timeout_seconds: int = 90) -> None:
         creationflags=int(getattr(subprocess, "CREATE_NO_WINDOW", 0)),
     )
     if database.returncode != 0:
-        raise RuntimeError("Не удалось запустить PostgreSQL для резервного копирования")
+        raise RuntimeError("Не удалось запустить контейнер PostgreSQL")
+    if status is not None:
+        status("Подготавливается резервная копия базы…")
     BackupService(
         settings,
         adapter=DockerPostgresBackupAdapter(root),
     ).create("pre-update")
+    if status is not None:
+        status("Погодите, запускаются сервер и база Hugin…")
     completed = subprocess.run(
         ["docker", "compose", "up", "--detach", "--build", "--wait"],
         cwd=root,
@@ -845,8 +928,9 @@ def main() -> None:
         "application.start",
         environment=settings.environment,
     )
+    startup_status = StartupStatusWindow()
     try:
-        ensure_services(settings)
+        ensure_services(settings, status=startup_status.update)
         webview = cast(WebviewModule, import_module("webview"))
     except ImportError as error:
         failure = RuntimeError("Установите оконную часть: uv sync --extra desktop --extra browser")
@@ -855,6 +939,8 @@ def main() -> None:
     except Exception as error:
         starting.fail(error)
         raise
+    finally:
+        startup_status.close()
     browser_lock = threading.Lock()
     application_worker = ApplicationWorker(
         settings,
@@ -902,11 +988,12 @@ def main() -> None:
         backup_worker,
     )
     started_workers: list[BackgroundWorker] = []
+    tray: DesktopTray | None = None
     try:
         for background_worker in workers:
             background_worker.start()
             started_workers.append(background_worker)
-        webview.create_window(
+        window = webview.create_window(
             "Hugin — поиск работы",
             settings.desktop_api_url,
             js_api=bridge,
@@ -915,6 +1002,8 @@ def main() -> None:
             min_size=(1080, 700),
             background_color="#f4f7f5",
         )
+        tray = DesktopTray(window, APP_ICON)
+        tray.start()
     except Exception as error:
         starting.fail(error)
         bridge.close()
@@ -931,6 +1020,8 @@ def main() -> None:
     else:
         session.succeed()
     finally:
+        if tray is not None:
+            tray.stop()
         bridge.close()
         for background_worker in reversed(started_workers):
             background_worker.stop()

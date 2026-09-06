@@ -25,6 +25,7 @@ from hugin.adapters.notification_gateway import (
 )
 from hugin.core.settings import Settings
 from hugin.domain import HhFormReviewResult, HhFormReviewStatus, HhScreeningForm
+from hugin.domain.automation import AutomationJobState
 from hugin.domain.content import RecruiterMessageState
 from hugin.domain.vacancies import VacancyAvailability
 from hugin.services.hh_login import LoginResult, LoginStatus
@@ -171,6 +172,86 @@ def prepare_bridge(
     monkeypatch.setattr(desktop, "ScreeningDraftService", FakeDraftService)
     monkeypatch.setattr(desktop, "VisibleHhBrowser", FakeBrowser)
     return desktop.DesktopBridge(Settings(environment="test", data_dir=tmp_path))
+
+
+def test_bridge_opens_manual_hh_login_and_restores_work(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    events: list[object] = []
+
+    class LoginBrowser:
+        def __init__(self, *_args: object, start_minimized: bool, **_kwargs: object) -> None:
+            events.append(("browser", start_minimized))
+            self.authenticated = False
+
+        def __enter__(self) -> LoginBrowser:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            events.append("closed")
+
+        def open_login(self) -> None:
+            events.append("opened")
+
+        def is_open(self) -> bool:
+            return True
+
+        def authentication_status(self) -> LoginStatus:
+            return (
+                LoginStatus.AUTHENTICATED
+                if self.authenticated
+                else LoginStatus.MANUAL_ACTION_REQUIRED
+            )
+
+        def wait_for_authentication(self) -> bool:
+            events.append("waited")
+            self.authenticated = True
+            return True
+
+    class ApplicationService:
+        def __init__(self, _session: object) -> None:
+            pass
+
+        def resume_after_authentication(self) -> None:
+            events.append("resumed")
+
+    blocked_job = SimpleNamespace(
+        state=AutomationJobState.BLOCKED,
+        last_error_code="AUTH_REQUIRED",
+        key="messages:1",
+    )
+
+    class Scheduler:
+        def __init__(self, _session: object) -> None:
+            pass
+
+        def list_for_account(self, account_id: int) -> list[object]:
+            assert account_id == 1
+            return [blocked_job]
+
+        def unblock(self, key: str) -> None:
+            events.append(("unblocked", key))
+
+    monkeypatch.setattr(desktop, "VisibleHhBrowser", LoginBrowser)
+    monkeypatch.setattr(desktop, "upgrade_database", lambda _settings: events.append("upgraded"))
+    monkeypatch.setattr(desktop, "create_database", lambda _settings: FakeDatabase())
+    monkeypatch.setattr(desktop, "ApplicationAutomationService", ApplicationService)
+    monkeypatch.setattr(desktop, "AutomationSchedulerService", Scheduler)
+    bridge = desktop.DesktopBridge(Settings(environment="test", data_dir=tmp_path))
+
+    result = bridge.login_hh()
+
+    assert result == {"status": "READY", "message": "Вход в hh.ru выполнен"}
+    assert events == [
+        ("browser", False),
+        "opened",
+        "waited",
+        "upgraded",
+        "resumed",
+        ("unblocked", "messages:1"),
+        "closed",
+    ]
 
 
 def test_bridge_keeps_saved_form_open_without_submitting(
@@ -903,6 +984,7 @@ def test_ensure_services_starts_docker_and_reports_failures(
 ) -> None:
     settings = Settings(environment="test")
     monkeypatch.setattr(desktop, "project_directory", lambda: tmp_path)
+    monkeypatch.setattr(desktop, "ensure_docker_desktop_running", lambda **_kwargs: False)
     backups: list[tuple[object, ...]] = []
 
     class Backup:
@@ -1015,9 +1097,32 @@ def test_main_starts_window_and_always_closes_bridge(
         def has_pending_work(self) -> bool:
             return False
 
+    class FakeStartupStatus:
+        def update(self, _message: str) -> None:
+            pass
+
+        def close(self) -> None:
+            events.append("startup-close")
+
+    class FakeTray:
+        def __init__(self, _window: object, _icon: Path) -> None:
+            pass
+
+        def start(self) -> None:
+            events.append("tray-start")
+
+        def stop(self) -> None:
+            events.append("tray-stop")
+
     monkeypatch.setattr(desktop, "get_settings", lambda: settings)
-    monkeypatch.setattr(desktop, "ensure_services", lambda _settings: events.append("services"))
+    monkeypatch.setattr(
+        desktop,
+        "ensure_services",
+        lambda _settings, **_kwargs: events.append("services"),
+    )
     monkeypatch.setattr(desktop, "import_module", lambda _name: FakeWebview())
+    monkeypatch.setattr(desktop, "StartupStatusWindow", FakeStartupStatus)
+    monkeypatch.setattr(desktop, "DesktopTray", FakeTray)
     monkeypatch.setattr(desktop, "DesktopBridge", FakeBridge)
     monkeypatch.setattr(desktop, "AutomationWorker", FakeWorker)
     monkeypatch.setattr(desktop, "ApplicationWorker", FakeWorker)
@@ -1028,8 +1133,10 @@ def test_main_starts_window_and_always_closes_bridge(
 
     assert desktop.APP_ICON.is_file()
     assert events[0] == "services"
-    assert events[-6:] == [
+    assert events[-8:] == [
+        "tray-start",
         ("start", False, str(desktop.APP_ICON)),
+        "tray-stop",
         "close",
         "worker-stop",
         "worker-stop",
@@ -1048,7 +1155,12 @@ def test_main_explains_missing_window_dependency(
         "get_settings",
         lambda: Settings(environment="test", data_dir=tmp_path),
     )
-    monkeypatch.setattr(desktop, "ensure_services", lambda _settings: None)
+    monkeypatch.setattr(desktop, "ensure_services", lambda _settings, **_kwargs: None)
+    monkeypatch.setattr(
+        desktop,
+        "StartupStatusWindow",
+        lambda: SimpleNamespace(update=lambda _message: None, close=lambda: None),
+    )
     monkeypatch.setattr(
         desktop,
         "import_module",
