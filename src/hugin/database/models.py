@@ -47,6 +47,12 @@ from hugin.domain.content import (
     ResumeMappingRole,
     ScreeningFormState,
 )
+from hugin.domain.development import (
+    DevelopmentItemKind,
+    DevelopmentItemStatus,
+    DevelopmentPriority,
+    QualityLevel,
+)
 from hugin.domain.directions import ConfigPayload, VacancyState
 from hugin.domain.tasks import SystemState, TaskState
 from hugin.domain.vacancies import VacancyAvailability
@@ -439,6 +445,7 @@ class ApplicationModel(Base):
     direction_id: Mapped[int | None] = mapped_column(
         ForeignKey("career_directions.id", ondelete="SET NULL")
     )
+    status_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     state: Mapped[ApplicationState] = mapped_column(
         Enum(
             ApplicationState,
@@ -472,6 +479,55 @@ class ApplicationModel(Base):
     )
     task: Mapped[ApplicationTaskModel | None] = relationship(
         back_populates="application", cascade="all, delete-orphan", single_parent=True
+    )
+
+
+class ApplicationStatusObservationModel(Base):
+    __tablename__ = "application_status_observations"
+    __table_args__ = (
+        UniqueConstraint(
+            "application_id", "checked_at", "state", name="uq_application_status_observations_check"
+        ),
+        Index(
+            "ix_application_status_observations_application_time", "application_id", "checked_at"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    application_id: Mapped[int] = mapped_column(
+        ForeignKey("applications.id", ondelete="CASCADE"), nullable=False
+    )
+    state: Mapped[ApplicationState] = mapped_column(
+        Enum(
+            ApplicationState,
+            name="observed_application_state",
+            native_enum=False,
+            create_constraint=True,
+            length=16,
+            values_callable=enum_values,
+        ),
+        nullable=False,
+    )
+    status_label: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    checked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    recorded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+
+
+class ApplicationOutcomeModel(Base):
+    __tablename__ = "application_outcomes"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    application_id: Mapped[int] = mapped_column(
+        ForeignKey("applications.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    interview_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    interview_evidence: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    rejection_reason: Mapped[str] = mapped_column(String(500), nullable=False, default="")
+    rejection_evidence: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    recorded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
     )
 
 
@@ -1343,6 +1399,137 @@ class ApplicationSettingsModel(Base):
     diagnostics_retention_days: Mapped[int] = mapped_column(Integer, default=30, nullable=False)
     logs_retention_days: Mapped[int] = mapped_column(Integer, default=90, nullable=False)
     backups_retention_days: Mapped[int] = mapped_column(Integer, default=30, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+    )
+
+
+class DevelopmentDirectionModel(Base):
+    __tablename__ = "development_directions"
+    __table_args__ = (
+        UniqueConstraint(
+            "block_key",
+            "position",
+            name="uq_development_directions_block_position",
+        ),
+    )
+
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    block_key: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    block_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    block_position: Mapped[int] = mapped_column(Integer, nullable=False)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    position: Mapped[int] = mapped_column(Integer, nullable=False)
+    rule: Mapped[str] = mapped_column(Text, nullable=False)
+    metric: Mapped[str] = mapped_column(Text, nullable=False)
+    criticality: Mapped[QualityLevel] = mapped_column(
+        Enum(
+            QualityLevel,
+            name="development_quality_level",
+            native_enum=False,
+            create_constraint=True,
+            length=16,
+            values_callable=enum_values,
+        ),
+        nullable=False,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+    )
+
+
+class DevelopmentAssessmentModel(Base):
+    __tablename__ = "development_assessments"
+    __table_args__ = (
+        CheckConstraint(
+            "score >= 0 AND score <= 5",
+            name="ck_development_assessments_score",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    direction_key: Mapped[str] = mapped_column(
+        ForeignKey("development_directions.key", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    score: Mapped[float] = mapped_column(Float, nullable=False)
+    confidence: Mapped[QualityLevel] = mapped_column(
+        Enum(
+            QualityLevel,
+            name="development_assessment_confidence",
+            native_enum=False,
+            create_constraint=True,
+            length=16,
+            values_callable=enum_values,
+        ),
+        nullable=False,
+    )
+    evidence: Mapped[str] = mapped_column(Text, nullable=False)
+    next_step: Mapped[str] = mapped_column(Text, nullable=False)
+    author: Mapped[str] = mapped_column(String(128), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False, index=True
+    )
+
+
+class DevelopmentItemModel(Base):
+    __tablename__ = "development_items"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    external_key: Mapped[str | None] = mapped_column(String(64), unique=True)
+    kind: Mapped[DevelopmentItemKind] = mapped_column(
+        Enum(
+            DevelopmentItemKind,
+            name="development_item_kind",
+            native_enum=False,
+            create_constraint=True,
+            length=16,
+            values_callable=enum_values,
+        ),
+        nullable=False,
+    )
+    title: Mapped[str] = mapped_column(String(500), nullable=False)
+    direction_key: Mapped[str] = mapped_column(
+        ForeignKey("development_directions.key", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    status: Mapped[DevelopmentItemStatus] = mapped_column(
+        Enum(
+            DevelopmentItemStatus,
+            name="development_item_status",
+            native_enum=False,
+            create_constraint=True,
+            length=24,
+            values_callable=enum_values,
+        ),
+        nullable=False,
+    )
+    priority: Mapped[DevelopmentPriority] = mapped_column(
+        Enum(
+            DevelopmentPriority,
+            name="development_priority",
+            native_enum=False,
+            create_constraint=True,
+            length=16,
+            values_callable=enum_values,
+        ),
+        nullable=False,
+    )
+    expected_metric: Mapped[str] = mapped_column(Text, nullable=False)
+    evidence: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    verification_method: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    next_step: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    actual_result: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    reference_codes: Mapped[list[str]] = mapped_column(JSONB, default=list, nullable=False)
+    author: Mapped[str] = mapped_column(String(128), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
     )
