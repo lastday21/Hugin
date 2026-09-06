@@ -13,7 +13,7 @@ from hugin.adapters.credentials import WindowsCredentialStore
 from hugin.adapters.hh_browser import VisibleHhBrowser
 from hugin.core.settings import Settings, get_settings
 from hugin.database import create_database, upgrade_database
-from hugin.diagnostics import OperationJournal
+from hugin.diagnostics import JournalRun, OperationJournal, operation_context
 from hugin.domain.automation import AutomationJobState
 from hugin.domain.directions import EmploymentForm, SearchRegion, WorkFormat
 from hugin.domain.hh import HhApplyResult, HhApplyStatus, HhProfileData
@@ -33,7 +33,7 @@ from hugin.services.hh_profile import HhProfileSyncService
 from hugin.services.job_search import JobSearchSyncService
 from hugin.services.queue import QueueService
 from hugin.services.resume_profile import ProfileQuestionService
-from hugin.services.screening_forms import ScreeningDraftService
+from hugin.services.screening_forms import ScreeningDraftService, StoredScreeningSubmission
 from hugin.services.vacancy_analysis import RuleCategory, VacancyAnalysisService
 from hugin.services.vacancy_review import VacancyReviewEntry, VacancyReviewService
 
@@ -256,6 +256,11 @@ def build_parser() -> argparse.ArgumentParser:
     selector.add_argument("--vacancy-id", help="номер вакансии hh.ru")
     supervised.add_argument("--letter-id", type=positive_int, required=True)
     supervised.add_argument("--letter-sha256", required=True)
+    supervised.add_argument(
+        "--with-confirmed-form",
+        action="store_true",
+        help="отправить также сохранённую простую анкету с подтверждёнными ответами",
+    )
     supervised.add_argument(
         "--session-limit",
         type=positive_int,
@@ -1209,6 +1214,8 @@ def _run_supervised_application(
     )
     database = create_database(settings)
     lease_acquired = False
+    apply_run: JournalRun | None = None
+    submission: StoredScreeningSubmission | None = None
     job = None
     result: HhApplyResult | None = None
     try:
@@ -1240,9 +1247,24 @@ def _run_supervised_application(
                 session_limit=arguments.session_limit,
                 now=claim_at,
             )
+            if getattr(arguments, "with_confirmed_form", False):
+                submission = ScreeningDraftService(session).get_auto_submission(job.application.id)
+                if submission is None:
+                    raise ValueError("Нет простой анкеты с актуальными подтверждёнными ответами")
             policy = service.policy(local_timezone_name())
             enforced_delay_seconds = max(60, policy.delay_min_seconds)
 
+        apply_run = OperationJournal(settings.data_dir).start(
+            "applications",
+            "apply",
+            account_id=arguments.account_id,
+            application_id=job.application.id,
+            task_id=job.task.id,
+            attempt_number=getattr(job.task, "attempts", None),
+            vacancy_id=job.vacancy.hh_id,
+            resume_id=job.resume.id,
+            parent_run_id=journal_run.run_id,
+        )
         try:
             _validate_supervised_resume(profile, job.resume.hh_id, job.resume.title)
         except ValueError:
@@ -1254,23 +1276,33 @@ def _run_supervised_application(
                 )
             raise
         try:
-            result = browser.apply_to_vacancy(
-                job.vacancy.source_url,
-                expected_resume_hh_id=job.resume.hh_id,
-                expected_resume_title=job.resume.title,
-                cover_letter=job.cover_letter or "",
-                submit=True,
-                submit_guard=lambda: _supervised_submission_allowed(
-                    settings,
-                    token,
-                    job.task.id,
-                    job.cover_letter_id,
-                    job.cover_letter_sha256,
-                    job.resume.hh_id,
-                    job.resume.title,
-                ),
-            )
+            with operation_context(
+                account_id=arguments.account_id,
+                application_id=job.application.id,
+                task_id=job.task.id,
+                attempt_number=getattr(job.task, "attempts", None),
+                parent_run_id=apply_run.run_id,
+            ):
+                result = browser.apply_to_vacancy(
+                    job.vacancy.source_url,
+                    expected_resume_hh_id=job.resume.hh_id,
+                    expected_resume_title=job.resume.title,
+                    cover_letter=job.cover_letter or "",
+                    submit=True,
+                    submit_guard=lambda: _supervised_submission_allowed(
+                        settings,
+                        token,
+                        job.task.id,
+                        job.cover_letter_id,
+                        job.cover_letter_sha256,
+                        job.resume.hh_id,
+                        job.resume.title,
+                        submission=submission,
+                    ),
+                    screening_submission=submission.payload if submission is not None else None,
+                )
         except Exception as error:
+            apply_run.fail(error, result_status=HhApplyStatus.UNKNOWN_RESULT.value)
             result = HhApplyResult(
                 HhApplyStatus.UNKNOWN_RESULT,
                 job.vacancy.source_url,
@@ -1313,16 +1345,20 @@ def _run_supervised_application(
             ),
         }
         if recorded.sent:
+            apply_run.succeed(**details)
             journal_run.succeed(**details)
             print(
                 f"Отклик на вакансию №{job.vacancy.hh_id} подтверждён. "
                 f"Следующая отправка не раньше чем через {enforced_delay_seconds} секунд."
             )
             return 0
+        apply_run.block(**details)
         journal_run.block(**details)
         print(f"Отклик не отправлен: {_apply_status_text(result.status)}.")
         return 3 if result.status is HhApplyStatus.UNKNOWN_RESULT else 2
     except (LookupError, RuntimeError, ValueError) as error:
+        if apply_run is not None:
+            apply_run.block(reason=str(error), stage="supervised_submission")
         journal_run.block(
             task_id=getattr(getattr(job, "task", None), "id", arguments.task_id),
             application_id=getattr(getattr(job, "application", None), "id", None),
@@ -1335,6 +1371,8 @@ def _run_supervised_application(
         print(f"Управляемая отправка остановлена: {error}", file=sys.stderr)
         return 2
     except Exception as error:
+        if apply_run is not None:
+            apply_run.fail(error, stage="supervised_submission")
         journal_run.fail(
             error,
             task_id=getattr(getattr(job, "task", None), "id", arguments.task_id),
@@ -1380,12 +1418,18 @@ def _supervised_submission_allowed(
     letter_sha256: str | None,
     resume_hh_id: str,
     resume_title: str,
+    *,
+    submission: StoredScreeningSubmission | None = None,
 ) -> bool:
     if letter_id is None or letter_sha256 is None:
         return False
     database = create_database(settings)
     try:
         with database.sessions.begin() as session:
+            if submission is not None and not ScreeningDraftService(
+                session
+            ).auto_submission_allowed(submission):
+                return False
             return ApplicationAutomationService(session).supervised_submission_is_allowed(
                 token,
                 task_id,

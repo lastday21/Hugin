@@ -118,11 +118,20 @@ def test_communications_migration_preserves_existing_rows(settings: Settings) ->
     database = create_database(settings)
     try:
         with database.sessions.begin() as session:
-            _, application_id = create_application(
-                session,
-                account_label="Миграция",
-                vacancy_hh_id="communications-migration",
+            account = AccountRepository(session).create("Миграция")
+            resume = ResumeRepository(session).upsert(account.id, "legacy-resume", "Резюме")
+            vacancy = VacancyRepository(session).upsert(
+                VacancyData("communications-migration", "Вакансия", "https://hh.ru/vacancy/legacy")
             )
+            application_id = session.execute(
+                text(
+                    "INSERT INTO applications "
+                    "(account_id, vacancy_id, resume_id, state, created_at, updated_at) "
+                    "VALUES (:account, :vacancy, :resume, 'APPLYING', "
+                    "CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) RETURNING id"
+                ),
+                {"account": account.id, "vacancy": vacancy.id, "resume": resume.id},
+            ).scalar_one()
 
         with database.engine.begin() as connection:
             application = connection.execute(
@@ -179,7 +188,7 @@ def test_communications_migration_preserves_existing_rows(settings: Settings) ->
         database.close()
 
     upgrade_database(settings)
-    assert current_revision(settings) == "0027_cover_letter_quality"
+    assert current_revision(settings) == "0030_status_history"
     check_database_schema(settings)
 
     migrated = create_database(settings)

@@ -31,6 +31,7 @@ from hugin.domain.tasks import SystemState, TaskState
 from hugin.domain.vacancies import VacancyAvailability, VacancyData, VacancySearchResult
 from hugin.services.career_directions import DirectionSearchSettings, VacancySearchTask
 from hugin.services.hh_login import HhCredentials, LoginStatus
+from hugin.services.screening_forms import StoredScreeningSubmission
 from hugin.services.vacancy_analysis import RuleCategory
 
 
@@ -1472,15 +1473,17 @@ def test_supervised_preflight_rejects_another_hh_account(
     assert "другой аккаунт" in entries[-1]["details"]["reason"]
 
 
+@pytest.mark.parametrize("with_form", [False, True])
 def test_supervised_apply_sends_exact_approved_letter_and_journals(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    with_form: bool,
 ) -> None:
     settings = Settings(environment="test", data_dir=tmp_path)
     database = FakeDatabase()
     digest = "a" * 64
     job = SimpleNamespace(
-        task=SimpleNamespace(id=41),
+        task=SimpleNamespace(id=41, attempts=2),
         application=SimpleNamespace(id=51),
         vacancy=SimpleNamespace(
             hh_id="100",
@@ -1553,6 +1556,14 @@ def test_supervised_apply_sends_exact_approved_letter_and_journals(
         ),
     )
     monkeypatch.setattr(hh_cli, "ApplicationAutomationService", FakeAutomationService)
+    form_payload = object()
+    monkeypatch.setattr(
+        hh_cli,
+        "ScreeningDraftService",
+        lambda session: SimpleNamespace(
+            get_auto_submission=lambda application_id: SimpleNamespace(payload=form_payload)
+        ),
+    )
     browser = FakeBrowser(
         tmp_path / "profile",
         "https://hh.ru/login",
@@ -1567,6 +1578,7 @@ def test_supervised_apply_sends_exact_approved_letter_and_journals(
         letter_id=71,
         letter_sha256=digest,
         session_limit=20,
+        with_confirmed_form=with_form,
     )
 
     assert (
@@ -1580,6 +1592,7 @@ def test_supervised_apply_sends_exact_approved_letter_and_journals(
     )
     assert released
     assert browser.application_submit_modes == [True]
+    assert browser.screening_submissions == [form_payload if with_form else None]
     entries = [
         entry
         for entry in OperationJournal(tmp_path).entries(component="applications")
@@ -1594,6 +1607,15 @@ def test_supervised_apply_sends_exact_approved_letter_and_journals(
     assert completed["enforced_delay_seconds"] == 60
     assert completed["actual_interval_seconds"] > 0
     assert completed["confirmation"] == "успешно"
+    attempt_entries = [
+        entry
+        for entry in OperationJournal(tmp_path).entries(component="applications")
+        if entry["event"] == "apply"
+    ]
+    assert [entry["status"] for entry in attempt_entries] == ["started", "completed"]
+    assert all(entry["details"]["attempt_number"] == 2 for entry in attempt_entries)
+    assert all(entry["details"]["application_id"] == 51 for entry in attempt_entries)
+    assert attempt_entries[-1]["details"]["confirmation"] == "успешно"
 
 
 def test_supervised_apply_stops_on_unknown_result(
@@ -2061,6 +2083,22 @@ def test_supervised_submission_guard_checks_exact_running_task(
     )
     assert checked == [("lease-token", 46, 73, "a" * 64, "resume-1", "Python-разработчик")]
     assert database.closed
+    monkeypatch.setattr(
+        hh_cli,
+        "ScreeningDraftService",
+        lambda session: SimpleNamespace(auto_submission_allowed=lambda submission: False),
+    )
+    assert not hh_cli._supervised_submission_allowed(
+        settings,
+        "lease-token",
+        46,
+        73,
+        "a" * 64,
+        "resume-1",
+        "Python-разработчик",
+        submission=cast(StoredScreeningSubmission, SimpleNamespace()),
+    )
+    assert len(checked) == 1
 
 
 def test_supervised_apply_validates_limit_and_letter_hash(tmp_path: Path) -> None:

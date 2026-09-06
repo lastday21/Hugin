@@ -342,6 +342,8 @@ def test_workspace_endpoints_return_real_data_and_protect_changes(settings: Sett
             "direction": "Другое ИТ",
             "state": "PENDING",
             "priority": 82.0,
+            "fit_tier": None,
+            "fit_reason": None,
             "scheduled_at": "2026-07-22T08:00:00Z",
             "last_error": None,
             "letter_state": "READY",
@@ -746,7 +748,7 @@ def test_workspace_endpoints_return_real_data_and_protect_changes(settings: Sett
         app.state.database.close()
 
 
-def test_queue_endpoint_uses_the_same_direction_and_category_priority_as_worker(
+def test_queue_endpoint_and_worker_use_three_tiers_and_latest_scores(
     settings: Settings,
 ) -> None:
     upgrade_database(settings)
@@ -770,12 +772,12 @@ def test_queue_endpoint_uses_the_same_direction_and_category_priority_as_worker(
             tasks = QueueTaskRepository(session)
 
             cases = (
-                ("backend-match", backend.id, "MATCH", 60),
-                ("backend-stretch", backend.id, "STRETCH", 99),
-                ("adjacent-match", adjacent.id, "MATCH", 100),
-                ("adjacent-stretch", adjacent.id, "STRETCH", 100),
+                ("backend-match", backend.id, "MATCH", 1, 60),
+                ("backend-stretch", backend.id, "STRETCH", 3, 99),
+                ("adjacent-match", adjacent.id, "MATCH", 1, 100),
+                ("adjacent-stretch", adjacent.id, "STRETCH", 2, 100),
             )
-            for hh_id, direction_id, category, priority in cases:
+            for hh_id, direction_id, category, tier, priority in cases:
                 vacancy = VacancyRepository(session).upsert(
                     VacancyData(
                         hh_id=hh_id,
@@ -789,7 +791,7 @@ def test_queue_endpoint_uses_the_same_direction_and_category_priority_as_worker(
                     vacancy.id,
                     state=VacancyState.QUEUED,
                     score=priority,
-                    details={"category": category},
+                    details={"category": category, "fit_tier": tier},
                     rules_version="queue-order-test",
                 )
                 application = applications.create_apply_intent(
@@ -798,7 +800,7 @@ def test_queue_endpoint_uses_the_same_direction_and_category_priority_as_worker(
                     resume.id,
                     direction_id,
                 )
-                tasks.enqueue(application.id, priority_score=priority)
+                tasks.enqueue(application.id, priority_score=100 - priority)
     finally:
         database.close()
 
@@ -807,11 +809,16 @@ def test_queue_endpoint_uses_the_same_direction_and_category_priority_as_worker(
         response = request(app, "GET", f"/api/queue?account_id={account.id}")
         assert response.status_code == 200
         assert [item["vacancy_id"] for item in response.json()] == [
-            "backend-match",
-            "backend-stretch",
             "adjacent-match",
+            "backend-match",
             "adjacent-stretch",
+            "backend-stretch",
         ]
+        assert [item["fit_tier"] for item in response.json()] == [1, 1, 2, 3]
+        with app.state.database.sessions.begin() as session:
+            claimed = QueueTaskRepository(session).claim_next(account_id=account.id)
+            assert claimed is not None
+            assert claimed.id == response.json()[0]["task_id"]
     finally:
         app.state.database.close()
 

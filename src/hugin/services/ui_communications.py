@@ -4,10 +4,11 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from hugin.database.models import (
+    ApplicationEventModel,
     ApplicationModel,
     ApplicationSettingsModel,
     HhAccountModel,
@@ -16,6 +17,7 @@ from hugin.database.models import (
     RecruiterMessageModel,
     VacancyModel,
 )
+from hugin.domain.applications import ApplicationEventType
 from hugin.domain.content import (
     InvitationState,
     MessageDirection,
@@ -24,6 +26,7 @@ from hugin.domain.content import (
     RecruiterMessageState,
 )
 from hugin.domain.directions import ConfigPayload
+from hugin.domain.search_outcomes import ApplicationOutcome
 from hugin.domain.time import as_utc
 from hugin.repositories.communications import CommunicationRepository
 from hugin.services.ai_prompts import (
@@ -35,6 +38,8 @@ from hugin.services.ai_prompts import (
     AiPromptSettingsService,
     AiReasoningOption,
 )
+from hugin.services.application_outcomes import ApplicationOutcomeService
+from hugin.services.message_sender import uncertain_sender_message_ids
 from hugin.services.recruiter_reply_policy import (
     RecruiterReplyDisposition,
     classify_recruiter_reply,
@@ -65,6 +70,7 @@ class UiRecruiterMessage:
     read_at: datetime | None
     content_hash: str | None
     content_version: int
+    sender_review_required: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,6 +103,16 @@ class UiInvitation:
 
 
 @dataclass(frozen=True, slots=True)
+class UiSentOutcomeApplication:
+    application_id: int
+    vacancy_title: str
+    company: str
+    source_url: str
+    state: str
+    confirmed_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
 class UiCommunications:
     conversations: tuple[UiConversation, ...]
     invitations: tuple[UiInvitation, ...]
@@ -105,6 +121,8 @@ class UiCommunications:
     notification_settings: UiNotificationSettings
     ai_model_settings: UiAiModelSettings
     ai_prompt_settings: UiAiPromptSettings
+    outcomes: dict[int, ApplicationOutcome]
+    sent_applications: tuple[UiSentOutcomeApplication, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -188,12 +206,17 @@ class UiCommunicationService:
         ):
             actions_by_message[action.message_id].append(action)
 
+        uncertain_senders = uncertain_sender_message_ids(self._session, account_id=account_id)
         conversations: list[UiConversation] = []
         for rows in grouped.values():
             application = rows[0][1]
             vacancy = rows[0][2]
             message_models = tuple(message for message, _application, _vacancy in rows)
-            messages = tuple(self._message(message) for message in message_models)
+            messages = tuple(
+                self._message(message, sender_review_required=message.id in uncertain_senders)
+                for message in message_models
+            )
+            sender_review = any(message.sender_review_required for message in messages)
             unread_count = sum(
                 message.direction is MessageDirection.INCOMING and message.read_at is None
                 for message, _application, _vacancy in rows
@@ -207,7 +230,7 @@ class UiCommunicationService:
                 ),
                 None,
             )
-            needs_reply = self._needs_reply(
+            needs_reply = not sender_review and self._needs_reply(
                 application,
                 latest,
                 latest_incoming,
@@ -221,7 +244,7 @@ class UiCommunicationService:
                     vacancy_title=vacancy.title,
                     company=vacancy.employer_name or "Компания не указана",
                     source_url=vacancy.source_url,
-                    unread_count=max(unread_count, 1) if needs_reply else 0,
+                    unread_count=max(unread_count, 1) if needs_reply or sender_review else 0,
                     needs_reply=needs_reply,
                     messages=messages,
                 )
@@ -278,6 +301,37 @@ class UiCommunicationService:
             ),
             ai_model_settings=self._ai_model_settings(),
             ai_prompt_settings=self._ai_prompt_settings(),
+            outcomes=ApplicationOutcomeService(self._session).for_account(account_id),
+            sent_applications=self._sent_applications(account_id),
+        )
+
+    def _sent_applications(self, account_id: int) -> tuple[UiSentOutcomeApplication, ...]:
+        confirmations = (
+            select(
+                ApplicationEventModel.application_id,
+                func.min(ApplicationEventModel.created_at).label("confirmed_at"),
+            )
+            .where(ApplicationEventModel.event_type == ApplicationEventType.APPLIED)
+            .group_by(ApplicationEventModel.application_id)
+            .subquery()
+        )
+        rows = self._session.execute(
+            select(ApplicationModel, VacancyModel, confirmations.c.confirmed_at)
+            .join(VacancyModel, VacancyModel.id == ApplicationModel.vacancy_id)
+            .join(confirmations, confirmations.c.application_id == ApplicationModel.id)
+            .where(ApplicationModel.account_id == account_id)
+            .order_by(confirmations.c.confirmed_at.desc(), ApplicationModel.id.desc())
+        )
+        return tuple(
+            UiSentOutcomeApplication(
+                application_id=application.id,
+                vacancy_title=vacancy.title,
+                company=vacancy.employer_name or "Компания не указана",
+                source_url=vacancy.source_url,
+                state=application.state.value,
+                confirmed_at=confirmed_at,
+            )
+            for application, vacancy, confirmed_at in rows
         )
 
     def update_ai_model_settings(
@@ -376,7 +430,9 @@ class UiCommunicationService:
         return self.get(account_id)
 
     @staticmethod
-    def _message(message: RecruiterMessageModel) -> UiRecruiterMessage:
+    def _message(
+        message: RecruiterMessageModel, *, sender_review_required: bool = False
+    ) -> UiRecruiterMessage:
         occurred_at = message.received_at or message.sent_at or message.created_at
         return UiRecruiterMessage(
             id=message.id,
@@ -387,6 +443,7 @@ class UiCommunicationService:
             read_at=message.read_at,
             content_hash=message.content_hash,
             content_version=message.version,
+            sender_review_required=sender_review_required,
         )
 
     @staticmethod

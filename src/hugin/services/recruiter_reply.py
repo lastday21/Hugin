@@ -15,6 +15,7 @@ from hugin.database.models import (
     VacancyModel,
     VerifiedFactModel,
 )
+from hugin.diagnostics import operation_context
 from hugin.domain.communications import (
     CommunicationNotFoundError,
     CommunicationStateError,
@@ -27,6 +28,7 @@ from hugin.domain.content import (
 )
 from hugin.services.ai_prompts import AiPromptSettingsService, with_user_prompt
 from hugin.services.communications import CommunicationService, RecordingMessageSender
+from hugin.services.message_sender import has_uncertain_sender
 from hugin.services.recruiter_reply_policy import (
     RecruiterReplyDisposition,
     classify_recruiter_reply,
@@ -77,6 +79,10 @@ class RecruiterReplyService:
         if application_row is None:
             raise CommunicationNotFoundError("Отклик не найден")
         application, vacancy = application_row
+        if has_uncertain_sender(self._session, application_id=application.id):
+            raise CommunicationStateError(
+                "Сначала проверьте отправителя сообщения, совпадающего с вашей отправкой"
+            )
 
         messages = tuple(
             self._session.scalars(
@@ -136,14 +142,19 @@ class RecruiterReplyService:
             )
         )
         prompt_settings = AiPromptSettingsService(self._session).get()
-        response = self._model.complete(
-            with_user_prompt(SYSTEM_PROMPT, prompt_settings.recruiter_reply),
-            self._prompt(
-                vacancy,
-                messages[: incoming_position + 1][-MAX_MESSAGES:],
-                facts,
-            ),
-        )
+        with operation_context(
+            account_id=account_id,
+            application_id=application_id,
+            message_id=messages[incoming_position].id,
+        ):
+            response = self._model.complete(
+                with_user_prompt(SYSTEM_PROMPT, prompt_settings.recruiter_reply),
+                self._prompt(
+                    vacancy,
+                    messages[: incoming_position + 1][-MAX_MESSAGES:],
+                    facts,
+                ),
+            )
         body = response.strip()
         if not body:
             raise ValueError("Нейросеть вернула пустой ответ")

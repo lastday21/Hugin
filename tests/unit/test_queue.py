@@ -263,7 +263,7 @@ def test_queue_prefers_rule_score_before_freshness(settings: Settings) -> None:
         database.close()
 
 
-def test_queue_uses_four_automatic_match_steps_without_manual_list(
+def test_queue_uses_three_fit_tiers_across_directions(
     settings: Settings,
 ) -> None:
     upgrade_database(settings)
@@ -302,6 +302,7 @@ def test_queue_uses_four_automatic_match_steps_without_manual_list(
                 published_at: datetime,
                 location_priority: float,
                 category: str = "MATCH",
+                fit_tier: int = 1,
                 priority_score: float = 80,
             ) -> int:
                 vacancy = vacancies.upsert(
@@ -320,6 +321,7 @@ def test_queue_uses_four_automatic_match_steps_without_manual_list(
                     score=priority_score,
                     details={
                         "category": category,
+                        "fit_tier": fit_tier,
                         "accepted": True,
                         "location_priority": location_priority,
                         "experience_priority": 90,
@@ -347,6 +349,7 @@ def test_queue_uses_four_automatic_match_steps_without_manual_list(
                 published_at=now,
                 location_priority=100,
                 category="STRETCH",
+                fit_tier=3,
                 priority_score=95,
             )
             adjacent_task = enqueue(
@@ -362,6 +365,7 @@ def test_queue_uses_four_automatic_match_steps_without_manual_list(
                 published_at=now + timedelta(hours=1),
                 location_priority=100,
                 category="STRETCH",
+                fit_tier=2,
                 priority_score=100,
             )
             inactive_task = enqueue(
@@ -381,14 +385,14 @@ def test_queue_uses_four_automatic_match_steps_without_manual_list(
                 assert claimed is not None
                 return claimed.id
 
-            assert claim() == backend_task
-            tasks.transition(backend_task, TaskState.COMPLETED)
-            assert claim() == backend_stretch_task
-            tasks.transition(backend_stretch_task, TaskState.COMPLETED)
             assert claim() == adjacent_task
             tasks.transition(adjacent_task, TaskState.COMPLETED)
+            assert claim() == backend_task
+            tasks.transition(backend_task, TaskState.COMPLETED)
             assert claim() == adjacent_stretch_task
             tasks.transition(adjacent_stretch_task, TaskState.COMPLETED)
+            assert claim() == backend_stretch_task
+            tasks.transition(backend_stretch_task, TaskState.COMPLETED)
             assert (
                 tasks.claim_next(
                     now,

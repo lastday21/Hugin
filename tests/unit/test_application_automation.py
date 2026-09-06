@@ -1,17 +1,21 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Callable
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import cast
 
 import pytest
 from sqlalchemy import delete, select
+from sqlalchemy.orm import Session
 
 from hugin.core.settings import Settings
 from hugin.database import create_database, upgrade_database
 from hugin.database.models import (
     ApplicationEventModel,
+    ApplicationModel,
     CandidateProfileModel,
     CoverLetterFactModel,
     CoverLetterModel,
@@ -70,6 +74,51 @@ from hugin.services.vacancy_analysis import (
 )
 
 pytestmark = pytest.mark.integration
+
+
+def _assert_duplicate_history_blocks_submission(
+    session: Session, application_id: int, allowed: Callable[[], bool]
+) -> None:
+    applications = ApplicationRepository(session)
+    current = applications.get(application_id)
+    vacancies = VacancyRepository(session)
+    original = vacancies.get(current.vacancy_id)
+    for application_state, task_state in (
+        (ApplicationState.APPLIED, None),
+        (ApplicationState.APPLYING, TaskState.UNKNOWN_RESULT),
+        (ApplicationState.APPLYING, TaskState.PENDING),
+    ):
+        with session.begin_nested() as transaction:
+            other = vacancies.upsert(
+                replace(
+                    VacancyAnalysisService._data(original),
+                    hh_id="another-publication",
+                    source_url="https://hh.ru/vacancy/another-publication",
+                )
+            )
+            vacancies.mark_duplicate(other.id, original.id, 1.0)
+            earlier = applications.create_apply_intent(
+                current.account_id,
+                other.id,
+                current.resume_id,
+                current.direction_id,
+            )
+            earlier_model = session.get(ApplicationModel, earlier.id)
+            assert earlier_model is not None
+            earlier_model.state = application_state
+            if task_state is not None:
+                task = QueueTaskRepository(session).enqueue(earlier.id, 90)
+                if task_state is not TaskState.PENDING:
+                    QueueTaskRepository(session).transition(task.id, TaskState.RUNNING)
+                    QueueTaskRepository(session).transition(task.id, task_state)
+            session.flush()
+            assert not allowed()
+            vacancies.unlink_duplicate(other.id, reason="distinct_job", rules_version=RULES_VERSION)
+            assert allowed()
+            vacancies.mark_duplicate(original.id, other.id, 1.0)
+            assert not allowed()
+            transaction.rollback()
+        assert allowed()
 
 
 def _supervised_letter() -> str:
@@ -135,10 +184,15 @@ def test_repeated_confirmed_form_does_not_loop_in_queue(
     )
     service = ApplicationAutomationService(object())  # type: ignore[arg-type]
     service._tasks = FakeTasks()  # type: ignore[assignment]
+    monkeypatch.setattr(
+        service,
+        "_validate_result_job",
+        lambda _job: (SimpleNamespace(attempts=1, state=TaskState.RUNNING), SimpleNamespace()),
+    )
     job = cast(
         ApplyJob,
         SimpleNamespace(
-            task=SimpleNamespace(id=41),
+            task=SimpleNamespace(id=41, attempts=1),
             application=SimpleNamespace(id=51),
             vacancy=SimpleNamespace(source_url="https://hh.ru/vacancy/61"),
         ),
@@ -1740,6 +1794,18 @@ def test_background_claim_and_submit_guard_require_the_same_current_letter(
                 resume_title=resume.title,
             )
 
+            _assert_duplicate_history_blocks_submission(
+                session,
+                application.id,
+                lambda: service.background_submission_is_allowed(
+                    task.id,
+                    letter_id=letter.id,
+                    letter_sha256=job.cover_letter_sha256,
+                    resume_hh_id=resume.hh_id,
+                    resume_title=resume.title,
+                ),
+            )
+
             letter.context_hash = "0" * 64
             session.flush()
             assert not service.background_submission_is_allowed(
@@ -2042,6 +2108,19 @@ def test_supervised_claim_requires_exact_letter_and_excludes_worker(
                 letter_sha256=digest,
                 resume_hh_id=resume.hh_id,
                 resume_title=resume.title,
+            )
+
+            _assert_duplicate_history_blocks_submission(
+                session,
+                application.id,
+                lambda: service.supervised_submission_is_allowed(
+                    "lease-one",
+                    task.id,
+                    letter_id=letter.id,
+                    letter_sha256=digest,
+                    resume_hh_id=resume.hh_id,
+                    resume_title=resume.title,
+                ),
             )
             letter.model_name = "old-model"
             session.flush()

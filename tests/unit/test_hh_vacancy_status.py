@@ -53,6 +53,25 @@ def test_vacancy_status_probe_reads_hh_page(
     assert requests[0].get_header("User-agent")
 
 
+def test_vacancy_status_probe_ignores_translation_dictionary() -> None:
+    body = """
+        <script>
+            window.translations = {"vacancyArchived": "Вакансия в архиве"};
+        </script>
+        <template>{"vacancyNotFound": "Вакансия не найдена"}</template>
+        <h1 data-qa="vacancy-title">Python Backend Developer</h1>
+        <a data-qa="vacancy-response-link-top">Откликнуться</a>
+    """
+
+    def transport(_request: Request, *, timeout: float) -> FakeResponse:
+        assert timeout == 4.0
+        return FakeResponse(body)
+
+    result = HhVacancyStatusProbe(transport).check("https://hh.ru/vacancy/900000001")
+
+    assert result is VacancyAvailability.ACTIVE
+
+
 def test_vacancy_status_probe_handles_missing_and_unsafe_pages() -> None:
     def missing(request: Request, *, timeout: float) -> FakeResponse:
         raise HTTPError(request.full_url, 404, "not found", Message(), None)

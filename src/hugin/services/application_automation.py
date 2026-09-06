@@ -5,7 +5,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from hugin.database.models import (
@@ -34,7 +34,6 @@ from hugin.domain.content import (
 from hugin.domain.directions import (
     AccountRecord,
     DirectionRecord,
-    DirectionScope,
     DirectionVacancyRecord,
     ResumeRecord,
     VacancyState,
@@ -43,6 +42,7 @@ from hugin.domain.hh import HhApplyResult, HhApplyStatus
 from hugin.domain.tasks import ApplicationPolicyRecord, SystemState, TaskRecord, TaskState
 from hugin.domain.time import as_utc
 from hugin.domain.vacancies import VacancyAvailability, VacancyRecord
+from hugin.domain.vacancy_priority import vacancy_priority_key
 from hugin.repositories.applications import ApplicationRepository
 from hugin.repositories.automation import AutomationJobRepository
 from hugin.repositories.directions import (
@@ -59,11 +59,14 @@ from hugin.repositories.tasks import (
 )
 from hugin.repositories.vacancies import VacancyRepository
 from hugin.services.ai_prompts import AiPromptSettingsService
+from hugin.services.application_exposure import application_profile_snapshot
 from hugin.services.autonomy import AutonomyPolicyService
 from hugin.services.cover_letter import CoverLetterService
 from hugin.services.cover_letter_quality import QUALITY_RUBRIC_VERSION
+from hugin.services.decision_evidence import fingerprint, source_fingerprint
 from hugin.services.incidents import IncidentService
 from hugin.services.queue import QueueService
+from hugin.services.screening_evidence import screening_evidence
 from hugin.services.screening_forms import ScreeningDraft, ScreeningDraftService
 from hugin.services.vacancy_analysis import RULES_VERSION, RuleCategory
 
@@ -93,6 +96,7 @@ class ApplyJob:
     cover_letter_id: int | None = None
     cover_letter_instruction_version: str | None = None
     cover_letter_sha256: str | None = None
+    profile_snapshot: EventPayload | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -239,6 +243,10 @@ class ApplicationAutomationService:
                 account.id,
                 tracked.vacancy_id,
             )
+        if self._vacancies.duplicate_family_has_sent_or_live_application(
+            account.id, vacancy.id, exclude_application_id=current.id if current else None
+        ):
+            return 0, 1
         priority = self._priority(tracked)
         if current is not None:
             task = self._tasks.get_by_application_id(current.id)
@@ -330,12 +338,10 @@ class ApplicationAutomationService:
     @staticmethod
     def _preparation_order(
         item: tuple[DirectionRecord, ResumeRecord, DirectionVacancyRecord],
-    ) -> tuple[int, int, float, int]:
+    ) -> tuple[int, float, float, float, int, int]:
         direction, _resume, tracked = item
         return (
-            0 if direction.scope is DirectionScope.PYTHON_BACKEND else 1,
-            0 if tracked.rules_details.get("category") == RuleCategory.MATCH.value else 1,
-            -(tracked.rules_score or 0),
+            *vacancy_priority_key(tracked.rules_details, tracked.rules_score, tracked.vacancy_id),
             direction.id,
         )
 
@@ -500,6 +506,10 @@ class ApplicationAutomationService:
         if row is None:
             return False
         letter, resume, application = row
+        if self._vacancies.duplicate_family_has_sent_or_live_application(
+            application.account_id, application.vacancy_id, exclude_application_id=application.id
+        ):
+            return False
         previous_confirmed_at = self.last_confirmed_application_at(
             application.account_id,
             before=selected_at,
@@ -578,6 +588,7 @@ class ApplicationAutomationService:
                 ApplicationTaskModel.state == TaskState.RUNNING,
                 ApplicationModel.state == ApplicationState.APPLYING,
                 VacancyModel.availability == VacancyAvailability.ACTIVE,
+                VacancyModel.duplicate_of_id.is_(None),
                 DirectionVacancyModel.state == VacancyState.QUEUED,
                 DirectionVacancyModel.rules_version == RULES_VERSION,
                 DirectionVacancyModel.rules_details["category"].as_string().in_(allowed_categories),
@@ -599,6 +610,10 @@ class ApplicationAutomationService:
         if row is None:
             return False
         letter, resume, application = row
+        if self._vacancies.duplicate_family_has_sent_or_live_application(
+            application.account_id, application.vacancy_id, exclude_application_id=application.id
+        ):
+            return False
         if (
             letter.text is None
             or hashlib.sha256(letter.text.encode("utf-8")).hexdigest()
@@ -739,7 +754,7 @@ class ApplicationAutomationService:
         application = self._applications.get(application_model.id)
         if application.direction_id is None:
             raise RuntimeError("Направление отклика отсутствует")
-        return ApplyJob(
+        job = ApplyJob(
             task=claimed,
             application=application,
             vacancy=self._vacancies.get(vacancy_model.id),
@@ -752,7 +767,9 @@ class ApplicationAutomationService:
             cover_letter_id=letter.id,
             cover_letter_instruction_version=letter.instruction_version,
             cover_letter_sha256=actual_sha256,
+            profile_snapshot=application_profile_snapshot(self._session, application),
         )
+        return self._save_attempt(job)
 
     def release_supervised_claim(
         self,
@@ -917,7 +934,7 @@ class ApplicationAutomationService:
             if cover_letter is not None
             else None
         )
-        return ApplyJob(
+        job = ApplyJob(
             task=task,
             application=application,
             vacancy=self._vacancies.get(application.vacancy_id),
@@ -932,7 +949,9 @@ class ApplicationAutomationService:
                 letter.instruction_version if letter is not None else None
             ),
             cover_letter_sha256=cover_letter_sha256,
+            profile_snapshot=application_profile_snapshot(self._session, application),
         )
+        return self._save_attempt(job)
 
     def claim_next_form_preflight(
         self,
@@ -1129,7 +1148,7 @@ class ApplicationAutomationService:
                 error_code="COVER_LETTER_STALE",
             )
             return None
-        return ApplyJob(
+        job = ApplyJob(
             task=claimed,
             application=application,
             vacancy=vacancy,
@@ -1139,7 +1158,9 @@ class ApplicationAutomationService:
             cover_letter_id=letter.id,
             cover_letter_instruction_version=letter.instruction_version,
             cover_letter_sha256=hashlib.sha256(letter.text.encode("utf-8")).hexdigest(),
+            profile_snapshot=application_profile_snapshot(self._session, application),
         )
+        return self._save_attempt(job)
 
     def defer_letter_preparation(
         self,
@@ -1337,11 +1358,23 @@ class ApplicationAutomationService:
         apply_delay: timedelta | None = None,
         now: datetime | None = None,
     ) -> RecordedApplyResult:
+        locked_task, locked_application = self._validate_result_job(job)
+        if job.task.attempts < 1 or locked_task.attempts < job.task.attempts:
+            raise ValueError("Номер попытки результата ещё не зарегистрирован")
+        stale_attempt = locked_task.attempts != job.task.attempts
+        if stale_attempt and result.status not in {
+            HhApplyStatus.APPLIED,
+            HhApplyStatus.ALREADY_APPLIED,
+        }:
+            raise RuntimeError(
+                "Результат относится к прежней попытке; текущая попытка уже изменилась"
+            )
         selected_at = now or datetime.now(UTC)
         payload: EventPayload = {
             "hh_status": result.status.value,
             "confirmation": result.confirmation[:1000],
             "final_url": result.final_url[:1000],
+            "attempt_number": job.task.attempts,
         }
         if result.status in {HhApplyStatus.APPLIED, HhApplyStatus.UNKNOWN_RESULT}:
             payload["selection_snapshot"] = self._selection_snapshot(job)
@@ -1354,11 +1387,31 @@ class ApplicationAutomationService:
             payload["retry_blocks_queue"] = result.retry_blocks_queue
         if result.screening_form_version_hash is not None:
             payload["screening_form_version_hash"] = result.screening_form_version_hash
+        revoked_attempt = locked_task.state in {
+            TaskState.PENDING,
+            TaskState.RETRY_SCHEDULED,
+            TaskState.REVIEW_REQUIRED,
+            TaskState.INPUT_REQUIRED,
+            TaskState.SKIPPED,
+        }
+        if stale_attempt or (
+            revoked_attempt
+            and result.status in {HhApplyStatus.APPLIED, HhApplyStatus.ALREADY_APPLIED}
+        ):
+            return self._record_late_confirmation(
+                job,
+                result,
+                payload,
+                current_task=locked_task,
+                current_application=locked_application,
+                selected_at=selected_at,
+                apply_delay=apply_delay,
+            )
         if result.status in {HhApplyStatus.APPLIED, HhApplyStatus.ALREADY_APPLIED}:
             current_application = self._applications.get(job.application.id)
             current_task = self._tasks.get(job.task.id)
             if current_application.state is not ApplicationState.APPLYING:
-                if current_task.state is TaskState.RUNNING:
+                if current_task.state in {TaskState.RUNNING, TaskState.UNKNOWN_RESULT}:
                     current_task = self._tasks.transition(
                         current_task.id,
                         TaskState.COMPLETED,
@@ -1375,6 +1428,13 @@ class ApplicationAutomationService:
                             ApplicationEventModel.event_type == ApplicationEventType.APPLIED,
                             ApplicationEventModel.payload["hh_status"].as_string()
                             == HhApplyStatus.APPLIED.value,
+                            or_(
+                                ApplicationEventModel.payload["attempt_number"].as_integer()
+                                == job.task.attempts,
+                                ApplicationEventModel.payload["attempt_number"]
+                                .as_integer()
+                                .is_(None),
+                            ),
                             func.coalesce(
                                 ApplicationEventModel.payload["source"].as_string(),
                                 "",
@@ -1581,9 +1641,134 @@ class ApplicationAutomationService:
             target_state=system_states.get(result.status),
         )
 
+    def _validate_result_job(self, job: ApplyJob) -> tuple[ApplicationTaskModel, ApplicationModel]:
+        self._session.flush()
+        self._system.lock()
+        row = self._session.execute(
+            select(
+                ApplicationTaskModel,
+                ApplicationModel,
+                VacancyModel.hh_id,
+                VacancyModel.source_url,
+                ResumeModel.hh_id,
+                ResumeModel.account_id,
+            )
+            .join(ApplicationModel, ApplicationModel.id == ApplicationTaskModel.application_id)
+            .join(VacancyModel, VacancyModel.id == ApplicationModel.vacancy_id)
+            .join(ResumeModel, ResumeModel.id == ApplicationModel.resume_id)
+            .where(ApplicationTaskModel.id == job.task.id)
+            .with_for_update(of=(ApplicationTaskModel, ApplicationModel))
+            .execution_options(populate_existing=True)
+        ).one_or_none()
+        if row is None:
+            raise LookupError("Задание результата или связанный отклик отсутствует")
+        task, application, vacancy_hh_id, vacancy_url, resume_hh_id, resume_account_id = row
+        if (
+            application.id != job.application.id
+            or job.task.application_id != application.id
+            or job.application.account_id != application.account_id
+            or job.application.vacancy_id != application.vacancy_id
+            or job.application.resume_id != application.resume_id
+            or job.vacancy.id != application.vacancy_id
+            or job.resume.id != application.resume_id
+            or job.resume.account_id != application.account_id
+            or resume_account_id != application.account_id
+            or job.vacancy.hh_id != vacancy_hh_id
+            or job.vacancy.source_url != vacancy_url
+            or job.resume.hh_id != resume_hh_id
+        ):
+            raise ValueError("Задание, отклик, аккаунт, вакансия и резюме результата не совпадают")
+        return task, application
+
+    def _record_late_confirmation(
+        self,
+        job: ApplyJob,
+        result: HhApplyResult,
+        payload: EventPayload,
+        *,
+        current_task: ApplicationTaskModel,
+        current_application: ApplicationModel,
+        selected_at: datetime,
+        apply_delay: timedelta | None,
+    ) -> RecordedApplyResult:
+        payload["late_confirmation"] = True
+        payload["stale_attempt"] = current_task.attempts != job.task.attempts
+        payload["current_attempt_number"] = current_task.attempts
+        recorded = self._session.scalar(
+            select(ApplicationEventModel.id)
+            .where(
+                ApplicationEventModel.application_id == job.application.id,
+                ApplicationEventModel.event_type == ApplicationEventType.APPLIED,
+                ApplicationEventModel.payload["attempt_number"].as_integer() == job.task.attempts,
+                ApplicationEventModel.payload["hh_status"].as_string() == result.status.value,
+            )
+            .limit(1)
+        )
+        if current_application.state is ApplicationState.APPLYING:
+            self._applications.transition_state(
+                job.application.id, ApplicationState.APPLIED, payload
+            )
+        elif recorded is None:
+            self._applications.append_event(
+                job.application.id, ApplicationEventType.APPLIED, payload
+            )
+        if result.status is HhApplyStatus.APPLIED:
+            self._mark_cover_letter_sent(job.application.id, job.cover_letter_id, selected_at)
+        if result.screening_form_version_hash is not None:
+            ScreeningDraftService(self._session).mark_sent(
+                job.application.id,
+                version_hash=result.screening_form_version_hash,
+                sent_at=selected_at,
+            )
+        if current_task.state is TaskState.RUNNING:
+            self._tasks.transition(
+                current_task.id,
+                TaskState.UNKNOWN_RESULT,
+                error_code="PREVIOUS_ATTEMPT_CONFIRMED",
+                event_payload=payload,
+            )
+        elif current_task.state in {
+            TaskState.PENDING,
+            TaskState.RETRY_SCHEDULED,
+            TaskState.REVIEW_REQUIRED,
+            TaskState.INPUT_REQUIRED,
+        }:
+            self._tasks.transition(
+                current_task.id,
+                TaskState.SKIPPED,
+                error_code="PREVIOUS_ATTEMPT_CONFIRMED",
+                event_payload=payload,
+            )
+        sent = result.status is HhApplyStatus.APPLIED
+        next_apply_at = None
+        if sent and apply_delay is not None:
+            next_apply_at = selected_at + apply_delay
+            existing_delay = self._system.get().next_apply_at
+            if existing_delay is not None:
+                next_apply_at = max(next_apply_at, as_utc(existing_delay))
+            self._system.set_next_apply_at(next_apply_at)
+        return RecordedApplyResult(blocking=False, sent=sent, next_apply_at=next_apply_at)
+
+    def _save_attempt(self, job: ApplyJob) -> ApplyJob:
+        snapshot = self._selection_snapshot(job)
+        snapshot["screening_forms"] = screening_evidence(self._session, job.application.id)
+        snapshot["sha256"] = fingerprint({k: v for k, v in snapshot.items() if k != "sha256"})
+        self._applications.append_event(
+            job.application.id,
+            ApplicationEventType.APPLY_INTENT,
+            {
+                "source": "hugin_attempt",
+                "task_id": job.task.id,
+                "attempt_number": job.task.attempts,
+                "selection_snapshot": snapshot,
+            },
+        )
+        return job
+
     @staticmethod
     def _selection_snapshot(job: ApplyJob) -> EventPayload:
-        return {
+        snapshot: EventPayload = {
+            "source_sha256": source_fingerprint(),
             "category": job.direction_vacancy.rules_details.get("category"),
             "fit_score": (
                 job.direction_vacancy.fit_score
@@ -1596,7 +1781,57 @@ class ApplicationAutomationService:
             "resume_id": job.application.resume_id,
             "cover_letter_id": job.cover_letter_id,
             "cover_letter_instruction_version": job.cover_letter_instruction_version,
+            "outcome_context": {
+                "schema_version": 1,
+                "profile": deepcopy(job.profile_snapshot),
+                "letter_sha256": job.cover_letter_sha256,
+                "letter_text": job.cover_letter,
+                "vacancy": {
+                    "title": job.vacancy.title,
+                    "source_url": job.vacancy.source_url,
+                    "details_fetched_at": (
+                        as_utc(job.vacancy.details_fetched_at).isoformat()
+                        if job.vacancy.details_fetched_at is not None
+                        else None
+                    ),
+                    "description": job.vacancy.description,
+                    "responsibilities": job.vacancy.responsibilities,
+                    "required_qualifications": job.vacancy.required_qualifications,
+                    "preferred_qualifications": job.vacancy.preferred_qualifications,
+                    "key_skills": list(job.vacancy.key_skills),
+                    "has_screening_form": job.vacancy.has_screening_form,
+                    "has_test_assignment": job.vacancy.has_test_assignment,
+                    "employer": job.vacancy.employer_name,
+                    "published_at": (
+                        as_utc(job.vacancy.published_at).isoformat()
+                        if job.vacancy.published_at is not None
+                        else None
+                    ),
+                    "region": job.vacancy.region,
+                    "work_format": job.vacancy.work_format,
+                    "employment": job.vacancy.employment,
+                    "experience": job.vacancy.experience,
+                    "salary_from": (
+                        str(job.vacancy.salary_from)
+                        if job.vacancy.salary_from is not None
+                        else None
+                    ),
+                    "salary_to": (
+                        str(job.vacancy.salary_to) if job.vacancy.salary_to is not None else None
+                    ),
+                    "salary_currency": job.vacancy.salary_currency,
+                    "salary_gross": job.vacancy.salary_gross,
+                    "description_sha256": (
+                        hashlib.sha256(job.vacancy.description.encode("utf-8")).hexdigest()
+                        if job.vacancy.description
+                        else None
+                    ),
+                },
+            },
         }
+
+        snapshot["sha256"] = fingerprint(snapshot)
+        return snapshot
 
     def _record_retry_or_blocked_result(
         self,

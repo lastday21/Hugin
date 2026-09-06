@@ -9,6 +9,7 @@ from hugin.adapters.hh_browser import VisibleHhBrowser
 from hugin.adapters.hh_messages import HhBrowserMessageSender
 from hugin.core.settings import Settings
 from hugin.database import create_database
+from hugin.diagnostics import OperationJournal
 from hugin.domain.automation import (
     AutomationJobKind,
     AutomationJobRecord,
@@ -94,6 +95,7 @@ class HhSyncJobHandler:
             with (
                 background_browser_access(
                     self._browser_lock,
+                    journal=OperationJournal(self._settings.data_dir),
                     timeout_seconds=_BACKGROUND_PROFILE_LOCK_TIMEOUT_SECONDS,
                     message=(
                         "Профиль hh.ru занят; фоновая проверка быстро уступила очередь откликам"
@@ -106,6 +108,7 @@ class HhSyncJobHandler:
                     self._settings.hh_resumes_url,
                     self._settings.hh_search_url,
                     self._settings.hh_browser_timeout_ms,
+                    journal=OperationJournal(self._settings.data_dir),
                     start_minimized=True,
                     browser_source_ip=(
                         str(self._settings.hh_browser_source_ip)

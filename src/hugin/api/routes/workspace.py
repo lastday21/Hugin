@@ -18,6 +18,7 @@ from hugin.database.models import (
     ApplicationTaskModel,
     VacancyModel,
 )
+from hugin.diagnostics import OperationJournal
 from hugin.domain.applications import (
     ApplicationReconciliationResult,
     ReconciliationStatus,
@@ -34,6 +35,7 @@ from hugin.services.career_directions import (
 )
 from hugin.services.queue import QueueService
 from hugin.services.screening_forms import ScreeningDraft, ScreeningDraftService
+from hugin.services.search_outcomes import SearchOutcomes, SearchOutcomeService
 from hugin.services.ui_workspace import UiWorkspaceService
 
 
@@ -90,6 +92,7 @@ class IncidentResponse(BaseModel):
     severity: str
     message: str
     created_at: datetime
+    requires_action: bool = True
 
 
 class BackgroundStatusResponse(BaseModel):
@@ -142,6 +145,8 @@ class QueueItemResponse(BaseModel):
     direction: str
     state: str
     priority: float
+    fit_tier: int | None
+    fit_reason: str | None
     scheduled_at: datetime
     last_error: str | None
     letter_state: str | None
@@ -334,6 +339,16 @@ router = APIRouter(prefix="/api", tags=["workspace"])
 ReadSession = Annotated[Session, Depends(read_session)]
 WriteSession = Annotated[Session, Depends(write_session)]
 SessionGuard = Annotated[None, Depends(require_session_key)]
+
+
+@router.get("/outcomes", response_model=SearchOutcomes)
+def search_outcomes(
+    session: ReadSession, account_id: int = Query(default=1, ge=1)
+) -> SearchOutcomes:
+    try:
+        return SearchOutcomeService(session).snapshot(account_id)
+    except LookupError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
 
 
 @router.get("/session", response_model=SessionResponse)
@@ -593,13 +608,17 @@ def pause_queue(
 
 @router.post("/queue/resume", response_model=QueueControlResponse)
 def resume_queue(
+    request: Request,
     session: WriteSession,
     _guard: SessionGuard,
 ) -> QueueControlResponse:
+    run = OperationJournal(request.app.state.settings.data_dir).start("queue", "resume")
     try:
         state = QueueService(session).resume()
     except ValueError as error:
+        run.fail(error)
         raise HTTPException(status_code=409, detail=str(error)) from error
+    run.succeed(state=state.state.value, commit_pending=True)
     return QueueControlResponse(state=state.state.value, updated_at=state.updated_at)
 
 

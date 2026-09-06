@@ -17,6 +17,7 @@ from hugin.database.models import (
     VacancyModel,
     VerifiedFactModel,
 )
+from hugin.diagnostics import operation_context
 from hugin.domain.applications import ApplicationState
 from hugin.domain.communications import CommunicationStateError
 from hugin.domain.content import (
@@ -30,6 +31,7 @@ from hugin.domain.content import (
 )
 from hugin.services.autonomy import AutonomyPolicyService
 from hugin.services.communications import CommunicationService, RecordingMessageSender
+from hugin.services.message_sender import has_uncertain_sender, uncertain_sender_message_ids
 from hugin.services.recruiter_reply import RecruiterReplyService, RecruiterReplyTextModel
 from hugin.services.recruiter_reply_policy import (
     RecruiterReplyDisposition,
@@ -146,6 +148,7 @@ class AutonomousReplyService:
         salary_expectation_reply = self._confirmed_salary_expectation_reply(account_id)
         eligible_incoming_ids = set(incoming_message_ids)
         auto_send_incoming_ids = set(incoming_message_ids)
+        uncertain_senders = uncertain_sender_message_ids(self._session, account_id=account_id)
         if include_backlog:
             backlog_ids: list[int] = []
             for conversation in by_application.values():
@@ -172,6 +175,9 @@ class AutonomousReplyService:
             eligible_incoming_ids.update(sorted(backlog_ids, reverse=True)[:backlog_limit])
 
         for application_id, conversation in by_application.items():
+            if any(message.id in uncertain_senders for message in conversation):
+                skipped_manual += 1
+                continue
             incoming = next(
                 (
                     message
@@ -407,10 +413,15 @@ class AutonomousReplyService:
                     try:
                         if requirement_model is None:
                             requirement_model = requirement_model_factory()
-                        requirement = classify_reply_requirement(
-                            requirement_model,
-                            conversation,
-                        )
+                        with operation_context(
+                            account_id=account_id,
+                            application_id=application_id,
+                            message_id=incoming.id,
+                        ):
+                            requirement = classify_reply_requirement(
+                                requirement_model,
+                                conversation,
+                            )
                     except (CodexCliError, LookupError, ValueError, YandexAIError):
                         failed += 1
                         reply_action = communications.record_reply_requirement(
@@ -545,6 +556,8 @@ class AutonomousReplyService:
         if row is None:
             return False
         message, application = row
+        if has_uncertain_sender(self._session, application_id=application.id):
+            return False
         if (
             message.direction is not MessageDirection.OUTGOING
             or message.state is not RecruiterMessageState.CONFIRMED

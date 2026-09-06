@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import html
+import re
 from collections.abc import Callable
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -14,6 +16,10 @@ _CLOSED_MARKERS = (
     "вакансия недоступна",
     "вакансия не найдена",
 )
+_NON_VISIBLE_PAGE_CONTENT = re.compile(
+    r"(?is)<(?:script|style|template)\b[^>]*>.*?</(?:script|style|template)>"
+)
+_HTML_TAG = re.compile(r"(?s)<[^>]+>")
 
 
 class HhVacancyStatusProbe:
@@ -52,8 +58,10 @@ class HhVacancyStatusProbe:
             return VacancyAvailability.UNAVAILABLE
         if status != 200 or not isinstance(content, bytes):
             return None
-        page_text = content.decode("utf-8", errors="ignore").casefold()
-        if any(marker in page_text for marker in _CLOSED_MARKERS):
+        page_text = content.decode("utf-8", errors="ignore")
+        visible_page = _NON_VISIBLE_PAGE_CONTENT.sub(" ", page_text)
+        visible_text = html.unescape(_HTML_TAG.sub(" ", visible_page)).casefold()
+        if any(marker in visible_text for marker in _CLOSED_MARKERS):
             return VacancyAvailability.ARCHIVED
         return VacancyAvailability.ACTIVE
 

@@ -33,6 +33,7 @@ from hugin.domain.applications import ApplicationEventType, ApplicationState
 from hugin.domain.automation import AutomationJobKind, AutomationJobState
 from hugin.domain.content import (
     CoverLetterState,
+    IncidentSeverity,
     IncidentState,
     InvitationState,
     MessageDirection,
@@ -44,7 +45,9 @@ from hugin.domain.directions import DirectionScope, VacancyState
 from hugin.domain.tasks import TaskState
 from hugin.domain.time import day_start_utc
 from hugin.domain.vacancies import VacancyAvailability
+from hugin.domain.vacancy_priority import stored_fit_tier
 from hugin.repositories.applications import ApplicationRepository
+from hugin.repositories.vacancy_priority import vacancy_ordering
 from hugin.services.ai_prompts import AiPromptSettingsService
 from hugin.services.queue import QueueService
 
@@ -137,6 +140,7 @@ class UiIncident:
     severity: str
     message: str
     created_at: datetime
+    requires_action: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -175,6 +179,8 @@ class UiQueueItem:
     direction: str
     state: str
     priority: float
+    fit_tier: int | None
+    fit_reason: str | None
     scheduled_at: datetime
     last_error: str | None
     letter_state: str | None
@@ -386,8 +392,11 @@ class UiWorkspaceService:
         incident_models = self._session.scalars(
             select(IncidentModel)
             .where(IncidentModel.state == IncidentState.OPEN)
-            .order_by(IncidentModel.created_at.desc())
-            .limit(5)
+            .order_by(
+                case((IncidentModel.severity == IncidentSeverity.CRITICAL, 0), else_=1),
+                IncidentModel.created_at.desc(),
+            )
+            .limit(20)
         )
         incidents = tuple(
             UiIncident(
@@ -396,6 +405,7 @@ class UiWorkspaceService:
                 incident.severity.value,
                 incident.message,
                 incident.created_at,
+                self._incident_requires_action(incident),
             )
             for incident in incident_models
         )
@@ -421,6 +431,22 @@ class UiWorkspaceService:
             directions=directions,
             incidents=incidents,
         )
+
+    def _incident_requires_action(self, incident: IncidentModel) -> bool:
+        if incident.code == "NOTIFICATION_DELIVERY_FAILED":
+            return False
+        if incident.scope_type == "application_task" and incident.scope_id is not None:
+            task = self._session.get(ApplicationTaskModel, incident.scope_id)
+            return task is None or task.state in {
+                TaskState.REVIEW_REQUIRED,
+                TaskState.INPUT_REQUIRED,
+                TaskState.UNKNOWN_RESULT,
+            }
+        if incident.scope_type == "recruiter_message" and incident.scope_id is not None:
+            message = self._session.get(RecruiterMessageModel, incident.scope_id)
+            if message is not None and message.state is RecruiterMessageState.SENT:
+                return False
+        return True
 
     def _background_status(self, account_id: int) -> UiBackgroundStatus:
         jobs = tuple(
@@ -538,19 +564,6 @@ class UiWorkspaceService:
             (ApplicationTaskModel.state.in_(AUTOMATIC_QUEUE_STATES), 0),
             else_=1,
         )
-        direction_priority = case(
-            (
-                CareerDirectionModel.scoring_config["role_scope"].as_string()
-                == DirectionScope.PYTHON_BACKEND.value,
-                0,
-            ),
-            else_=1,
-        )
-        category_priority = case(
-            (DirectionVacancyModel.rules_details["category"].as_string() == "MATCH", 0),
-            (DirectionVacancyModel.rules_details["category"].as_string() == "STRETCH", 1),
-            else_=2,
-        )
         instruction_version = cover_letter_instruction_version(
             AiPromptSettingsService(self._session).get().cover_letter
         )
@@ -582,6 +595,7 @@ class UiWorkspaceService:
                 CareerDirectionModel,
                 letter_state,
                 form_state,
+                DirectionVacancyModel,
             )
             .join(ApplicationModel, ApplicationModel.id == ApplicationTaskModel.application_id)
             .join(VacancyModel, VacancyModel.id == ApplicationModel.vacancy_id)
@@ -601,9 +615,7 @@ class UiWorkspaceService:
             )
             .order_by(
                 automatic_state_priority,
-                direction_priority,
-                category_priority,
-                ApplicationTaskModel.priority_score.desc(),
+                *vacancy_ordering(),
                 ApplicationTaskModel.scheduled_at,
                 ApplicationTaskModel.id,
             )
@@ -622,7 +634,13 @@ class UiWorkspaceService:
                 if direction is not None
                 else "Без направления",
                 state=task.state.value,
-                priority=task.priority_score,
+                priority=(
+                    tracking.rules_score
+                    if tracking is not None and tracking.rules_score is not None
+                    else task.priority_score
+                ),
+                fit_tier=stored_fit_tier(tracking.rules_details) if tracking else None,
+                fit_reason=tracking.rules_details.get("fit_reason") if tracking else None,
                 scheduled_at=task.scheduled_at,
                 last_error=_queue_error_text(task.last_error_code),
                 letter_state=stored_letter_state.value if stored_letter_state is not None else None,
@@ -636,6 +654,7 @@ class UiWorkspaceService:
                 direction,
                 stored_letter_state,
                 stored_form_state,
+                tracking,
             ) in rows
         )
 

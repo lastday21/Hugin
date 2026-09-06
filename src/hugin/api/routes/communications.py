@@ -16,7 +16,9 @@ from hugin.domain.communications import (
     StaleMessageDraftError,
 )
 from hugin.domain.content import MessageDirection, RecruiterMessageState
+from hugin.domain.search_outcomes import ApplicationOutcome, StaleOutcomeError
 from hugin.services.ai_prompts import MAX_PROMPT_LENGTH
+from hugin.services.application_outcomes import ApplicationOutcomeService
 from hugin.services.communications import CommunicationService, RecordingMessageSender
 from hugin.services.ui_communications import (
     WINDOWS_NOTIFICATION_EVENTS,
@@ -35,6 +37,7 @@ class RecruiterMessageResponse(BaseModel):
     read_at: datetime | None
     content_hash: str | None
     content_version: int
+    sender_review_required: bool = False
 
 
 class ConversationResponse(BaseModel):
@@ -106,6 +109,17 @@ class AiModelSettingsResponse(BaseModel):
     reasoning_options: tuple[AiModelOptionResponse, ...]
 
 
+class SentOutcomeApplicationResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    application_id: int
+    vacancy_title: str
+    company: str
+    source_url: str
+    state: str
+    confirmed_at: datetime
+
+
 class CommunicationsResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -116,6 +130,18 @@ class CommunicationsResponse(BaseModel):
     notification_settings: NotificationSettingsResponse
     ai_model_settings: AiModelSettingsResponse
     ai_prompt_settings: AiPromptSettingsResponse
+    outcomes: dict[int, ApplicationOutcome]
+    sent_applications: tuple[SentOutcomeApplicationResponse, ...]
+
+
+class ApplicationOutcomeUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    revision: int = Field(ge=0, strict=True)
+    interview_at: datetime | None
+    interview_evidence: str = Field(max_length=2000)
+    rejection_reason: str = Field(max_length=500)
+    rejection_evidence: str = Field(max_length=2000)
 
 
 class ReplyDraftUpdate(BaseModel):
@@ -243,6 +269,23 @@ def mark_invitation_seen(
             invitation_id=invitation_id,
         )
         return _response(session, account_id)
+    except (LookupError, ValueError) as error:
+        raise _communication_error(error) from error
+
+
+@router.put("/applications/{application_id}/outcome", response_model=CommunicationsResponse)
+def save_application_outcome(
+    application_id: int,
+    values: ApplicationOutcomeUpdate,
+    session: WriteSession,
+    _guard: SessionGuard,
+    account_id: int = Query(default=1, ge=1),
+) -> CommunicationsResponse:
+    try:
+        ApplicationOutcomeService(session).save(account_id, application_id, **values.model_dump())
+        return _response(session, account_id)
+    except StaleOutcomeError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
     except (LookupError, ValueError) as error:
         raise _communication_error(error) from error
 

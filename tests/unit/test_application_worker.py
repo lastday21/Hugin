@@ -268,6 +268,7 @@ def test_worker_does_not_claim_application_while_browser_is_busy(
         tmp_path,
         browser_lock=browser_lock,
     )
+    monkeypatch.setattr(worker, "has_pending_work", lambda *_: True)
 
     try:
         assert not worker.run_once(datetime(2026, 7, 27, 10, 0, tzinfo=UTC))

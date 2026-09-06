@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
 from hugin.core.settings import Settings
 from hugin.database import create_database, upgrade_database
+from hugin.database.models import ApplicationModel
 from hugin.domain.applications import ApplicationState
 from hugin.domain.content import InvitationState, MessageDirection, RecruiterMessageState
 from hugin.domain.directions import VacancyState
@@ -31,6 +32,55 @@ from hugin.services.application_automation import ApplicationAutomationService
 from hugin.services.hh_sync import HhSynchronizationService
 
 pytestmark = pytest.mark.integration
+
+
+def test_observation_date_requires_a_matching_status_and_does_not_regress(
+    settings: Settings,
+) -> None:
+    database = create_database(settings)
+    checked_at = datetime(2026, 9, 5, 9, tzinfo=UTC)
+    try:
+        with database.sessions.begin() as session:
+            account = AccountRepository(session).create("Observed account")
+            resume = ResumeRepository(session).upsert(account.id, "observed-resume", "Python")
+            apps: list[ApplicationModel] = []
+            for hh_id in ("observed", "not-returned"):
+                vacancy = VacancyRepository(session).upsert(
+                    VacancyData(hh_id, "Python", f"https://hh.ru/vacancy/{hh_id}")
+                )
+                record = ApplicationRepository(session).create_apply_intent(
+                    account.id, vacancy.id, resume.id
+                )
+                ApplicationRepository(session).transition_state(record.id, ApplicationState.APPLIED)
+                model = session.get(ApplicationModel, record.id)
+                assert model is not None
+                apps.append(model)
+            sync = HhSynchronizationService(session)
+            viewed = HhNegotiationData("observed", HhNegotiationStatus.VIEWED, "Viewed")
+            sync.synchronize_statuses(
+                account_id=account.id, statuses=(viewed,), checked_at=checked_at
+            )
+            second = checked_at + timedelta(hours=1)
+            unchanged = sync.synchronize_statuses(
+                account_id=account.id, statuses=(viewed,), checked_at=second
+            )
+            assert unchanged["updated"] == 0
+            assert apps[0].status_checked_at == second
+            assert apps[1].status_checked_at is None
+            stale = sync.synchronize_statuses(
+                account_id=account.id,
+                statuses=(HhNegotiationData("observed", HhNegotiationStatus.REJECTED, "Rejected"),),
+                checked_at=checked_at,
+            )
+            assert stale["matched"] == stale["updated"] == 0
+            assert apps[0].state is ApplicationState.VIEWED
+            sync.synchronize_statuses(
+                account_id=account.id, statuses=(), checked_at=second + timedelta(hours=1)
+            )
+            assert apps[0].status_checked_at == second
+            assert apps[1].status_checked_at is None
+    finally:
+        database.close()
 
 
 def test_test_assignment_takes_priority_over_interview_wording() -> None:

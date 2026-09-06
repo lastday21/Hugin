@@ -277,6 +277,7 @@ class ApplicationRepository:
         result.pop("cover_letter_id", None)
         result.pop("cover_letter_instruction_version", None)
         result.pop("selection_snapshot", None)
+        result.pop("outcome_context", None)
 
         source = payload.get("source")
         snapshot_required = source in {"hugin_send", "hugin_reconciliation"}
@@ -341,6 +342,9 @@ class ApplicationRepository:
             )
 
         if attempt_snapshot is not None:
+            outcome_context = attempt_snapshot.get("outcome_context")
+            if isinstance(outcome_context, dict):
+                result["outcome_context"] = deepcopy(outcome_context)
             requested_letter_id = attempt_snapshot.get("cover_letter_id")
             instruction_version = attempt_snapshot.get("cover_letter_instruction_version")
             if isinstance(requested_letter_id, int) and not isinstance(requested_letter_id, bool):
@@ -430,7 +434,6 @@ class ApplicationRepository:
             )
             .order_by(ApplicationEventModel.id.desc())
         )
-        snapshot = None
         for event in events:
             event_task_id = event.payload.get("task_id")
             if (
@@ -438,6 +441,34 @@ class ApplicationRepository:
                 and not isinstance(event_task_id, bool)
                 and event_task_id == task_id
             ):
-                snapshot = event.payload.get("selection_snapshot")
-                break
-        return self._validated_selection_snapshot(snapshot)
+                snapshot = self._validated_selection_snapshot(
+                    event.payload.get("selection_snapshot")
+                )
+                if snapshot is not None or event.payload.get("recovery") not in (
+                    "startup",
+                    "supervised_lease_expired",
+                ):
+                    return snapshot
+                task = self._session.get(ApplicationTaskModel, task_id)
+                if task is None or task.application_id != application_id:
+                    return None
+                attempts = self._session.scalars(
+                    select(ApplicationEventModel)
+                    .where(
+                        ApplicationEventModel.application_id == application_id,
+                        ApplicationEventModel.event_type == ApplicationEventType.APPLY_INTENT,
+                        ApplicationEventModel.id < event.id,
+                    )
+                    .order_by(ApplicationEventModel.id.desc())
+                )
+                for attempt in attempts:
+                    if (
+                        attempt.payload.get("source") == "hugin_attempt"
+                        and attempt.payload.get("task_id") == task_id
+                        and attempt.payload.get("attempt_number") == task.attempts
+                    ):
+                        return self._validated_selection_snapshot(
+                            attempt.payload.get("selection_snapshot")
+                        )
+                return None
+        return None

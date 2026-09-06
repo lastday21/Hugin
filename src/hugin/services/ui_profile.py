@@ -139,6 +139,7 @@ class UiProfileService:
                     updated_at=fact.updated_at,
                 )
                 for fact in facts
+                if not self._is_screening_answer(fact)
             ),
             questions=tuple(
                 UiProfileQuestion(
@@ -171,3 +172,8 @@ class UiProfileService:
             source_page_count=resume.source_page_count,
             imported_at=resume.imported_at,
         )
+
+    @staticmethod
+    def _is_screening_answer(fact: VerifiedFactModel) -> bool:
+        reference = fact.source_reference or ""
+        return reference.startswith("screening:")

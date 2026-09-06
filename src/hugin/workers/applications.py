@@ -13,7 +13,7 @@ from hugin.adapters.hh_browser import VisibleHhBrowser
 from hugin.core.settings import Settings
 from hugin.database import create_database, upgrade_database
 from hugin.database.models import CareerDirectionModel
-from hugin.diagnostics import OperationJournal, error_details
+from hugin.diagnostics import JournalRun, OperationJournal, error_details, operation_context
 from hugin.domain.hh import HhApplyResult, HhApplyStatus
 from hugin.domain.hh_sync import HhSyncBlockedError, HhSyncRetryableError
 from hugin.domain.time import as_utc, day_start_utc
@@ -59,6 +59,7 @@ class ApplicationWorker:
         self._thread: threading.Thread | None = None
         self._browser: VisibleHhBrowser | None = None
         self._browser_owner: int | None = None
+        self._browser_wait: JournalRun | None = None
 
     @property
     def running(self) -> bool:
@@ -98,6 +99,17 @@ class ApplicationWorker:
         thread = self._thread
         if thread is not None and thread.is_alive():
             thread.join(timeout_seconds)
+        if thread is not None and thread.is_alive():
+            self._journal.record(
+                "applications",
+                "worker.lifecycle",
+                status="blocked",
+                level="WARNING",
+                action="stop",
+                account_id=self._account_id,
+                reason="WORKER_STOP_TIMEOUT",
+            )
+            return
         if thread is None or not thread.is_alive():
             self._close_browser()
         self._thread = None
@@ -110,10 +122,27 @@ class ApplicationWorker:
         )
 
     def run_once(self, now: datetime | None = None) -> bool:
+        if self._stop.is_set():
+            self._finish_browser_wait("STOPPED")
+            return False
         selected_at = as_utc(now or datetime.now(UTC))
         if not self._browser_lock.acquire(blocking=False):
+            if self.has_pending_work(selected_at):
+                if self._browser_wait is None:
+                    self._browser_wait = self._journal.start(
+                        "applications",
+                        "browser.wait",
+                        account_id=self._account_id,
+                        timing_kind="wait",
+                        reason="BROWSER_BUSY",
+                    )
+            else:
+                self._finish_browser_wait("NO_PENDING_WORK")
             return False
         try:
+            self._finish_browser_wait("BROWSER_AVAILABLE")
+            if self._stop.is_set():
+                return False
             job, may_prepare_letters = self._claim(selected_at)
             if job is None:
                 if not may_prepare_letters:
@@ -136,6 +165,11 @@ class ApplicationWorker:
         finally:
             self._browser_lock.release()
 
+    def _finish_browser_wait(self, reason: str) -> None:
+        if self._browser_wait is not None:
+            self._browser_wait.succeed(end_reason=reason)
+            self._browser_wait = None
+
     def _process_application(
         self,
         job: ApplyJob,
@@ -155,10 +189,24 @@ class ApplicationWorker:
             application_id=getattr(application, "id", None),
             vacancy_id=getattr(vacancy, "hh_id", None),
             resume_id=getattr(resume, "id", None),
+            attempt_number=getattr(task, "attempts", None),
+            required_steps=["execute", "persist"],
         )
         handler_error: Exception | None = None
         try:
-            result = self._job_handler(job)
+            with (
+                run.step("execute"),
+                operation_context(
+                    account_id=self._account_id,
+                    application_id=getattr(application, "id", None),
+                    task_id=getattr(task, "id", None),
+                    attempt_number=getattr(task, "attempts", None),
+                    parent_run_id=run.run_id,
+                ),
+            ):
+                result = (
+                    self._stopped_result(job) if self._stop.is_set() else self._job_handler(job)
+                )
         except HhSyncRetryableError as error:
             self._close_browser()
             handler_error = error
@@ -193,7 +241,7 @@ class ApplicationWorker:
         finished_at = selected_at if now_is_fixed else datetime.now(UTC)
         database = create_database(self._settings)
         try:
-            with database.sessions.begin() as session:
+            with run.step("persist"), database.sessions.begin() as session:
                 service = ApplicationAutomationService(session)
                 policy = service.policy()
                 apply_delay = (
@@ -243,10 +291,16 @@ class ApplicationWorker:
             application_id=job.application.id,
             vacancy_id=job.vacancy.hh_id,
             resume_id=job.resume.id,
+            required_steps=["execute", "persist"],
         )
         handler_error: Exception | None = None
         try:
-            result = self._form_preflight_handler(job)
+            with run.step("execute"):
+                result = (
+                    self._stopped_result(job)
+                    if self._stop.is_set()
+                    else self._form_preflight_handler(job)
+                )
         except HhSyncRetryableError as error:
             handler_error = error
             run.fail(error, result_status=HhApplyStatus.RETRYABLE_ERROR.value)
@@ -291,7 +345,7 @@ class ApplicationWorker:
         )
         database = create_database(self._settings)
         try:
-            with database.sessions.begin() as session:
+            with run.step("persist"), database.sessions.begin() as session:
                 service = ApplicationAutomationService(session)
                 if plain_form_ready:
                     service.release_form_preflight(job, now=finished_at)
@@ -344,6 +398,8 @@ class ApplicationWorker:
         *,
         now_is_fixed: bool,
     ) -> None:
+        if self._stop.is_set():
+            return
         run = self._journal.start(
             "applications",
             "cover_letters.prepare_candidate",
@@ -353,8 +409,13 @@ class ApplicationWorker:
             vacancy_id=job.vacancy.hh_id,
             resume_id=job.resume.id,
         )
-        if not self._prepare_exact_letter(job, selected_at):
+        with operation_context(parent_run_id=run.run_id):
+            prepared = self._prepare_exact_letter(job, selected_at)
+        if not prepared:
             run.succeed(prepared=False)
+            return
+        if self._stop.is_set():
+            run.succeed(prepared=True, claimed=False, stopped=True)
             return
         claim_at = selected_at if now_is_fixed else datetime.now(UTC)
         prepared_job = self._claim_exact_prepared(job.task.id, claim_at)
@@ -430,7 +491,13 @@ class ApplicationWorker:
 
     def _prepare_exact_letter(self, job: ApplyJob, selected_at: datetime) -> bool:
         try:
-            prepared = self._letter_preparer(job)
+            with operation_context(
+                account_id=self._account_id,
+                application_id=job.application.id,
+                task_id=job.task.id,
+                attempt_number=getattr(job.task, "attempts", None),
+            ):
+                prepared = self._letter_preparer(job)
         except (LookupError, RuntimeError, ValueError) as error:
             self._journal.record(
                 "applications",
@@ -510,7 +577,11 @@ class ApplicationWorker:
             database.close()
 
     def _run_form_preflight(self, job: ApplyJob) -> HhApplyResult:
+        if self._stop.is_set():
+            return self._stopped_result(job)
         browser = self._get_browser()
+        if self._stop.is_set():
+            return self._stopped_result(job)
         login = HhLoginService(WindowsCredentialStore()).authenticate(
             self._account_id,
             browser,
@@ -522,6 +593,8 @@ class ApplicationWorker:
                 job.vacancy.source_url,
                 "Перед проверкой формы требуется завершить вход в hh.ru",
             )
+        if self._stop.is_set():
+            return self._stopped_result(job)
         return browser.apply_to_vacancy(
             job.vacancy.source_url,
             expected_resume_hh_id=job.resume.hh_id,
@@ -532,6 +605,8 @@ class ApplicationWorker:
         )
 
     def _run_job(self, job: ApplyJob) -> HhApplyResult:
+        if self._stop.is_set():
+            return self._stopped_result(job)
         application = getattr(job, "application", None)
         application_id = getattr(application, "id", None)
         submission = (
@@ -539,7 +614,11 @@ class ApplicationWorker:
             if isinstance(application_id, int)
             else None
         )
+        if self._stop.is_set():
+            return self._stopped_result(job)
         browser = self._get_browser()
+        if self._stop.is_set():
+            return self._stopped_result(job)
         login = HhLoginService(WindowsCredentialStore()).authenticate(
             self._account_id,
             browser,
@@ -551,6 +630,8 @@ class ApplicationWorker:
                 job.vacancy.source_url,
                 "Перед отправкой требуется завершить вход в hh.ru",
             )
+        if self._stop.is_set():
+            return self._stopped_result(job)
         if not job.cover_letter:
             raise RuntimeError("Готовое сопроводительное письмо отсутствует")
         return browser.apply_to_vacancy(
@@ -564,6 +645,14 @@ class ApplicationWorker:
                 submission,
             ),
             screening_submission=(submission.payload if submission is not None else None),
+        )
+
+    @staticmethod
+    def _stopped_result(job: ApplyJob) -> HhApplyResult:
+        return HhApplyResult(
+            HhApplyStatus.RETRYABLE_ERROR,
+            job.vacancy.source_url,
+            "Работник остановлен до начала отправки; внешнее действие не выполнялось",
         )
 
     def _get_browser(self) -> VisibleHhBrowser:
@@ -646,7 +735,7 @@ class ApplicationWorker:
         job: ApplyJob,
         submission: StoredScreeningSubmission | None = None,
     ) -> bool:
-        if job.cover_letter_id is None or job.cover_letter_sha256 is None:
+        if self._stop.is_set() or job.cover_letter_id is None or job.cover_letter_sha256 is None:
             return False
         database = create_database(self._settings)
         try:
@@ -659,8 +748,11 @@ class ApplicationWorker:
                     resume_title=job.resume.title,
                 )
                 if not allowed or submission is None:
-                    return allowed
-                return ScreeningDraftService(session).auto_submission_allowed(submission)
+                    return allowed and not self._stop.is_set()
+                return (
+                    ScreeningDraftService(session).auto_submission_allowed(submission)
+                    and not self._stop.is_set()
+                )
         finally:
             database.close()
 
@@ -725,4 +817,5 @@ class ApplicationWorker:
                     )
                 self._stop.wait(self._poll_seconds)
         finally:
+            self._finish_browser_wait("WORKER_STOPPED")
             self._close_browser()

@@ -5,12 +5,25 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
-from hugin.database.models import ApplicationModel, ApplicationTaskModel, VacancyModel
+from hugin.database.models import (
+    ApplicationModel,
+    ApplicationStatusObservationModel,
+    ApplicationTaskModel,
+    CoverLetterModel,
+    RecruiterMessageModel,
+    VacancyModel,
+)
 from hugin.domain.applications import ApplicationState, EventPayload
 from hugin.domain.automation import AutomationJobResult
-from hugin.domain.content import MessageDirection, RecruiterMessageState
+from hugin.domain.content import (
+    CoverLetterState,
+    IncidentSeverity,
+    MessageDirection,
+    RecruiterMessageState,
+)
 from hugin.domain.hh_sync import (
     HhChatMessageData,
     HhNegotiationData,
@@ -18,23 +31,25 @@ from hugin.domain.hh_sync import (
 )
 from hugin.domain.state_machines import APPLICATION_TRANSITIONS
 from hugin.domain.tasks import TaskState
+from hugin.domain.time import as_utc
 from hugin.repositories.applications import ApplicationRepository
 from hugin.repositories.communications import CommunicationRepository
 from hugin.repositories.tasks import QueueTaskRepository
 from hugin.services.incidents import IncidentService
+from hugin.services.message_sender import UNCERTAIN_MESSAGE_SENDER
 from hugin.services.screening_forms import ScreeningDraftService
 
 _INTERVIEW_TITLE = "Приглашение на собеседование"
 _NEGATED_ATTENTION_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(
-        r"\bне\s+"  # noqa: RUF001
+        r"\bне\s+"
         r"(?:(?:готов|мож|смож|буд|планир|хот)\w*\s+){0,2}"
         r"(?:(?:пока|сейчас|далее|больше)\s+)?"
         r"(?:приглас|приглаш)\w*",
         re.I,
     ),
     re.compile(
-        r"\bне\s+"  # noqa: RUF001
+        r"\bне\s+"
         r"(?:(?:готов|буд|планир)\w*\s+){0,2}"
         r"(?:провод\w+\s+)?"
         r"(?:собеседован|интервью|встреч|созвон)\w*",
@@ -87,8 +102,8 @@ class HhSynchronizationService:
         statuses: tuple[HhNegotiationData, ...],
         checked_at: datetime | None = None,
     ) -> AutomationJobResult:
-        selected_at = checked_at or datetime.now(UTC)
-        applications = self._application_map(account_id)
+        selected_at = as_utc(checked_at or datetime.now(UTC))
+        applications = self._application_map(account_id, lock=True)
         manual_reconciliation = self._ambiguous_unknown_result_vacancies(account_id)
         updated = 0
         invitations = 0
@@ -98,8 +113,24 @@ class HhSynchronizationService:
             application = applications.get(item.vacancy_id)
             if application is None or item.vacancy_id in manual_reconciliation:
                 continue
-            matched.add(item.vacancy_id)
             target = ApplicationState(item.status.value)
+            self._session.execute(
+                insert(ApplicationStatusObservationModel)
+                .values(
+                    application_id=application.id,
+                    state=target,
+                    status_label=item.status_label[:255],
+                    checked_at=selected_at,
+                )
+                .on_conflict_do_nothing(constraint="uq_application_status_observations_check")
+            )
+            if (
+                application.status_checked_at is not None
+                and as_utc(application.status_checked_at) > selected_at
+            ):
+                continue
+            matched.add(item.vacancy_id)
+            application.status_checked_at = selected_at
             current = self._applications.get(application.id)
             task = self._tasks.get_by_application_id(application.id)
             event_source = (
@@ -238,6 +269,21 @@ class HhSynchronizationService:
             )
             if is_new:
                 created += 1
+            if self._sender_needs_review(application.id, item):
+                self._incidents.report(
+                    code=UNCERTAIN_MESSAGE_SENDER,
+                    severity=IncidentSeverity.WARNING,
+                    scope_type="recruiter_message",
+                    scope_id=record.id,
+                    message=(
+                        f"Проверьте отправителя сообщения {record.id} в отклике "
+                        f"{application.id}. Текст совпадает с подтверждённой отправкой, "
+                        "а направление выведено только из отсутствия исходящих значков. "
+                        "Возможна цитата работодателя. Полный текст сохранён в переписке; "
+                        "автоматические ответы приостановлены."
+                    ),
+                )
+                continue
             if item.direction is MessageDirection.OUTGOING:
                 if record.state is RecruiterMessageState.SENT:
                     self._communications.complete_reply_action_for_sent_outgoing(
@@ -290,15 +336,51 @@ class HhSynchronizationService:
             new_incoming_message_ids=tuple(new_incoming_message_ids),
         )
 
-    def _application_map(self, account_id: int) -> dict[str, ApplicationModel]:
+    def _sender_needs_review(self, application_id: int, item: HhChatMessageData) -> bool:
+        if item.direction is not MessageDirection.INCOMING or not item.direction_inferred:
+            return False
+        letter = self._session.scalar(
+            select(CoverLetterModel.id)
+            .where(
+                CoverLetterModel.application_id == application_id,
+                CoverLetterModel.state == CoverLetterState.SENT,
+                CoverLetterModel.text == item.body,
+            )
+            .limit(1)
+        )
+        if letter is not None:
+            return True
+        return (
+            self._session.scalar(
+                select(RecruiterMessageModel.id)
+                .where(
+                    RecruiterMessageModel.application_id == application_id,
+                    RecruiterMessageModel.direction == MessageDirection.OUTGOING,
+                    RecruiterMessageModel.state == RecruiterMessageState.SENT,
+                    RecruiterMessageModel.body == item.body,
+                )
+                .limit(1)
+            )
+            is not None
+        )
+
+    def _application_map(
+        self, account_id: int, *, lock: bool = False
+    ) -> dict[str, ApplicationModel]:
         if account_id < 1:
             raise ValueError("Идентификатор аккаунта должен быть положительным")
-        rows = self._session.execute(
+        query = (
             select(ApplicationModel, VacancyModel.hh_id)
             .join(VacancyModel, VacancyModel.id == ApplicationModel.vacancy_id)
             .where(ApplicationModel.account_id == account_id)
             .order_by(ApplicationModel.id.desc())
         )
+        if lock:
+            self._session.flush()
+            query = query.with_for_update(of=ApplicationModel).execution_options(
+                populate_existing=True
+            )
+        rows = self._session.execute(query)
         applications: dict[str, ApplicationModel] = {}
         for application, vacancy_hh_id in rows:
             applications.setdefault(vacancy_hh_id, application)
