@@ -84,6 +84,7 @@ def save_ranking_evidence(
     observed_at: datetime,
     duration_ms: float,
     applied: object,
+    semantic: object = None,
 ) -> int:
     evidence = {
         "schema_version": 1,
@@ -93,7 +94,12 @@ def save_ranking_evidence(
         "observed_at": observed_at.isoformat(),
         "account_id": account_id,
         "direction_id": direction_id,
-        "inputs": {"scope": scope, "vacancy": vacancy, "context": context},
+        "inputs": {
+            "scope": scope,
+            "vacancy": vacancy,
+            "context": context,
+            **({"semantic": semantic} if semantic is not None else {}),
+        },
         "output": evaluation,
         "applied": applied,
         "duration_ms": round(duration_ms, 3),
@@ -155,9 +161,15 @@ def replay_ranking(evidence: Mapping[str, Any]) -> dict[str, Any]:
     scope = DirectionScope(inputs["scope"])
     rules = PythonBackendRules() if scope is DirectionScope.PYTHON_BACKEND else AdjacentItRules()
     with decision_time(datetime.fromisoformat(evidence["observed_at"])):
-        actual = json.loads(
-            canonical_json(rules.evaluate(VacancyData(**values), RuleContext(**context_values)))
-        )
+        if "semantic" in inputs:
+            from hugin.services.semantic_ranking import replay_semantic_evaluation
+
+            evaluated = replay_semantic_evaluation(
+                VacancyData(**values), RuleContext(**context_values), scope, inputs["semantic"]
+            )
+        else:
+            evaluated = rules.evaluate(VacancyData(**values), RuleContext(**context_values))
+        actual = json.loads(canonical_json(evaluated))
     expected = evidence["output"]
     return {
         "matches": actual == expected,

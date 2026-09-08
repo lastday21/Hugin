@@ -35,7 +35,7 @@ from hugin.services.vacancy_duties import TechnicalDuty, technical_duty_evidence
 from hugin.services.vacancy_fit import FitAssessment, assess_fit, unsupported_administration
 from hugin.services.vacancy_skills import skill_terms
 
-RULES_VERSION = "python_it_v69"
+RULES_VERSION = "python_it_v70"
 MAX_VACANCY_AGE = timedelta(days=30)
 NET_SALARY_FACTOR = 0.87
 
@@ -56,6 +56,7 @@ class RuleCategory(StrEnum):
     STRETCH = "STRETCH"
     REJECTED = "REJECTED"
     ROUTED = "ROUTED"
+    REVIEW = "REVIEW"
 
 
 @dataclass(frozen=True, slots=True)
@@ -2789,7 +2790,15 @@ class VacancyAnalysisService:
         observed_at = decision_now()
         started = monotonic()
         with decision_time(observed_at):
-            evaluation = rules.evaluate(vacancy, context)
+            evaluation, semantic = self._evaluate(direction, stored, vacancy, context)
+        if semantic is not None:
+            previous_semantic = tracked.rules_details.get("semantic_selection")
+            manual_accept = (
+                manual_accept
+                and isinstance(previous_semantic, dict)
+                and previous_semantic.get("key") == semantic.get("key")
+                and not semantic.get("constraint_reasons")
+            )
         rule_evaluation = evaluation
         if manual_accept:
             evaluation = replace(
@@ -2849,6 +2858,7 @@ class VacancyAnalysisService:
                 "manual_accept": manual_accept,
                 "duplicate_of_id": stored.duplicate_of_id,
             },
+            semantic=semantic,
         )
         self._directions.apply_rules(
             direction.id,
@@ -2857,6 +2867,7 @@ class VacancyAnalysisService:
             score=evaluation.score,
             details={
                 "evidence_id": evidence_id,
+                **({"semantic_selection": semantic} if semantic is not None else {}),
                 **({"manual_override": "ACCEPT"} if manual_accept else {}),
                 "accepted": evaluation.accepted,
                 "category": evaluation.category.value,
@@ -2901,6 +2912,53 @@ class VacancyAnalysisService:
         )
         return VacancyAnalysisResult(stored, evaluation, state)
 
+    def reanalyze_one(
+        self, account_id: int, direction_id: int, vacancy_id: int
+    ) -> VacancyAnalysisResult:
+        direction = self._directions.get_for_account(account_id, direction_id)
+        stored = self._vacancies.get(vacancy_id)
+        vacancy = self._data(stored)
+        context = self._context(direction.account_id, direction.name)
+        result = self._apply(direction, stored, vacancy, context)
+        self._route(direction.account_id, direction, stored, vacancy, result)
+        return result
+
+    def _evaluate(
+        self,
+        direction: DirectionRecord,
+        stored: VacancyRecord,
+        vacancy: VacancyData,
+        context: RuleContext,
+    ) -> tuple[RuleEvaluation, dict[str, object] | None]:
+        from hugin.services.semantic_ranking import independent_constraints, semantic_evaluation
+        from hugin.services.semantic_results import read_selection
+        from hugin.services.semantic_snapshot import selection_snapshot
+
+        try:
+            snapshot = selection_snapshot(self._session, direction, stored)
+        except ValueError:
+            return (
+                RuleEvaluation(
+                    0, RuleCategory.REVIEW, ("Некорректная настройка смыслового отбора",)
+                ),
+                {"status": "CONFIGURATION_ERROR"},
+            )
+        if snapshot is None:
+            return self._rules[direction.scope].evaluate(vacancy, context), None
+        result = read_selection(self._session, snapshot)
+        target_scope = result.target_scope
+        if target_scope is not None and self._routing_direction(direction, target_scope) is None:
+            target_scope = None
+        evidence = {
+            **result.evidence,
+            "constraint_reasons": list(independent_constraints(vacancy, context)),
+            "routing_target_scope": target_scope.value if target_scope is not None else None,
+        }
+        return (
+            semantic_evaluation(vacancy, context, direction.scope, result.decision, target_scope),
+            evidence,
+        )
+
     def _refresh_duplicate_family(self, vacancy: VacancyRecord) -> VacancyRecord:
         canonical = self._vacancies.get(vacancy.duplicate_of_id or vacancy.id)
         if canonical.details_fetched_at is None:
@@ -2929,21 +2987,34 @@ class VacancyAnalysisService:
         target_scope = result.evaluation.target_scope
         if result.evaluation.category is not RuleCategory.ROUTED or target_scope is None:
             return
-        target = next(
-            (
-                direction
-                for direction in self._directions.list_for_account(account_id)
-                if direction.id != source.id
-                and direction.is_active
-                and direction.scope is target_scope
-            ),
-            None,
-        )
+        target = self._routing_direction(source, target_scope)
         if target is None:
             return
         self._directions.track_vacancy(target.id, stored.id)
         target_context = self._context(account_id, target.name)
         self._apply(target, stored, vacancy, target_context)
+
+    def _routing_direction(
+        self, source: DirectionRecord, target_scope: DirectionScope
+    ) -> DirectionRecord | None:
+        from hugin.services.semantic_snapshot import selection_config
+
+        semantic = selection_config(source) is not None
+        for direction in self._directions.list_for_account(source.account_id):
+            if (
+                direction.id == source.id
+                or not direction.is_active
+                or direction.scope is not target_scope
+            ):
+                continue
+            if semantic:
+                try:
+                    if selection_config(direction) is None:
+                        continue
+                except ValueError:
+                    continue
+            return direction
+        return None
 
     def _account_and_direction(
         self,

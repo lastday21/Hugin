@@ -49,6 +49,7 @@ SELECTION_RECOVERY_ERRORS = frozenset(
         "VACANCY_RULES_CHANGED",
         "VACANCY_DUPLICATE",
         "NO_RELEVANT_EVIDENCE",
+        "SEMANTIC_SELECTION_STALE",
     }
 )
 
@@ -282,7 +283,13 @@ class QueueTaskRepository:
         task = self._session.get(ApplicationTaskModel, task_id)
         if (
             task is None
-            or task.state is not TaskState.SKIPPED
+            or not (
+                task.state is TaskState.SKIPPED
+                or (
+                    task.state is TaskState.REVIEW_REQUIRED
+                    and task.last_error_code == "SEMANTIC_SELECTION_STALE"
+                )
+            )
             or task.last_error_code not in SELECTION_RECOVERY_ERRORS
         ):
             raise ValueError("Задание не было остановлено исправленной причиной отбора")

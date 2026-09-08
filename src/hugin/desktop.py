@@ -60,6 +60,7 @@ from hugin.workers.backups import BackupWorker
 from hugin.workers.hh_search import HhSearchJobHandler
 from hugin.workers.hh_sync import HhSyncJobHandler
 from hugin.workers.notifications import NotificationWorker
+from hugin.workers.semantic_selection import SemanticSelectionWorker
 
 APP_ICON = Path(__file__).with_name("assets") / "hugin.ico"
 
@@ -976,6 +977,7 @@ def main() -> None:
     )
     notification_worker = NotificationWorker(settings, journal=journal)
     backup_worker = BackupWorker(settings, journal=journal)
+    semantic_worker = SemanticSelectionWorker(settings, journal=journal)
     bridge = DesktopBridge(
         settings,
         browser_lock=browser_lock,
@@ -986,6 +988,7 @@ def main() -> None:
         worker,
         notification_worker,
         backup_worker,
+        semantic_worker,
     )
     started_workers: list[BackgroundWorker] = []
     tray: DesktopTray | None = None

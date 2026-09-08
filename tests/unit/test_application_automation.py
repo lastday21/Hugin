@@ -1324,7 +1324,10 @@ def test_rule_change_skips_actionable_task_waiting_for_user(
         database.close()
 
 
-def test_routed_pending_application_moves_to_target_direction(settings: Settings) -> None:
+@pytest.mark.parametrize("stale_selection", [False, True])
+def test_routed_pending_application_moves_to_target_direction(
+    settings: Settings, stale_selection: bool
+) -> None:
     upgrade_database(settings)
     database = create_database(settings)
     try:
@@ -1400,6 +1403,14 @@ def test_routed_pending_application_moves_to_target_direction(settings: Settings
                 direction_name=source.name,
                 include_stretch=False,
             )
+
+            if stale_selection:
+                tasks = QueueTaskRepository(session)
+                tasks.requeue_after_selection_recovery(task.id, priority_score=75)
+                tasks.transition(task.id, TaskState.RUNNING)
+                tasks.transition(
+                    task.id, TaskState.REVIEW_REQUIRED, error_code="SEMANTIC_SELECTION_STALE"
+                )
 
             created = service.prepare_vacancies(
                 account_external_id=account.external_id or "",

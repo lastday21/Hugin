@@ -1128,16 +1128,18 @@ def test_main_starts_window_and_always_closes_bridge(
     monkeypatch.setattr(desktop, "ApplicationWorker", FakeWorker)
     monkeypatch.setattr(desktop, "NotificationWorker", FakeWorker)
     monkeypatch.setattr(desktop, "BackupWorker", FakeWorker)
+    monkeypatch.setattr(desktop, "SemanticSelectionWorker", FakeWorker)
 
     desktop.main()
 
     assert desktop.APP_ICON.is_file()
     assert events[0] == "services"
-    assert events[-8:] == [
+    assert events[-9:] == [
         "tray-start",
         ("start", False, str(desktop.APP_ICON)),
         "tray-stop",
         "close",
+        "worker-stop",
         "worker-stop",
         "worker-stop",
         "worker-stop",

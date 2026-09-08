@@ -54,6 +54,7 @@ from hugin.repositories.tasks import (
     FORM_PREFLIGHT_PASSED,
     FORM_PREFLIGHT_RUNNING,
     FORM_RETRY_EXHAUSTED,
+    SELECTION_RECOVERY_ERRORS,
     QueueTaskRepository,
     SystemStateRepository,
 )
@@ -229,6 +230,8 @@ class ApplicationAutomationService:
         tracked: DirectionVacancyRecord,
     ) -> tuple[int, int]:
         vacancy = self._vacancies.get(tracked.vacancy_id)
+        if not self._semantic_selection_current(direction, vacancy, resume.id):
+            return 0, 1
         if vacancy.duplicate_of_id is not None:
             if self._vacancies.duplicate_family_has_sent_or_live_application(
                 account.id,
@@ -282,9 +285,14 @@ class ApplicationAutomationService:
                 return 1, 0
             if (
                 task is not None
-                and task.state is TaskState.SKIPPED
-                and task.last_error_code
-                in {"VACANCY_RULES_CHANGED", "VACANCY_DUPLICATE", "NO_RELEVANT_EVIDENCE"}
+                and (
+                    task.state is TaskState.SKIPPED
+                    or (
+                        task.state is TaskState.REVIEW_REQUIRED
+                        and task.last_error_code == "SEMANTIC_SELECTION_STALE"
+                    )
+                )
+                and task.last_error_code in SELECTION_RECOVERY_ERRORS
                 and current.state is ApplicationState.APPLYING
             ):
                 self._tasks.requeue_after_selection_recovery(
@@ -355,9 +363,14 @@ class ApplicationAutomationService:
         if application.state is not ApplicationState.APPLYING:
             return False
         if task is not None and (
-            task.state is not TaskState.SKIPPED
-            or task.last_error_code
-            not in {"VACANCY_RULES_CHANGED", "VACANCY_DUPLICATE", "NO_RELEVANT_EVIDENCE"}
+            not (
+                task.state is TaskState.SKIPPED
+                or (
+                    task.state is TaskState.REVIEW_REQUIRED
+                    and task.last_error_code == "SEMANTIC_SELECTION_STALE"
+                )
+            )
+            or task.last_error_code not in SELECTION_RECOVERY_ERRORS
         ):
             return False
         if application.direction_id is None:
@@ -506,6 +519,8 @@ class ApplicationAutomationService:
         if row is None:
             return False
         letter, resume, application = row
+        if not self._application_selection_current(application):
+            return False
         if self._vacancies.duplicate_family_has_sent_or_live_application(
             application.account_id, application.vacancy_id, exclude_application_id=application.id
         ):
@@ -610,6 +625,8 @@ class ApplicationAutomationService:
         if row is None:
             return False
         letter, resume, application = row
+        if not self._application_selection_current(application):
+            return False
         if self._vacancies.duplicate_family_has_sent_or_live_application(
             application.account_id, application.vacancy_id, exclude_application_id=application.id
         ):
@@ -769,7 +786,10 @@ class ApplicationAutomationService:
             cover_letter_sha256=actual_sha256,
             profile_snapshot=application_profile_snapshot(self._session, application),
         )
-        return self._save_attempt(job)
+        saved = self._save_attempt(job)
+        if saved is None:
+            raise RuntimeError("Смысловой отбор устарел; перед откликом нужен новый разбор")
+        return saved
 
     def release_supervised_claim(
         self,
@@ -1749,7 +1769,59 @@ class ApplicationAutomationService:
             self._system.set_next_apply_at(next_apply_at)
         return RecordedApplyResult(blocking=False, sent=sent, next_apply_at=next_apply_at)
 
-    def _save_attempt(self, job: ApplyJob) -> ApplyJob:
+    def _application_selection_current(
+        self, application: ApplicationRecord | ApplicationModel
+    ) -> bool:
+        if application.direction_id is None:
+            return False
+        direction = self._directions.get_for_account(
+            application.account_id, application.direction_id
+        )
+        return self._semantic_selection_current(
+            direction, self._vacancies.get(application.vacancy_id), application.resume_id
+        )
+
+    def _semantic_selection_current(
+        self,
+        direction: DirectionRecord,
+        vacancy: VacancyRecord,
+        resume_id: int,
+    ) -> bool:
+        from hugin.services.semantic_ranking import independent_constraints
+        from hugin.services.semantic_results import read_selection
+        from hugin.services.semantic_snapshot import selection_snapshot
+        from hugin.services.vacancy_analysis import VacancyAnalysisService
+
+        try:
+            snapshot = selection_snapshot(self._session, direction, vacancy)
+        except ValueError:
+            return False
+        if snapshot is None:
+            return True
+        if snapshot.resume_id != resume_id:
+            return False
+        context = VacancyAnalysisService(self._session)._context(
+            direction.account_id, direction.name
+        )
+        if independent_constraints(VacancyAnalysisService._data(vacancy), context):
+            return False
+        tracked = self._directions.get_tracked_vacancy(direction.id, vacancy.id)
+        evidence = tracked.rules_details.get("semantic_selection")
+        if not isinstance(evidence, dict) or evidence.get("key") != snapshot.key:
+            return False
+        if (
+            tracked.rules_details.get("manual_override") == "ACCEPT"
+            and tracked.rules_version == RULES_VERSION
+        ):
+            return True
+        return read_selection(self._session, snapshot).decision.status == "ALLOW"
+
+    def _save_attempt(self, job: ApplyJob) -> ApplyJob | None:
+        if not self._application_selection_current(job.application):
+            self._tasks.transition(
+                job.task.id, TaskState.REVIEW_REQUIRED, error_code="SEMANTIC_SELECTION_STALE"
+            )
+            return None
         snapshot = self._selection_snapshot(job)
         snapshot["screening_forms"] = screening_evidence(self._session, job.application.id)
         snapshot["sha256"] = fingerprint({k: v for k, v in snapshot.items() if k != "sha256"})
