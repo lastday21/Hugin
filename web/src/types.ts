@@ -121,6 +121,7 @@ export interface SearchRegion {
 }
 
 export interface DirectionSummary {
+  semantic_selection_enabled: boolean;
   id: number;
   name: string;
   description: string | null;
@@ -143,6 +144,7 @@ export interface DirectionOptions {
 }
 
 export interface DirectionSettings {
+  semantic_selection_enabled: boolean;
   is_active: boolean;
   queries: string[];
   regions: SearchRegion[];
@@ -380,6 +382,7 @@ export interface FormDraft {
 }
 
 export interface RejectedVacancy {
+  decision_state: string;
   vacancy_id: string;
   title: string;
   company: string;

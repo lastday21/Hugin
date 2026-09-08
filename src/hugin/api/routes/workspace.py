@@ -64,6 +64,7 @@ class DirectionResponse(BaseModel):
     desired_salary: int | None
     remote_all_russia: bool
     schedule_minutes: int
+    semantic_selection_enabled: bool = False
 
 
 class DirectionOptionsResponse(BaseModel):
@@ -82,6 +83,7 @@ class DirectionSettingsUpdate(BaseModel):
     desired_salary: int | None = Field(default=None, ge=1, strict=True)
     remote_all_russia: bool
     schedule_minutes: int = Field(ge=5, le=1440, strict=True)
+    semantic_selection_enabled: bool | None = Field(default=None, strict=True)
 
 
 class IncidentResponse(BaseModel):
@@ -165,6 +167,7 @@ class RejectedVacancyResponse(BaseModel):
     score: float | None
     reasons: tuple[str, ...]
     decision_reasons: tuple[str, ...]
+    decision_state: str = "REJECTED"
 
 
 class SentApplicationResponse(BaseModel):
@@ -444,6 +447,7 @@ def update_direction(
             desired_salary=values.desired_salary,
             remote_all_russia=values.remote_all_russia,
             schedule_minutes=values.schedule_minutes,
+            semantic_selection_enabled=values.semantic_selection_enabled,
         )
         direction = next(
             item

@@ -104,6 +104,7 @@ def _queue_error_text(error_code: str | None) -> str | None:
         "CAPTCHA_REQUIRED": "hh.ru запросил проверку пользователя",
         "ACCOUNT_WARNING": "hh.ru ограничил работу аккаунта",
         "RESUME_MISMATCH": "в форме выбрано не то резюме",
+        "SEMANTIC_SELECTION_STALE": "текст вакансии или профиль изменился; нужен новый разбор",
     }
     return descriptions.get(error_code, "требуется проверка причины")
 
@@ -131,6 +132,7 @@ class UiDirection:
     desired_salary: int | None
     remote_all_russia: bool
     schedule_minutes: int
+    semantic_selection_enabled: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -209,6 +211,7 @@ class UiRejectedVacancy:
     score: float | None
     reasons: tuple[str, ...]
     decision_reasons: tuple[str, ...]
+    decision_state: str = "REJECTED"
 
 
 @dataclass(frozen=True, slots=True)
@@ -688,6 +691,9 @@ class UiWorkspaceService:
                 score=tracking.rules_score,
                 reasons=self._reasons(tracking.rules_details),
                 decision_reasons=self._decision_reasons(tracking.rules_details),
+                decision_state=(
+                    "REVIEW" if tracking.rules_details.get("category") == "REVIEW" else "REJECTED"
+                ),
             )
             for vacancy, tracking, direction in rows
         )
@@ -829,7 +835,11 @@ class UiWorkspaceService:
             skills=tuple(vacancy.key_skills),
             description=vacancy.description or "Описание пока не загружено",
             direction=_direction_name(direction),
-            state=tracking.state.value,
+            state=(
+                "REVIEW"
+                if tracking.rules_details.get("category") == "REVIEW"
+                else tracking.state.value
+            ),
             score=tracking.rules_score,
             reasons=self._reasons(tracking.rules_details),
             discoveries=discoveries,
@@ -885,6 +895,7 @@ class UiWorkspaceService:
             if region.get("area") and region.get("name")
         }
         raw_search = direction.scoring_config.get("search_settings")
+        raw_semantic = direction.scoring_config.get("semantic_selection")
         search = raw_search if isinstance(raw_search, dict) else {}
         employment_forms = tuple(
             value for value in search.get("employment_forms", []) if isinstance(value, str)
@@ -905,6 +916,9 @@ class UiWorkspaceService:
             desired_salary=self._optional_int(search.get("desired_salary")),
             remote_all_russia=search.get("remote_all_russia") is True,
             schedule_minutes=first_query.schedule_minutes if first_query is not None else 120,
+            semantic_selection_enabled=(
+                isinstance(raw_semantic, dict) and raw_semantic.get("enabled", True) is True
+            ),
         )
 
     def _questions(self, form_id: int) -> tuple[UiQuestion, ...]:

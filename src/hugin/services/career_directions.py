@@ -4,10 +4,10 @@ import re
 from dataclasses import dataclass
 from decimal import Decimal
 
-from sqlalchemy import or_, select
+from sqlalchemy import or_, select, update
 from sqlalchemy.orm import Session
 
-from hugin.database.models import CandidateProfileModel, VerifiedFactModel
+from hugin.database.models import CandidateProfileModel, DirectionVacancyModel, VerifiedFactModel
 from hugin.domain.content import ConfirmationState
 from hugin.domain.directions import (
     DirectionRecord,
@@ -126,6 +126,7 @@ class CareerDirectionService:
         remote_all_russia: bool | None = None,
         role_scope: DirectionScope | None = None,
         schedule_minutes: int = 120,
+        semantic_selection_enabled: bool | None = None,
     ) -> DirectionSearchSettings:
         self._accounts.get(account_id)
         resume = self._resumes.get_profile_active(account_id)
@@ -160,6 +161,22 @@ class CareerDirectionService:
                 "только для удалённого формата"
             )
         scoring_config = dict(existing.scoring_config) if existing is not None else {}
+        if semantic_selection_enabled is not None:
+            from hugin.services.semantic_snapshot import SelectionConfig
+
+            previous = scoring_config.get("semantic_selection")
+            config_values = dict(previous) if isinstance(previous, dict) else {}
+            config_values["enabled"] = semantic_selection_enabled
+            selected_config = SelectionConfig.model_validate(config_values).model_dump()
+            scoring_config["semantic_selection"] = selected_config
+            if existing is not None and previous != selected_config:
+                self._session.execute(
+                    update(DirectionVacancyModel)
+                    .where(
+                        DirectionVacancyModel.direction_id == existing.id,
+                    )
+                    .values(rules_version=None)
+                )
         scoring_config["role_scope"] = actual_scope.value
         scoring_config["search_settings"] = {
             "minimum_salary": actual_minimum,
@@ -239,6 +256,7 @@ class CareerDirectionService:
         desired_salary: int | None,
         remote_all_russia: bool,
         schedule_minutes: int,
+        semantic_selection_enabled: bool | None = None,
     ) -> DirectionSearchSettings:
         direction = self._directions.get_for_account(account_id, direction_id)
         if schedule_minutes < 5:
@@ -255,6 +273,7 @@ class CareerDirectionService:
             remote_all_russia=remote_all_russia,
             role_scope=direction.scope,
             schedule_minutes=schedule_minutes,
+            semantic_selection_enabled=semantic_selection_enabled,
         )
         updated_direction = self._directions.set_active(account_id, direction_id, is_active)
         return DirectionSearchSettings(

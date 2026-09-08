@@ -617,6 +617,7 @@ def test_workspace_endpoints_return_real_data_and_protect_changes(settings: Sett
             "desired_salary": 220000,
             "remote_all_russia": True,
             "schedule_minutes": 90,
+            "semantic_selection_enabled": True,
         }
         direction_path = f"/api/directions/{stored_direction['id']}?account_id={account_id}"
         assert request(app, "PUT", direction_path, json=direction_values).status_code == 403
@@ -638,6 +639,7 @@ def test_workspace_endpoints_return_real_data_and_protect_changes(settings: Sett
         assert saved_direction.json()["desired_salary"] == 220000
         assert saved_direction.json()["remote_all_russia"] is True
         assert saved_direction.json()["schedule_minutes"] == 90
+        assert saved_direction.json()["semantic_selection_enabled"] is True
 
         invalid_direction = request(
             app,

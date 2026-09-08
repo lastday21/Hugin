@@ -200,6 +200,7 @@ const stateNames: Record<string, string> = {
   UNKNOWN_RESULT: "Нужно уточнить",
   COMPLETED: "Готово",
   FILTERED_OUT: "Не подходит",
+  REVIEW: "Нужен разбор",
   READY: "Готово",
   FAILED: "Ошибка",
   SENT: "Отправлено",
@@ -1683,7 +1684,7 @@ function VacanciesView({
             onClick={() => onTabChanged("rejected")}
             onKeyDown={onTabKeyDown}
           >
-            Не подошли <span>{rejected.length}</span>
+            Вне очереди <span>{rejected.length}</span>
           </button>
         </div>
         <div className="search-field">
@@ -1852,7 +1853,9 @@ function VacanciesView({
                       <small>{reason ?? "Не прошло правила отбора"}</small>
                     </div>
                     <div className="vacancy-state">
-                      <span className="status-pill muted">Не подходит</span>
+                      <span className="status-pill muted">
+                        {item.decision_state === "REVIEW" ? "Нужен разбор" : "Не подходит"}
+                      </span>
                       {item.score !== null && <small>Оценка {Math.round(item.score)}</small>}
                     </div>
                     <button
@@ -5003,6 +5006,7 @@ function NotificationSettingsForm({
 }
 
 type DirectionDraft = {
+  semantic_selection_enabled: boolean;
   is_active: boolean;
   queries: string;
   regionAreas: string[];
@@ -5029,6 +5033,7 @@ const employmentFormNames: Record<EmploymentForm, string> = {
 
 function directionDraft(direction: DirectionSummary): DirectionDraft {
   return {
+    semantic_selection_enabled: direction.semantic_selection_enabled,
     is_active: direction.is_active,
     queries: direction.queries.join("\n"),
     regionAreas: direction.regions.map((region) => region.area),
@@ -5104,6 +5109,7 @@ function DirectionSettingsCard({
         throw new Error("Интервал поиска должен быть от 5 до 1440 минут");
       }
       const values: DirectionSettings = {
+        semantic_selection_enabled: draft.semantic_selection_enabled,
         is_active: draft.is_active,
         queries,
         regions,
@@ -5160,10 +5166,11 @@ function DirectionSettingsCard({
             </span>
           </div>
           {direction.description && <span>{direction.description}</span>}
+          {direction.semantic_selection_enabled && <span>Смысловой разбор требований включён</span>}
           <span>
             {plural(direction.queued, "вакансия", "вакансии", "вакансий")} в очереди
             {direction.rejected > 0
-              ? ` · ${plural(direction.rejected, "отклонена", "отклонены", "отклонено")}`
+              ? ` · ${plural(direction.rejected, "вакансия", "вакансии", "вакансий")} вне очереди`
               : ""}
           </span>
         </div>
@@ -5194,6 +5201,26 @@ function DirectionSettingsCard({
             <span>
               <strong>Искать вакансии по этому направлению</strong>
               <small>Выключение остановит новые поиски, но сохранит историю.</small>
+            </span>
+          </label>
+
+          <label className="direction-active-control">
+            <span className="check-control">
+              <input
+                type="checkbox"
+                checked={draft.semantic_selection_enabled}
+                onChange={(event) =>
+                  setDraft((current) => ({ ...current, semantic_selection_enabled: event.target.checked }))
+                }
+              />
+              <span aria-hidden="true" />
+            </span>
+            <span>
+              <strong>Разбирать смысл требований</strong>
+              <small>
+                Сопоставлять обязанности с подтверждённым профилем. Использует подписку Codex
+                и работает при включённом поиске. До завершения разбора отклик не готовится.
+              </small>
             </span>
           </label>
 
