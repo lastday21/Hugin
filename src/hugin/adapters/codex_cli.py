@@ -5,6 +5,7 @@ import os
 import shutil
 import subprocess
 from pathlib import Path
+from uuid import uuid4
 
 from hugin.core.settings import Settings
 from hugin.diagnostics import OperationJournal
@@ -67,9 +68,38 @@ class CodexCliClient:
     def model_name(self) -> str:
         return f"codex:{self._model}"
 
+    @property
+    def request_identity(self) -> str:
+        return f"{self.model_name}:{self._reasoning_effort}"
+
     def complete(self, system_prompt: str, user_prompt: str) -> str:
+        return self._complete(system_prompt, user_prompt)
+
+    def complete_json(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        schema: dict[str, object],
+    ) -> str:
         self._runtime_dir.mkdir(parents=True, exist_ok=True)
-        if self._operation == "recruiter_reply":
+        schema_path = self._runtime_dir / f"schema-{uuid4().hex}.json"
+        try:
+            schema_path.write_text(json.dumps(schema, ensure_ascii=False), encoding="utf-8")
+            return self._complete(system_prompt, user_prompt, schema_path=schema_path)
+        finally:
+            schema_path.unlink(missing_ok=True)
+
+    def _complete(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        *,
+        schema_path: Path | None = None,
+    ) -> str:
+        self._runtime_dir.mkdir(parents=True, exist_ok=True)
+        if schema_path is not None:
+            result_name = "результат разбора в формате JSON по заданной схеме"
+        elif self._operation == "recruiter_reply":
             result_name = "итоговый ответ работодателю"
         elif self._operation == "recruiter_reply_requirement":
             result_name = "решение REPLY_REQUIRED или NO_REPLY_REQUIRED"
@@ -107,6 +137,8 @@ class CodexCliClient:
             f'model_reasoning_effort="{self._reasoning_effort}"',
             "-",
         ]
+        if schema_path is not None:
+            command[-1:-1] = ["--output-schema", str(schema_path)]
         run = (
             self._journal.start(
                 "codex_cli",
@@ -149,7 +181,7 @@ class CodexCliClient:
                 ),
             )
         except subprocess.TimeoutExpired as error:
-            failure = CodexCliError("Истекло время ожидания сопроводительного письма")
+            failure = CodexCliError("Истекло время ожидания ответа модели")
             if run is not None:
                 run.save_evidence(
                     "response",
@@ -181,6 +213,12 @@ class CodexCliClient:
                 )
                 run.fail(failure, return_code=result.returncode)
             raise failure
+        if schema_path is not None and self._used_tools(result.stdout):
+            failure = CodexCliError("При разборе вызван инструмент; результат не принят")
+            if run is not None:
+                run.save_evidence("response", stdout=result.stdout, stderr=result.stderr)
+                run.fail(failure)
+            raise failure
         text, usage = self._parse_output(result.stdout)
         if not text:
             failure = CodexCliError("Программа создания писем вернула пустой ответ")
@@ -210,6 +248,25 @@ class CodexCliClient:
                 **usage,
             )
         return text
+
+    @staticmethod
+    def _used_tools(value: str) -> bool:
+        for line in value.splitlines():
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(event, dict):
+                continue
+            item = event.get("item")
+            if isinstance(item, dict) and item.get("type") in {
+                "command_execution",
+                "mcp_tool_call",
+                "web_search",
+                "file_change",
+            }:
+                return True
+        return False
 
     @staticmethod
     def _captured_text(value: str | bytes | None) -> str:
@@ -286,12 +343,13 @@ def configured_codex_cli_client(
     operation: str = "cover_letter",
     model: str | None = None,
     timeout_seconds: int | None = None,
+    reasoning_effort: str | None = None,
 ) -> CodexCliClient:
     return CodexCliClient(
         find_codex_cli(settings.codex_cli_path),
         settings.data_dir / "codex-letter-runtime",
         model=model or settings.codex_letter_model,
-        reasoning_effort=settings.codex_letter_reasoning_effort,
+        reasoning_effort=reasoning_effort or settings.codex_letter_reasoning_effort,
         timeout_seconds=timeout_seconds or settings.codex_letter_timeout_seconds,
         journal=OperationJournal(settings.data_dir),
         operation=operation,

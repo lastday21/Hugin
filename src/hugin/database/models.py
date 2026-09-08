@@ -363,6 +363,33 @@ class VacancyModel(Base):
     )
 
 
+class SemanticStageModel(Base):
+    __tablename__ = "semantic_stages"
+    __table_args__ = (
+        Index("ix_semantic_stages_lookup", "account_id", "vacancy_id", "cache_key", "id"),
+        CheckConstraint("duration_seconds >= 0", name="ck_semantic_stages_duration"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    account_id: Mapped[int] = mapped_column(
+        ForeignKey("hh_accounts.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    vacancy_id: Mapped[int] = mapped_column(
+        ForeignKey("vacancies.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    cache_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    stage: Mapped[str] = mapped_column(String(32), nullable=False)
+    model: Mapped[str] = mapped_column(String(128), nullable=False)
+    request: Mapped[ConfigPayload] = mapped_column(JSONB, nullable=False)
+    response_text: Mapped[str] = mapped_column(Text, nullable=False)
+    response_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    errors: Mapped[list[str]] = mapped_column(JSONB, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    duration_seconds: Mapped[float] = mapped_column(Float, nullable=False)
+
+
 class DirectionVacancyModel(Base):
     __tablename__ = "direction_vacancies"
     __table_args__ = (

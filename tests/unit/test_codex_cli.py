@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -37,6 +38,66 @@ def make_client(tmp_path: Path) -> CodexCliClient:
     executable = tmp_path / "codex.cmd"
     executable.touch()
     return CodexCliClient(executable, tmp_path / "runtime")
+
+
+def test_structured_analysis_has_its_own_schema_and_no_letter_instruction(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    schema = {"type": "object", "properties": {}, "required": [], "additionalProperties": False}
+    paths: list[Path] = []
+
+    def run(command: list[str], **kwargs: object) -> object:
+        path = Path(command[command.index("--output-schema") + 1])
+        paths.append(path)
+        assert json.loads(path.read_text(encoding="utf-8")) == schema
+        assert "сопроводительное письмо" not in str(kwargs["input"])
+        assert "JSON" in str(kwargs["input"])
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "agent_message",
+                        "text": '{"entries": []}',
+                    },
+                }
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr("hugin.adapters.codex_cli.subprocess.run", run)
+    client = make_client(tmp_path)
+    assert client.complete_json("Правила", "Вакансия", schema) == '{"entries": []}'
+    assert not paths[0].exists()
+    client.complete_json("Правила", "Другая вакансия", schema)
+    assert paths[0] != paths[1]
+
+
+def test_structured_analysis_rejects_tool_use_and_cleans_schema(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    paths: list[Path] = []
+
+    def run(command: list[str], **_kwargs: object) -> object:
+        paths.append(Path(command[command.index("--output-schema") + 1]))
+        return SimpleNamespace(
+            returncode=0,
+            stdout="\n".join(
+                [
+                    '{"type":"item.completed","item":{"type":"command_execution"}}',
+                    '{"type":"item.completed","item":{"type":"agent_message","text":"{}"}}',
+                ]
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr("hugin.adapters.codex_cli.subprocess.run", run)
+    with pytest.raises(CodexCliError, match="инструмент"):
+        make_client(tmp_path).complete_json("Правила", "Вакансия", {})
+    assert not paths[0].exists()
 
 
 def test_client_uses_subscription_login_without_api_key(
