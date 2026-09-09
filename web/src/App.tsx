@@ -1974,6 +1974,31 @@ function AttentionView({
     }
   }
 
+  async function confirmAnswers(form: FormDraft): Promise<void> {
+    if (busyFormRef.current !== null) return;
+    const answers = form.questions.flatMap((question) =>
+      question.answer?.trim()
+        ? [{ field_key: question.field_key, answer: question.answer }]
+        : [],
+    );
+    if (!answers.length) return;
+    busyFormRef.current = form.form_id;
+    setBusyForm(form.form_id);
+    try {
+      const updated = await saveFormAnswers(form.form_id, answers);
+      onFormChanged(updated);
+      onToast({
+        kind: "success",
+        message: updated.review_reason ?? "Ответы подтверждены. Анкета готова к продолжению обработки.",
+      });
+    } catch (reason) {
+      onToast({ kind: "error", message: readableError(reason) });
+    } finally {
+      busyFormRef.current = null;
+      setBusyForm(null);
+    }
+  }
+
   return (
     <div className="page-stack">
       <div className="attention-intro">
@@ -2049,6 +2074,17 @@ function AttentionView({
                   {plural(form.unanswered_count, "вопрос", "вопроса", "вопросов")} без ответа
                 </span>
               </div>
+              {form.review_reason && <p className="form-review-reason">{form.review_reason}</p>}
+              {form.state === "REVIEW_REQUIRED" && form.answered_count > 0 && (
+                <button
+                  type="button"
+                  className="secondary-button form-confirmation-button"
+                  disabled={busyForm !== null}
+                  onClick={() => void confirmAnswers(form)}
+                >
+                  {busyForm === form.form_id ? "Сохраняем…" : "Подтвердить сохранённые ответы"}
+                </button>
+              )}
               <details className="questions-details">
                 <summary>
                   <span>Показать вопросы</span>
@@ -2068,7 +2104,8 @@ function AttentionView({
                             <small>{sourceNames[question.source] ?? question.source}</small>
                           )}
                         </>
-                      ) : (
+                      ) : null}
+                      {(!question.answer || form.state === "REVIEW_REQUIRED") && (
                         <FormQuestionEditor
                           formId={form.form_id}
                           question={question}
@@ -2105,7 +2142,7 @@ function FormQuestionEditor({
   onFormChanged: (form: FormDraft) => void;
   onToast: (toast: Toast) => void;
 }) {
-  const [answer, setAnswer] = useState("");
+  const [answer, setAnswer] = useState(question.answer ?? "");
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
 

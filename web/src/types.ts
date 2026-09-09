@@ -379,6 +379,7 @@ export interface FormDraft {
   answered_count: number;
   unanswered_count: number;
   questions: FormQuestion[];
+  review_reason: string | null;
 }
 
 export interface RejectedVacancy {

@@ -1374,6 +1374,19 @@ ol {
   font-weight: 600;
 }
 
+.form-review-reason {
+  margin: 14px 20px;
+  color: #47574e;
+  font-size: 13px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.form-confirmation-button {
+  margin: 0 20px 14px;
+  max-width: calc(100% - 40px);
+}
+
 .questions-details summary,
 .drawer-section summary {
   display: flex;
