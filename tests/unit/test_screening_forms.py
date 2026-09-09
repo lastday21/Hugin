@@ -232,7 +232,10 @@ def test_draft_uses_only_confirmed_safe_answers_and_replaces_changed_form(
             assert submission.form_id == changed.form_id
             assert submission.payload.answers == (("name:telegram", "@ivan"),)
             assert ScreeningDraftService(session).auto_submission_allowed(submission)
-            assert session.scalar(select(func.count()).select_from(ScreeningFormModel)) == 1
+            assert session.scalar(select(func.count()).select_from(ScreeningFormModel)) == 2
+            original = session.get(ScreeningFormModel, draft.form_id)
+            assert original is not None
+            assert original.state is ScreeningFormState.INVALIDATED
             ScreeningDraftService(session).invalidate(changed.form_id)
             assert ScreeningDraftService(session).list_pending(account.id) == ()
     finally:
@@ -571,6 +574,84 @@ def test_explicit_assignment_is_never_a_simple_form(question: str) -> None:
     assert not ScreeningDraftService._simple_structure(HhScreeningForm((field,)))
 
 
+@pytest.mark.parametrize(
+    "question",
+    ("Почему хотите работать у нас?", "Расскажите о своей последней задаче"),
+)
+def test_user_confirmation_releases_nonstandard_form_and_survives_recapture(
+    settings: Settings,
+    question: str,
+) -> None:
+    database = create_database(settings)
+    try:
+        with database.sessions.begin() as session:
+            account = AccountRepository(session).create("Иван", "confirmed-nonstandard")
+            resume = ResumeRepository(session).upsert(account.id, "resume-1", "Python")
+            vacancy = VacancyRepository(session).upsert(
+                VacancyData("confirmed-form", "Python", "https://hh.ru/vacancy/confirmed-form")
+            )
+            application = ApplicationRepository(session).create_apply_intent(
+                account.id,
+                vacancy.id,
+                resume.id,
+            )
+            session.add(
+                CandidateProfileModel(
+                    account_id=account.id,
+                    active_resume_id=resume.id,
+                    display_name="Иван",
+                )
+            )
+            session.flush()
+            tasks = QueueTaskRepository(session)
+            task = tasks.enqueue(application.id, 90)
+            tasks.transition(task.id, TaskState.RUNNING)
+            tasks.transition(task.id, TaskState.INPUT_REQUIRED)
+            service = ScreeningDraftService(session)
+            form = HhScreeningForm(
+                (HhScreeningField("details", question, "textarea", is_required=True),)
+            )
+            draft = service.capture(application.id, form)
+            saved = service.save_confirmed_answers(
+                account.id,
+                draft.form_id,
+                {"details": "Разрабатываю приложения на Python."},
+            )
+            assert saved.state is ScreeningFormState.CONFIRMED
+            assert tasks.get(task.id).state is TaskState.RETRY_SCHEDULED
+            submission = service.get_auto_submission(application.id)
+            assert submission is not None
+            confirmed = session.get(ScreeningFormModel, saved.form_id)
+            assert confirmed is not None
+            confirmed_at = confirmed.confirmed_at
+
+            repeated = service.capture(application.id, form)
+            assert repeated.form_id == saved.form_id
+            assert repeated.state is ScreeningFormState.CONFIRMED
+            assert repeated.questions[0].answer == saved.questions[0].answer
+            assert confirmed.confirmed_at == confirmed_at
+            assert service.get_auto_submission(application.id) == submission
+
+            confirmed.state = ScreeningFormState.REVIEW_REQUIRED
+            confirmed.requires_confirmation = True
+            confirmed.confirmed_at = None
+            stored_task = session.get(ApplicationTaskModel, task.id)
+            assert stored_task is not None
+            stored_task.state = TaskState.REVIEW_REQUIRED
+            stored_task.last_error_code = "FORM_ANSWERS_CONFIRMED"
+            session.flush()
+            assert service.reconcile_pending_answers(account.id) == 1
+            assert confirmed.state is ScreeningFormState.CONFIRMED
+            assert tasks.get(task.id).state is TaskState.RETRY_SCHEDULED
+            assert service.reconcile_pending_answers(account.id) == 0
+            assert service.get_auto_submission(application.id) == submission
+
+            service.mark_sent(application.id, version_hash=saved.version_hash)
+            assert service.get_auto_submission(application.id) is None
+    finally:
+        database.close()
+
+
 def test_confirmed_form_answer_is_scoped_reused_and_requeues_application(
     settings: Settings,
 ) -> None:
@@ -723,7 +804,7 @@ def test_confirmed_form_answer_is_scoped_reused_and_requeues_application(
 
             reused = service.capture(application.id, form)
             assert reused.state is ScreeningFormState.CONFIRMED
-            assert reused.questions[0].source is AnswerSource.BANK
+            assert reused.questions[0].source is AnswerSource.USER
             service.mark_sent(
                 application.id,
                 version_hash=reused.version_hash,
@@ -763,8 +844,8 @@ def test_confirmed_form_answer_is_scoped_reused_and_requeues_application(
                 serious.form_id,
                 {"motivation": "Интересны задачи серверной разработки."},
             )
-            assert serious.state is ScreeningFormState.REVIEW_REQUIRED
-            assert service.get_auto_submission(serious_application.id) is None
+            assert serious.state is ScreeningFormState.CONFIRMED
+            assert service.get_auto_submission(serious_application.id) is not None
 
             dangerous = service.capture(
                 serious_application.id,

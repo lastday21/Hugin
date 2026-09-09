@@ -207,6 +207,7 @@ class FormDraftResponse(BaseModel):
     answered_count: int
     unanswered_count: int
     questions: tuple[FormQuestionResponse, ...]
+    review_reason: str | None = None
 
 
 class FormAnswerUpdate(BaseModel):
@@ -551,6 +552,7 @@ def _form_response(draft: ScreeningDraft) -> FormDraftResponse:
         answered_count=len(draft.answers),
         unanswered_count=draft.unanswered_count,
         questions=tuple(FormQuestionResponse(**asdict(question)) for question in draft.questions),
+        review_reason=draft.review_reason,
     )
 
 

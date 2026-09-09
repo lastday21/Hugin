@@ -402,7 +402,8 @@ def test_workspace_endpoints_return_real_data_and_protect_changes(settings: Sett
             },
         )
         assert saved_form.status_code == 200
-        assert saved_form.json()["state"] == "REVIEW_REQUIRED"
+        assert saved_form.json()["state"] == "CONFIRMED"
+        assert saved_form.json()["review_reason"] is None
         assert saved_form.json()["questions"][0]["source"] == "USER"
         assert (
             saved_form.json()["questions"][0]["answer"]

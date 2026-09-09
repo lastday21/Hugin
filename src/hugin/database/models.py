@@ -1009,6 +1009,7 @@ class ScreeningFormModel(Base):
         nullable=False,
     )
     requires_confirmation: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    submission_block_reason: Mapped[str | None] = mapped_column(Text)
     confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     availability_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(

@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from typing import cast
 
-from sqlalchemy import delete, or_, select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from hugin.database.models import (
@@ -71,6 +71,7 @@ class ScreeningDraft:
     state: ScreeningFormState
     questions: tuple[ScreeningDraftQuestion, ...]
     cover_letter: str | None = None
+    review_reason: str | None = None
 
     @property
     def answers(self) -> dict[str, str]:
@@ -251,18 +252,54 @@ class ScreeningDraftService:
         form: HhScreeningForm,
         *,
         force_review: bool = False,
+        review_reason: str | None = None,
     ) -> ScreeningDraft:
         application = self._session.get(ApplicationModel, application_id)
         if application is None:
             raise LookupError("Отклик не найден")
         policy = AutonomyPolicyService(self._session).get()
         confirmed_at = datetime.now(UTC)
-        self._session.execute(
-            delete(ScreeningFormModel).where(ScreeningFormModel.application_id == application_id)
+        previous = tuple(
+            self._session.scalars(
+                select(ScreeningFormModel)
+                .where(ScreeningFormModel.application_id == application_id)
+                .order_by(ScreeningFormModel.id)
+            )
         )
+        version_hash = screening_form_hash(form)
+        stored = next((item for item in previous if item.version_hash == version_hash), None)
+        for item in previous:
+            if item is not stored and item.state is not ScreeningFormState.SENT:
+                item.state = ScreeningFormState.INVALIDATED
+        block_reason = (
+            review_reason or "hh.ru потребовал ручной проверки анкеты. Откройте её на сайте."
+            if force_review
+            else self._form_block_reason(form)
+        )
+        if stored is not None:
+            if stored.state is not ScreeningFormState.SENT:
+                stored.submission_block_reason = block_reason
+                if (
+                    force_review
+                    or stored.state is ScreeningFormState.INVALIDATED
+                    or (
+                        stored.state is ScreeningFormState.CONFIRMED
+                        and (
+                            not policy.auto_submit_simple_forms
+                            or self._stored_block_reason(stored)
+                            or not self._answers_still_allowed(stored.id, application, policy)
+                        )
+                    )
+                ):
+                    stored.requires_confirmation = True
+                    stored.state = ScreeningFormState.REVIEW_REQUIRED
+                    stored.confirmed_at = None
+            self._session.flush()
+            return self._draft(stored)
         stored = ScreeningFormModel(
             application_id=application_id,
-            version_hash=screening_form_hash(form),
+            version_hash=version_hash,
+            submission_block_reason=block_reason,
             requires_confirmation=(
                 force_review
                 or not self._simple_structure(form)
@@ -409,7 +446,12 @@ class ScreeningDraftService:
             raise LookupError("Черновик анкеты для этой вакансии не найден")
         return self._draft(form)
 
-    def reconcile_pending_answers(self, account_id: int) -> int:
+    def reconcile_pending_answers(
+        self,
+        account_id: int,
+        *,
+        form_ids: tuple[int, ...] | None = None,
+    ) -> int:
         forms = tuple(
             self._session.scalars(
                 select(ScreeningFormModel)
@@ -441,6 +483,8 @@ class ScreeningDraftService:
         policy = AutonomyPolicyService(self._session).get()
         selected_at = datetime.now(UTC)
         for form in forms:
+            if form_ids is not None and form.id not in form_ids:
+                continue
             application = self._session.get(ApplicationModel, form.application_id)
             if application is None:
                 continue
@@ -494,6 +538,13 @@ class ScreeningDraftService:
                 answer.is_confirmed = resolved.confirmed
                 answer.confirmed_at = selected_at if resolved.confirmed else None
 
+            if form.requires_confirmation and self._confirmed_answers_release_review(
+                form,
+                application,
+                policy,
+            ):
+                form.requires_confirmation = False
+                changed = True
             if not changed:
                 continue
             self._session.flush()
@@ -647,6 +698,18 @@ class ScreeningDraftService:
         form.state = ScreeningFormState.INVALIDATED
         self._session.flush()
 
+    def require_review(self, form_id: int, reason: str) -> ScreeningDraft:
+        form = self._session.get(ScreeningFormModel, form_id)
+        if form is None:
+            raise LookupError("Черновик анкеты не найден")
+        if form.state not in {ScreeningFormState.SENT, ScreeningFormState.INVALIDATED}:
+            form.submission_block_reason = reason
+            form.requires_confirmation = True
+            form.state = ScreeningFormState.REVIEW_REQUIRED
+            form.confirmed_at = None
+        self._session.flush()
+        return self._draft(form)
+
     def save_confirmed_answers(
         self,
         account_id: int,
@@ -724,11 +787,18 @@ class ScreeningDraftService:
         if required_missing:
             form.state = ScreeningFormState.INPUT_REQUIRED
             form.confirmed_at = None
-        elif form.requires_confirmation or has_unconfirmed_answer:
+        elif (
+            self._stored_block_reason(form)
+            or has_unconfirmed_answer
+            or not self._answers_still_allowed(
+                form.id, application, AutonomyPolicyService(self._session).get()
+            )
+        ):
             form.state = ScreeningFormState.REVIEW_REQUIRED
             form.confirmed_at = None
             self._move_task_to_review(form.application_id)
         else:
+            form.requires_confirmation = False
             form.state = ScreeningFormState.CONFIRMED
             form.confirmed_at = selected_at
             self._resume_task(form.application_id, selected_at)
@@ -753,6 +823,8 @@ class ScreeningDraftService:
             .limit(1)
         )
         if form is None:
+            return None
+        if self._stored_block_reason(form):
             return None
         application = self._session.get(ApplicationModel, application_id)
         if application is None or application.state is not ApplicationState.APPLYING:
@@ -983,7 +1055,128 @@ class ScreeningDraftService:
             state=form.state,
             questions=questions,
             cover_letter=cover_letter,
+            review_reason=self._review_reason(form),
         )
+
+    @classmethod
+    def _form_block_reason(cls, form: HhScreeningForm) -> str | None:
+        if form.warnings:
+            return "Предупреждение анкеты: " + "; ".join(form.warnings)
+        if not form.fields:
+            return "Вопросы анкеты не удалось прочитать. Откройте её на hh.ru."
+        for field in form.fields:
+            if cls._prohibited(field):
+                return f"Вопрос «{field.question}» требует действий непосредственно на hh.ru."
+            if field.field_type.casefold() not in SUPPORTED_AUTOMATIC_FIELD_TYPES:
+                return f"Формат поля «{field.question}» не распознан. Откройте анкету на hh.ru."
+        return None
+
+    def _stored_block_reason(self, form: ScreeningFormModel) -> str | None:
+        if form.submission_block_reason:
+            return form.submission_block_reason
+        fields = tuple(
+            self._stored_field(question)
+            for question in self._session.scalars(
+                select(ScreeningQuestionModel)
+                .where(ScreeningQuestionModel.form_id == form.id)
+                .order_by(ScreeningQuestionModel.position, ScreeningQuestionModel.id)
+            )
+        )
+        restored = HhScreeningForm(fields)
+        reason = self._form_block_reason(restored)
+        if reason:
+            return reason
+        if screening_form_hash(restored) != form.version_hash:
+            return "Сохранены не все сведения или предупреждения анкеты. Откройте её на hh.ru."
+        task = self._session.scalar(
+            select(ApplicationTaskModel).where(
+                ApplicationTaskModel.application_id == form.application_id
+            )
+        )
+        if task is not None and task.last_error_code in {
+            "FORM_RETRY_EXHAUSTED",
+            "MANUAL_REVIEW_REQUIRED",
+        }:
+            return (
+                "hh.ru повторно запросил проверку после заполнения анкеты. "
+                "Откройте её на сайте и проверьте результат перед новой отправкой."
+            )
+        return None
+
+    def _review_reason(self, form: ScreeningFormModel) -> str | None:
+        reason = self._stored_block_reason(form)
+        if reason:
+            return reason
+        if not AutonomyPolicyService(self._session).get().auto_submit_simple_forms:
+            return "Автоматическая отправка анкет выключена в настройках. Ответы сохранены."
+        if form.state is ScreeningFormState.INPUT_REQUIRED:
+            previous = self._session.scalar(
+                select(ScreeningFormModel.id)
+                .where(
+                    ScreeningFormModel.application_id == form.application_id,
+                    ScreeningFormModel.id != form.id,
+                )
+                .limit(1)
+            )
+            prefix = "Вопросы или формат анкеты изменились. " if previous is not None else ""
+            return prefix + "Заполните и подтвердите ответы на обязательные вопросы."
+        if form.state is ScreeningFormState.REVIEW_REQUIRED:
+            application = self._session.get(ApplicationModel, form.application_id)
+            if application is not None and not self._answers_still_allowed(
+                form.id,
+                application,
+                AutonomyPolicyService(self._session).get(),
+            ):
+                return (
+                    "Часть ответов больше не подтверждена действующими сведениями. "
+                    "Проверьте их заново."
+                )
+            previous = self._session.scalar(
+                select(ScreeningFormModel.id)
+                .where(
+                    ScreeningFormModel.application_id == form.application_id,
+                    ScreeningFormModel.id != form.id,
+                )
+                .limit(1)
+            )
+            if previous is not None:
+                return "Вопросы или формат анкеты изменились. Проверьте и подтвердите ответы."
+            return "Подтвердите ответы на вопросы анкеты."
+        return None
+
+    def _confirmed_answers_release_review(
+        self,
+        form: ScreeningFormModel,
+        application: ApplicationModel,
+        policy: AutonomyPolicy,
+    ) -> bool:
+        if not policy.auto_submit_simple_forms or self._stored_block_reason(form):
+            return False
+        rows = tuple(
+            self._session.execute(
+                select(ScreeningQuestionModel, ScreeningAnswerModel)
+                .outerjoin(
+                    ScreeningAnswerModel,
+                    ScreeningAnswerModel.question_id == ScreeningQuestionModel.id,
+                )
+                .where(ScreeningQuestionModel.form_id == form.id)
+            )
+        )
+        if not rows:
+            return False
+        for question, answer in rows:
+            if answer is None or not answer.answer_text or not answer.answer_text.strip():
+                if question.is_required:
+                    return False
+                continue
+            if not answer.is_confirmed:
+                return False
+            if not self._simple_field(self._stored_field(question)) and answer.source not in {
+                AnswerSource.USER,
+                AnswerSource.BANK,
+            }:
+                return False
+        return self._answers_still_allowed(form.id, application, policy)
 
     def _templates(
         self,

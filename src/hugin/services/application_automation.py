@@ -1528,6 +1528,13 @@ class ApplicationAutomationService:
             repeated_confirmed_form = (
                 previous_submission is not None and draft.state is ScreeningFormState.CONFIRMED
             )
+            if repeated_confirmed_form:
+                draft = ScreeningDraftService(self._session).require_review(
+                    draft.form_id,
+                    "hh.ru повторно запросил анкету после заполнения подтверждённых ответов. "
+                    "Откройте её на сайте и проверьте результат перед новой отправкой.",
+                )
+                payload["screening_form_state"] = draft.state.value
             self._tasks.transition(
                 job.task.id,
                 (
@@ -1553,6 +1560,7 @@ class ApplicationAutomationService:
                     job.application.id,
                     result.screening_form,
                     force_review=True,
+                    review_reason=result.confirmation,
                 )
                 payload["question_count"] = len(draft.questions)
                 payload["answered_count"] = len(draft.answers)

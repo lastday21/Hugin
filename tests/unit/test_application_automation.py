@@ -147,6 +147,7 @@ def test_repeated_confirmed_form_does_not_loop_in_queue(
     expected_error: str,
 ) -> None:
     draft = SimpleNamespace(
+        form_id=71,
         state=ScreeningFormState.CONFIRMED,
         questions=(SimpleNamespace(),),
         answers=(SimpleNamespace(),),
@@ -163,6 +164,12 @@ def test_repeated_confirmed_form_does_not_loop_in_queue(
         def capture_questions(self, application_id: int, questions: object) -> object:
             assert application_id == 51
             assert questions == ("Расскажите об опыте",)  # noqa: RUF001
+            return draft
+
+        def require_review(self, form_id: int, reason: str) -> object:
+            assert form_id == 71
+            assert "повторно запросил" in reason
+            draft.state = ScreeningFormState.REVIEW_REQUIRED
             return draft
 
     transitions: list[tuple[int, TaskState, dict[str, object]]] = []
