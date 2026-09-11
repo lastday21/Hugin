@@ -100,7 +100,14 @@ class FakeScheduler:
     def unblock(self, job_key: str, now: datetime | None = None) -> None:
         self.unblocked.append((job_key, now))
 
-    def claim_due(self, now: datetime | None = None) -> AutomationJobRecord | None:
+    def claim_due(
+        self,
+        now: datetime | None = None,
+        *,
+        allowed_kinds: tuple[AutomationJobKind, ...] | None = None,
+        force_synchronization: bool = False,
+        account_id: int | None = None,
+    ) -> AutomationJobRecord | None:
         del now
         job = self.job
         self.job = None

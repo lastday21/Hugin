@@ -60,6 +60,8 @@ from hugin.workers.backups import BackupWorker
 from hugin.workers.hh_search import HhSearchJobHandler
 from hugin.workers.hh_sync import HhSyncJobHandler
 from hugin.workers.notifications import NotificationWorker
+from hugin.workers.processes import BackgroundProcessWorker
+from hugin.workers.replies import ReplyWorker
 from hugin.workers.semantic_selection import SemanticSelectionWorker
 
 APP_ICON = Path(__file__).with_name("assets") / "hugin.ico"
@@ -947,23 +949,24 @@ def main() -> None:
         settings,
         browser_lock=browser_lock,
         journal=journal,
+        release_browser_after_turn=True,
     )
     search_handler = HhSearchJobHandler(
         settings,
         browser_lock=browser_lock,
-        application_work_pending=application_worker.has_pending_work,
+        incremental=True,
     )
     messages_handler = HhSyncJobHandler(
         settings,
         AutomationJobKind.MESSAGES,
         browser_lock=browser_lock,
-        application_work_pending=application_worker.has_pending_work,
+        incremental=True,
     )
     statuses_handler = HhSyncJobHandler(
         settings,
         AutomationJobKind.STATUSES,
         browser_lock=browser_lock,
-        application_work_pending=application_worker.has_pending_work,
+        incremental=True,
     )
     worker = AutomationWorker(
         settings,
@@ -977,18 +980,59 @@ def main() -> None:
     )
     notification_worker = NotificationWorker(settings, journal=journal)
     backup_worker = BackupWorker(settings, journal=journal)
-    semantic_worker = SemanticSelectionWorker(settings, journal=journal)
+    semantic_worker = SemanticSelectionWorker(settings, journal=journal, max_calls_per_turn=1)
+    reply_worker = ReplyWorker(settings, browser_lock=browser_lock, journal=journal)
+
+    def synchronize(token: int | None) -> bool:
+        messages_handler.one_shot_token = statuses_handler.one_shot_token = token
+        try:
+            if token is not None:
+                messages = worker.run_once(
+                    allowed_kinds=(AutomationJobKind.MESSAGES,),
+                    force_synchronization=True,
+                )
+                statuses = worker.run_once(
+                    allowed_kinds=(AutomationJobKind.STATUSES,),
+                    force_synchronization=True,
+                )
+                return messages or statuses
+            return worker.run_once(
+                allowed_kinds=(AutomationJobKind.MESSAGES, AutomationJobKind.STATUSES)
+            )
+        finally:
+            messages_handler.one_shot_token = statuses_handler.one_shot_token = None
+
+    def apply() -> bool:
+        prepared = application_worker.prepare_queue()
+        worked = application_worker.run_once()
+        return worked or bool(prepared)
+
+    def cancel_processes() -> None:
+        application_worker.request_stop()
+        semantic_worker.stop(timeout_seconds=0)
+        reply_worker.stop()
+
+    process_worker = BackgroundProcessWorker(
+        settings,
+        journal=journal,
+        steps={
+            "search": lambda _token: worker.run_once(allowed_kinds=(AutomationJobKind.SEARCH,)),
+            "evaluation": lambda _token: semantic_worker.run_once(),
+            "applications": lambda _token: apply(),
+            "synchronization": synchronize,
+            "replies": lambda _token: reply_worker.run_once(),
+        },
+        cancel=cancel_processes,
+    )
     bridge = DesktopBridge(
         settings,
         browser_lock=browser_lock,
         journal=journal,
     )
     workers: tuple[BackgroundWorker, ...] = (
-        application_worker,
-        worker,
+        process_worker,
         notification_worker,
         backup_worker,
-        semantic_worker,
     )
     started_workers: list[BackgroundWorker] = []
     tray: DesktopTray | None = None

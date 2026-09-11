@@ -6,6 +6,7 @@ import pytest
 
 from hugin.core.settings import Settings
 from hugin.database import create_database, upgrade_database
+from hugin.database.models import ApplicationSettingsModel
 from hugin.domain import (
     AutomationJobKind,
     AutomationJobState,
@@ -34,6 +35,9 @@ def seed_search_query(settings: Settings) -> tuple[int, int]:
     database = create_database(settings)
     try:
         with database.sessions.begin() as session:
+            options = session.get(ApplicationSettingsModel, 1)
+            assert options is not None
+            options.synchronization_enabled = True
             account = AccountRepository(session).create("Фоновая проверка")
             direction = DirectionRepository(session).create(account.id, "Python backend")
             query = DirectionRepository(session).add_query(
@@ -46,7 +50,7 @@ def seed_search_query(settings: Settings) -> tuple[int, int]:
         database.close()
 
 
-def test_scheduler_uses_resource_saving_intervals_and_does_not_catch_up(
+def test_scheduler_preserves_explicit_sync_intervals_and_does_not_catch_up(
     settings: Settings,
 ) -> None:
     account_id, query_id = seed_search_query(settings)
@@ -64,8 +68,8 @@ def test_scheduler_uses_resource_saving_intervals_and_does_not_catch_up(
                 now=due_at,
             )
 
-            assert messages.interval_seconds == 15 * 60
-            assert statuses.interval_seconds == 60 * 60
+            assert messages.interval_seconds == 5 * 60
+            assert statuses.interval_seconds == 30 * 60
             assert search.interval_seconds == 240 * 60
             assert messages.next_run_at == statuses.next_run_at == search.next_run_at == due_at
 
@@ -84,7 +88,7 @@ def test_scheduler_uses_resource_saving_intervals_and_does_not_catch_up(
             assert completed.state is AutomationJobState.WAITING
             assert completed.last_success_at == messages_finished_at
             assert completed.last_result == {"new_messages": 2}
-            assert completed.next_run_at == messages_finished_at + timedelta(minutes=15)
+            assert completed.next_run_at == messages_finished_at + timedelta(minutes=5)
 
         statuses_finished_at = messages_finished_at + timedelta(seconds=10)
         with database.sessions.begin() as session:
@@ -93,7 +97,7 @@ def test_scheduler_uses_resource_saving_intervals_and_does_not_catch_up(
             assert claimed is not None
             assert claimed.kind is AutomationJobKind.STATUSES
             completed = scheduler.complete(claimed.key, now=statuses_finished_at)
-            assert completed.next_run_at == statuses_finished_at + timedelta(minutes=60)
+            assert completed.next_run_at == statuses_finished_at + timedelta(minutes=30)
 
         search_finished_at = statuses_finished_at + timedelta(seconds=10)
         with database.sessions.begin() as session:
@@ -107,7 +111,7 @@ def test_scheduler_uses_resource_saving_intervals_and_does_not_catch_up(
         database.close()
 
 
-def test_scheduler_processes_python_backlog_before_older_adjacent_backlog(
+def test_scheduler_processes_the_oldest_due_search_without_direction_starvation(
     settings: Settings,
 ) -> None:
     upgrade_database(settings)
@@ -148,7 +152,7 @@ def test_scheduler_processes_python_backlog_before_older_adjacent_backlog(
             claimed = AutomationSchedulerService(session).claim_due(due_at + timedelta(minutes=2))
 
             assert claimed is not None
-            assert claimed.search_query_id == backend_query.id
+            assert claimed.search_query_id == adjacent_query.id
     finally:
         database.close()
 
@@ -166,7 +170,7 @@ def test_scheduler_limits_failure_backoff(settings: Settings) -> None:
         for failure_number, delay_minutes in enumerate(expected_delays, start=1):
             with database.sessions.begin() as session:
                 scheduler = AutomationSchedulerService(session)
-                claimed = scheduler.claim_due(current)
+                claimed = scheduler.claim_due(current, allowed_kinds=(AutomationJobKind.MESSAGES,))
                 assert claimed is not None
                 assert claimed.kind is AutomationJobKind.MESSAGES
                 failed = scheduler.fail(
@@ -558,8 +562,8 @@ def test_resource_saving_staggers_new_search_jobs_and_preserves_saved_schedule(
                 scheduled_at,
                 scheduled_at + timedelta(minutes=5),
             ]
-            assert messages.interval_seconds == 15 * 60
-            assert statuses.interval_seconds == 60 * 60
+            assert messages.interval_seconds == 5 * 60
+            assert statuses.interval_seconds == 30 * 60
 
         later = scheduled_at + timedelta(hours=1)
         with database.sessions.begin() as session:
@@ -614,6 +618,9 @@ def test_scheduler_creates_jobs_only_for_configured_search_queries(
 
     try:
         with database.sessions.begin() as session:
+            options = session.get(ApplicationSettingsModel, 1)
+            assert options is not None
+            options.synchronization_enabled = True
             account = AccountRepository(session).create("Фоновая проверка")
             direction = DirectionRepository(session).create(account.id, "Python backend")
             configured = DirectionRepository(session).add_query(
@@ -648,5 +655,32 @@ def test_scheduler_creates_jobs_only_for_configured_search_queries(
                 configured.id: AutomationJobState.WAITING,
                 legacy_variant.id: AutomationJobState.DISABLED,
             }
+    finally:
+        database.close()
+
+
+def test_claim_and_forced_sync_are_limited_to_executor_account(settings: Settings) -> None:
+    first, _ = seed_search_query(settings)
+    database = create_database(settings)
+    now = datetime.now(UTC)
+    later = now + timedelta(hours=1)
+    try:
+        with database.sessions.begin() as session:
+            second = AccountRepository(session).create("Второй аккаунт").id
+            scheduler = AutomationSchedulerService(session)
+            scheduler.ensure_account_jobs(first, later)
+            scheduler.ensure_account_jobs(second, later)
+        with database.sessions.begin() as session:
+            scheduler = AutomationSchedulerService(session)
+            claimed = scheduler.claim_due(
+                now,
+                account_id=second,
+                allowed_kinds=(AutomationJobKind.MESSAGES, AutomationJobKind.STATUSES),
+                force_synchronization=True,
+            )
+            assert claimed is not None and claimed.account_id == second
+            assert all(job.next_run_at == later for job in scheduler.list_for_account(first))
+        with database.sessions.begin() as session:
+            assert AutomationSchedulerService(session).claim_due(now, account_id=first) is None
     finally:
         database.close()

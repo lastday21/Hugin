@@ -139,6 +139,8 @@ class AutomationJobRepository:
         now: datetime | None = None,
         *,
         search_enabled: bool = True,
+        allowed_kinds: tuple[AutomationJobKind, ...] | None = None,
+        account_id: int | None = None,
     ) -> AutomationJobRecord | None:
         selected_at = as_utc(now or datetime.now(UTC))
         priority = case(
@@ -170,9 +172,9 @@ class AutomationJobRepository:
                 AutomationJobModel.next_run_at <= selected_at,
             )
             .order_by(
+                AutomationJobModel.next_run_at,
                 priority,
                 search_direction_priority,
-                AutomationJobModel.next_run_at,
                 AutomationJobModel.key,
             )
             .with_for_update(of=AutomationJobModel, skip_locked=True)
@@ -180,6 +182,10 @@ class AutomationJobRepository:
         )
         if not search_enabled:
             statement = statement.where(AutomationJobModel.kind != AutomationJobKind.SEARCH)
+        if allowed_kinds is not None:
+            statement = statement.where(AutomationJobModel.kind.in_(allowed_kinds))
+        if account_id is not None:
+            statement = statement.where(AutomationJobModel.account_id == account_id)
         model = self._session.scalar(statement)
         if model is None:
             return None
@@ -207,7 +213,8 @@ class AutomationJobRepository:
         finished_at = as_utc(now or datetime.now(UTC))
         model = self._running_model(job_key)
         model.state = AutomationJobState.WAITING
-        model.next_run_at = finished_at + timedelta(seconds=model.interval_seconds)
+        delay = 15 if result and result.get("continuation") is True else model.interval_seconds
+        model.next_run_at = finished_at + timedelta(seconds=delay)
         model.last_finished_at = finished_at
         model.last_success_at = finished_at
         model.heartbeat_at = finished_at

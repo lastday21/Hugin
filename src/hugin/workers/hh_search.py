@@ -6,8 +6,11 @@ from collections.abc import Callable
 from hugin.adapters.credentials import WindowsCredentialStore
 from hugin.adapters.hh_browser import VisibleHhBrowser
 from hugin.core.settings import Settings
+from hugin.database import create_database
 from hugin.domain.automation import AutomationJobKind, AutomationJobRecord, AutomationJobResult
+from hugin.services.background_processes import BackgroundProcessService
 from hugin.services.hh_login import HhLoginService, LoginStatus
+from hugin.services.incremental_search import IncrementalSearchCycle
 from hugin.services.search_cycle import BackgroundSearchCycle
 from hugin.workers.automation import (
     AutomationJobBlocked,
@@ -31,12 +34,15 @@ class HhSearchJobHandler:
         account_id: int = 1,
         browser_lock: threading.Lock | None = None,
         application_work_pending: ApplicationWorkPending | None = None,
+        incremental: bool = False,
     ) -> None:
         self._settings = settings
         self._account_id = account_id
         self._browser_lock = browser_lock or threading.Lock()
         self._application_work_pending = application_work_pending
-        self._cycle = BackgroundSearchCycle(
+        self._incremental = incremental
+        cycle = IncrementalSearchCycle if incremental else BackgroundSearchCycle
+        self._cycle = cycle(
             settings,
             page_limit=settings.hh_background_search_pages,
             detail_limit=settings.hh_background_detail_limit,
@@ -47,6 +53,12 @@ class HhSearchJobHandler:
             raise ValueError("Обработчик получил не поисковое задание")
         if job.account_id != self._account_id:
             raise ValueError("Фоновое задание относится к другому аккаунту")
+        if self._incremental and not self._allowed():
+            raise AutomationJobDeferred(
+                "DISABLED",
+                "Поиск остановлен",
+                retry_after_seconds=15,
+            )
         if self._application_work_pending is not None and self._application_work_pending():
             raise AutomationJobDeferred(
                 "APPLICATIONS_PENDING",
@@ -86,6 +98,14 @@ class HhSearchJobHandler:
                         login.status.value.upper(),
                         self._login_message(login.status),
                     )
+                if isinstance(self._cycle, IncrementalSearchCycle):
+                    return self._cycle.run(
+                        account_id=self._account_id,
+                        search_query_id=job.search_query_id,
+                        browser=browser,
+                        progress=job.last_result,
+                        allowed=self._allowed,
+                    )
                 return self._cycle.run(
                     account_id=self._account_id,
                     search_query_id=job.search_query_id,
@@ -100,6 +120,14 @@ class HhSearchJobHandler:
                 "Профиль hh.ru занят; фоновый поиск быстро уступил очередь откликам",
                 retry_after_seconds=_BACKGROUND_PROFILE_RETRY_SECONDS,
             ) from error
+
+    def _allowed(self) -> bool:
+        database = create_database(self._settings)
+        try:
+            with database.sessions() as session:
+                return BackgroundProcessService(session, self._account_id).enabled("search")
+        finally:
+            database.close()
 
     @staticmethod
     def _login_message(status: LoginStatus) -> str:

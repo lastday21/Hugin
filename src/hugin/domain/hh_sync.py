@@ -64,3 +64,7 @@ class HhChatReadFailure:
 class HhRecruiterMessagesReadResult:
     messages: tuple[HhChatMessageData, ...] = ()
     failures: tuple[HhChatReadFailure, ...] = ()
+    next_page: int = 1
+    next_offset: int = 0
+    scan_complete: bool = True
+    chats_checked: int = 0

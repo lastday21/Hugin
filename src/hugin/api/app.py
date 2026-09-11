@@ -10,6 +10,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import RequestResponseEndpoint
 
 from hugin import __version__
+from hugin.api.routes.background_processes import router as background_processes_router
 from hugin.api.routes.communications import router as communications_router
 from hugin.api.routes.development import router as development_router
 from hugin.api.routes.diagnostics import router as diagnostics_router
@@ -108,6 +109,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return response
 
     application.include_router(communications_router)
+    application.include_router(background_processes_router)
     application.include_router(development_router)
     application.include_router(diagnostics_router)
     application.include_router(health_router)

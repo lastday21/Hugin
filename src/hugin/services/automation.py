@@ -2,13 +2,14 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
 from hugin.database.models import (
     ApplicationModel,
     ApplicationSettingsModel,
     ApplicationTaskModel,
+    AutomationJobModel,
     CareerDirectionModel,
     DirectionSearchQueryModel,
     HhAccountModel,
@@ -75,16 +76,6 @@ class AutomationSchedulerService:
     ) -> tuple[AutomationJobRecord, AutomationJobRecord]:
         if message_interval_minutes < 1 or status_interval_minutes < 1:
             raise ValueError("Интервалы фоновых проверок должны быть положительными")
-        settings = self._settings()
-        if settings.resource_saving_mode:
-            message_interval_minutes = max(
-                message_interval_minutes,
-                RESOURCE_SAVING_MESSAGE_INTERVAL_MINUTES,
-            )
-            status_interval_minutes = max(
-                status_interval_minutes,
-                RESOURCE_SAVING_STATUS_INTERVAL_MINUTES,
-            )
         selected_at = self._now(now)
         messages = self._jobs.ensure(
             kind=AutomationJobKind.MESSAGES,
@@ -186,7 +177,14 @@ class AutomationSchedulerService:
     def list_for_account(self, account_id: int) -> tuple[AutomationJobRecord, ...]:
         return self._jobs.list_for_account(account_id)
 
-    def claim_due(self, now: datetime | None = None) -> AutomationJobRecord | None:
+    def claim_due(
+        self,
+        now: datetime | None = None,
+        *,
+        allowed_kinds: tuple[AutomationJobKind, ...] | None = None,
+        force_synchronization: bool = False,
+        account_id: int | None = None,
+    ) -> AutomationJobRecord | None:
         selected_at = self._now(now)
         settings = self._settings()
         if not settings.search_enabled:
@@ -194,9 +192,34 @@ class AutomationSchedulerService:
         system = self._session.get(SystemStateModel, 1)
         if system is not None and system.state in PROTECTIVE_SYSTEM_STATES:
             return None
+        kinds = tuple(
+            kind
+            for kind in (tuple(AutomationJobKind) if allowed_kinds is None else allowed_kinds)
+            if kind is AutomationJobKind.SEARCH
+            or settings.synchronization_enabled
+            or force_synchronization
+        )
+        if force_synchronization:
+            statement = (
+                update(AutomationJobModel)
+                .where(
+                    AutomationJobModel.kind.in_(
+                        tuple(kind for kind in kinds if kind is not AutomationJobKind.SEARCH)
+                    ),
+                    AutomationJobModel.state == AutomationJobState.WAITING,
+                    AutomationJobModel.last_error_code.is_(None),
+                    AutomationJobModel.next_run_at > selected_at,
+                )
+                .values(next_run_at=selected_at)
+            )
+            if account_id is not None:
+                statement = statement.where(AutomationJobModel.account_id == account_id)
+            self._session.execute(statement)
         return self._jobs.claim_due(
             selected_at,
             search_enabled=settings.search_enabled,
+            allowed_kinds=kinds,
+            account_id=account_id,
         )
 
     def heartbeat(

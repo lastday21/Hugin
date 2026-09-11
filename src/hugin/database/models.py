@@ -666,6 +666,28 @@ class SystemStateModel(Base):
     )
 
 
+class BackgroundProcessRunModel(Base):
+    __tablename__ = "background_process_runs"
+
+    account_id: Mapped[int] = mapped_column(
+        ForeignKey("hh_accounts.id", ondelete="CASCADE"), primary_key=True
+    )
+    key: Mapped[str] = mapped_column(String(32), primary_key=True)
+    state: Mapped[str] = mapped_column(String(32), default="waiting", nullable=False)
+    reason: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    last_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    runs: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    completed: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    check_now_pending: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    cancel_generation: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    cursor_application_id: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    cursor_vacancy_id: Mapped[int | None] = mapped_column(Integer)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    retry_after_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
 class CandidateProfileModel(Base):
     __tablename__ = "candidate_profiles"
     __table_args__ = (UniqueConstraint("account_id", name="uq_candidate_profiles_account_id"),)
@@ -1402,6 +1424,8 @@ class ApplicationSettingsModel(Base):
     message_interval_minutes: Mapped[int] = mapped_column(Integer, default=5, nullable=False)
     status_interval_minutes: Mapped[int] = mapped_column(Integer, default=30, nullable=False)
     search_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    evaluation_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    synchronization_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     resource_saving_mode: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     hh_apply_daily_limit: Mapped[int] = mapped_column(Integer, default=25, nullable=False)
     hh_apply_delay_min_seconds: Mapped[int] = mapped_column(Integer, default=30, nullable=False)

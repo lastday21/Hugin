@@ -77,6 +77,7 @@ class AnalysisResult:
     matching: Matching | None
     stages: tuple[StageRecord, ...]
     model_calls: int
+    budget_exhausted: bool = False
 
 
 class SemanticAnalyzer:
@@ -97,10 +98,12 @@ class SemanticAnalyzer:
         self._max_calls = max_calls
         self._force = force
         self._calls = 0
+        self._budget_exhausted = False
         self._stages: list[StageRecord] = []
 
     def analyze(self, lines: list[SourceLine], facts: list[ProfileFact]) -> AnalysisResult:
         self._calls = 0
+        self._budget_exhausted = False
         self._stages = []
         if not lines or not facts:
             return self._result(
@@ -257,6 +260,7 @@ class SemanticAnalyzer:
             record = None
         if record is None:
             if self._calls >= self._max_calls:
+                self._budget_exhausted = True
                 return None, ("Достигнут предел обращений при исправлении разбора",)
             self._calls += 1
             started = monotonic()
@@ -312,4 +316,5 @@ class SemanticAnalyzer:
             matching,
             tuple(self._stages),
             self._calls,
+            self._budget_exhausted,
         )

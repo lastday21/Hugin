@@ -12,8 +12,16 @@ from hugin.adapters.credentials import WindowsCredentialStore
 from hugin.adapters.hh_browser import VisibleHhBrowser
 from hugin.core.settings import Settings
 from hugin.database import create_database, upgrade_database
-from hugin.database.models import CareerDirectionModel
+from hugin.database.models import (
+    ApplicationModel,
+    BackgroundProcessRunModel,
+    CareerDirectionModel,
+    DirectionVacancyModel,
+    HhAccountModel,
+    VacancyModel,
+)
 from hugin.diagnostics import JournalRun, OperationJournal, error_details, operation_context
+from hugin.domain.directions import VacancyState
 from hugin.domain.hh import HhApplyResult, HhApplyStatus
 from hugin.domain.hh_sync import HhSyncBlockedError, HhSyncRetryableError
 from hugin.domain.time import as_utc, day_start_utc
@@ -21,9 +29,12 @@ from hugin.services.application_automation import (
     ApplicationAutomationService,
     ApplyJob,
 )
+from hugin.services.background_processes import BackgroundProcessService
 from hugin.services.cover_letter import CoverLetterService
 from hugin.services.hh_login import HhLoginService, LoginStatus
 from hugin.services.screening_forms import ScreeningDraftService, StoredScreeningSubmission
+from hugin.services.vacancy_analysis import RULES_VERSION
+from hugin.workers.model_turn import ModelTurn
 
 type ApplicationJobHandler = Callable[[ApplyJob], HhApplyResult]
 type FormPreflightHandler = Callable[[ApplyJob], HhApplyResult]
@@ -42,6 +53,7 @@ class ApplicationWorker:
         form_preflight_handler: FormPreflightHandler | None = None,
         letter_preparer: LetterQueuePreparer | None = None,
         journal: OperationJournal | None = None,
+        release_browser_after_turn: bool = False,
     ) -> None:
         if account_id < 1:
             raise ValueError("Идентификатор аккаунта должен быть положительным")
@@ -60,6 +72,67 @@ class ApplicationWorker:
         self._browser: VisibleHhBrowser | None = None
         self._browser_owner: int | None = None
         self._browser_wait: JournalRun | None = None
+        self._release_browser_after_turn = release_browser_after_turn
+
+    def request_stop(self) -> None:
+        self._stop.set()
+
+    def prepare_queue(self) -> int:
+        database = create_database(self._settings)
+        try:
+            with database.sessions.begin() as session:
+                service = ApplicationAutomationService(session)
+                if self._stop.is_set() or not service.applications_enabled():
+                    return 0
+                account = session.get(HhAccountModel, self._account_id)
+                if account is None or account.external_id is None:
+                    return 0
+                include_stretch = service.stretch_automation_enabled()
+                categories = ("MATCH", "STRETCH") if include_stretch else ("MATCH",)
+                runtime = session.get(BackgroundProcessRunModel, (self._account_id, "applications"))
+                if runtime is None:
+                    runtime = BackgroundProcessRunModel(
+                        account_id=self._account_id, key="applications"
+                    )
+                    session.add(runtime)
+                statement = (
+                    select(VacancyModel.id)
+                    .join(DirectionVacancyModel)
+                    .join(
+                        CareerDirectionModel,
+                        CareerDirectionModel.id == DirectionVacancyModel.direction_id,
+                    )
+                    .where(
+                        CareerDirectionModel.account_id == self._account_id,
+                        CareerDirectionModel.is_active.is_(True),
+                        DirectionVacancyModel.state == VacancyState.ANALYZED,
+                        DirectionVacancyModel.rules_version == RULES_VERSION,
+                        DirectionVacancyModel.rules_details["category"].astext.in_(categories),
+                        ~select(ApplicationModel.id)
+                        .where(
+                            ApplicationModel.account_id == self._account_id,
+                            ApplicationModel.vacancy_id == VacancyModel.id,
+                        )
+                        .exists(),
+                    )
+                    .distinct()
+                    .order_by(VacancyModel.id.desc())
+                    .limit(3)
+                )
+                continued = statement
+                if runtime.cursor_vacancy_id is not None:
+                    continued = continued.where(VacancyModel.id < runtime.cursor_vacancy_id)
+                vacancies = tuple(session.scalars(continued))
+                if not vacancies and runtime.cursor_vacancy_id is not None:
+                    vacancies = tuple(session.scalars(statement))
+                runtime.cursor_vacancy_id = vacancies[-1] if vacancies else None
+                return service.prepare_vacancies(
+                    account_external_id=account.external_id,
+                    vacancy_ids=vacancies,
+                    include_stretch=include_stretch,
+                )
+        finally:
+            database.close()
 
     @property
     def running(self) -> bool:
@@ -163,6 +236,8 @@ class ApplicationWorker:
             self._process_application(job, selected_at, now_is_fixed=now is not None)
             return True
         finally:
+            if self._release_browser_after_turn:
+                self._close_browser()
             self._browser_lock.release()
 
     def _finish_browser_wait(self, reason: str) -> None:
@@ -532,6 +607,7 @@ class ApplicationWorker:
         return False
 
     def _prepare_letter(self, job: ApplyJob) -> int:
+        turn = ModelTurn(self._preparation_allowed)
         database = create_database(self._settings)
         try:
             with database.sessions.begin() as session:
@@ -553,17 +629,19 @@ class ApplicationWorker:
                 client = configured_codex_cli_client(
                     self._settings,
                     operation="cover_letter",
+                    timeout_seconds=60,
                 )
                 quality_model = configured_codex_cli_client(
                     self._settings,
                     operation="cover_letter_quality_check",
+                    timeout_seconds=60,
                 )
                 if not automation.applications_enabled():
                     return 0
                 result = CoverLetterService(
                     session,
-                    client,
-                    quality_model=quality_model,
+                    turn.wrap(client),
+                    quality_model=turn.wrap(quality_model),
                 ).prepare(
                     account_id=job.application.account_id,
                     direction_name=direction_name,
@@ -573,6 +651,16 @@ class ApplicationWorker:
                     include_stretch=include_stretch,
                 )
                 return result.generated + result.reused + result.already_ready
+        finally:
+            database.close()
+
+    def _preparation_allowed(self) -> bool:
+        if self._stop.is_set():
+            return False
+        database = create_database(self._settings)
+        try:
+            with database.sessions() as session:
+                return BackgroundProcessService(session, self._account_id).enabled("applications")
         finally:
             database.close()
 

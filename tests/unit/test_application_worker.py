@@ -1026,7 +1026,10 @@ def test_worker_prepares_one_letter_for_active_direction(
             *,
             quality_model: object,
         ) -> None:
-            assert quality_model is judge
+            from hugin.workers.model_turn import GuardedTextModel
+
+            assert isinstance(quality_model, GuardedTextModel)
+            assert quality_model._model is judge
 
         def prepare(self, **values: object) -> SimpleNamespace:
             assert values == {
@@ -1056,7 +1059,9 @@ def test_worker_prepares_one_letter_for_active_direction(
     monkeypatch.setattr(
         applications,
         "configured_codex_cli_client",
-        lambda _settings, *, operation: client if operation == "cover_letter" else judge,
+        lambda _settings, *, operation, timeout_seconds: (
+            client if operation == "cover_letter" else judge
+        ),
     )
 
     monkeypatch.setattr(applications, "CoverLetterService", FakeLetterService)

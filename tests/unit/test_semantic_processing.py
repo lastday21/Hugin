@@ -298,7 +298,7 @@ def test_snapshot_uses_direction_resume_and_full_confirmed_professional_facts(
         database.close()
 
 
-def test_worker_obeys_search_switch_and_does_not_repeat_completed_result(
+def test_worker_obeys_evaluation_switch_independently_of_search(
     settings: Settings,
 ) -> None:
     from hugin.database.models import ApplicationSettingsModel, SystemStateModel
@@ -318,11 +318,12 @@ def test_worker_obeys_search_switch_and_does_not_repeat_completed_result(
             options = session.get(ApplicationSettingsModel, 1)
             assert options is not None
             options.search_enabled = False
+            options.evaluation_enabled = False
         assert not worker.run_once() and client.calls == 0
         with database.sessions.begin() as session:
             options = session.get(ApplicationSettingsModel, 1)
             assert options is not None
-            options.search_enabled = True
+            options.evaluation_enabled = True
             state = session.get(SystemStateModel, 1)
             assert state is not None
             state.state = SystemState.CAPTCHA_REQUIRED
@@ -334,8 +335,43 @@ def test_worker_obeys_search_switch_and_does_not_repeat_completed_result(
         assert worker.run_once()
         assert client.calls == 2
         assert not worker.run_once()
+        with database.sessions() as session:
+            from sqlalchemy import func, select
+
+            from hugin.database.models import ApplicationModel
+
+            assert session.scalar(select(func.count()).select_from(ApplicationModel)) == 0
     finally:
         worker.stop()
+        database.close()
+
+
+def test_application_process_prepares_queue_only_after_its_switch_is_enabled(
+    settings: Settings,
+) -> None:
+    from sqlalchemy import func, select
+
+    from hugin.database.models import ApplicationModel, SystemStateModel
+    from hugin.domain.tasks import SystemState
+    from hugin.workers.applications import ApplicationWorker
+
+    account, direction, vacancy, _, _ = seed(settings)
+    client = Client()
+    processor = SemanticSelectionProcessor(settings, client_factory=lambda *_: client)
+    assert processor.process(account, direction, vacancy).applied
+    worker = ApplicationWorker(settings, account_id=account)
+    assert worker.prepare_queue() == 0
+    database = create_database(settings)
+    try:
+        with database.sessions.begin() as session:
+            state = session.get(SystemStateModel, 1)
+            assert state is not None
+            state.state = SystemState.RUNNING
+        assert worker.prepare_queue() == 1
+        assert worker.prepare_queue() == 0
+        with database.sessions() as session:
+            assert session.scalar(select(func.count()).select_from(ApplicationModel)) == 1
+    finally:
         database.close()
 
 
@@ -531,8 +567,8 @@ def test_worker_start_is_idempotent_and_recovers_after_unexpected_failure(
     assert not worker.running
 
 
-@pytest.mark.parametrize("config", [{"enabled": False}, {"enabled": "invalid"}])
-def test_worker_skips_disabled_or_invalid_direction_without_model_calls(
+@pytest.mark.parametrize("config", [{"enabled": "invalid"}])
+def test_worker_skips_invalid_direction_without_model_calls(
     settings: Settings, config: dict[str, object]
 ) -> None:
     from hugin.database.models import ApplicationSettingsModel, CareerDirectionModel
@@ -546,7 +582,7 @@ def test_worker_skips_disabled_or_invalid_direction_without_model_calls(
             options = session.get(ApplicationSettingsModel, 1)
             assert direction is not None and options is not None
             direction.scoring_config = {"semantic_selection": config}
-            options.search_enabled = True
+            options.evaluation_enabled = True
         client = Client()
         worker = SemanticSelectionWorker(
             settings,
@@ -554,6 +590,143 @@ def test_worker_skips_disabled_or_invalid_direction_without_model_calls(
             processor=SemanticSelectionProcessor(settings, client_factory=lambda *_: client),
         )
         assert not worker.run_once() and client.calls == 0
+    finally:
+        database.close()
+
+
+@pytest.mark.parametrize("config", [{}, {"semantic_selection": {"enabled": False}}])
+def test_worker_evaluates_rules_only_once_per_vacancy_and_turn(
+    settings: Settings, config: dict[str, object]
+) -> None:
+    from sqlalchemy import func, select
+
+    from hugin.database.models import (
+        ApplicationModel,
+        ApplicationSettingsModel,
+        CareerDirectionModel,
+        DirectionVacancyModel,
+    )
+    from hugin.services.vacancy_analysis import RULES_VERSION
+    from hugin.workers.semantic_selection import SemanticSelectionWorker
+
+    account_id, direction_id, first_id, _, _ = seed(settings)
+    database = create_database(settings)
+    try:
+        with database.sessions.begin() as session:
+            direction = session.get(CareerDirectionModel, direction_id)
+            options = session.get(ApplicationSettingsModel, 1)
+            assert direction is not None and options is not None
+            direction.scoring_config = config
+            options.evaluation_enabled = True
+            options.search_enabled = False
+            second = VacancyRepository(session).upsert(
+                VacancyData(
+                    "rules-only-second",
+                    "Администратор баз данных",
+                    "https://hh.ru/vacancy/rules-only-second",
+                    description="Настраивать PostgreSQL, резервное копирование и права доступа.",
+                    details_fetched_at=datetime.now(UTC),
+                )
+            )
+            DirectionRepository(session).track_vacancy(direction_id, second.id)
+            vacancy_ids = (first_id, second.id)
+        client = Client()
+        worker = SemanticSelectionWorker(
+            settings,
+            account_id=account_id,
+            processor=SemanticSelectionProcessor(settings, client_factory=lambda *_: client),
+        )
+        for count in (1, 2):
+            assert worker.run_once()
+            with database.sessions() as session:
+                assert (
+                    session.scalar(
+                        select(func.count())
+                        .select_from(DirectionVacancyModel)
+                        .where(
+                            DirectionVacancyModel.direction_id == direction_id,
+                            DirectionVacancyModel.vacancy_id.in_(vacancy_ids),
+                            DirectionVacancyModel.rules_version == RULES_VERSION,
+                        )
+                    )
+                    == count
+                )
+        assert not worker.run_once()
+        assert client.calls == 0
+        with database.sessions() as session:
+            assert session.scalar(select(func.count()).select_from(ApplicationModel)) == 0
+    finally:
+        database.close()
+
+
+def test_worker_respects_stop_after_selecting_rules_only_vacancy(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from sqlalchemy.orm import Session
+
+    from hugin.database.models import ApplicationSettingsModel, CareerDirectionModel
+    from hugin.workers.semantic_selection import SemanticSelectionWorker
+
+    account_id, direction_id, vacancy_id, _, _ = seed(settings)
+    database = create_database(settings)
+    try:
+        with database.sessions.begin() as session:
+            direction = session.get(CareerDirectionModel, direction_id)
+            options = session.get(ApplicationSettingsModel, 1)
+            assert direction is not None and options is not None
+            direction.scoring_config = {}
+            options.evaluation_enabled = True
+        worker = SemanticSelectionWorker(settings, account_id=account_id)
+        original_next = worker._next
+
+        def stop_after_selection(session: Session) -> tuple[int, int] | None:
+            selected = original_next(session)
+            assert selected == (direction_id, vacancy_id)
+            options = session.get(ApplicationSettingsModel, 1)
+            assert options is not None
+            options.evaluation_enabled = False
+            return selected
+
+        monkeypatch.setattr(worker, "_next", stop_after_selection)
+        worker.run_once()
+        with database.sessions() as session:
+            tracked = DirectionRepository(session).get_tracked_vacancy(direction_id, vacancy_id)
+            assert tracked.rules_version is None
+    finally:
+        database.close()
+
+
+def test_worker_replaces_semantic_result_when_direction_switches_to_rules(
+    settings: Settings,
+) -> None:
+    from hugin.database.models import ApplicationSettingsModel, CareerDirectionModel
+    from hugin.services.vacancy_analysis import RULES_VERSION
+    from hugin.workers.semantic_selection import SemanticSelectionWorker
+
+    account_id, direction_id, vacancy_id, _, _ = seed(settings)
+    client = Client()
+    processor = SemanticSelectionProcessor(settings, client_factory=lambda *_: client)
+    assert processor.process(account_id, direction_id, vacancy_id).applied
+    calls_before = client.calls
+    database = create_database(settings)
+    try:
+        with database.sessions.begin() as session:
+            direction = session.get(CareerDirectionModel, direction_id)
+            options = session.get(ApplicationSettingsModel, 1)
+            assert direction is not None and options is not None
+            direction.scoring_config = {}
+            options.evaluation_enabled = True
+            tracked = DirectionRepository(session).get_tracked_vacancy(direction_id, vacancy_id)
+            assert tracked.rules_version == RULES_VERSION
+            assert "semantic_selection" in tracked.rules_details
+        worker = SemanticSelectionWorker(settings, account_id=account_id, processor=processor)
+        assert worker.run_once()
+        assert not worker.run_once()
+        assert client.calls == calls_before
+        with database.sessions() as session:
+            tracked = DirectionRepository(session).get_tracked_vacancy(direction_id, vacancy_id)
+            assert tracked.rules_version == RULES_VERSION
+            assert "semantic_selection" not in tracked.rules_details
     finally:
         database.close()
 
@@ -570,8 +743,15 @@ def test_worker_stop_during_model_call_does_not_prepare_application(settings: Se
         with database.sessions.begin() as session:
             options = session.get(ApplicationSettingsModel, 1)
             assert options is not None
-            options.search_enabled = True
-        client = Client(lambda: worker.stop())
+            options.evaluation_enabled = True
+
+        class StoppingClient(Client):
+            def complete_json(self, system: str, user: str, schema: dict[str, object]) -> str:
+                response = super().complete_json(system, user, schema)
+                worker.stop()
+                return response
+
+        client = StoppingClient()
         worker = SemanticSelectionWorker(
             settings,
             account_id=account_id,
@@ -580,6 +760,332 @@ def test_worker_stop_during_model_call_does_not_prepare_application(settings: Se
         assert worker.run_once()
         with database.sessions() as session:
             assert session.scalar(select(func.count()).select_from(ApplicationModel)) == 0
+        assert client.calls == 1
         assert not worker.run_once()
+    finally:
+        database.close()
+
+
+def test_incremental_analysis_yields_between_calls_and_reuses_saved_stage(
+    settings: Settings,
+) -> None:
+    from sqlalchemy import func, select
+
+    from hugin.database.models import SemanticStageModel
+
+    account_id, direction_id, vacancy_id, _, _ = seed(settings)
+    client = Client()
+    processor = SemanticSelectionProcessor(settings, client_factory=lambda *_: client)
+    first = processor.process(account_id, direction_id, vacancy_id, max_calls=1)
+    assert first.status == "IN_PROGRESS" and not first.applied
+    assert first.model_calls == 1
+    with create_database(settings).sessions() as session:
+        assert (
+            session.scalar(
+                select(func.count())
+                .select_from(SemanticStageModel)
+                .where(SemanticStageModel.stage == "selection")
+            )
+            == 0
+        )
+    second = processor.process(account_id, direction_id, vacancy_id, max_calls=1)
+    assert second.applied and second.model_calls == 1
+    assert client.calls == 2
+    assert processor.process(account_id, direction_id, vacancy_id, max_calls=1).model_calls == 0
+
+
+def test_evaluation_uses_oldest_unfinished_description_before_new_publication(
+    settings: Settings,
+) -> None:
+    from datetime import timedelta
+
+    from hugin.database.models import VacancyModel
+    from hugin.services.background_processes import BackgroundProcessService
+    from hugin.workers.semantic_selection import SemanticSelectionWorker
+
+    account, direction, first_id, _, _ = seed(settings)
+    now = datetime.now(UTC)
+    database = create_database(settings)
+    try:
+        with database.sessions.begin() as session:
+            first = session.get(VacancyModel, first_id)
+            assert first is not None
+            first.details_fetched_at = now - timedelta(minutes=10)
+            first.published_at = now - timedelta(days=2)
+            newer = VacancyRepository(session).upsert(
+                VacancyData(
+                    "newer-publication",
+                    "Разработчик",
+                    "https://hh.ru/vacancy/newer-publication",
+                    description="Создавать API на Python",
+                    details_fetched_at=now,
+                    published_at=now,
+                )
+            )
+            DirectionRepository(session).track_vacancy(direction, newer.id)
+            BackgroundProcessService(session, account).set_enabled("evaluation", True)
+        worker = SemanticSelectionWorker(settings, account_id=account)
+        with database.sessions.begin() as session:
+            assert worker._next(session) == (direction, first_id)
+    finally:
+        database.close()
+
+
+def test_evaluation_resumes_saved_vacancy_after_restart_despite_new_arrival(
+    settings: Settings,
+) -> None:
+    from datetime import timedelta
+
+    from hugin.database.models import VacancyModel
+    from hugin.services.background_processes import BackgroundProcessService
+    from hugin.services.vacancy_analysis import RULES_VERSION
+    from hugin.workers.semantic_selection import SemanticSelectionWorker
+
+    account, direction, first_id, _, _ = seed(settings)
+    client = Client()
+    processor = SemanticSelectionProcessor(settings, client_factory=lambda *_: client)
+    database = create_database(settings)
+    try:
+        with database.sessions.begin() as session:
+            BackgroundProcessService(session, account).set_enabled("evaluation", True)
+        worker = SemanticSelectionWorker(
+            settings, account_id=account, processor=processor, max_calls_per_turn=1
+        )
+        assert worker.run_once()
+        assert client.calls == 1
+        with database.sessions.begin() as session:
+            first = session.get(VacancyModel, first_id)
+            assert first is not None
+            first.published_at = datetime.now(UTC) - timedelta(days=1)
+            newcomer = VacancyRepository(session).upsert(
+                VacancyData(
+                    "arrival-during-evaluation",
+                    "Разработчик",
+                    "https://hh.ru/vacancy/arrival-during-evaluation",
+                    description="Создавать API на Python",
+                    details_fetched_at=datetime.now(UTC) - timedelta(minutes=30),
+                    published_at=datetime.now(UTC),
+                )
+            )
+            DirectionRepository(session).track_vacancy(direction, newcomer.id)
+        resumed = SemanticSelectionWorker(
+            settings, account_id=account, processor=processor, max_calls_per_turn=1
+        )
+        assert resumed.run_once()
+        assert client.calls == 2
+        with database.sessions() as session:
+            tracked = DirectionRepository(session).get_tracked_vacancy(direction, first_id)
+            assert tracked.rules_version == RULES_VERSION
+            semantic = tracked.rules_details["semantic_selection"]
+            assert isinstance(semantic, dict) and semantic["status"] == "ALLOW"
+            assert (
+                DirectionRepository(session)
+                .get_tracked_vacancy(direction, newcomer.id)
+                .rules_version
+                is None
+            )
+    finally:
+        database.close()
+
+
+def test_evaluation_finishes_other_direction_before_leaving_saved_vacancy(
+    settings: Settings,
+) -> None:
+    from datetime import timedelta
+
+    from hugin.services.background_processes import BackgroundProcessService
+    from hugin.services.vacancy_analysis import RULES_VERSION
+    from hugin.workers.semantic_selection import SemanticSelectionWorker
+
+    account, first_direction, vacancy_id, _, _ = seed(settings)
+    client = Client()
+    processor = SemanticSelectionProcessor(settings, client_factory=lambda *_: client)
+    database = create_database(settings)
+    try:
+        with database.sessions.begin() as session:
+            BackgroundProcessService(session, account).set_enabled("evaluation", True)
+        worker = SemanticSelectionWorker(
+            settings, account_id=account, processor=processor, max_calls_per_turn=1
+        )
+        assert worker.run_once() and worker.run_once()
+        with database.sessions.begin() as session:
+            directions = DirectionRepository(session)
+            second = directions.create(
+                account,
+                "Второе направление",
+                scoring_config={"semantic_selection": {"enabled": True}},
+            )
+            resume = ResumeRepository(session).upsert(account, "other-resume", "Python API")
+            directions.attach_resume(second.id, resume.id)
+            profile = session.get(CandidateProfileModel, 1)
+            assert profile is not None
+            session.add(
+                VerifiedFactModel(
+                    profile_id=profile.id,
+                    category="project",
+                    source_type="user",
+                    content="Создал API на Python для второго проекта",
+                    resume_id=resume.id,
+                    state=ConfirmationState.CONFIRMED,
+                )
+            )
+            directions.track_vacancy(second.id, vacancy_id)
+            newcomer = VacancyRepository(session).upsert(
+                VacancyData(
+                    "other-description",
+                    "Разработчик",
+                    "https://hh.ru/vacancy/other-description",
+                    description="Создавать API на Python",
+                    details_fetched_at=datetime.now(UTC) - timedelta(hours=1),
+                    published_at=datetime.now(UTC),
+                )
+            )
+            directions.track_vacancy(first_direction, newcomer.id)
+        resumed = SemanticSelectionWorker(
+            settings, account_id=account, processor=processor, max_calls_per_turn=1
+        )
+        assert resumed.run_once()
+        assert client.calls == 3
+        with database.sessions.begin() as session:
+            second_result = DirectionRepository(session).get_tracked_vacancy(second.id, vacancy_id)
+            assert second_result.rules_version == RULES_VERSION
+            semantic = second_result.rules_details["semantic_selection"]
+            assert isinstance(semantic, dict) and semantic["status"] == "ALLOW"
+            assert resumed._next(session) == (first_direction, newcomer.id)
+    finally:
+        database.close()
+
+
+@pytest.mark.parametrize("change", ["archived", "deleted", "disabled", "duplicate", "expired"])
+def test_evaluation_skips_saved_vacancy_that_is_no_longer_eligible(
+    settings: Settings, change: str
+) -> None:
+    from datetime import timedelta
+
+    from hugin.database.models import CareerDirectionModel, VacancyModel
+    from hugin.domain.vacancies import VacancyAvailability
+    from hugin.services.background_processes import BackgroundProcessService
+    from hugin.workers.semantic_selection import SemanticSelectionWorker
+
+    account, first_direction, vacancy_id, _, _ = seed(settings)
+    client = Client()
+    processor = SemanticSelectionProcessor(settings, client_factory=lambda *_: client)
+    database = create_database(settings)
+    try:
+        with database.sessions.begin() as session:
+            BackgroundProcessService(session, account).set_enabled("evaluation", True)
+        worker = SemanticSelectionWorker(
+            settings, account_id=account, processor=processor, max_calls_per_turn=1
+        )
+        assert worker.run_once()
+        with database.sessions.begin() as session:
+            directions = DirectionRepository(session)
+            second = directions.create(account, "Другое активное направление")
+            newcomer = VacancyRepository(session).upsert(
+                VacancyData(
+                    "eligible-after-cursor",
+                    "Разработчик",
+                    "https://hh.ru/vacancy/eligible-after-cursor",
+                    description="Создавать API на Python",
+                    details_fetched_at=datetime.now(UTC),
+                )
+            )
+            directions.track_vacancy(second.id, newcomer.id)
+            vacancy = session.get(VacancyModel, vacancy_id)
+            assert vacancy is not None
+            if change == "archived":
+                vacancy.availability = VacancyAvailability.ARCHIVED
+            elif change == "deleted":
+                session.delete(vacancy)
+            elif change == "disabled":
+                direction = session.get(CareerDirectionModel, first_direction)
+                assert direction is not None
+                direction.is_active = False
+            elif change == "duplicate":
+                vacancy.duplicate_of_id = newcomer.id
+            else:
+                vacancy.published_at = datetime.now(UTC) - timedelta(days=31)
+        resumed = SemanticSelectionWorker(settings, account_id=account, processor=processor)
+        with database.sessions.begin() as session:
+            assert resumed._next(session) == (second.id, newcomer.id)
+        assert client.calls == 1
+    finally:
+        database.close()
+
+
+def test_invalid_model_response_does_not_keep_cursor_ahead_of_other_vacancies(
+    settings: Settings,
+) -> None:
+    from hugin.services.background_processes import BackgroundProcessService
+    from hugin.workers.semantic_selection import SemanticSelectionWorker
+
+    account, direction, vacancy_id, _, _ = seed(settings)
+
+    class InvalidClient(Client):
+        def complete_json(self, system: str, user: str, schema: dict[str, object]) -> str:
+            self.calls += 1
+            return "{}"
+
+    client = InvalidClient()
+    processor = SemanticSelectionProcessor(settings, client_factory=lambda *_: client)
+    database = create_database(settings)
+    try:
+        with database.sessions.begin() as session:
+            BackgroundProcessService(session, account).set_enabled("evaluation", True)
+        worker = SemanticSelectionWorker(
+            settings, account_id=account, processor=processor, max_calls_per_turn=1
+        )
+        assert worker.run_once() and worker.run_once()
+        with database.sessions.begin() as session:
+            tracked = DirectionRepository(session).get_tracked_vacancy(direction, vacancy_id)
+            semantic = tracked.rules_details["semantic_selection"]
+            assert isinstance(semantic, dict) and semantic["status"] == "REVIEW"
+            newcomer = VacancyRepository(session).upsert(
+                VacancyData(
+                    "after-failed-evaluation",
+                    "Разработчик",
+                    "https://hh.ru/vacancy/after-failed-evaluation",
+                    description="Создавать API на Python",
+                    details_fetched_at=datetime.now(UTC),
+                )
+            )
+            DirectionRepository(session).track_vacancy(direction, newcomer.id)
+        with database.sessions.begin() as session:
+            assert worker._next(session) == (direction, newcomer.id)
+        assert client.calls == 2
+    finally:
+        database.close()
+
+
+def test_disabling_evaluation_preserves_cursor_until_explicit_resume(settings: Settings) -> None:
+    from hugin.database.models import BackgroundProcessRunModel
+    from hugin.services.background_processes import BackgroundProcessService
+    from hugin.workers.semantic_selection import SemanticSelectionWorker
+
+    account, _, vacancy_id, _, _ = seed(settings)
+    client = Client()
+    processor = SemanticSelectionProcessor(settings, client_factory=lambda *_: client)
+    worker = SemanticSelectionWorker(
+        settings, account_id=account, processor=processor, max_calls_per_turn=1
+    )
+    database = create_database(settings)
+    try:
+        with database.sessions.begin() as session:
+            BackgroundProcessService(session, account).set_enabled("evaluation", True)
+        assert worker.run_once()
+        with database.sessions.begin() as session:
+            BackgroundProcessService(session, account).set_enabled("evaluation", False)
+        resumed = SemanticSelectionWorker(
+            settings, account_id=account, processor=processor, max_calls_per_turn=1
+        )
+        assert not resumed.run_once()
+        assert client.calls == 1
+        with database.sessions.begin() as session:
+            runtime = session.get(BackgroundProcessRunModel, (account, "evaluation"))
+            assert runtime is not None and runtime.cursor_vacancy_id == vacancy_id
+            BackgroundProcessService(session, account).set_enabled("evaluation", True)
+        assert resumed.run_once()
+        assert client.calls == 2
+        assert not resumed.run_once()
     finally:
         database.close()

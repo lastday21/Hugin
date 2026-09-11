@@ -35,6 +35,7 @@ from hugin.domain.hh import (
     screening_form_hash,
 )
 from hugin.domain.hh_sync import (
+    HhChatMessageData,
     HhNegotiationData,
     HhNegotiationStatus,
     HhSyncBlockedError,
@@ -4909,3 +4910,28 @@ def test_found_vacancies_distinguishes_empty_and_malformed_result() -> None:
 def test_vacancy_url_rejects_external_or_malformed_link(href: str) -> None:
     with pytest.raises(RuntimeError):
         VisibleHhBrowser._vacancy_id_and_url(href)
+
+
+def test_recruiter_messages_bounded_turn_resumes_next_chat(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page = FakePage("https://hh.ru/applicant/resumes")
+    page.negotiations_payload = [
+        {"vacancyHref": f"/vacancy/{number}", "chatAvailable": True} for number in (101, 202)
+    ]
+    browser = make_browser(page, tmp_path)
+    read: list[str] = []
+
+    def read_chat(_page: object, vacancy_id: str) -> tuple[HhChatMessageData, ...]:
+        read.append(vacancy_id)
+        return ()
+
+    monkeypatch.setattr(browser, "_read_recruiter_chat", read_chat)
+    first = browser.read_recruiter_messages(("101", "202"), page_number=1, chat_limit=1)
+    assert read == ["101"]
+    assert not first.scan_complete and first.next_offset == 1 and first.next_page == 1
+    second = browser.read_recruiter_messages(
+        ("101", "202"), page_number=first.next_page, offset=first.next_offset, chat_limit=1
+    )
+    assert read == ["101", "202"] and second.scan_complete

@@ -1097,6 +1097,9 @@ def test_main_starts_window_and_always_closes_bridge(
         def has_pending_work(self) -> bool:
             return False
 
+        def request_stop(self) -> None:
+            pass
+
     class FakeStartupStatus:
         def update(self, _message: str) -> None:
             pass
@@ -1129,18 +1132,18 @@ def test_main_starts_window_and_always_closes_bridge(
     monkeypatch.setattr(desktop, "NotificationWorker", FakeWorker)
     monkeypatch.setattr(desktop, "BackupWorker", FakeWorker)
     monkeypatch.setattr(desktop, "SemanticSelectionWorker", FakeWorker)
+    monkeypatch.setattr(desktop, "BackgroundProcessWorker", FakeWorker)
+    monkeypatch.setattr(desktop, "ReplyWorker", FakeWorker)
 
     desktop.main()
 
     assert desktop.APP_ICON.is_file()
     assert events[0] == "services"
-    assert events[-9:] == [
+    assert events[-7:] == [
         "tray-start",
         ("start", False, str(desktop.APP_ICON)),
         "tray-stop",
         "close",
-        "worker-stop",
-        "worker-stop",
         "worker-stop",
         "worker-stop",
         "worker-stop",

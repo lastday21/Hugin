@@ -82,14 +82,18 @@ class AutonomousReplyService:
         self,
         *,
         account_id: int,
+        application_id: int | None = None,
         model_factory: Callable[[], RecruiterReplyTextModel] | None = None,
         requirement_model_factory: Callable[[], ReplyRequirementModel] | None = None,
         incoming_message_ids: Collection[int] = (),
         include_backlog: bool = False,
         backlog_limit: int = 250,
+        can_continue: Callable[[], bool] | None = None,
     ) -> AutonomousReplyBatch:
         if backlog_limit < 1:
             raise ValueError("Размер очереди сообщений должен быть положительным")
+        if can_continue is not None and not can_continue():
+            return AutonomousReplyBatch((), 0, 0, 0)
         policy = AutonomyPolicyService(self._session).get()
         if not policy.auto_prepare_replies and not policy.auto_send_approved_replies:
             return AutonomousReplyBatch((), 0, 0, 0)
@@ -101,7 +105,10 @@ class AutonomousReplyService:
                     ApplicationModel,
                     ApplicationModel.id == RecruiterMessageModel.application_id,
                 )
-                .where(ApplicationModel.account_id == account_id)
+                .where(
+                    ApplicationModel.account_id == account_id,
+                    *(() if application_id is None else (ApplicationModel.id == application_id,)),
+                )
                 .order_by(
                     RecruiterMessageModel.application_id,
                     RecruiterMessageModel.id,
@@ -175,6 +182,8 @@ class AutonomousReplyService:
             eligible_incoming_ids.update(sorted(backlog_ids, reverse=True)[:backlog_limit])
 
         for application_id, conversation in by_application.items():
+            if can_continue is not None and not can_continue():
+                break
             if any(message.id in uncertain_senders for message in conversation):
                 skipped_manual += 1
                 continue
@@ -411,8 +420,12 @@ class AutonomousReplyService:
                     requirement = ReplyRequirement.REQUIRED
                 elif requirement_model_factory is not None:
                     try:
+                        if can_continue is not None and not can_continue():
+                            break
                         if requirement_model is None:
                             requirement_model = requirement_model_factory()
+                        if can_continue is not None and not can_continue():
+                            break
                         with operation_context(
                             account_id=account_id,
                             application_id=application_id,
@@ -471,9 +484,13 @@ class AutonomousReplyService:
                 disposition = RecruiterReplyDisposition.REVIEW_DRAFT
             if not policy.auto_prepare_replies or model_factory is None:
                 continue
+            if can_continue is not None and not can_continue():
+                break
             try:
                 if model is None:
                     model = model_factory()
+                if can_continue is not None and not can_continue():
+                    break
                 draft = RecruiterReplyService(self._session, model).generate(
                     account_id=account_id,
                     application_id=application_id,
@@ -496,6 +513,7 @@ class AutonomousReplyService:
                 )
                 if (
                     policy.auto_send_approved_replies
+                    and (can_continue is None or can_continue())
                     and incoming.id in auto_send_incoming_ids
                     and not automatic_send_blocked
                     and generated_disposition is RecruiterReplyDisposition.AUTOMATIC_DRAFT

@@ -199,7 +199,13 @@ class AutomationWorker:
         finally:
             database.close()
 
-    def run_once(self, now: datetime | None = None) -> bool:
+    def run_once(
+        self,
+        now: datetime | None = None,
+        *,
+        allowed_kinds: tuple[AutomationJobKind, ...] | None = None,
+        force_synchronization: bool = False,
+    ) -> bool:
         database = create_database(self._settings)
         try:
             with database.sessions.begin() as session:
@@ -216,7 +222,12 @@ class AutomationWorker:
                 system_state = SystemStateRepository(session).get().state
             recovery_attempted = self._recover_authentication_if_due(system_state, now)
             with database.sessions.begin() as session:
-                job = AutomationSchedulerService(session).claim_due(now)
+                job = AutomationSchedulerService(session).claim_due(
+                    now,
+                    allowed_kinds=allowed_kinds,
+                    force_synchronization=force_synchronization,
+                    account_id=self._account_id,
+                )
             if job is None:
                 return recovery_attempted
 
@@ -248,7 +259,25 @@ class AutomationWorker:
                     result = self._run_handler(job, handler)
             except AutomationJobDeferred as error:
                 deferred_result: AutomationJobResult = {
-                    **job.last_result,
+                    **{
+                        key: value
+                        for key, value in job.last_result.items()
+                        if key.startswith("observed_")
+                        or key
+                        in {
+                            "cursor_signature",
+                            "cursor_details_before",
+                            "variant_index",
+                            "page_index",
+                            "next_step",
+                            "round_complete",
+                            "message_page",
+                            "message_offset",
+                            "message_baseline_initialized",
+                            "coverage_exhausted",
+                            "coverage_page_limit",
+                        }
+                    },
                     "deferred": True,
                     "reason": error.code,
                 }

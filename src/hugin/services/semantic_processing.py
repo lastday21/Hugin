@@ -20,6 +20,27 @@ class ProcessingResult:
     key: str | None
 
 
+class _SelectionStopped(Exception):
+    pass
+
+
+class _ControlledClient:
+    def __init__(self, client: StructuredClient, allowed: Callable[[], bool]) -> None:
+        self._client = client
+        self._allowed = allowed
+        self.calls = 0
+
+    @property
+    def request_identity(self) -> str:
+        return self._client.request_identity
+
+    def complete_json(self, system_prompt: str, user_prompt: str, schema: dict[str, object]) -> str:
+        if not self._allowed():
+            raise _SelectionStopped
+        self.calls += 1
+        return self._client.complete_json(system_prompt, user_prompt, schema)
+
+
 class SemanticSelectionProcessor:
     def __init__(
         self,
@@ -40,7 +61,15 @@ class SemanticSelectionProcessor:
             reasoning_effort=config.reasoning_effort,
         )
 
-    def process(self, account_id: int, direction_id: int, vacancy_id: int) -> ProcessingResult:
+    def process(
+        self,
+        account_id: int,
+        direction_id: int,
+        vacancy_id: int,
+        *,
+        max_calls: int = 6,
+        allowed: Callable[[], bool] = lambda: True,
+    ) -> ProcessingResult:
         from hugin.repositories.directions import DirectionRepository
         from hugin.repositories.vacancies import VacancyRepository
         from hugin.services.vacancy_analysis import VacancyAnalysisService
@@ -58,14 +87,28 @@ class SemanticSelectionProcessor:
             database.close()
         calls = 0
         if current.due:
+            if not allowed():
+                return ProcessingResult("STOPPED", 0, False, snapshot.key)
             cache = DatabaseStageCache(self._settings, account_id, vacancy_id)
+            extractor = _ControlledClient(self._client_factory("extract", snapshot), allowed)
+            matcher = _ControlledClient(self._client_factory("match", snapshot), allowed)
             analyzer = SemanticAnalyzer(
-                self._client_factory("extract", snapshot),
-                self._client_factory("match", snapshot),
+                extractor,
+                matcher,
                 cache,
+                max_calls=max_calls,
             )
-            result = analyzer.analyze(snapshot.lines, snapshot.facts)
+            try:
+                result = analyzer.analyze(snapshot.lines, snapshot.facts)
+            except _SelectionStopped:
+                return ProcessingResult(
+                    "STOPPED", extractor.calls + matcher.calls, False, snapshot.key
+                )
             calls = result.model_calls
+            if not allowed():
+                return ProcessingResult("STOPPED", calls, False, snapshot.key)
+            if result.budget_exhausted:
+                return ProcessingResult("IN_PROGRESS", calls, False, snapshot.key)
             cache.put(final_stage(snapshot, result))
 
         database = create_database(self._settings)

@@ -3,7 +3,6 @@ from __future__ import annotations
 import threading
 from collections.abc import Callable
 
-from hugin.adapters.codex_cli import configured_codex_cli_client
 from hugin.adapters.credentials import WindowsCredentialStore
 from hugin.adapters.hh_browser import VisibleHhBrowser
 from hugin.adapters.hh_messages import HhBrowserMessageSender
@@ -32,6 +31,7 @@ from hugin.services.autonomous_replies import (
     ApprovedReplyToSend,
     AutonomousReplyService,
 )
+from hugin.services.background_processes import BackgroundProcessService
 from hugin.services.communications import CommunicationService
 from hugin.services.hh_login import HhLoginService, LoginStatus
 from hugin.services.hh_sync import HhSynchronizationService
@@ -74,6 +74,7 @@ class HhSyncJobHandler:
         account_id: int = 1,
         browser_lock: threading.Lock | None = None,
         application_work_pending: ApplicationWorkPending | None = None,
+        incremental: bool = False,
     ) -> None:
         if kind not in {AutomationJobKind.MESSAGES, AutomationJobKind.STATUSES}:
             raise ValueError("Обработчик поддерживает только сообщения и статусы hh.ru")
@@ -82,6 +83,21 @@ class HhSyncJobHandler:
         self._account_id = account_id
         self._browser_lock = browser_lock or threading.Lock()
         self._application_work_pending = application_work_pending
+        self._incremental = incremental
+        self.one_shot_token: int | None = None
+
+    def _allowed(self) -> bool:
+        database = create_database(self._settings)
+        try:
+            with database.sessions() as session:
+                service = BackgroundProcessService(session, self._account_id)
+                return (
+                    service.one_shot_allowed(self.one_shot_token)
+                    if self.one_shot_token is not None
+                    else service.enabled("synchronization")
+                )
+        finally:
+            database.close()
 
     def __call__(self, job: AutomationJobRecord) -> AutomationJobResult:
         if job.kind is not self.kind or job.search_query_id is not None:
@@ -89,6 +105,11 @@ class HhSyncJobHandler:
         if job.account_id != self._account_id:
             raise ValueError("Фоновое задание относится к другому аккаунту")
         self._defer_for_application()
+
+        if self._incremental and not self._allowed():
+            raise AutomationJobDeferred(
+                "DISABLED", "Проверка переписки остановлена", retry_after_seconds=15
+            )
 
         vacancy_ids = self._tracked_vacancy_ids()
         try:
@@ -129,8 +150,23 @@ class HhSyncJobHandler:
                         self._login_message(login.status),
                     )
                 self._defer_for_application()
+                if self._incremental and not self._allowed():
+                    raise AutomationJobDeferred(
+                        "DISABLED",
+                        "Проверка переписки остановлена",
+                        retry_after_seconds=15,
+                    )
                 if self.kind is AutomationJobKind.MESSAGES:
-                    message_read = browser.read_recruiter_messages(vacancy_ids)
+                    if self._incremental:
+                        message_read = browser.read_recruiter_messages(
+                            vacancy_ids,
+                            page_number=int(job.last_result.get("message_page") or 1),
+                            offset=int(job.last_result.get("message_offset") or 0),
+                            chat_limit=3,
+                            allowed=self._allowed,
+                        )
+                    else:
+                        message_read = browser.read_recruiter_messages(vacancy_ids)
                 else:
                     statuses = browser.read_application_statuses()
             if self.kind is AutomationJobKind.MESSAGES:
@@ -142,6 +178,16 @@ class HhSyncJobHandler:
                     **synchronized,
                     **self._chat_failure_metrics(message_read.failures),
                     "message_baseline_initialized": True,
+                    **(
+                        {
+                            "message_page": message_read.next_page,
+                            "message_offset": message_read.next_offset,
+                            "continuation": not message_read.scan_complete,
+                            "chats_checked": message_read.chats_checked,
+                        }
+                        if self._incremental
+                        else {}
+                    ),
                 }
             return self._synchronize_statuses(statuses)
         except HhSyncBlockedError as error:
@@ -267,52 +313,23 @@ class HhSyncJobHandler:
         database = create_database(self._settings)
         try:
             with database.sessions.begin() as session:
-                synchronization = HhSynchronizationService(session)
-                if not allow_replies:
-                    return synchronization.synchronize_messages(
-                        account_id=self._account_id,
-                        messages=messages,
-                    )
-                synchronized = synchronization.synchronize_messages_with_new_ids(
+                return HhSynchronizationService(session).synchronize_messages(
                     account_id=self._account_id,
                     messages=messages,
                 )
-                result = synchronized.metrics
-                batch = AutonomousReplyService(session).prepare(
-                    account_id=self._account_id,
-                    incoming_message_ids=synchronized.new_incoming_message_ids,
-                    include_backlog=True,
-                    model_factory=lambda: configured_codex_cli_client(
-                        self._settings,
-                        operation="recruiter_reply",
-                    ),
-                    requirement_model_factory=lambda: configured_codex_cli_client(
-                        self._settings,
-                        operation="recruiter_reply_requirement",
-                        model=self._settings.codex_reply_requirement_model,
-                        timeout_seconds=self._settings.codex_reply_requirement_timeout_seconds,
-                    ),
-                )
         finally:
             database.close()
-        send_metrics = self._send_approved_replies(batch.approved)
-        return {
-            **result,
-            "reply_drafts": batch.drafts_created,
-            "approved_replies": len(batch.approved),
-            "replies_sent": send_metrics["sent"],
-            "replies_failed": send_metrics["failed"] + batch.failed,
-            "replies_unknown": send_metrics["unknown"],
-            "replies_cancelled": send_metrics["cancelled"],
-            "replies_manual": batch.skipped_manual,
-        }
 
     def _send_approved_replies(
         self,
         approved_replies: tuple[ApprovedReplyToSend, ...],
+        *,
+        can_continue: Callable[[], bool] | None = None,
     ) -> dict[str, int]:
         if not approved_replies:
             return {"sent": 0, "failed": 0, "unknown": 0, "cancelled": 0}
+        if can_continue is not None and not can_continue():
+            return {"sent": 0, "failed": 0, "unknown": 0, "cancelled": len(approved_replies)}
         sent = 0
         failed = 0
         unknown = 0
@@ -353,12 +370,17 @@ class HhSyncJobHandler:
                 database = create_database(self._settings)
                 try:
                     with database.sessions.begin() as session:
-                        if not AutonomousReplyService(session).approved_for_send(
+                        if not BackgroundProcessService(session, self._account_id).enabled(
+                            "replies"
+                        ) or not AutonomousReplyService(session).approved_for_send(
                             account_id=self._account_id,
                             message_id=approved.message_id,
                             content_version=approved.content_version,
                             content_hash=approved.content_hash,
                         ):
+                            cancelled += 1
+                            continue
+                        if can_continue is not None and not can_continue():
                             cancelled += 1
                             continue
                         message = CommunicationService(

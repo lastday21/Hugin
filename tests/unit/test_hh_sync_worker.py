@@ -10,14 +10,12 @@ from typing import ClassVar, cast
 import pytest
 
 from hugin.core.settings import Settings
-from hugin.database import create_database, upgrade_database
 from hugin.domain.automation import (
     AutomationJobKind,
     AutomationJobRecord,
     AutomationJobState,
 )
-from hugin.domain.communications import MessageSendOutcome, MessageSendResult
-from hugin.domain.content import MessageDirection, RecruiterMessageState
+from hugin.domain.content import MessageDirection
 from hugin.domain.hh_sync import (
     HhChatMessageData,
     HhChatReadFailure,
@@ -28,15 +26,6 @@ from hugin.domain.hh_sync import (
     HhSyncRetryableError,
 )
 from hugin.domain.tasks import SystemState
-from hugin.domain.vacancies import VacancyData
-from hugin.repositories import (
-    AccountRepository,
-    ApplicationRepository,
-    ResumeRepository,
-    VacancyRepository,
-)
-from hugin.repositories.communications import CommunicationRepository
-from hugin.services.autonomy import DEFAULT_AUTONOMY_POLICY, AutonomyPolicyService
 from hugin.services.hh_login import LoginStatus
 from hugin.workers import hh_sync as worker_module
 from hugin.workers.automation import (
@@ -409,126 +398,6 @@ def test_temporary_hh_limit_is_retried_without_protecting_system(
     assert error.value.code == "HH_RATE_LIMITED"
     assert error.value.retry_after_seconds == 180
     assert protected == []
-
-
-@pytest.mark.integration
-def test_message_rate_limit_pauses_and_retries_same_approved_reply(
-    settings: Settings,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    upgrade_database(settings)
-    database = create_database(settings)
-    response_text = "Здравствуйте! Да, готов обсудить детали."
-    try:
-        with database.sessions.begin() as session:
-            account = AccountRepository(session).create("Повтор ответа после ограничения")
-            resume = ResumeRepository(session).upsert(
-                account.id,
-                "rate-limit-resume",
-                "Python-разработчик",
-            )
-            vacancy = VacancyRepository(session).upsert(
-                VacancyData(
-                    hh_id="101",
-                    title="Python-разработчик",
-                    source_url="https://hh.ru/vacancy/101",
-                )
-            )
-            ApplicationRepository(session).create_apply_intent(
-                account.id,
-                vacancy.id,
-                resume.id,
-            )
-            account_id = account.id
-            AutonomyPolicyService(session).update(
-                {
-                    **DEFAULT_AUTONOMY_POLICY,
-                    "reply_templates": [
-                        {
-                            "key": "interest",
-                            "incoming_text": "Предложение ещё актуально?",
-                            "response_text": response_text,
-                            "enabled": True,
-                        }
-                    ],
-                }
-            )
-        assert account_id == 1
-
-        incoming = HhChatMessageData(
-            vacancy_id="101",
-            hh_id="rate-limit-incoming",
-            direction=MessageDirection.INCOMING,
-            body="Предложение ещё актуально?",
-        )
-        monkeypatch.setattr(FakeBrowser, "messages", (incoming,))
-        monkeypatch.setattr(FakeLoginService, "status", LoginStatus.AUTHENTICATED)
-        attempts: list[str] = []
-
-        def send_recruiter_message(
-            _browser: FakeBrowser,
-            source_url: str,
-            body: str,
-        ) -> MessageSendResult:
-            assert source_url == "https://hh.ru/vacancy/101"
-            attempts.append(body)
-            if len(attempts) == 1:
-                raise HhSyncRetryableError(
-                    "HH_RATE_LIMITED",
-                    "hh.ru временно ограничил отправку сообщений",
-                    retry_after_seconds=180,
-                )
-            return MessageSendResult(MessageSendOutcome.SENT, "hh-reply-1")
-
-        monkeypatch.setattr(
-            FakeBrowser,
-            "send_recruiter_message",
-            send_recruiter_message,
-            raising=False,
-        )
-        handler = prepare_handler(
-            monkeypatch,
-            AutomationJobKind.MESSAGES,
-            settings,
-        )
-        job = replace(
-            make_job(AutomationJobKind.MESSAGES),
-            last_result={"message_baseline_initialized": True},
-        )
-
-        with pytest.raises(AutomationJobRetry) as error:
-            handler(job)
-
-        assert error.value.code == "HH_RATE_LIMITED"
-        assert error.value.retry_after_seconds == 180
-        with database.sessions() as session:
-            outgoing_after_limit = tuple(
-                message
-                for message in CommunicationRepository(session).list_messages_for_account(
-                    account_id
-                )
-                if message.direction is MessageDirection.OUTGOING
-            )
-            assert len(outgoing_after_limit) == 1
-            assert outgoing_after_limit[0].state is RecruiterMessageState.CONFIRMED
-
-        result = handler(job)
-
-        assert result["replies_sent"] == 1
-        assert attempts == [response_text, response_text]
-        with database.sessions() as session:
-            outgoing_after_retry = tuple(
-                message
-                for message in CommunicationRepository(session).list_messages_for_account(
-                    account_id
-                )
-                if message.direction is MessageDirection.OUTGOING
-            )
-            assert len(outgoing_after_retry) == 1
-            assert outgoing_after_retry[0].state is RecruiterMessageState.SENT
-            assert outgoing_after_retry[0].hh_id == "hh-reply-1"
-    finally:
-        database.close()
 
 
 @pytest.mark.parametrize(

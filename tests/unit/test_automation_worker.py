@@ -24,6 +24,11 @@ def seed_account(settings: Settings, external_id: str) -> int:
     database = create_database(settings)
     try:
         with database.sessions.begin() as session:
+            from hugin.database.models import ApplicationSettingsModel
+
+            options = session.get(ApplicationSettingsModel, 1)
+            assert options is not None
+            options.synchronization_enabled = True
             return AccountRepository(session).create("Фоновая проверка", external_id).id
     finally:
         database.close()
@@ -59,9 +64,9 @@ def test_worker_runs_due_jobs_once_without_catch_up(settings: Settings) -> None:
             messages = next(job for job in jobs if job.kind is AutomationJobKind.MESSAGES)
             statuses = next(job for job in jobs if job.kind is AutomationJobKind.STATUSES)
             assert messages.state is AutomationJobState.WAITING
-            assert messages.next_run_at == now + timedelta(minutes=15)
+            assert messages.next_run_at == now + timedelta(minutes=5)
             assert statuses.state is AutomationJobState.WAITING
-            assert statuses.next_run_at == now + timedelta(minutes=60)
+            assert statuses.next_run_at == now + timedelta(minutes=30)
     finally:
         database.close()
 
@@ -83,3 +88,36 @@ def test_worker_blocks_missing_sources_instead_of_retrying(settings: Settings) -
             assert {job.last_error_code for job in jobs} == {"SOURCE_NOT_CONNECTED"}
     finally:
         database.close()
+
+
+def test_worker_can_select_search_without_running_due_messages(settings: Settings) -> None:
+    from sqlalchemy import select
+
+    from hugin.database.models import ApplicationSettingsModel
+    from hugin.domain import SearchRegion
+    from hugin.repositories import DirectionRepository
+
+    account_id = seed_account(settings, "filtered-worker")
+    with create_database(settings).sessions.begin() as session:
+        options = session.scalar(select(ApplicationSettingsModel))
+        assert options is not None
+        options.search_enabled = True
+        options.synchronization_enabled = True
+        directions = DirectionRepository(session)
+        direction = directions.create(account_id, "Python backend")
+        directions.add_query(
+            direction.id, "Python", regions=(SearchRegion("1", "Москва"),), schedule_minutes=120
+        )
+    calls: list[AutomationJobKind] = []
+
+    def handle(job: AutomationJobRecord) -> AutomationJobResult:
+        calls.append(job.kind)
+        return {"checked": 1}
+
+    worker = AutomationWorker(
+        settings,
+        account_id=account_id,
+        handlers={kind: handle for kind in AutomationJobKind},
+    )
+    assert worker.run_once(allowed_kinds=(AutomationJobKind.SEARCH,))
+    assert calls == [AutomationJobKind.SEARCH]

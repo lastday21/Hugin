@@ -35,7 +35,7 @@ from hugin.services.vacancy_duties import TechnicalDuty, technical_duty_evidence
 from hugin.services.vacancy_fit import FitAssessment, assess_fit, unsupported_administration
 from hugin.services.vacancy_skills import skill_terms
 
-RULES_VERSION = "python_it_v70"
+RULES_VERSION = "python_it_v71"
 MAX_VACANCY_AGE = timedelta(days=30)
 NET_SALARY_FACTOR = 0.87
 
@@ -2750,6 +2750,8 @@ class VacancyAnalysisService:
         stored: VacancyRecord,
         vacancy: VacancyData,
         context: RuleContext,
+        *,
+        synchronize_route_conflict: bool = True,
     ) -> VacancyAnalysisResult:
         stored = self._refresh_duplicate_family(self._vacancies.get(stored.id))
         tracked = self._directions.get_tracked_vacancy(direction.id, stored.id)
@@ -2800,6 +2802,34 @@ class VacancyAnalysisService:
                 and not semantic.get("constraint_reasons")
             )
         rule_evaluation = evaluation
+        route_conflict = (
+            self._routing_conflict(direction, stored, vacancy, evaluation)
+            if not manual_accept and not is_duplicate
+            else None
+        )
+        if route_conflict is not None:
+            target, target_evidence = route_conflict
+            reason = (
+                f"Актуальные оценки направлений «{direction.name}» и «{target.name}» "
+                "противоречат друг другу: каждое передаёт вакансию другому направлению. "
+                "Нужно выбрать подходящее направление."
+            )
+            semantic = {
+                **(semantic or {}),
+                "routing_conflict": {
+                    "code": "MUTUAL_TARGETS",
+                    "reason": reason,
+                    "target_direction_id": target.id,
+                    "target_direction_name": target.name,
+                    "target_selection": target_evidence,
+                },
+            }
+            evaluation = replace(
+                evaluation,
+                category=RuleCategory.REVIEW,
+                reasons=(*evaluation.reasons, reason),
+                target_scope=None,
+            )
         if manual_accept:
             evaluation = replace(
                 evaluation,
@@ -2910,6 +2940,16 @@ class VacancyAnalysisService:
             },
             rules_version=RULES_VERSION,
         )
+        if route_conflict is not None and synchronize_route_conflict:
+            target = route_conflict[0]
+            self._directions.track_vacancy(target.id, stored.id)
+            self._apply(
+                target,
+                stored,
+                vacancy,
+                self._context(target.account_id, target.name),
+                synchronize_route_conflict=False,
+            )
         return VacancyAnalysisResult(stored, evaluation, state)
 
     def reanalyze_one(
@@ -2975,6 +3015,59 @@ class VacancyAnalysisService:
                     member.id, reason=reason, rules_version=RULES_VERSION
                 )
         return self._vacancies.get(vacancy.id)
+
+    def _routing_conflict(
+        self,
+        source: DirectionRecord,
+        stored: VacancyRecord,
+        vacancy: VacancyData,
+        evaluation: RuleEvaluation,
+    ) -> tuple[DirectionRecord, dict[str, object]] | None:
+        from hugin.services.semantic_ranking import semantic_evaluation
+        from hugin.services.semantic_results import read_selection
+        from hugin.services.semantic_snapshot import selection_snapshot
+
+        if (
+            not source.is_active
+            or evaluation.category is not RuleCategory.ROUTED
+            or evaluation.target_scope is None
+        ):
+            return None
+        target = self._routing_direction(source, evaluation.target_scope)
+        if target is None:
+            return None
+        try:
+            snapshot = selection_snapshot(self._session, target, stored)
+        except ValueError:
+            return None
+        if snapshot is None:
+            return None
+        selection = read_selection(self._session, snapshot)
+        if selection.decision.status != "ALLOW" or selection.target_scope is not source.scope:
+            return None
+        return_target = self._routing_direction(target, source.scope)
+        if return_target is None or return_target.id != source.id:
+            return None
+        with suppress(LookupError):
+            tracked = self._directions.get_tracked_vacancy(target.id, stored.id)
+            previous = tracked.rules_details.get("semantic_selection")
+            if (
+                tracked.rules_version == RULES_VERSION
+                and tracked.rules_details.get("manual_override") == "ACCEPT"
+                and isinstance(previous, dict)
+                and previous.get("key") == snapshot.key
+            ):
+                return None
+        target_evaluation = semantic_evaluation(
+            vacancy,
+            self._context(target.account_id, target.name),
+            target.scope,
+            selection.decision,
+            selection.target_scope,
+        )
+        if target_evaluation.category is not RuleCategory.ROUTED:
+            return None
+        return target, selection.evidence
 
     def _route(
         self,

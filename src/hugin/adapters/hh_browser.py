@@ -2024,7 +2024,14 @@ class VisibleHhBrowser:
     def read_recruiter_messages(
         self,
         vacancy_ids: tuple[str, ...],
+        *,
+        page_number: int | None = None,
+        offset: int = 0,
+        chat_limit: int | None = None,
+        allowed: Callable[[], bool] | None = None,
     ) -> HhRecruiterMessagesReadResult:
+        if offset < 0 or (chat_limit is not None and chat_limit < 1):
+            raise ValueError("Позиция и размер порции переписки заданы неверно")
         selected_ids = {value.strip() for value in vacancy_ids if value.strip()}
         if not selected_ids:
             return HhRecruiterMessagesReadResult()
@@ -2034,10 +2041,28 @@ class VisibleHhBrowser:
         read_ids: set[str] = set()
         page_numbers = self._negotiation_page_numbers(page)
         pages: tuple[int | None, ...] = page_numbers or (None,)
+        selected_number = (
+            page_number if page_number in page_numbers else (page_numbers[0] if page_numbers else 1)
+        )
+        if page_number is not None:
+            pages = (selected_number,) if page_numbers else (None,)
         for page_number in pages:
             if page_number is not None:
                 self._select_negotiation_page(page, page_number)
-            for item in self._negotiations_payload(page):
+            for position, item in enumerate(self._negotiations_payload(page)):
+                if position < offset:
+                    continue
+                if (chat_limit is not None and len(read_ids) >= chat_limit) or (
+                    allowed is not None and not allowed()
+                ):
+                    return HhRecruiterMessagesReadResult(
+                        tuple(messages),
+                        tuple(failures),
+                        selected_number,
+                        position,
+                        False,
+                        len(read_ids),
+                    )
                 if item.get("chatAvailable") is not True:
                     continue
                 vacancy_id = self._optional_string(item, "vacancyId")
@@ -2075,6 +2100,10 @@ class VisibleHhBrowser:
         return HhRecruiterMessagesReadResult(
             messages=tuple(messages),
             failures=tuple(failures),
+            next_page=next((number for number in page_numbers if number > selected_number), 1),
+            scan_complete=chat_limit is None
+            or not any(number > selected_number for number in page_numbers),
+            chats_checked=len(read_ids),
         )
 
     def _read_recruiter_chat(
