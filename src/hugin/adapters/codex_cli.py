@@ -183,13 +183,21 @@ class CodexCliClient:
         except subprocess.TimeoutExpired as error:
             failure = CodexCliError("Истекло время ожидания ответа модели")
             if run is not None:
+                stdout = self._captured_text(error.stdout)
+                _, usage = self._parse_output(stdout)
                 run.save_evidence(
                     "response",
                     error_type=type(error).__name__,
-                    stdout=self._captured_text(error.stdout),
+                    stdout=stdout,
                     stderr=self._captured_text(error.stderr),
                 )
-                run.fail(failure)
+                run.fail(
+                    failure,
+                    token_usage_available=bool(usage),
+                    cost=None,
+                    cost_available=False,
+                    **usage,
+                )
             raise failure from error
         except OSError as error:
             failure = CodexCliError("Не удалось запустить создание сопроводительного письма")
@@ -198,6 +206,7 @@ class CodexCliClient:
                 run.fail(failure)
             raise failure from error
 
+        text, usage = self._parse_output(result.stdout)
         if result.returncode != 0:
             detail = self._safe_error(result.stderr or result.stdout)
             failure = CodexCliError(
@@ -211,15 +220,27 @@ class CodexCliClient:
                     stderr=result.stderr,
                     return_code=result.returncode,
                 )
-                run.fail(failure, return_code=result.returncode)
+                run.fail(
+                    failure,
+                    return_code=result.returncode,
+                    token_usage_available=bool(usage),
+                    cost=None,
+                    cost_available=False,
+                    **usage,
+                )
             raise failure
         if schema_path is not None and self._used_tools(result.stdout):
             failure = CodexCliError("При разборе вызван инструмент; результат не принят")
             if run is not None:
                 run.save_evidence("response", stdout=result.stdout, stderr=result.stderr)
-                run.fail(failure)
+                run.fail(
+                    failure,
+                    token_usage_available=bool(usage),
+                    cost=None,
+                    cost_available=False,
+                    **usage,
+                )
             raise failure
-        text, usage = self._parse_output(result.stdout)
         if not text:
             failure = CodexCliError("Программа создания писем вернула пустой ответ")
             if run is not None:
@@ -229,7 +250,13 @@ class CodexCliClient:
                     stderr=result.stderr,
                     return_code=result.returncode,
                 )
-                run.fail(failure)
+                run.fail(
+                    failure,
+                    token_usage_available=bool(usage),
+                    cost=None,
+                    cost_available=False,
+                    **usage,
+                )
             raise failure
         if run is not None:
             run.save_evidence(

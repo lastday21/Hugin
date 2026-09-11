@@ -270,3 +270,82 @@ def test_reply_requirement_prompt_requests_only_a_decision(
     prompt = str(calls[0]["input"])
     assert "решение REPLY_REQUIRED или NO_REPLY_REQUIRED" in prompt
     assert "итоговое сопроводительное письмо" not in prompt
+
+
+@pytest.mark.parametrize("failure", ["timeout", "nonzero", "tool", "empty"])
+@pytest.mark.parametrize(
+    ("reported", "expected"),
+    [
+        (
+            {"input_tokens": 120, "cached_input_tokens": 80, "output_tokens": 15},
+            {
+                "input_tokens": 120,
+                "cached_input_tokens": 80,
+                "output_tokens": 15,
+                "total_tokens": 135,
+            },
+        ),
+        ({"input_tokens": 120}, {"input_tokens": 120}),
+        (None, {}),
+    ],
+)
+def test_failed_call_preserves_reported_usage_without_inventing_missing_values(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    failure: str,
+    reported: dict[str, int] | None,
+    expected: dict[str, int],
+) -> None:
+    from hugin.diagnostics import OperationJournal
+
+    stdout = json.dumps({"type": "thread.started", "thread_id": "test"}) + "\n"
+    if failure == "tool":
+        stdout += '{"type":"item.completed","item":{"type":"command_execution"}}\n'
+    if reported is not None:
+        stdout += json.dumps({"type": "turn.completed", "usage": reported}) + "\n"
+    monkeypatch.setenv("OPENAI_API_KEY", "test-private-openai-key")
+    monkeypatch.setenv("CODEX_API_KEY", "test-private-codex-key")
+
+    def run(command: list[str], **kwargs: object) -> object:
+        environment = kwargs["env"]
+        assert isinstance(environment, dict)
+        assert "OPENAI_API_KEY" not in environment
+        assert "CODEX_API_KEY" not in environment
+        if failure == "timeout":
+            raise subprocess.TimeoutExpired(
+                command,
+                180,
+                output=(stdout + '{"type":"turn.completed","usage":').encode("utf-8"),
+                stderr=b"Authorization: Bearer test-private-token",
+            )
+        return SimpleNamespace(
+            returncode=1 if failure == "nonzero" else 0,
+            stdout=stdout,
+            stderr="Authorization: Bearer test-private-token",
+        )
+
+    monkeypatch.setattr("hugin.adapters.codex_cli.subprocess.run", run)
+    journal = OperationJournal(tmp_path)
+    client = CodexCliClient(tmp_path / "codex.cmd", tmp_path / "runtime", journal=journal)
+    with pytest.raises(CodexCliError):
+        if failure == "tool":
+            client.complete_json("Rules", "Task", {})
+        else:
+            client.complete("Rules", "Task")
+
+    entries = list(journal.entries(component="codex_cli"))
+    assert [entry["status"] for entry in entries] == ["started", "failed"]
+    details = entries[-1]["details"]
+    assert details["token_usage_available"] is bool(expected)
+    assert details["cost"] is None
+    assert details["cost_available"] is False
+    token_fields = {
+        "input_tokens",
+        "cached_input_tokens",
+        "output_tokens",
+        "reasoning_tokens",
+        "total_tokens",
+    }
+    assert {key: details[key] for key in token_fields if key in details} == expected
+    assert "test-private-token" not in json.dumps(entries)
+    assert not list((tmp_path / "runtime").glob("schema-*.json"))
