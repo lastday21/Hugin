@@ -6,7 +6,6 @@ import {
   ChevronDown,
   ChevronRight,
   CirclePause,
-  CirclePlay,
   ExternalLink,
   FileQuestion,
   Gauge,
@@ -36,8 +35,6 @@ import {
   useState,
 } from "react";
 import {
-  changeQueueState,
-  changeSearchState,
   correctProfileFact,
   dismissProfileQuestion,
   importResume,
@@ -75,7 +72,10 @@ import {
 import { DevelopmentView } from "./development/DevelopmentView";
 import { OutcomeSummary } from "./outcomes/OutcomeSummary";
 import { OutcomeEditor } from "./outcomes/OutcomeEditor";
+import { DailyProgress } from "./DailyProgress";
+import { ProcessPanel } from "./processes/ProcessPanel";
 import type {
+  BackgroundProcesses,
   AiModelSettings,
   AiPromptSettings,
   AiPromptValues,
@@ -122,6 +122,7 @@ type CommunicationsTab = "messages" | "invitations";
 type Toast = { kind: "success" | "error"; message: string };
 
 interface Workspace {
+  processes: BackgroundProcesses | null;
   dashboard: Dashboard | null;
   autonomy: AutonomyPolicy | null;
   directionOptions: DirectionOptions | null;
@@ -136,6 +137,7 @@ interface Workspace {
 }
 
 const emptyWorkspace: Workspace = {
+  processes: null,
   dashboard: null, autonomy: null, directionOptions: null, profile: null,
   queue: [], forms: [], rejected: [], sent: [], communications: null, development: null,
   outcomes: null,
@@ -251,14 +253,6 @@ function formatDate(value: string | null, includeDate = false): string {
   }).format(date);
 }
 
-function formatNextApply(value: string): string {
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime()) || date.getTime() <= Date.now()) {
-    return "при первой возможности";
-  }
-  return formatDate(value);
-}
-
 function plural(value: number, one: string, few: string, many: string): string {
   const lastTwo = value % 100;
   const last = value % 10;
@@ -266,11 +260,6 @@ function plural(value: number, one: string, few: string, many: string): string {
   if (last === 1) return `${value} ${one}`;
   if (last >= 2 && last <= 4) return `${value} ${few}`;
   return `${value} ${many}`;
-}
-
-function formatDelayRange(minSeconds: number, maxSeconds: number): string {
-  if (maxSeconds < 120) return `${minSeconds}–${maxSeconds} сек`;
-  return `${Math.round(minSeconds / 60)}–${Math.round(maxSeconds / 60)} мин`;
 }
 
 function visibleReasons(reasons: string[]): string[] {
@@ -693,6 +682,8 @@ export default function App() {
               {view === "dashboard" && workspace.dashboard && (
                 <DashboardView
                   workspace={{ ...workspace, dashboard: workspace.dashboard }}
+                  processesError={sectionErrors.processes}
+                  onProcessesSaved={(processes) => applyWorkspaceChange("processes", (current) => ({ ...current, processes }))}
                   queueLoaded={Boolean(loadedSections.queue)}
                   formsLoaded={Boolean(loadedSections.forms)}
                   widgets={widgets}
@@ -878,6 +869,8 @@ function EmptyState({
 
 function DashboardView({
   workspace,
+  processesError,
+  onProcessesSaved,
   queueLoaded,
   formsLoaded,
   widgets,
@@ -890,6 +883,8 @@ function DashboardView({
   onToast,
 }: {
   workspace: Workspace & { dashboard: Dashboard };
+  processesError?: string;
+  onProcessesSaved: (data: BackgroundProcesses) => void;
   queueLoaded: boolean;
   formsLoaded: boolean;
   widgets: DashboardWidget[];
@@ -902,45 +897,7 @@ function DashboardView({
   onToast: (toast: Toast) => void;
 }) {
   const { dashboard, queue, forms } = workspace;
-  const [changingHugin, setChangingHugin] = useState(false);
   const [signingInToHh, setSigningInToHh] = useState(false);
-  const huginRunning =
-    dashboard.system_state === "RUNNING" && dashboard.search_enabled;
-
-  async function controlHugin(action: "pause" | "resume"): Promise<void> {
-    if (changingHugin) return;
-    setChangingHugin(true);
-    try {
-      if (action === "resume") {
-        if (dashboard.system_state === "PAUSED") {
-          await changeQueueState("resume");
-        }
-        if (!dashboard.search_enabled) {
-          await changeSearchState("resume");
-        }
-      } else {
-        if (dashboard.system_state === "RUNNING") {
-          await changeQueueState("pause");
-        }
-        if (dashboard.search_enabled) {
-          await changeSearchState("pause");
-        }
-      }
-      onToast({
-        kind: "success",
-        message:
-          action === "pause"
-            ? "Hugin приостановлен: поиск и новые отклики выключены"
-            : "Hugin запущен: поиск и новые отклики включены",
-      });
-      onRefresh();
-    } catch (reason) {
-      onToast({ kind: "error", message: readableError(reason) });
-      onRefresh();
-    } finally {
-      setChangingHugin(false);
-    }
-  }
 
   async function loginToHh(): Promise<void> {
     if (signingInToHh) return;
@@ -967,15 +924,11 @@ function DashboardView({
   const automaticQueue = queue.filter((item) =>
     ["PENDING", "RUNNING", "RETRY_SCHEDULED"].includes(item.state),
   );
-  const automaticQueueCount =
-    (dashboard.task_counts.PENDING ?? 0) +
-    (dashboard.task_counts.RUNNING ?? 0) +
-    (dashboard.task_counts.RETRY_SCHEDULED ?? 0);
   const dashboardIncidents = compactDashboardIncidents(dashboard.incidents);
   const secondaryCodes = new Set(["NOTIFICATION_DELIVERY_FAILED", "RECRUITER_MESSAGE_SEND_FAILED"]);
   const actionableIncidents = dashboardIncidents.filter((incident) => incident.requires_action !== false && !secondaryCodes.has(incident.code));
   const secondaryIncidents = dashboardIncidents.filter((incident) => incident.requires_action === false || secondaryCodes.has(incident.code));
-  const system = systemPresentation(dashboard, automaticQueueCount);
+  const system = systemPresentation(dashboard, workspace.processes, processesError);
   const SystemIcon = system.icon;
 
   return (
@@ -988,40 +941,12 @@ function DashboardView({
           <span className="eyebrow">Состояние программы</span>
           <h2 id="system-title">{system.title}</h2>
           <p>{system.description}</p>
-          <div className="system-substates" aria-label="Состояние отдельных действий">
-            <span className={dashboard.search_enabled ? "active" : "paused"}>
-              Поиск {dashboard.search_enabled ? "включён" : "остановлен"}
-            </span>
-            <span
-              className={dashboard.system_state === "RUNNING" ? "active" : "paused"}
-            >
-              Отклики {dashboard.system_state === "RUNNING" ? "включены" : "остановлены"}
-            </span>
-            {dashboard.resource_saving_mode && <span>Бережный режим</span>}
-          </div>
-          <span className="next-action">{nextApplicationText(dashboard)}</span>
+          {workspace.processes && <small className="system-observed">Последний сигнал работы: {(() => {
+            const latest = workspace.processes.processes.map((item) => item.heartbeat_at).filter((value): value is string => Boolean(value)).sort().at(-1);
+            return latest ? formatDate(latest, true) : "не получен";
+          })()}</small>}
         </div>
         <div className="system-action">
-          {(dashboard.system_state === "RUNNING" ||
-            dashboard.system_state === "PAUSED") && (
-            <button
-              type="button"
-              className={huginRunning ? "secondary-button" : "primary-button"}
-              disabled={changingHugin}
-              onClick={() => void controlHugin(huginRunning ? "pause" : "resume")}
-            >
-              {huginRunning ? (
-                <CirclePause size={19} aria-hidden="true" />
-              ) : (
-                <CirclePlay size={19} aria-hidden="true" />
-              )}
-              {changingHugin
-                ? "Сохраняем…"
-                : huginRunning
-                  ? "Приостановить Hugin"
-                  : "Запустить Hugin"}
-            </button>
-          )}
           {(dashboard.system_state === "AUTH_REQUIRED" ||
             dashboard.system_state === "CAPTCHA_REQUIRED") && (
             <button
@@ -1085,12 +1010,12 @@ function DashboardView({
         </section>
       )}
 
-      {workspace.outcomes && <OutcomeSummary outcomes={workspace.outcomes} />}
+      <DailyProgress dashboard={dashboard} onOpenVacancy={onOpenVacancy} />
 
-      <details className="background-details">
-        <summary>Сегодня: отправлено {dashboard.applied_today}, в очереди {automaticQueueCount}</summary>
-        <DailyWidget dashboard={dashboard} queueLength={automaticQueueCount} />
-      </details>
+      <ProcessPanel data={workspace.processes} loadError={processesError}
+        onSaved={onProcessesSaved} onRefresh={onRefresh} />
+
+      {workspace.outcomes && <OutcomeSummary outcomes={workspace.outcomes} />}
 
       <details className="background-details">
         <summary>Последние проверки и уведомления{secondaryIncidents.length ? ` · ${secondaryIncidents.length}` : ""}</summary>
@@ -1256,54 +1181,17 @@ function friendlyBackgroundError(error: string | null): string {
   return "Последняя проверка завершилась ошибкой. Hugin повторит её, когда фоновая работа возобновится.";
 }
 
-function nextApplicationText(dashboard: Dashboard): string {
-  if (dashboard.system_state !== "RUNNING") {
-    return "Следующий отклик — после запуска Hugin";
+function systemPresentation(dashboard: Dashboard, processes: BackgroundProcesses | null, loadError?: string) {
+  if (["RUNNING", "PAUSED"].includes(dashboard.system_state)) {
+    if (!processes || loadError) return { title: "Состояние работы неизвестно", description: loadError ? `Не удалось обновить сведения: ${loadError}` : "Сведения о процессах ещё не получены", tone: "warning", icon: AlertTriangle };
+    const active = processes.processes.filter((item) => item.state === "running" || item.state === "stopping");
+    const problems = processes.processes.filter((item) => ["error", "blocked", "interrupted"].includes(item.state));
+    if (active.length) return { title: active.some((item) => item.state === "stopping") ? "Работа останавливается" : `Сейчас: ${active.map((item) => item.name).join(", ")}`, description: [...active, ...problems].map((item) => `${item.name}: ${item.reason}`).join(" · "), tone: problems.length ? "warning" : "positive", icon: RefreshCw };
+    if (problems.length) return { title: "Работа требует проверки", description: problems.map((item) => `${item.name}: ${item.reason}`).join(" · "), tone: "warning", icon: AlertTriangle };
+    if (processes.processes.every((item) => !item.enabled)) return { title: "Все процессы выключены", description: "Включите нужный процесс в блоке управления ниже.", tone: "neutral", icon: CirclePause };
+    return { title: "Ожидание следующего действия", description: processes.processes.filter((item) => item.enabled).map((item) => `${item.name}: ${item.reason}`).join(" · "), tone: "neutral", icon: CirclePause };
   }
-  if (dashboard.remaining_today <= 0) {
-    return "Дневной лимит выполнен — очередь продолжится завтра";
-  }
-  if (dashboard.next_apply_at) {
-    return `Следующий отклик — ${formatNextApply(dashboard.next_apply_at)}`;
-  }
-  return "Следующий отклик — при первой возможности";
-}
-
-function systemPresentation(dashboard: Dashboard, queueLength: number) {
-  const queueText = queueLength
-    ? `${plural(queueLength, "вакансия", "вакансии", "вакансий")} ждут обработки`
-    : "Новых вакансий в очереди нет";
   switch (dashboard.system_state) {
-    case "RUNNING":
-      if (!dashboard.search_enabled) {
-        return {
-          title: "Поиск приостановлен",
-          description: `${queueText}. Новые вакансии пока не добавляются.`,
-          tone: "neutral",
-          icon: CirclePause,
-        };
-      }
-      if (dashboard.remaining_today <= 0) {
-        return {
-          title: "Дневной лимит выполнен",
-          description: `${dashboard.applied_today} из ${dashboard.daily_limit} откликов отправлено. ${queueText}.`,
-          tone: "positive",
-          icon: CheckCircle2,
-        };
-      }
-      return {
-        title: "Hugin работает",
-        description: queueText,
-        tone: "positive",
-        icon: CheckCircle2,
-      };
-    case "PAUSED":
-      return {
-        title: "Hugin приостановлен",
-        description: `${queueText}. Новые отклики и поиск вакансий не выполняются.`,
-        tone: "neutral",
-        icon: CirclePause,
-      };
     case "AUTH_REQUIRED":
       return {
         title: "Нужно войти на hh.ru",
@@ -1318,6 +1206,7 @@ function systemPresentation(dashboard: Dashboard, queueLength: number) {
         tone: "warning",
         icon: AlertTriangle,
       };
+    default:
     case "ACCOUNT_WARNING":
       return {
         title: "Действия временно ограничены",
@@ -1345,8 +1234,8 @@ function AttentionWidget({
           <Bell size={20} />
         </span>
         <div>
-          <h3 id="attention-widget-title">Требует внимания</h3>
-          <p>Здесь только действия, которые нельзя выполнить без вас</p>
+          <h3 id="attention-widget-title">Анкеты требуют внимания</h3>
+          <p>Заполнение и проверка анкет. Сообщения работодателей — в разделе «Общение».</p>
         </div>
       </div>
       {forms.length ? (
@@ -1450,76 +1339,6 @@ function fitTierLabel(tier: number | null) {
     case 3: return "3 · Возможная работа";
     default: return "Соответствие ещё не пересчитано";
   }
-}
-
-function DailyWidget({
-  dashboard,
-  queueLength,
-}: {
-  dashboard: Dashboard;
-  queueLength: number;
-}) {
-  const progress =
-    dashboard.daily_limit > 0
-      ? Math.min((dashboard.applied_today / dashboard.daily_limit) * 100, 100)
-      : 0;
-  return (
-    <section className="dashboard-card daily-card" aria-labelledby="daily-widget-title">
-      <div className="card-heading">
-        <span className="card-icon green" aria-hidden="true">
-          <Gauge size={20} />
-        </span>
-        <div>
-          <h3 id="daily-widget-title">Сегодня</h3>
-          <p>Что Hugin уже сделал с начала дня</p>
-        </div>
-      </div>
-      <div className="daily-summary-values">
-        <div>
-          <strong>
-            {dashboard.applied_today} <span>из {dashboard.daily_limit}</span>
-          </strong>
-          <small>откликов отправлено</small>
-        </div>
-        <div>
-          <strong>{dashboard.replies_sent_today}</strong>
-          <small>ответов работодателям отправлено</small>
-        </div>
-        <div>
-          <strong>{queueLength}</strong>
-          <small>вакансий ждут обработки</small>
-        </div>
-      </div>
-      <div
-        className="progress-track"
-        role="progressbar"
-        aria-label="Использовано дневное ограничение"
-        aria-valuemin={0}
-        aria-valuemax={dashboard.daily_limit}
-        aria-valuenow={dashboard.applied_today}
-      >
-        <span style={{ width: `${progress}%` }} />
-      </div>
-      <div className="daily-notes">
-        <p className="queue-breakdown">
-          <span>{dashboard.task_counts.PENDING ?? 0} ждут обработки</span>
-          <span>{dashboard.task_counts.RETRY_SCHEDULED ?? 0} повторных попыток</span>
-          <span>
-            {plural(
-              dashboard.task_counts.REVIEW_REQUIRED ?? 0,
-              "задание остановлено",
-              "задания остановлены",
-              "заданий остановлено",
-            )}
-          </span>
-        </p>
-        <p className="card-note">
-          Пауза между откликами —{" "}
-          {formatDelayRange(dashboard.delay_min_seconds, dashboard.delay_max_seconds)}
-        </p>
-      </div>
-    </section>
-  );
 }
 
 function DirectionsWidget({ dashboard }: { dashboard: Dashboard }) {
@@ -1642,6 +1461,7 @@ function VacanciesView({
 
   return (
     <div className="page-stack">
+      <p className="section-context">Здесь очередь откликов, отправленные и отклонённые вакансии. Для отправленных и отклонённых загружаются до 1000 последних записей. Прочитанные сегодня и ожидающие оценки — на главной.</p>
       <div className="list-toolbar">
         <div className="tabs" role="tablist" aria-label="Списки вакансий">
           <button
@@ -2493,6 +2313,7 @@ function CommunicationsView({
 
   return (
     <div className="page-stack">
+      <p className="section-context">Сообщения и приглашения работодателей. Число у вкладки «Сообщения» — непрочитанные, у «Приглашения» — ещё не просмотренные приглашения.</p>
       <div className="list-toolbar">
         <div className="tabs" role="tablist" aria-label="Разделы общения">
           <button
@@ -3955,18 +3776,6 @@ const autonomyOptions: {
       "Только когда каждый обязательный ответ взят из подтверждённого профиля или сохранённого банка.",
   },
   {
-    key: "auto_prepare_replies",
-    title: "Готовить ответы работодателям",
-    description:
-      "Черновик создаётся после нового входящего сообщения и не заменяет написанный вами текст.",
-  },
-  {
-    key: "auto_send_approved_replies",
-    title: "Отправлять точные утверждённые ответы",
-    description:
-      "Автоматическая отправка разрешена только при точном совпадении сообщения с шаблоном ниже.",
-  },
-  {
     key: "auto_reconcile_unknown",
     title: "Самостоятельно сверять неопределённые результаты",
     description:
@@ -4111,6 +3920,7 @@ function AutonomySettingsForm({
 
   return (
     <div className="autonomy-settings">
+      <p>Подготовка и отправка ответов включаются вместе на главной, в процессе «Ответы работодателям».</p>
       <div className="autonomy-option-grid">
         {autonomyOptions.map((option) => (
           <label className="direction-active-control" key={option.key}>

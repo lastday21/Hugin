@@ -899,7 +899,7 @@ ol {
 
 .daily-summary-values {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 10px;
   margin-top: 16px;
 }
@@ -3892,3 +3892,87 @@ ol {
   .outcome-totals dt { max-width: 80%; }
   .outcome-editor { padding: 12px; }
 }
+.process-panel { padding: 24px; }
+.process-heading { display: flex; align-items: start; justify-content: space-between; gap: 20px; }
+.process-heading h2 { margin: 0; font-size: 21px; }
+.process-panel p { color: #576760; line-height: 1.5; }
+.process-panel [role="alert"] { color: #9b3329; }
+.process-panel [role="status"] { color: #285c3e; }
+.process-heading button { flex-shrink: 0; }
+.process-list { display: grid; margin-top: 12px; }
+.process-row { display: flex; align-items: start; justify-content: space-between; gap: 20px; padding: 18px 0; border-top: 1px solid #e5eae7; }
+.process-row h3 { font-size: 16px; margin: 0; }
+.process-row p { margin: 6px 0; font-size: 14px; }
+.process-row details { font-size: 13px; color: #576760; }
+.process-row summary, .process-search summary { cursor: pointer; }
+.process-error strong, .process-interrupted strong, .process-blocked strong { color: #9b3329; }
+.process-running strong { color: #285c3e; }
+.process-toggle { display: flex; align-items: center; gap: 8px; flex-shrink: 0; padding: 4px; cursor: pointer; font-size: 14px; }
+.process-toggle input { width: 22px; height: 22px; accent-color: #397550; }
+.process-schedule, .process-funnel, .process-search { border-top: 1px solid #e5eae7; padding-top: 16px; margin-top: 12px; }
+.process-schedule h3, .process-funnel h3 { margin: 0 0 12px; font-size: 17px; }
+.process-schedule-fields { display: flex; align-items: end; flex-wrap: wrap; gap: 14px; }
+.process-schedule label { display: grid; gap: 8px; font-size: 13px; }
+.process-schedule input { padding: 10px; border: 1px solid #c9d6cf; border-radius: 8px; font: inherit; width: 140px; }
+.process-schedule p, .process-funnel p, .process-search p { font-size: 13px; }
+.process-funnel dl { display: grid; grid-template-columns: repeat(auto-fit, minmax(165px, 1fr)); gap: 12px; }
+.process-funnel dl > div { border: 1px solid #e5eae7; border-radius: 10px; padding: 14px; }
+.process-funnel dt { font-size: 13px; color: #576760; }
+.process-funnel dd { margin: 8px 0 0; font-size: 25px; font-weight: 650; }
+.process-search summary { font-weight: 600; }
+.process-search dl > div { display: grid; grid-template-columns: minmax(120px, 1fr) 2fr; gap: 14px; margin-top: 12px; font-size: 14px; }
+.process-search dt { color: #576760; }
+.process-search dd { margin: 0; overflow-wrap: anywhere; }
+@media (max-width: 700px) {
+  .process-panel { padding: 16px; }
+  .process-heading, .process-row { flex-direction: column; gap: 12px; }
+  .process-toggle { align-self: flex-start; }
+  .process-schedule-fields { align-items: stretch; flex-direction: column; }
+  .process-schedule input { width: 100%; }
+  .process-funnel dl { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .process-search dl > div { grid-template-columns: 1fr; gap: 4px; }
+}
+/* Сводка и управление остаются читаемыми в узком окне. */
+.system-observed { display: block; margin-top: 8px; color: var(--text-secondary, #576760); }
+.day-progress-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-top: 20px; }
+.day-progress-heading h3 { margin: 0; font-size: 17px; }
+.day-progress-heading span { color: #576760; font-size: 14px; }
+.day-stages { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; margin: 12px 0; }
+.day-stage { text-align: left; padding: 12px; border: 1px solid #dbe3df; border-radius: 10px; background: #f8faf9; color: #233d31; min-width: 0; }
+.day-stage span, .day-stage small { display: block; }
+.day-stage strong { font-size: 23px; padding-right: 5px; }
+.day-stage small { line-height: 1.4; margin-top: 6px; color: #576760; }
+.day-stage:disabled { opacity: 1; cursor: default; color: #66766f; }
+.day-stage:not(:disabled):hover, .day-stage.selected { border-color: #327959; background: #eaf5ee; }
+.day-stage:focus-visible, .day-vacancies button:focus-visible, summary:focus-visible { outline: 3px solid #397cbd; outline-offset: 3px; }
+.day-progress-list { padding: 16px; background: #f7faf8; border: 1px solid #dbe3df; border-radius: 10px; margin: 14px 0; }
+.day-progress-list h4 { margin: 0; }
+.day-vacancies { list-style: none; padding: 0; margin: 10px 0; }
+.day-vacancies li + li { border-top: 1px solid #dbe3df; }
+.day-vacancies button { background: transparent; border: 0; width: 100%; padding: 12px 0; text-align: left; display: grid; gap: 5px; color: #244332; overflow-wrap: anywhere; }
+.day-vacancies small { color: #576760; }
+.day-pagination { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
+.day-limit, .process-settings { border-top: 1px solid #e5eae7; margin-top: 14px; padding-top: 14px; font-size: 14px; }
+.day-limit summary, .process-settings > summary { cursor: pointer; }
+.process-list { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 12px; }
+.process-row { display: flex; flex-direction: column; padding: 12px 0; gap: 8px; }
+.process-toggle { margin-top: auto; }
+.process-heading h2 { font-size: 19px; }
+.process-panel { padding: 18px 24px; }
+.daily-card { padding: 24px; }
+.daily-summary-values strong { overflow-wrap: anywhere; }
+@media (max-width: 1000px) {
+  .day-stages { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .process-list { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 520px) {
+  .daily-card { padding: 16px; }
+  .day-progress-heading { align-items: start; flex-direction: column; gap: 4px; }
+  .day-stage { padding: 10px; }
+  .day-stage strong { display: block; }
+  .process-list { grid-template-columns: 1fr; }
+  .process-row { flex-direction: row; align-items: start; }
+  .process-row > div { min-width: 0; }
+  .process-toggle { margin-top: 0; flex-shrink: 0; }
+}
+.section-context { margin: 0; color: #576760; line-height: 1.5; font-size: 14px; }

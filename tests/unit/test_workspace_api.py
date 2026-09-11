@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
@@ -21,6 +21,8 @@ from hugin.database.models import (
     IncidentModel,
     InvitationModel,
     RecruiterMessageModel,
+    VacancyDiscoveryModel,
+    VacancyModel,
 )
 from hugin.domain import (
     ApplicationState,
@@ -38,6 +40,7 @@ from hugin.domain import (
     VacancyState,
     WorkFormat,
 )
+from hugin.domain.applications import ApplicationEventType
 from hugin.domain.content import cover_letter_instruction_version
 from hugin.repositories import (
     AccountRepository,
@@ -52,6 +55,110 @@ from hugin.services.ai_prompts import DEFAULT_AI_PROMPTS
 from hugin.services.screening_forms import ScreeningDraftService
 
 pytestmark = pytest.mark.integration
+
+
+def test_daily_confirmed_sends_exclude_unknown_results(settings: Settings) -> None:
+    account_id, _, _ = seed_workspace(settings)
+    database = create_database(settings)
+    try:
+        with database.sessions.begin() as session:
+            task = session.scalar(select(ApplicationTaskModel).order_by(ApplicationTaskModel.id))
+            assert task is not None
+            task.state = TaskState.UNKNOWN_RESULT
+            ApplicationRepository(session).append_event(
+                task.application_id, ApplicationEventType.UNKNOWN_RESULT, {}
+            )
+        response = request(create_app(settings), "GET", f"/api/dashboard?account_id={account_id}")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["applied_today"] == 2
+        assert data["confirmed_applied_today"] == 1
+        assert data["remaining_today"] == data["daily_limit"] - 2
+    finally:
+        database.close()
+
+
+@pytest.mark.parametrize("minutes, expected", [(-1, 0), (0, 1), (60, 1)])
+def test_daily_read_count_uses_local_day_and_unique_account_vacancies(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch, minutes: int, expected: int
+) -> None:
+    account_id, _, _ = seed_workspace(settings)
+    start = datetime(2026, 9, 9, 19, tzinfo=UTC)
+    monkeypatch.setattr("hugin.services.ui_workspace.day_start_utc", lambda _: start)
+    database = create_database(settings)
+    try:
+        with database.sessions.begin() as session:
+            vacancy = session.scalar(select(VacancyModel).where(VacancyModel.hh_id == "ui-101"))
+            assert vacancy is not None
+            vacancy.details_fetched_at = start + timedelta(minutes=minutes)
+            discovery = session.scalar(select(VacancyDiscoveryModel))
+            assert discovery is not None
+            discovery.discovered_at = start
+            session.add(
+                VacancyDiscoveryModel(
+                    vacancy_id=vacancy.id,
+                    direction_id=discovery.direction_id,
+                    search_query_id=discovery.search_query_id,
+                    query_text="Повтор",
+                    region="Екатеринбург",
+                    discovered_at=start,
+                )
+            )
+            VacancyRepository(session).upsert(
+                VacancyData(
+                    hh_id="unlinked-today",
+                    title="Без связи с аккаунтом",
+                    source_url="https://hh.ru/vacancy/unlinked-today",
+                    details_fetched_at=start,
+                )
+            )
+        app = create_app(settings)
+        response = request(app, "GET", f"/api/dashboard?account_id={account_id}")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["viewed_today"] == expected
+        assert data["day_progress"]["total"] == expected
+        assert sum(stage["count"] for stage in data["day_progress"]["stages"]) == expected
+        assert data["found_today"] == 1
+        assert data["day_started_at"] == "2026-09-09T19:00:00Z"
+    finally:
+        database.close()
+
+
+def test_progress_lists_match_dashboard_and_validate_boundaries(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    account_id, _, _ = seed_workspace(settings)
+    start = datetime(2026, 9, 9, 19, tzinfo=UTC)
+    monkeypatch.setattr("hugin.services.ui_workspace.day_start_utc", lambda _: start)
+    monkeypatch.setattr("hugin.api.routes.workspace.day_start_utc", lambda _: start)
+    database = create_database(settings)
+    try:
+        with database.sessions.begin() as session:
+            vacancy = session.scalar(select(VacancyModel).where(VacancyModel.hh_id == "ui-101"))
+            assert vacancy is not None
+            vacancy.details_fetched_at = start
+        app = create_app(settings)
+        data = request(app, "GET", f"/api/dashboard?account_id={account_id}").json()
+        ids: list[str] = []
+        for stage in data["day_progress"]["stages"]:
+            path = f"/api/progress/vacancies?account_id={account_id}&stage={stage['key']}"
+            response = request(app, "GET", path + "&limit=1")
+            assert response.status_code == 200
+            page = response.json()
+            assert page["total"] == stage["count"]
+            assert page["since"] == data["day_started_at"]
+            ids.extend(item["vacancy_id"] for item in page["items"])
+            assert request(app, "GET", path + "&offset=1").json()["items"] == []
+        assert ids == ["ui-101"]
+        assert (
+            request(app, "GET", "/api/progress/vacancies?stage=sent&account_id=999").status_code
+            == 404
+        )
+        for query in ("stage=invalid", "stage=sent&offset=-1", "stage=sent&limit=101"):
+            assert request(app, "GET", "/api/progress/vacancies?" + query).status_code == 422
+    finally:
+        database.close()
 
 
 def request(

@@ -1,4 +1,7 @@
 import type {
+  ProgressVacancies,
+  BackgroundProcesses,
+  ProcessKey,
   ApplicationOutcome,
   AiPromptValues,
   AutonomyPolicy,
@@ -56,6 +59,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export interface WorkspaceData {
+  processes: BackgroundProcesses;
   dashboard: Dashboard;
   autonomy: AutonomyPolicy;
   directionOptions: DirectionOptions;
@@ -72,6 +76,7 @@ export interface WorkspaceData {
 export type WorkspaceSection = keyof WorkspaceData;
 
 export const workspaceSectionNames: Record<WorkspaceSection, string> = {
+  processes: "Пять процессов и остаток вакансий",
   dashboard: "Состояние программы", autonomy: "Порядок работы",
   directionOptions: "Настройки направлений", profile: "Профиль", queue: "Очередь",
   forms: "Анкеты", rejected: "Отклонённые вакансии", sent: "Отправленные отклики",
@@ -80,6 +85,7 @@ export const workspaceSectionNames: Record<WorkspaceSection, string> = {
 };
 
 const workspacePaths: Record<WorkspaceSection, string> = {
+  processes: `/api/processes?account_id=${ACCOUNT_ID}`,
   dashboard: `/api/dashboard?account_id=${ACCOUNT_ID}`,
   autonomy: "/api/autonomy",
   directionOptions: "/api/directions/options",
@@ -92,6 +98,34 @@ const workspacePaths: Record<WorkspaceSection, string> = {
   development: "/api/development",
   outcomes: `/api/outcomes?account_id=${ACCOUNT_ID}`,
 };
+
+async function changeProcesses(path: string, method: "PUT" | "POST", body?: object): Promise<BackgroundProcesses> {
+  const session = await request<{ key: string }>("/api/session");
+  return request<BackgroundProcesses>(`/api/processes${path}?account_id=${ACCOUNT_ID}`, {
+    method,
+    headers: { "X-Hugin-Session": session.key },
+    ...(body ? { body: JSON.stringify(body) } : {}),
+  });
+}
+
+export function setProcessEnabled(key: ProcessKey, enabled: boolean): Promise<BackgroundProcesses> {
+  return changeProcesses(`/${key}`, "PUT", { enabled });
+}
+
+export function stopAllProcesses(): Promise<BackgroundProcesses> {
+  return changeProcesses("/stop-all", "POST");
+}
+
+export function checkMessagesNow(): Promise<BackgroundProcesses> {
+  return changeProcesses("/synchronization/check-now", "POST");
+}
+
+export function saveProcessSchedule(messageInterval: number, statusInterval: number): Promise<BackgroundProcesses> {
+  return changeProcesses("/synchronization/schedule", "PUT", {
+    message_interval_minutes: messageInterval,
+    status_interval_minutes: statusInterval,
+  });
+}
 
 export async function loadWorkspace(
   onSection: (section: WorkspaceSection, update: Partial<WorkspaceData>, error?: string) => void,
@@ -232,10 +266,11 @@ export async function updateAutonomyPolicy(
   values: AutonomyPolicyValues,
 ): Promise<AutonomyPolicy> {
   const session = await request<{ key: string }>("/api/session");
+  const { auto_prepare_replies: _prepare, auto_send_approved_replies: _send, ...settings } = values;
   return request<AutonomyPolicy>("/api/autonomy", {
     method: "PUT",
     headers: { "X-Hugin-Session": session.key },
-    body: JSON.stringify(values),
+    body: JSON.stringify(settings),
   });
 }
 
@@ -465,4 +500,8 @@ export async function resetAiPromptSettings(): Promise<Communications> {
       headers: { "X-Hugin-Session": session.key },
     },
   );
+}
+
+export function fetchProgressVacancies(stage: string, offset: number, signal: AbortSignal): Promise<ProgressVacancies> {
+  return request(`/api/progress/vacancies?stage=${encodeURIComponent(stage)}&offset=${offset}&limit=25&account_id=${ACCOUNT_ID}`, { signal });
 }

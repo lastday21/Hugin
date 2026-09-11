@@ -176,6 +176,7 @@ export interface BackgroundStatus {
 }
 
 export interface Dashboard {
+  day_progress?: DayProgress;
   account_label: string;
   system_state: SystemState;
   search_enabled: boolean;
@@ -185,7 +186,12 @@ export interface Dashboard {
   delay_min_seconds: number;
   delay_max_seconds: number;
   applied_today: number;
+  confirmed_applied_today: number;
   replies_sent_today: number;
+  viewed_today: number;
+  found_today: number;
+  day_started_at: string;
+  day_timezone: string;
   remaining_today: number;
   task_counts: Record<string, number>;
   pending_forms: number;
@@ -579,4 +585,56 @@ declare global {
       };
     };
   }
+}
+export type ProcessKey = "search" | "evaluation" | "applications" | "synchronization" | "replies";
+
+export interface BackgroundProcesses {
+  processes: {
+    key: ProcessKey;
+    name: string;
+    enabled: boolean;
+    state: "disabled" | "waiting" | "running" | "stopping" | "interrupted" | "blocked" | "error";
+    reason: string;
+    last_started_at: string | null;
+    last_finished_at: string | null;
+    heartbeat_at: string | null;
+    runs: number;
+    completed: number;
+  }[];
+  synchronization: {
+    message_interval_minutes: number;
+    status_interval_minutes: number;
+    check_now_pending: boolean;
+  };
+  funnel: {
+    total: number;
+    scope: string;
+    stages: { key: string; name: string; count: number }[];
+  };
+  last_search: {
+    observed_at: string;
+    query: string | null;
+    region: string | null;
+    page: number | null;
+    found: number | null;
+    coverage_exhausted: boolean | null;
+    coverage_page_limit: number | null;
+    job_key: string;
+  } | null;
+}
+
+export interface DayProgress {
+  observed_at: string;
+  since: string;
+  total: number;
+  stages: { key: string; name: string; description: string; count: number }[];
+  oldest_pending_at: string | null;
+}
+export interface ProgressVacancies {
+  observed_at: string;
+  since: string;
+  total: number;
+  items: { vacancy_id: string; title: string; company: string; stage: string; description: string; read_at: string }[];
+  offset: number;
+  limit: number;
 }

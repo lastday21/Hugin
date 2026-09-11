@@ -367,6 +367,8 @@ def test_delayed_form_check_does_not_replace_a_saved_answer(
         expect(page.get_by_role("heading", name="Вакансия с анкетой")).to_be_visible()
         page.get_by_text("Показать вопросы", exact=True).click()
         if delayed_source == "refresh":
+            # Первичная сверка сама обновляет экран; задерживаем только ручной запрос.
+            page.wait_for_function("window.formResponses.some(forms => forms.length === 0)")
             expect(page.get_by_role("button", name="Обновить данные", exact=True)).to_be_enabled()
             page.route("**/api/forms?*", lambda route: held.append(route))
             with page.expect_request("**/api/forms?*"):

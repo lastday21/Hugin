@@ -16,6 +16,7 @@ from hugin.database.models import (
     ApplicationModel,
     ApplicationSettingsModel,
     ApplicationTaskModel,
+    HhAccountModel,
     VacancyModel,
 )
 from hugin.diagnostics import OperationJournal
@@ -25,6 +26,7 @@ from hugin.domain.applications import (
 )
 from hugin.domain.content import AnswerSource
 from hugin.domain.directions import EmploymentForm, SearchRegion, WorkFormat
+from hugin.domain.time import day_start_utc
 from hugin.services.application_reconciliation import ApplicationReconciliationService
 from hugin.services.automation import AutomationSchedulerService
 from hugin.services.autonomy import AutonomyPolicy, AutonomyPolicyService
@@ -37,6 +39,12 @@ from hugin.services.queue import QueueService
 from hugin.services.screening_forms import ScreeningDraft, ScreeningDraftService
 from hugin.services.search_outcomes import SearchOutcomes, SearchOutcomeService
 from hugin.services.ui_workspace import UiWorkspaceService
+from hugin.services.vacancy_progress import (
+    DailyProgress,
+    ProgressPage,
+    ProgressStageKey,
+    VacancyProgressService,
+)
 
 
 class RegionResponse(BaseModel):
@@ -121,7 +129,13 @@ class DashboardResponse(BaseModel):
     delay_min_seconds: int
     delay_max_seconds: int
     applied_today: int
+    confirmed_applied_today: int
     replies_sent_today: int
+    viewed_today: int
+    found_today: int
+    day_started_at: datetime
+    day_progress: DailyProgress
+    day_timezone: str
     remaining_today: int
     task_counts: dict[str, int]
     pending_forms: int
@@ -311,8 +325,8 @@ class AutonomyPolicyUpdate(BaseModel):
 
     auto_apply_stretch: bool
     auto_submit_simple_forms: bool
-    auto_prepare_replies: bool
-    auto_send_approved_replies: bool
+    auto_prepare_replies: bool | None = None
+    auto_send_approved_replies: bool | None = None
     auto_reconcile_unknown: bool
     reuse_confirmed_profile_facts: bool
     mark_opened_invitations_seen: bool
@@ -321,6 +335,8 @@ class AutonomyPolicyUpdate(BaseModel):
 
 
 class AutonomyPolicyResponse(AutonomyPolicyUpdate):
+    auto_prepare_replies: bool
+    auto_send_approved_replies: bool
     revision: int
 
 
@@ -369,6 +385,22 @@ def dashboard(
         return DashboardResponse.model_validate(UiWorkspaceService(session).dashboard(account_id))
     except LookupError as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
+
+
+@router.get("/progress/vacancies", response_model=ProgressPage)
+def progress_vacancies(
+    session: ReadSession,
+    stage: ProgressStageKey,
+    account_id: int = Query(default=1, ge=1),
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=25, ge=1, le=100),
+) -> ProgressPage:
+    if session.get(HhAccountModel, account_id) is None:
+        raise HTTPException(status_code=404, detail="Аккаунт hh.ru не найден")
+    since = day_start_utc(QueueService(session).policy().timezone_name)
+    return VacancyProgressService(session, account_id).vacancies(
+        since, stage, offset=offset, limit=limit
+    )
 
 
 @router.post("/search/pause", response_model=BackgroundPreferencesResponse)
@@ -724,7 +756,14 @@ def update_autonomy_policy(
     _guard: SessionGuard,
 ) -> AutonomyPolicyResponse:
     try:
-        saved = AutonomyPolicyService(session).update(values.model_dump(mode="json"))
+        service = AutonomyPolicyService(session)
+        current = service.get_for_update()
+        saved = service.update(
+            {
+                **current.as_payload(),
+                **values.model_dump(mode="json", exclude_none=True),
+            }
+        )
     except LookupError as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
     except ValueError as error:

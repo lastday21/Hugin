@@ -50,6 +50,7 @@ from hugin.repositories.applications import ApplicationRepository
 from hugin.repositories.vacancy_priority import vacancy_ordering
 from hugin.services.ai_prompts import AiPromptSettingsService
 from hugin.services.queue import QueueService
+from hugin.services.vacancy_progress import DailyProgress, VacancyProgressService
 
 ACTIVE_QUEUE_STATES = (
     TaskState.PENDING,
@@ -156,7 +157,13 @@ class UiDashboard:
     delay_min_seconds: int
     delay_max_seconds: int
     applied_today: int
+    confirmed_applied_today: int
     replies_sent_today: int
+    viewed_today: int
+    found_today: int
+    day_started_at: datetime
+    day_progress: DailyProgress
+    day_timezone: str
     remaining_today: int
     task_counts: dict[str, int]
     pending_forms: int
@@ -281,9 +288,41 @@ class UiWorkspaceService:
         if settings is None:
             raise LookupError("Настройки приложения не найдены")
         queue = QueueService(self._session).status()
+        day_started_at = day_start_utc(queue.policy.timezone_name)
+        day_progress = VacancyProgressService(self._session, account_id).snapshot(day_started_at)
+        viewed_today = day_progress.total
+        found_today = (
+            self._session.scalar(
+                select(func.count(func.distinct(VacancyDiscoveryModel.vacancy_id)))
+                .join(
+                    CareerDirectionModel,
+                    CareerDirectionModel.id == VacancyDiscoveryModel.direction_id,
+                )
+                .where(
+                    CareerDirectionModel.account_id == account_id,
+                    VacancyDiscoveryModel.discovered_at >= day_started_at,
+                )
+            )
+            or 0
+        )
         applied_today = ApplicationRepository(self._session).count_applied_since(
             account_id,
-            day_start_utc(queue.policy.timezone_name),
+            day_started_at,
+        )
+        confirmed_applied_today = (
+            self._session.scalar(
+                select(func.count(func.distinct(ApplicationEventModel.application_id)))
+                .join(ApplicationModel, ApplicationModel.id == ApplicationEventModel.application_id)
+                .where(
+                    ApplicationModel.account_id == account_id,
+                    ApplicationEventModel.created_at >= day_started_at,
+                    ApplicationEventModel.event_type == ApplicationEventType.APPLIED,
+                    ApplicationEventModel.payload["hh_status"].as_string() == "APPLIED",
+                    func.coalesce(ApplicationEventModel.payload["source"].as_string(), "")
+                    != "hh.ru",
+                )
+            )
+            or 0
         )
         replies_sent_today = (
             self._session.scalar(
@@ -298,7 +337,7 @@ class UiWorkspaceService:
                     RecruiterMessageModel.direction == MessageDirection.OUTGOING,
                     RecruiterMessageModel.state == RecruiterMessageState.SENT,
                     RecruiterMessageModel.content_hash.is_not(None),
-                    RecruiterMessageModel.sent_at >= day_start_utc(queue.policy.timezone_name),
+                    RecruiterMessageModel.sent_at >= day_started_at,
                 )
             )
             or 0
@@ -422,7 +461,13 @@ class UiWorkspaceService:
             delay_min_seconds=queue.policy.delay_min_seconds,
             delay_max_seconds=queue.policy.delay_max_seconds,
             applied_today=applied_today,
+            confirmed_applied_today=confirmed_applied_today,
             replies_sent_today=replies_sent_today,
+            viewed_today=viewed_today,
+            found_today=found_today,
+            day_started_at=day_started_at,
+            day_progress=day_progress,
+            day_timezone=queue.policy.timezone_name,
             remaining_today=max(queue.policy.daily_limit - applied_today, 0),
             task_counts={state.value: count for state, count in queue.task_counts.items()},
             pending_forms=pending_forms,
