@@ -18,6 +18,8 @@ class FakeBackupAdapter:
         self.fail_all_live_restores = False
         self.empty_dump = False
         self.negative_table_count = False
+        self.archive_tables = tuple(f"table_{index}" for index in range(42))
+        self.restored_tables = self.archive_tables
         self.stop_error: Exception | None = None
 
     def dump(self, database_name: str, database_user: str, destination: Path) -> None:
@@ -46,7 +48,17 @@ class FakeBackupAdapter:
 
     def public_table_count(self, database_name: str, database_user: str) -> int:
         self.calls.append(("count", database_name, database_user))
-        return -1 if self.negative_table_count else 42
+        return -1 if self.negative_table_count else len(self.restored_tables)
+
+    def archive_public_table_names(self, source: Path) -> tuple[str, ...]:
+        self.calls.append(("archive_tables", source))
+        return self.archive_tables
+
+    def public_table_names(self, database_name: str, database_user: str) -> tuple[str, ...]:
+        self.calls.append(("tables", database_name, database_user))
+        if self.negative_table_count:
+            raise RuntimeError("PostgreSQL не подтвердил структуру восстановленной базы")
+        return self.restored_tables
 
     def stop_application(self) -> None:
         self.calls.append(("stop",))
@@ -94,9 +106,10 @@ def test_create_verifies_lists_and_skips_recent_daily_backup(tmp_path: Path) -> 
     assert service.ensure_daily() is None
     assert [call[0] for call in adapter.calls] == [
         "dump",
+        "archive_tables",
         "create_database",
         "restore",
-        "count",
+        "tables",
         "drop_database",
     ]
 
@@ -213,6 +226,123 @@ def test_verification_rejects_bad_manifest_and_negative_table_result(
     assert adapter.calls[-1][0] == "drop_database"
 
 
+@pytest.mark.parametrize("result", ["empty", "missing", "replaced"])
+def test_verification_rejects_incomplete_restored_tables(
+    tmp_path: Path,
+    result: str,
+) -> None:
+    adapter = FakeBackupAdapter()
+    service = BackupService(backup_settings(tmp_path), adapter=adapter)
+    record = service.create("manual", verify=False)
+    adapter.restored_tables = {
+        "empty": (),
+        "missing": adapter.archive_tables[:-1],
+        "replaced": (*adapter.archive_tables[:-1], "wrong_table"),
+    }[result]
+
+    with pytest.raises(RuntimeError, match="структуру"):
+        service.verify(record.path)
+
+    assert service.list()[0].verified_at is None
+    assert adapter.calls[-1][0] == "drop_database"
+
+
+def test_verification_does_not_replace_inconsistent_manifest_table_count(tmp_path: Path) -> None:
+    adapter = FakeBackupAdapter()
+    service = BackupService(backup_settings(tmp_path), adapter=adapter)
+    record = service.create("manual", verify=False)
+    manifest_path = record.path / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["public_tables"] = len(adapter.archive_tables) - 1
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="описанию"):
+        service.verify(record.path)
+
+    assert service.list()[0].verified_at is None
+    assert json.loads(manifest_path.read_text(encoding="utf-8"))["public_tables"] == 41
+
+
+def test_old_copy_without_table_names_is_verified_against_its_archive(tmp_path: Path) -> None:
+    adapter = FakeBackupAdapter()
+    service = BackupService(backup_settings(tmp_path), adapter=adapter)
+    record = service.create("manual", verify=False)
+    manifest_path = record.path / "manifest.json"
+    assert "public_table_names" not in json.loads(manifest_path.read_text(encoding="utf-8"))
+
+    verified = service.verify(record.path)
+
+    assert verified.verified_at is not None
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["format_version"] == 1
+    assert manifest["public_tables"] == 42
+    assert manifest["public_table_names"] == sorted(adapter.archive_tables)
+
+
+@pytest.mark.parametrize("names", [(), ("repeated", "repeated")])
+def test_verification_rejects_empty_or_ambiguous_archive(
+    tmp_path: Path,
+    names: tuple[str, ...],
+) -> None:
+    adapter = FakeBackupAdapter()
+    adapter.archive_tables = names
+    service = BackupService(backup_settings(tmp_path), adapter=adapter)
+    record = service.create("manual", verify=False)
+
+    with pytest.raises(RuntimeError, match="структуру"):
+        service.verify(record.path)
+
+    assert service.list()[0].verified_at is None
+    assert not any(call[0] == "create_database" for call in adapter.calls)
+
+
+def test_verification_rejects_table_names_inconsistent_with_archive(tmp_path: Path) -> None:
+    adapter = FakeBackupAdapter()
+    service = BackupService(backup_settings(tmp_path), adapter=adapter)
+    record = service.create("manual", verify=False)
+    manifest_path = record.path / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["public_table_names"] = ["wrong_table"]
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="описанию"):
+        service.verify(record.path)
+
+    assert service.list()[0].verified_at is None
+
+
+@pytest.mark.parametrize("failure", ["structure", "checksum", "manifest"])
+def test_failed_reverification_invalidates_copy_and_allows_new_daily_backup(
+    tmp_path: Path,
+    failure: str,
+) -> None:
+    adapter = FakeBackupAdapter()
+    service = BackupService(backup_settings(tmp_path), adapter=adapter)
+    record = service.create("daily")
+    assert record.verified_at is not None
+    manifest_path = record.path / "manifest.json"
+    prior = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if failure == "structure":
+        adapter.restored_tables = ()
+    elif failure == "checksum":
+        (record.path / "database.dump").write_bytes(b"damaged")
+    else:
+        prior["public_tables"] = 0
+        manifest_path.write_text(json.dumps(prior), encoding="utf-8")
+
+    with pytest.raises(RuntimeError):
+        service.verify(record.path)
+
+    after = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert after == {**prior, "verified_at": None}
+    assert service.list()[0].verified_at is None
+    adapter.restored_tables = adapter.archive_tables
+    replacement = service.ensure_daily()
+    assert replacement is not None
+    assert replacement.path != record.path
+    assert replacement.verified_at is not None
+
+
 def test_restore_replaces_database_and_keeps_safety_copy(tmp_path: Path) -> None:
     adapter = FakeBackupAdapter()
     service = BackupService(
@@ -236,8 +366,31 @@ def test_restore_replaces_database_and_keeps_safety_copy(tmp_path: Path) -> None
         "drop_database",
         "create_database",
         "restore",
-        "count",
+        "tables",
     ]
+
+
+def test_incomplete_live_restore_returns_verified_safety_copy(tmp_path: Path) -> None:
+    class IncompleteLiveRestoreAdapter(FakeBackupAdapter):
+        live_checks = 0
+
+        def public_table_names(self, database_name: str, database_user: str) -> tuple[str, ...]:
+            names = super().public_table_names(database_name, database_user)
+            if database_name == "hugin":
+                self.live_checks += 1
+                if self.live_checks == 1:
+                    return names[:-1]
+            return names
+
+    adapter = IncompleteLiveRestoreAdapter()
+    service = BackupService(backup_settings(tmp_path), adapter=adapter)
+    source = service.create("manual")
+
+    with pytest.raises(RuntimeError, match="исходная база возвращена"):
+        service.restore(source.path, confirmation="hugin")
+
+    assert adapter.live_checks == 2
+    assert adapter.calls[-1] == ("start",)
 
 
 def test_restore_rolls_back_after_failure_and_does_not_touch_database_if_stop_fails(

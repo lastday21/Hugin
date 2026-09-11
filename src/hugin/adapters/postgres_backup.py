@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import os
+import re
 import subprocess
 from pathlib import Path
 from typing import IO, Any
@@ -96,6 +98,44 @@ class DockerPostgresBackupAdapter:
             return int(result.stdout.strip())
         except ValueError as error:
             raise RuntimeError("PostgreSQL не подтвердил восстановление копии") from error
+
+    def archive_public_table_names(self, source: Path) -> tuple[str, ...]:
+        with source.open("rb") as backup:
+            result = self._run_postgres(["pg_restore", "--list"], stdin=backup)
+        names = []
+        for line in result.stdout.decode("utf-8").splitlines():
+            match = re.fullmatch(r"\d+;\s+\d+\s+\d+\s+TABLE public (.+) \S+", line)
+            if match is not None:
+                names.append(match.group(1))
+        return tuple(sorted(names))
+
+    def public_table_names(self, database_name: str, database_user: str) -> tuple[str, ...]:
+        result = self._run_postgres(
+            [
+                "psql",
+                "--username",
+                database_user,
+                "--dbname",
+                database_name,
+                "--tuples-only",
+                "--no-align",
+                "--no-password",
+                "--command",
+                (
+                    "SELECT COALESCE(json_agg(tablename ORDER BY tablename), '[]'::json) "
+                    "FROM pg_catalog.pg_tables WHERE schemaname = 'public';"
+                ),
+            ]
+        )
+        try:
+            names = json.loads(result.stdout)
+            if not isinstance(names, list) or any(
+                not isinstance(name, str) or not name for name in names
+            ):
+                raise ValueError("Некорректный состав таблиц")
+        except (ValueError, UnicodeDecodeError) as error:
+            raise RuntimeError("PostgreSQL не подтвердил состав таблиц") from error
+        return tuple(names)
 
     def stop_application(self) -> None:
         self._run_compose(["stop", "api"])

@@ -35,7 +35,9 @@ class PostgresBackupAdapter(Protocol):
         source: Path,
     ) -> None: ...
 
-    def public_table_count(self, database_name: str, database_user: str) -> int: ...
+    def archive_public_table_names(self, source: Path) -> tuple[str, ...]: ...
+
+    def public_table_names(self, database_name: str, database_user: str) -> tuple[str, ...]: ...
 
     def stop_application(self) -> None: ...
 
@@ -158,7 +160,21 @@ class BackupService:
         *,
         verified_at: datetime | None = None,
     ) -> BackupRecord:
+        manifest_path = backup_path.resolve() / "manifest.json"
+        previous = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if isinstance(previous, dict) and previous.get("verified_at") is not None:
+            previous["verified_at"] = None
+            self._write_json(manifest_path, previous)
         path, manifest, dump_path = self._validated_files(backup_path)
+        expected_tables = self._archive_tables(dump_path)
+        previous_count = manifest.get("public_tables")
+        if previous_count is not None and (
+            type(previous_count) is not int or previous_count != len(expected_tables)
+        ):
+            raise RuntimeError("Состав таблиц дампа не соответствует описанию резервной копии")
+        previous_names = manifest.get("public_table_names")
+        if previous_names is not None and previous_names != sorted(expected_tables):
+            raise RuntimeError("Состав таблиц дампа не соответствует описанию резервной копии")
         temporary_database = f"hugin_restore_check_{uuid4().hex[:16]}"
         self._adapter.create_database(
             temporary_database,
@@ -170,12 +186,7 @@ class BackupService:
                 self._settings.database_user,
                 dump_path,
             )
-            public_tables = self._adapter.public_table_count(
-                temporary_database,
-                self._settings.database_user,
-            )
-            if public_tables < 0:
-                raise RuntimeError("PostgreSQL не подтвердил структуру восстановленной базы")
+            self._check_restored_tables(temporary_database, expected_tables)
         finally:
             self._adapter.drop_database(
                 temporary_database,
@@ -183,7 +194,8 @@ class BackupService:
             )
         timestamp = verified_at or self._selected_now()
         manifest["verified_at"] = timestamp.isoformat()
-        manifest["public_tables"] = public_tables
+        manifest["public_tables"] = len(expected_tables)
+        manifest["public_table_names"] = sorted(expected_tables)
         self._write_json(path / "manifest.json", manifest)
         return self._read_record(path)
 
@@ -192,19 +204,20 @@ class BackupService:
             raise ValueError("Для восстановления укажите точное название базы")
         path, _manifest, dump_path = self._validated_files(backup_path)
         self.verify(path)
+        expected_tables = self._archive_tables(dump_path)
         safety = self.create("before-restore")
         safety_dump = safety.path / "database.dump"
         self._adapter.stop_application()
         try:
             try:
                 self._replace_database(dump_path)
-                self._adapter.public_table_count(
-                    self._settings.database_name,
-                    self._settings.database_user,
-                )
+                self._check_restored_tables(self._settings.database_name, expected_tables)
             except Exception as error:
                 try:
                     self._replace_database(safety_dump)
+                    self._check_restored_tables(
+                        self._settings.database_name, self._archive_tables(safety_dump)
+                    )
                 except Exception as rollback_error:
                     raise RuntimeError(
                         "Восстановление не удалось; не удалось вернуть и страховочную копию"
@@ -242,6 +255,17 @@ class BackupService:
             self._settings.database_user,
             dump_path,
         )
+
+    def _archive_tables(self, dump_path: Path) -> frozenset[str]:
+        names = self._adapter.archive_public_table_names(dump_path)
+        if not names or len(names) != len(set(names)):
+            raise RuntimeError("Дамп не содержит однозначную структуру таблиц Hugin")
+        return frozenset(names)
+
+    def _check_restored_tables(self, database_name: str, expected: frozenset[str]) -> None:
+        actual = self._adapter.public_table_names(database_name, self._settings.database_user)
+        if frozenset(actual) != expected or len(actual) != len(expected):
+            raise RuntimeError("PostgreSQL не подтвердил структуру восстановленной базы")
 
     def _validated_files(
         self,

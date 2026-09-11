@@ -11,6 +11,59 @@ from hugin.adapters.postgres_backup import (
 )
 
 
+def test_adapter_compares_archive_and_database_table_names(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "database.dump"
+    source.write_bytes(b"PGDMP")
+    commands: list[list[str]] = []
+
+    def run(command: list[str], **values: object) -> subprocess.CompletedProcess[bytes]:
+        commands.append(command)
+        if "pg_restore" in command:
+            archive = values["stdin"]
+            assert hasattr(archive, "read")
+            assert archive.read() == b"PGDMP"
+            output = (
+                b"; Archive created at 2026-09-11\n"
+                b"219; 1259 16385 TABLE public applications hugin\n"
+                b"220; 1259 16386 TABLE public table with spaces hugin\n"
+                b"221; 1259 16387 TABLE another ignored hugin\n"
+                b"222; 0 16385 TABLE DATA public applications hugin\n"
+                b"223; 1259 16388 SEQUENCE public applications_id_seq hugin\n"
+            )
+        else:
+            output = b'["applications", "table with spaces"]\n'
+        return subprocess.CompletedProcess(command, 0, output, b"")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    adapter = DockerPostgresBackupAdapter(tmp_path)
+
+    assert adapter.archive_public_table_names(source) == ("applications", "table with spaces")
+    assert adapter.public_table_names("temporary", "hugin") == (
+        "applications",
+        "table with spaces",
+    )
+    assert "--list" in commands[0]
+    assert "temporary" in commands[1]
+
+
+@pytest.mark.parametrize("output", [b"invalid", b"null", b"{}", b"[42]", b'[""]'])
+def test_adapter_rejects_invalid_table_names(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    output: bytes,
+) -> None:
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda command, **_values: subprocess.CompletedProcess(command, 0, output, b""),
+    )
+    with pytest.raises(RuntimeError, match="таблиц"):
+        DockerPostgresBackupAdapter(tmp_path).public_table_names("temporary", "hugin")
+
+
 def test_adapter_runs_dump_restore_database_and_application_commands(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
