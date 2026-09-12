@@ -9,7 +9,7 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import ClassVar
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from hugin.adapters.resume_documents import ResumeDocumentReader
@@ -721,6 +721,10 @@ class ProfileFactService:
             VerifiedFactModel.category == fact.category,
             VerifiedFactModel.state == ConfirmationState.CONFIRMED,
             VerifiedFactModel.id != fact.id,
+            or_(
+                VerifiedFactModel.source_reference.is_(None),
+                VerifiedFactModel.source_reference.not_like("screening:%"),
+            ),
         )
         if fact.direction_id is None:
             statement = statement.where(VerifiedFactModel.direction_id.is_(None))
@@ -753,6 +757,10 @@ class ProfileFactService:
         fact = self._session.get(VerifiedFactModel, fact_id)
         if fact is None or fact.profile_id != profile.id:
             raise LookupError("Факт не найден")
+        if fact.category == "screening_answer" or (fact.source_reference or "").startswith(
+            "screening:"
+        ):
+            raise LookupError("Ответ анкеты изменяется в самой анкете, а не в общих сведениях")
         return fact
 
     def _profile(self, account_id: int) -> CandidateProfileModel:

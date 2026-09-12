@@ -176,4 +176,4 @@ class UiProfileService:
     @staticmethod
     def _is_screening_answer(fact: VerifiedFactModel) -> bool:
         reference = fact.source_reference or ""
-        return reference.startswith("screening:")
+        return fact.category == "screening_answer" or reference.startswith("screening:")

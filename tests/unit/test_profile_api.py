@@ -71,6 +71,57 @@ def test_profile_separates_saved_screening_answers_from_candidate_facts(
         database.close()
 
 
+@pytest.mark.parametrize("operation", ["confirm", "correct", "reject"])
+@pytest.mark.parametrize("legacy", [False, True])
+def test_profile_operations_preserve_question_specific_answers(
+    settings: Settings, operation: str, legacy: bool
+) -> None:
+    from hugin.services.resume_profile import ProfileFactService
+
+    database = create_database(settings)
+    try:
+        with database.sessions.begin() as session:
+            account = AccountRepository(session).create("Иван", "scoped-profile")
+            profile = CandidateProfileModel(account_id=account.id, display_name="Иван")
+            session.add(profile)
+            session.flush()
+            answer = VerifiedFactModel(
+                profile_id=profile.id,
+                category="technology" if legacy else "screening_answer",
+                content="Нет",
+                source_type="user",
+                source_reference="screening:0:1:question" if legacy else None,
+                state=ConfirmationState.CONFIRMED,
+                allow_in_forms=True,
+            )
+            fact = VerifiedFactModel(
+                profile_id=profile.id,
+                category="technology",
+                content="Python",
+                source_type="user",
+                state=ConfirmationState.PENDING,
+            )
+            session.add_all([answer, fact])
+            session.flush()
+            service = ProfileFactService(session)
+            with pytest.raises(LookupError, match="анкеты"):
+                if operation == "correct":
+                    service.correct(account.id, answer.id, "Пока только изучал")
+                elif operation == "confirm":
+                    service.confirm(account.id, answer.id, allow_in_letters=True)
+                else:
+                    service.reject(account.id, answer.id)
+            service.confirm(account.id, fact.id, allow_in_letters=True)
+            assert fact.state is ConfirmationState.CONFIRMED
+            assert answer.state is ConfirmationState.CONFIRMED
+            assert answer.content == "Нет" and answer.allow_in_forms
+            assert not answer.allow_in_letters and not answer.allow_in_messages
+            displayed = UiProfileService(session).get(account.id)
+            assert answer.id not in {item.id for item in displayed.facts}
+    finally:
+        database.close()
+
+
 def test_profile_api_previews_imports_and_reviews_resume(
     settings: Settings,
     tmp_path: Path,
