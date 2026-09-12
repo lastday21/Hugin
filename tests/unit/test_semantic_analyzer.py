@@ -108,6 +108,20 @@ def test_source_issue_gets_one_bounded_extraction_revision() -> None:
     assert "Обязанность искажена" in extractor.calls[1][1]
 
 
+def test_coverage_repair_identifies_the_missing_source_line() -> None:
+    lines = [*LINES, SourceLine(id=59, field="responsibilities", text="Что для нас важно")]
+    repaired = {**EXTRACTION, "excluded_lines": [{"line": 59, "reason": "heading"}]}
+    extractor = Client(EXTRACTION, repaired)
+    matcher = Client(MATCHING)
+    result = SemanticAnalyzer(extractor, matcher, MemoryStageCache()).analyze(lines, FACTS)
+    feedback = json.loads(extractor.calls[1][1])["validation_errors"]
+    assert any("пропущены 59" in message for message in feedback)
+    assert result.decision.status == "ALLOW"
+    assert result.model_calls == 3
+    assert result.extraction is not None
+    assert [line.line for line in result.extraction.excluded_lines] == [59]
+
+
 def test_revision_with_invalid_coverage_is_repaired_before_final_matching() -> None:
     issue = {**MATCHING, "source_issues": [{"line": 0, "issue": "Обязанность искажена"}]}
     wrong_kind = {**EXTRACTION, "entries": [{**EXTRACTION["entries"][0], "kind": "required"}]}

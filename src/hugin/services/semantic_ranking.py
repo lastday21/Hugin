@@ -122,8 +122,16 @@ def replay_semantic_evaluation(
     scope: DirectionScope,
     evidence: dict[str, Any],
 ) -> RuleEvaluation:
-    from hugin.services.semantic_results import StoredSelection, target_from_matching
-    from hugin.services.semantic_selection import ProfileFact, SourceLine, assess_requirements
+    from hugin.services.semantic_results import (
+        StoredSelection,
+        stored_decision,
+        target_from_selection,
+    )
+    from hugin.services.semantic_selection import (
+        SEMANTIC_SELECTION_VERSION,
+        ProfileFact,
+        SourceLine,
+    )
 
     if evidence.get("status") == "CONFIGURATION_ERROR":
         return RuleEvaluation(0, RuleCategory.REVIEW, ("Некорректная настройка смыслового отбора",))
@@ -141,13 +149,10 @@ def replay_semantic_evaluation(
             for item in request["profile"]["facts"]
             if item["content"].strip()
         ]
-        if stored.errors or stored.extraction is None or stored.matching is None:
-            decision = SemanticDecision(
-                "REVIEW", None, tuple(stored.errors) or ("Неполный разбор вакансии",)
-            )
-        else:
-            decision = assess_requirements(lines, facts, stored.extraction, stored.matching)
-        target = target_from_matching(stored.matching, decision)
+        decision = stored_decision(
+            lines, facts, stored, str(request.get("version", SEMANTIC_SELECTION_VERSION))
+        )
+        target = target_from_selection(stored, decision)
     if "routing_target_scope" in evidence:
         saved_target = evidence["routing_target_scope"]
         target = DirectionScope(saved_target) if saved_target is not None else None

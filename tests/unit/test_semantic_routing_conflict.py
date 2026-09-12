@@ -18,7 +18,8 @@ from hugin.domain.directions import DirectionScope, VacancyState
 from hugin.repositories.directions import DirectionRepository
 from hugin.repositories.vacancies import VacancyRepository
 from hugin.services.decision_evidence import fingerprint, replay_ranking
-from hugin.services.semantic_analyzer import MemoryStageCache, SemanticAnalyzer
+from hugin.services.role_analyzer import RoleAnalyzer
+from hugin.services.semantic_analyzer import MemoryStageCache
 from hugin.services.semantic_cache import DatabaseStageCache
 from hugin.services.semantic_processing import SemanticSelectionProcessor
 from hugin.services.semantic_results import final_stage, read_selection
@@ -44,8 +45,8 @@ class StoredResponseClient(Client):
 
     def complete_json(self, system: str, user: str, schema: dict[str, object]) -> str:
         answer = json.loads(super().complete_json(system, user, schema))
-        if "paths" in answer:
-            answer["paths"][0]["profession"] = self.profession
+        answer["profession"] = self.profession
+        answer["fit"] = "direct" if self.profession == "applied_python" else "related"
         return json.dumps(answer)
 
 
@@ -99,9 +100,7 @@ def save_response(settings: Settings, case: RoutingCase, index: int, profession:
     finally:
         database.close()
     client = StoredResponseClient(profession)
-    result = SemanticAnalyzer(client, client, MemoryStageCache()).analyze(
-        snapshot.lines, snapshot.facts
-    )
+    result = RoleAnalyzer(client, MemoryStageCache()).analyze(snapshot.lines, snapshot.facts)
     assert result.decision.status == "ALLOW"
     cache = DatabaseStageCache(settings, case.account_id, case.vacancy_id)
     for stage in (*result.stages, final_stage(snapshot, result)):

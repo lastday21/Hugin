@@ -6,7 +6,8 @@ from dataclasses import dataclass
 from hugin.adapters.codex_cli import configured_codex_cli_client
 from hugin.core.settings import Settings
 from hugin.database import create_database
-from hugin.services.semantic_analyzer import SemanticAnalyzer, StructuredClient
+from hugin.services.role_analyzer import RoleAnalyzer
+from hugin.services.semantic_analyzer import StructuredClient
 from hugin.services.semantic_cache import DatabaseStageCache
 from hugin.services.semantic_results import final_stage, read_selection
 from hugin.services.semantic_snapshot import SelectionSnapshot, selection_snapshot
@@ -56,7 +57,7 @@ class SemanticSelectionProcessor:
         return configured_codex_cli_client(
             self._settings,
             operation=f"semantic_{stage}",
-            model=config.extraction_model if stage == "extract" else config.matching_model,
+            model=config.model,
             timeout_seconds=config.timeout_seconds,
             reasoning_effort=config.reasoning_effort,
         )
@@ -67,7 +68,7 @@ class SemanticSelectionProcessor:
         direction_id: int,
         vacancy_id: int,
         *,
-        max_calls: int = 6,
+        max_calls: int = 1,
         allowed: Callable[[], bool] = lambda: True,
     ) -> ProcessingResult:
         from hugin.repositories.directions import DirectionRepository
@@ -90,20 +91,16 @@ class SemanticSelectionProcessor:
             if not allowed():
                 return ProcessingResult("STOPPED", 0, False, snapshot.key)
             cache = DatabaseStageCache(self._settings, account_id, vacancy_id)
-            extractor = _ControlledClient(self._client_factory("extract", snapshot), allowed)
-            matcher = _ControlledClient(self._client_factory("match", snapshot), allowed)
-            analyzer = SemanticAnalyzer(
-                extractor,
-                matcher,
+            client = _ControlledClient(self._client_factory("assess", snapshot), allowed)
+            analyzer = RoleAnalyzer(
+                client,
                 cache,
                 max_calls=max_calls,
             )
             try:
                 result = analyzer.analyze(snapshot.lines, snapshot.facts)
             except _SelectionStopped:
-                return ProcessingResult(
-                    "STOPPED", extractor.calls + matcher.calls, False, snapshot.key
-                )
+                return ProcessingResult("STOPPED", client.calls, False, snapshot.key)
             calls = result.model_calls
             if not allowed():
                 return ProcessingResult("STOPPED", calls, False, snapshot.key)
@@ -119,6 +116,8 @@ class SemanticSelectionProcessor:
                 latest = selection_snapshot(session, direction, vacancy)
                 if latest is None or latest.key != snapshot.key or not direction.is_active:
                     return ProcessingResult("STALE", calls, False, snapshot.key)
+                if not allowed():
+                    return ProcessingResult("STOPPED", calls, False, snapshot.key)
                 ranked = VacancyAnalysisService(session).reanalyze_one(
                     account_id, direction_id, vacancy_id
                 )

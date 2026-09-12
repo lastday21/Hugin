@@ -15,11 +15,14 @@ from hugin.services.semantic_analyzer import (
     StageRecord,
 )
 from hugin.services.semantic_cache import load_stage
+from hugin.services.semantic_role import ROLE_SELECTION_VERSION, RoleAssessment, assess_role
 from hugin.services.semantic_selection import (
     SEMANTIC_SELECTION_VERSION,
     Extraction,
     Matching,
+    ProfileFact,
     SemanticDecision,
+    SourceLine,
     StrictRecord,
     assess_requirements,
 )
@@ -33,6 +36,7 @@ class StoredSelection(StrictRecord):
     stage_keys: list[str]
     model_calls: int
     retryable: bool
+    assessment: RoleAssessment | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,16 +49,21 @@ class SelectionResult:
 
 def final_stage(snapshot: SelectionSnapshot, result: AnalysisResult) -> StageRecord:
     errors = list(result.decision.reasons) if result.decision.status == "REVIEW" else []
-    retryable = (
-        result.extraction is None
-        or result.matching is None
-        or any(stage.errors for stage in result.stages)
-    )
-    if result.extraction is not None and result.matching is not None:
+    retryable = any(stage.errors for stage in result.stages)
+    if snapshot.request.get("version") == ROLE_SELECTION_VERSION:
+        if result.assessment is None:
+            retryable = True
+            errors = errors or ["Нет общей оценки вакансии"]
+        else:
+            recomputed = assess_role(snapshot.lines, snapshot.facts, result.assessment)
+            retryable = retryable or recomputed != result.decision
+    elif result.extraction is not None and result.matching is not None:
         recomputed = assess_requirements(
             snapshot.lines, snapshot.facts, result.extraction, result.matching
         )
         retryable = retryable or recomputed != result.decision
+    else:
+        retryable = True
     stored = StoredSelection(
         extraction=result.extraction,
         matching=result.matching,
@@ -62,12 +71,13 @@ def final_stage(snapshot: SelectionSnapshot, result: AnalysisResult) -> StageRec
         stage_keys=[stage.cache_key for stage in result.stages],
         model_calls=result.model_calls,
         retryable=retryable,
+        assessment=result.assessment,
     )
     response = stored.model_dump_json()
     return StageRecord(
         snapshot.key,
         "selection",
-        f"program:{SEMANTIC_SELECTION_VERSION}",
+        f"program:{snapshot.request.get('version', SEMANTIC_SELECTION_VERSION)}",
         snapshot.request,
         response,
         fingerprint(response),
@@ -100,7 +110,7 @@ def read_selection(session: Session, snapshot: SelectionSnapshot) -> SelectionRe
             True,
         )
     decision = decision_from_stored(snapshot, stored)
-    target = target_from_matching(stored.matching, decision)
+    target = target_from_selection(stored, decision)
     evidence: dict[str, object] = {
         "key": snapshot.key,
         "status": decision.status,
@@ -114,11 +124,44 @@ def read_selection(session: Session, snapshot: SelectionSnapshot) -> SelectionRe
 
 
 def decision_from_stored(snapshot: SelectionSnapshot, stored: StoredSelection) -> SemanticDecision:
+    return stored_decision(
+        snapshot.lines,
+        snapshot.facts,
+        stored,
+        str(snapshot.request.get("version", SEMANTIC_SELECTION_VERSION)),
+    )
+
+
+def stored_decision(
+    lines: list[SourceLine], facts: list[ProfileFact], stored: StoredSelection, version: str
+) -> SemanticDecision:
+    if stored.errors:
+        return SemanticDecision("REVIEW", None, tuple(stored.errors))
+    if version == ROLE_SELECTION_VERSION:
+        if stored.assessment is None:
+            return SemanticDecision("REVIEW", None, ("Нет общей оценки вакансии",))
+        return assess_role(lines, facts, stored.assessment)
+    if version != SEMANTIC_SELECTION_VERSION:
+        return SemanticDecision("REVIEW", None, ("Неизвестная версия профессиональной оценки",))
     if stored.errors or stored.extraction is None or stored.matching is None:
         return SemanticDecision(
             "REVIEW", None, tuple(stored.errors) or ("Неполный разбор вакансии",)
         )
-    return assess_requirements(snapshot.lines, snapshot.facts, stored.extraction, stored.matching)
+    return assess_requirements(lines, facts, stored.extraction, stored.matching)
+
+
+def target_from_selection(
+    stored: StoredSelection, decision: SemanticDecision
+) -> DirectionScope | None:
+    if stored.assessment is None:
+        return target_from_matching(stored.matching, decision)
+    if decision.status != "ALLOW" or stored.assessment.profession == "unclear":
+        return None
+    return (
+        DirectionScope.PYTHON_BACKEND
+        if stored.assessment.profession == "applied_python"
+        else DirectionScope.IT_ADJACENT
+    )
 
 
 def target_from_matching(

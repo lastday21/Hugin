@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Literal
 
@@ -7,17 +8,14 @@ from pydantic import Field
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
-from hugin.database.models import CandidateProfileModel, VerifiedFactModel
+from hugin.database.models import CandidateProfileModel, SemanticStageModel, VerifiedFactModel
 from hugin.domain.content import ConfirmationState
 from hugin.domain.directions import DirectionRecord
 from hugin.domain.vacancies import VacancyData, VacancyRecord
 from hugin.repositories.directions import DirectionRepository
 from hugin.services.decision_evidence import fingerprint
-from hugin.services.semantic_prompts import EXTRACTION_INSTRUCTIONS, MATCHING_INSTRUCTIONS
+from hugin.services.semantic_role import ROLE_INSTRUCTIONS, ROLE_SELECTION_VERSION, RoleAssessment
 from hugin.services.semantic_selection import (
-    SEMANTIC_SELECTION_VERSION,
-    ExtractionDraft,
-    Matching,
     ProfileFact,
     SourceLine,
     StrictRecord,
@@ -38,7 +36,6 @@ PROFESSIONAL_FACT_CATEGORIES = frozenset(
         "english_level",
         "portfolio",
         "experience",
-        "screening_answer",
     }
 )
 
@@ -47,8 +44,13 @@ class SelectionConfig(StrictRecord):
     enabled: bool = True
     extraction_model: str = Field(default="gpt-5.6-luna", min_length=1)
     matching_model: str = Field(default="gpt-5.6-sol", min_length=1)
+    assessment_model: str | None = Field(default=None, min_length=1)
     reasoning_effort: Literal["low", "medium", "high"] = "medium"
     timeout_seconds: int = Field(default=300, ge=30, le=300)
+
+    @property
+    def model(self) -> str:
+        return self.assessment_model or "gpt-5.6-terra"
 
 
 def selection_config(direction: DirectionRecord) -> SelectionConfig | None:
@@ -58,8 +60,13 @@ def selection_config(direction: DirectionRecord) -> SelectionConfig | None:
     return config if config.enabled else None
 
 
-def source_lines(vacancy: VacancyData | VacancyRecord) -> list[SourceLine]:
+def source_lines(
+    vacancy: VacancyData | VacancyRecord,
+    *,
+    include_repeated_fields: bool = False,
+) -> list[SourceLine]:
     result: list[SourceLine] = []
+    description = {line.strip() for line in (vacancy.description or "").splitlines()}
     for field in (
         "title",
         "description",
@@ -72,9 +79,56 @@ def source_lines(vacancy: VacancyData | VacancyRecord) -> list[SourceLine]:
         values = value if isinstance(value, tuple) else (value or "",)
         for text in values:
             for line in text.splitlines():
-                if line.strip():
-                    result.append(SourceLine(id=len(result), field=field, text=line.strip()))
+                content = line.strip()
+                if not content:
+                    continue
+                if (
+                    not include_repeated_fields
+                    and field not in {"title", "description"}
+                    and content in description
+                ):
+                    continue
+                result.append(SourceLine(id=len(result), field=field, text=content))
     return result
+
+
+def selection_source_lines(
+    session: Session,
+    account_id: int,
+    vacancy: VacancyRecord,
+    *,
+    previous_stages: Iterable[SemanticStageModel] | None = None,
+) -> list[SourceLine]:
+    compact = source_lines(vacancy)
+    original = source_lines(vacancy, include_repeated_fields=True)
+    if compact == original:
+        return compact
+    original_payload = [line.model_dump() for line in original]
+    if previous_stages is None:
+        previous_stages = session.scalars(
+            select(SemanticStageModel)
+            .where(
+                SemanticStageModel.account_id == account_id,
+                SemanticStageModel.vacancy_id == vacancy.id,
+                SemanticStageModel.stage == "assess",
+            )
+            .order_by(SemanticStageModel.id.desc())
+        )
+    for stage in previous_stages:
+        payload = stage.request.get("payload")
+        if (
+            stage.account_id == account_id
+            and stage.vacancy_id == vacancy.id
+            and stage.stage == "assess"
+            and isinstance(payload, dict)
+            and payload.get("vacancy_lines") == original_payload
+            and fingerprint(stage.request) == stage.cache_key
+            and fingerprint(stage.response_text) == stage.response_sha256
+        ):
+            # Сохраняем нумерацию начатого разбора. Актуальность модели и ответа
+            # проверяет обычный механизм повторного использования ступеней.
+            return original
+    return compact
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,6 +179,10 @@ def selection_snapshot(
                     VerifiedFactModel.state == ConfirmationState.CONFIRMED,
                     VerifiedFactModel.category.in_(PROFESSIONAL_FACT_CATEGORIES),
                     or_(
+                        VerifiedFactModel.source_reference.is_(None),
+                        VerifiedFactModel.source_reference.not_like("screening:%"),
+                    ),
+                    or_(
                         VerifiedFactModel.resume_id == resume.id,
                         VerifiedFactModel.resume_id.is_(None),
                     ),
@@ -149,16 +207,20 @@ def selection_snapshot(
         for row in rows
         if row.content.strip()
     ]
-    lines = source_lines(vacancy)
+    lines = selection_source_lines(session, direction.account_id, vacancy)
     request: dict[str, object] = {
-        "version": SEMANTIC_SELECTION_VERSION,
+        "version": ROLE_SELECTION_VERSION,
         "rules_version": RULES_VERSION,
-        "config": config.model_dump(),
-        "instructions": fingerprint([EXTRACTION_INSTRUCTIONS, MATCHING_INSTRUCTIONS]),
+        "config": {
+            "enabled": config.enabled,
+            "model": config.model,
+            "reasoning_effort": config.reasoning_effort,
+            "timeout_seconds": config.timeout_seconds,
+        },
+        "instructions": fingerprint(ROLE_INSTRUCTIONS),
         "schemas": fingerprint(
             [
-                ExtractionDraft.model_json_schema(),
-                Matching.model_json_schema(),
+                RoleAssessment.model_json_schema(),
                 ProfileFact.model_json_schema(),
             ]
         ),

@@ -66,6 +66,178 @@ def seed(settings: Settings) -> tuple[int, int, int, int, int]:
         database.close()
 
 
+@pytest.mark.parametrize("completed", [False, True])
+def test_existing_full_source_continues_without_repeating_model_calls(
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    completed: bool,
+) -> None:
+    from hugin.database.models import VacancyModel
+    from hugin.services import semantic_snapshot
+    from hugin.services.semantic_selection import SourceLine
+
+    account_id, direction_id, vacancy_id, _, fact_id = seed(settings)
+    database = create_database(settings)
+    with database.sessions.begin() as session:
+        vacancy = session.get(VacancyModel, vacancy_id)
+        assert vacancy is not None
+        vacancy.responsibilities = vacancy.description
+    original = [
+        SourceLine(id=0, field="title", text="Разработчик"),
+        SourceLine(id=1, field="description", text="Создавать API на Python"),
+        SourceLine(id=2, field="responsibilities", text="Создавать API на Python"),
+    ]
+
+    class LegacyClient(Client):
+        def complete_json(self, system: str, user: str, schema: dict[str, object]) -> str:
+            result = json.loads(super().complete_json(system, user, schema))
+            result["source_line_ids"] = [1, 2]
+            return json.dumps(result)
+
+    allowed = True
+
+    def stop_before_apply() -> None:
+        nonlocal allowed
+        if not completed:
+            allowed = False
+
+    client = LegacyClient(stop_before_apply)
+    processor = SemanticSelectionProcessor(settings, client_factory=lambda *_: client)
+    try:
+        with monkeypatch.context() as old_version:
+            old_version.setattr(semantic_snapshot, "source_lines", lambda *_, **__: original)
+            previous = processor.process(
+                account_id,
+                direction_id,
+                vacancy_id,
+                max_calls=6 if completed else 1,
+                allowed=lambda: allowed,
+            )
+        with database.sessions.begin() as session:
+            vacancy_record = VacancyRepository(session).get(vacancy_id)
+            assert len(semantic_snapshot.source_lines(vacancy_record)) == 2
+            snapshot = selection_snapshot(
+                session,
+                DirectionRepository(session).get_for_account(account_id, direction_id),
+                vacancy_record,
+            )
+            assert snapshot is not None and snapshot.lines == original
+        result = processor.process(account_id, direction_id, vacancy_id)
+        assert result.status == "MATCH" and result.applied
+        assert result.key == previous.key
+        assert previous.status == ("MATCH" if completed else "STOPPED")
+        assert result.model_calls == 0
+        assert client.calls == 1
+        with database.sessions.begin() as session:
+            from hugin.services.background_processes import BackgroundProcessService
+
+            funnel = BackgroundProcessService(session, account_id)._funnel()
+            assert isinstance(funnel["stages"], list)
+            assert (
+                next(stage["count"] for stage in funnel["stages"] if stage["key"] == "ready") == 1
+            )
+        edit_fact(settings, fact_id)
+        changed = processor.process(account_id, direction_id, vacancy_id)
+        assert changed.model_calls == 1 and changed.key != result.key
+        assert client.calls == 2
+    finally:
+        database.close()
+
+
+def test_new_source_is_compact_and_replay_keeps_context_without_more_calls(
+    settings: Settings,
+) -> None:
+    from sqlalchemy import select
+
+    from hugin.database.models import VacancyChangeModel, VacancyModel
+    from hugin.services.decision_evidence import replay_ranking
+
+    account_id, direction_id, vacancy_id, _, _ = seed(settings)
+    database = create_database(settings)
+    try:
+        with database.sessions.begin() as session:
+            vacancy = session.get(VacancyModel, vacancy_id)
+            assert vacancy is not None
+            vacancy.responsibilities = vacancy.description
+        client = Client()
+        processor = SemanticSelectionProcessor(settings, client_factory=lambda *_: client)
+        first = processor.process(account_id, direction_id, vacancy_id)
+        assert first.status == "MATCH" and first.model_calls == 1
+        second = processor.process(account_id, direction_id, vacancy_id)
+        assert second.model_calls == 0 and second.key == first.key
+        with database.sessions.begin() as session:
+            events = session.scalars(
+                select(VacancyChangeModel).where(
+                    VacancyChangeModel.vacancy_id == vacancy_id,
+                    VacancyChangeModel.event_type == "RULES_EVALUATED",
+                )
+            ).all()
+            assert events and all(replay_ranking(event.changes)["matches"] for event in events)
+        assert client.calls == 1
+    finally:
+        database.close()
+
+
+@pytest.mark.parametrize("damage", ["request", "response", "source", "other_vacancy", "legacy"])
+def test_unrelated_or_damaged_legacy_stage_does_not_select_old_source(
+    settings: Settings,
+    damage: str,
+) -> None:
+    from hugin.database.models import SemanticStageModel, VacancyModel
+    from hugin.services.decision_evidence import fingerprint
+    from hugin.services.semantic_snapshot import source_lines
+
+    account_id, direction_id, vacancy_id, _, _ = seed(settings)
+    database = create_database(settings)
+    try:
+        with database.sessions.begin() as session:
+            vacancy = session.get(VacancyModel, vacancy_id)
+            assert vacancy is not None
+            vacancy.responsibilities = vacancy.description
+            source = source_lines(
+                VacancyRepository(session).get(vacancy_id),
+                include_repeated_fields=True,
+            )
+            request = {"payload": {"vacancy_lines": [line.model_dump() for line in source]}}
+            key = fingerprint(request)
+            if damage == "request":
+                key = "wrong-key"
+            elif damage == "source":
+                vacancy.description = "Создавать API на Python\nНовое условие"
+            stage_vacancy = vacancy_id
+            if damage == "other_vacancy":
+                stage_vacancy = (
+                    VacancyRepository(session)
+                    .upsert(VacancyData("other", "Other", "https://hh.ru/vacancy/other"))
+                    .id
+                )
+            session.add(
+                SemanticStageModel(
+                    account_id=account_id,
+                    vacancy_id=stage_vacancy,
+                    cache_key=key,
+                    stage="extract" if damage == "legacy" else "assess",
+                    model="test:model",
+                    request=request,
+                    response_text="{}",
+                    response_sha256="wrong" if damage == "response" else fingerprint("{}"),
+                    errors=[],
+                    created_at=datetime.now(UTC),
+                    duration_seconds=1,
+                )
+            )
+            session.flush()
+            vacancy_record = VacancyRepository(session).get(vacancy_id)
+            snapshot = selection_snapshot(
+                session,
+                DirectionRepository(session).get_for_account(account_id, direction_id),
+                vacancy_record,
+            )
+            assert snapshot is not None and snapshot.lines == source_lines(vacancy_record)
+    finally:
+        database.close()
+
+
 class Client:
     request_identity = "test:model"
 
@@ -76,54 +248,18 @@ class Client:
     def complete_json(self, system: str, user: str, schema: dict[str, object]) -> str:
         self.calls += 1
         payload = json.loads(user)
-        if "extraction" not in payload:
-            return json.dumps(
-                {
-                    "scopes": [
-                        {
-                            "id": "common",
-                            "label": "Общие",
-                            "alternative_group": "",
-                            "source_lines": [],
-                        }
-                    ],
-                    "entries": [
-                        {
-                            "line": 1,
-                            "subject": "Python API",
-                            "scope": "common",
-                            "kind": "duty",
-                            "activity": "development",
-                            "level": "working",
-                            "relation": "all",
-                            "terms": ["Python"],
-                        }
-                    ],
-                    "excluded_lines": [{"line": 0, "reason": "heading"}],
-                }
-            )
         if self.callback:
             self.callback()
         return json.dumps(
             {
-                "source_issues": [],
-                "matches": [
-                    {
-                        "entry_id": 0,
-                        "status": "confirmed",
-                        "profile_fact_ids": [payload["profile"]["facts"][0]["id"]],
-                        "gap": "none",
-                        "reason": "Подтверждено проектом",
-                    }
-                ],
-                "paths": [
-                    {
-                        "scope": "common",
-                        "profession": "applied_python",
-                        "core_entry_ids": [0],
-                        "reason": "Python API",
-                    }
-                ],
+                "fit": "direct",
+                "profession": "applied_python",
+                "role": "Python API",
+                "reason": "Подтверждено проектом",
+                "source_line_ids": [1],
+                "profile_fact_ids": [payload["profile"]["facts"][0]["id"]],
+                "gaps": [],
+                "blocker": None,
             }
         )
 
@@ -151,9 +287,9 @@ def test_pending_then_allowed_and_cached_with_profile_change_guard(settings: Set
         client = Client()
         processor = SemanticSelectionProcessor(settings, client_factory=lambda *_: client)
         first = processor.process(account_id, direction_id, vacancy_id)
-        assert first.applied and first.status == "MATCH" and first.model_calls == 2
+        assert first.applied and first.status == "MATCH" and first.model_calls == 1
         second = processor.process(account_id, direction_id, vacancy_id)
-        assert second.applied and second.model_calls == 0 and client.calls == 2
+        assert second.applied and second.model_calls == 0 and client.calls == 1
         with database.sessions.begin() as session:
             from sqlalchemy import select
 
@@ -211,18 +347,11 @@ def test_uncertain_fit_creates_queue_task_and_replays_without_new_model_call(
     class UncertainClient(Client):
         def complete_json(self, system: str, user: str, schema: dict[str, object]) -> str:
             result = json.loads(super().complete_json(system, user, schema))
-            if "matches" in result:
-                if uncertainty == "requirement":
-                    result["matches"][0].update(
-                        status="unconfirmed",
-                        profile_fact_ids=[],
-                        gap="unclear",
-                        reason="Неясен требуемый уровень работы с API",
-                    )
-                elif uncertainty == "profession":
-                    result["paths"][0].update(profession="unclear")
-                else:
-                    result["source_issues"] = [{"line": 1, "issue": "Неясен уровень требования"}]
+            result["fit"] = "possible"
+            if uncertainty == "profession":
+                result["profession"] = "unclear"
+            else:
+                result["gaps"] = ["Неясен требуемый уровень работы с API"]
             return json.dumps(result)
 
     account_id, direction_id, vacancy_id, _, _ = seed(settings)
@@ -298,6 +427,54 @@ def test_snapshot_uses_direction_resume_and_full_confirmed_professional_facts(
         database.close()
 
 
+@pytest.mark.parametrize(
+    "category,reference",
+    [
+        ("screening_answer", "screening:1:2:question"),
+        ("screening_answer", None),
+        ("technology", "screening:1:2:legacy-question"),
+    ],
+)
+def test_question_specific_answer_does_not_change_professional_selection(
+    settings: Settings, category: str, reference: str | None
+) -> None:
+    account_id, direction_id, vacancy_id, resume_id, fact_id = seed(settings)
+    database = create_database(settings)
+    try:
+        with database.sessions.begin() as session:
+            direction_record = DirectionRepository(session).get_for_account(
+                account_id, direction_id
+            )
+            vacancy_record = VacancyRepository(session).get(vacancy_id)
+            before = selection_snapshot(session, direction_record, vacancy_record)
+            assert before is not None
+            professional_fact = session.get(VerifiedFactModel, fact_id)
+            assert professional_fact is not None
+            answer = VerifiedFactModel(
+                profile_id=professional_fact.profile_id,
+                category=category,
+                source_type="user",
+                source_reference=reference,
+                content="Знаком с назначением, но практически не работал",
+                resume_id=resume_id,
+                direction_id=direction_id,
+                state=ConfirmationState.CONFIRMED,
+                allow_in_forms=True,
+            )
+            session.add(answer)
+            session.flush()
+            after = selection_snapshot(session, direction_record, vacancy_record)
+            assert after is not None
+            assert [item.id for item in after.facts] == [fact_id]
+            assert after.key == before.key
+            assert after.request == before.request
+            assert answer.state is ConfirmationState.CONFIRMED
+            assert answer.allow_in_forms
+            assert answer.content == "Знаком с назначением, но практически не работал"
+    finally:
+        database.close()
+
+
 def test_worker_obeys_evaluation_switch_independently_of_search(
     settings: Settings,
 ) -> None:
@@ -333,7 +510,7 @@ def test_worker_obeys_evaluation_switch_independently_of_search(
             assert state is not None
             state.state = SystemState.PAUSED
         assert worker.run_once()
-        assert client.calls == 2
+        assert client.calls == 1
         assert not worker.run_once()
         with database.sessions() as session:
             from sqlalchemy import func, select
@@ -487,11 +664,9 @@ def test_adjacent_role_keeps_semantic_selection_across_directions(
 
         class AdjacentClient(Client):
             def complete_json(self, system: str, user: str, schema: dict[str, object]) -> str:
-                return (
-                    super()
-                    .complete_json(system, user, schema)
-                    .replace('"applied_python"', '"adjacent_it"')
-                )
+                answer = json.loads(super().complete_json(system, user, schema))
+                answer.update(profession="adjacent_it", fit="related")
+                return json.dumps(answer)
 
         client = AdjacentClient()
         result = SemanticSelectionProcessor(settings, client_factory=lambda *_: client).process(
@@ -766,7 +941,7 @@ def test_worker_stop_during_model_call_does_not_prepare_application(settings: Se
         database.close()
 
 
-def test_incremental_analysis_yields_between_calls_and_reuses_saved_stage(
+def test_one_call_finishes_selection_and_repeat_reuses_saved_result(
     settings: Settings,
 ) -> None:
     from sqlalchemy import func, select
@@ -777,7 +952,7 @@ def test_incremental_analysis_yields_between_calls_and_reuses_saved_stage(
     client = Client()
     processor = SemanticSelectionProcessor(settings, client_factory=lambda *_: client)
     first = processor.process(account_id, direction_id, vacancy_id, max_calls=1)
-    assert first.status == "IN_PROGRESS" and not first.applied
+    assert first.status == "MATCH" and first.applied
     assert first.model_calls == 1
     with create_database(settings).sessions() as session:
         assert (
@@ -786,11 +961,11 @@ def test_incremental_analysis_yields_between_calls_and_reuses_saved_stage(
                 .select_from(SemanticStageModel)
                 .where(SemanticStageModel.stage == "selection")
             )
-            == 0
+            == 1
         )
     second = processor.process(account_id, direction_id, vacancy_id, max_calls=1)
-    assert second.applied and second.model_calls == 1
-    assert client.calls == 2
+    assert second.applied and second.model_calls == 0
+    assert client.calls == 1
     assert processor.process(account_id, direction_id, vacancy_id, max_calls=1).model_calls == 0
 
 
@@ -842,7 +1017,7 @@ def test_evaluation_resumes_saved_vacancy_after_restart_despite_new_arrival(
     from hugin.workers.semantic_selection import SemanticSelectionWorker
 
     account, direction, first_id, _, _ = seed(settings)
-    client = Client()
+    client = Client(lambda: worker.stop())
     processor = SemanticSelectionProcessor(settings, client_factory=lambda *_: client)
     database = create_database(settings)
     try:
@@ -872,7 +1047,7 @@ def test_evaluation_resumes_saved_vacancy_after_restart_despite_new_arrival(
             settings, account_id=account, processor=processor, max_calls_per_turn=1
         )
         assert resumed.run_once()
-        assert client.calls == 2
+        assert client.calls == 1
         with database.sessions() as session:
             tracked = DirectionRepository(session).get_tracked_vacancy(direction, first_id)
             assert tracked.rules_version == RULES_VERSION
@@ -907,7 +1082,7 @@ def test_evaluation_finishes_other_direction_before_leaving_saved_vacancy(
         worker = SemanticSelectionWorker(
             settings, account_id=account, processor=processor, max_calls_per_turn=1
         )
-        assert worker.run_once() and worker.run_once()
+        assert worker.run_once()
         with database.sessions.begin() as session:
             directions = DirectionRepository(session)
             second = directions.create(
@@ -945,7 +1120,7 @@ def test_evaluation_finishes_other_direction_before_leaving_saved_vacancy(
             settings, account_id=account, processor=processor, max_calls_per_turn=1
         )
         assert resumed.run_once()
-        assert client.calls == 3
+        assert client.calls == 2
         with database.sessions.begin() as session:
             second_result = DirectionRepository(session).get_tracked_vacancy(second.id, vacancy_id)
             assert second_result.rules_version == RULES_VERSION
@@ -1035,7 +1210,7 @@ def test_invalid_model_response_does_not_keep_cursor_ahead_of_other_vacancies(
         worker = SemanticSelectionWorker(
             settings, account_id=account, processor=processor, max_calls_per_turn=1
         )
-        assert worker.run_once() and worker.run_once()
+        assert worker.run_once() and not worker.run_once()
         with database.sessions.begin() as session:
             tracked = DirectionRepository(session).get_tracked_vacancy(direction, vacancy_id)
             semantic = tracked.rules_details["semantic_selection"]
@@ -1052,7 +1227,7 @@ def test_invalid_model_response_does_not_keep_cursor_ahead_of_other_vacancies(
             DirectionRepository(session).track_vacancy(direction, newcomer.id)
         with database.sessions.begin() as session:
             assert worker._next(session) == (direction, newcomer.id)
-        assert client.calls == 2
+        assert client.calls == 1
     finally:
         database.close()
 
@@ -1063,7 +1238,12 @@ def test_disabling_evaluation_preserves_cursor_until_explicit_resume(settings: S
     from hugin.workers.semantic_selection import SemanticSelectionWorker
 
     account, _, vacancy_id, _, _ = seed(settings)
-    client = Client()
+
+    def disable_during_call() -> None:
+        with database.sessions.begin() as session:
+            BackgroundProcessService(session, account).set_enabled("evaluation", False)
+
+    client = Client(disable_during_call)
     processor = SemanticSelectionProcessor(settings, client_factory=lambda *_: client)
     worker = SemanticSelectionWorker(
         settings, account_id=account, processor=processor, max_calls_per_turn=1
@@ -1085,7 +1265,7 @@ def test_disabling_evaluation_preserves_cursor_until_explicit_resume(settings: S
             assert runtime is not None and runtime.cursor_vacancy_id == vacancy_id
             BackgroundProcessService(session, account).set_enabled("evaluation", True)
         assert resumed.run_once()
-        assert client.calls == 2
+        assert client.calls == 1
         assert not resumed.run_once()
     finally:
         database.close()

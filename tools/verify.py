@@ -29,6 +29,10 @@ AREAS = {
         "test_yandex_ai",
     ],
     "ranking": [
+        "test_semantic_role",
+        "test_role_analyzer",
+        "test_role_processing",
+        "test_semantic_results",
         "test_semantic_selection",
         "test_semantic_snapshot",
         "test_semantic_analyzer",

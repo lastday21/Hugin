@@ -199,8 +199,14 @@ def extraction_errors(lines: list[SourceLine], extraction: Extraction) -> tuple[
         errors.append("Номера исключённых строк повторяются")
     if included & excluded:
         errors.append("Одна строка одновременно разобрана и исключена")
-    if included | excluded != source.keys():
-        errors.append("Разбор не покрывает точный набор исходных строк")
+    covered = included | excluded
+    if covered != source.keys():
+        details = []
+        if missing := source.keys() - covered:
+            details.append("пропущены " + ", ".join(map(str, sorted(missing))))
+        if unexpected := covered - source.keys():
+            details.append("лишние " + ", ".join(map(str, sorted(unexpected))))
+        errors.append("Разбор не покрывает точный набор исходных строк: " + "; ".join(details))
     return tuple(errors)
 
 

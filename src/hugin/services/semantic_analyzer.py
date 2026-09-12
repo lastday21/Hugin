@@ -10,6 +10,7 @@ from pydantic import BaseModel, ValidationError
 
 from hugin.services.decision_evidence import canonical_json, fingerprint
 from hugin.services.semantic_prompts import EXTRACTION_INSTRUCTIONS, MATCHING_INSTRUCTIONS
+from hugin.services.semantic_role import RoleAssessment
 from hugin.services.semantic_selection import (
     Extraction,
     ExtractionDraft,
@@ -78,9 +79,93 @@ class AnalysisResult:
     stages: tuple[StageRecord, ...]
     model_calls: int
     budget_exhausted: bool = False
+    assessment: RoleAssessment | None = None
 
 
-class SemanticAnalyzer:
+class StageAnalyzer:
+    def __init__(self, cache: StageCache, *, max_calls: int = 1, force: bool = False) -> None:
+        if not 1 <= max_calls <= 6:
+            raise ValueError("Число обращений должно быть от 1 до 6")
+        self._cache = cache
+        self._max_calls = max_calls
+        self._force = force
+        self._calls = 0
+        self._budget_exhausted = False
+        self._stages: list[StageRecord] = []
+
+    def _stage[T: BaseModel](
+        self,
+        stage: str,
+        client: StructuredClient,
+        instructions: str,
+        payload: dict[str, object],
+        record_type: type[T],
+        validate: Callable[[T], tuple[str, ...]],
+    ) -> tuple[T | None, tuple[str, ...]]:
+        schema = record_type.model_json_schema()
+        request: dict[str, object] = {
+            "model": client.request_identity,
+            "instructions": instructions,
+            "payload": payload,
+            "schema": schema,
+        }
+        key = fingerprint(request)
+        record = None if self._force else self._cache.get(key)
+        if record is not None and (
+            record.cache_key != key
+            or fingerprint(record.request) != key
+            or fingerprint(record.response_text) != record.response_sha256
+            or (record.errors and datetime.now(UTC) - record.created_at >= FAILED_STAGE_RETRY_AFTER)
+        ):
+            record = None
+        if record is None:
+            if self._calls >= self._max_calls:
+                self._budget_exhausted = True
+                return None, ("Достигнут предел обращений при исправлении разбора",)
+            self._calls += 1
+            started = monotonic()
+            response = ""
+            try:
+                response = client.complete_json(instructions, canonical_json(payload), schema)
+                _answer, errors = self._parse(response, record_type, validate)
+            except (RuntimeError, OSError) as error:
+                errors = (str(error) or "Не удалось получить разбор вакансии",)
+            record = StageRecord(
+                key,
+                stage,
+                client.request_identity,
+                request,
+                response,
+                fingerprint(response),
+                errors,
+                datetime.now(UTC),
+                monotonic() - started,
+            )
+            self._cache.put(record)
+        self._stages.append(record)
+        if not record.response_text:
+            return None, record.errors or ("Модель вернула пустой ответ",)
+        return self._parse(record.response_text, record_type, validate)
+
+    @staticmethod
+    def _parse[T: BaseModel](
+        response: str,
+        record_type: type[T],
+        validate: Callable[[T], tuple[str, ...]],
+    ) -> tuple[T | None, tuple[str, ...]]:
+        try:
+            answer = record_type.model_validate_json(response)
+        except ValidationError as error:
+            messages = tuple(
+                f"Поле {'.'.join(map(str, item['loc'])) or 'ответ'}: {item['msg']}"
+                for item in error.errors(include_input=False)
+            )
+            return None, messages
+        errors = validate(answer)
+        return (None, errors) if errors else (answer, ())
+
+
+class SemanticAnalyzer(StageAnalyzer):
     def __init__(
         self,
         extractor: StructuredClient,
@@ -90,16 +175,9 @@ class SemanticAnalyzer:
         max_calls: int = 6,
         force: bool = False,
     ) -> None:
-        if not 1 <= max_calls <= 6:
-            raise ValueError("Число обращений должно быть от 1 до 6")
+        super().__init__(cache, max_calls=max_calls, force=force)
         self._extractor = extractor
         self._matcher = matcher
-        self._cache = cache
-        self._max_calls = max_calls
-        self._force = force
-        self._calls = 0
-        self._budget_exhausted = False
-        self._stages: list[StageRecord] = []
 
     def analyze(self, lines: list[SourceLine], facts: list[ProfileFact]) -> AnalysisResult:
         self._calls = 0
@@ -232,77 +310,6 @@ class SemanticAnalyzer:
                 lambda value: matching_errors(lines, facts, extraction, value),
             )
         return answer, errors
-
-    def _stage[T: BaseModel](
-        self,
-        stage: str,
-        client: StructuredClient,
-        instructions: str,
-        payload: dict[str, object],
-        record_type: type[T],
-        validate: Callable[[T], tuple[str, ...]],
-    ) -> tuple[T | None, tuple[str, ...]]:
-        schema = record_type.model_json_schema()
-        request: dict[str, object] = {
-            "model": client.request_identity,
-            "instructions": instructions,
-            "payload": payload,
-            "schema": schema,
-        }
-        key = fingerprint(request)
-        record = None if self._force else self._cache.get(key)
-        if record is not None and (
-            record.cache_key != key
-            or fingerprint(record.request) != key
-            or fingerprint(record.response_text) != record.response_sha256
-            or (record.errors and datetime.now(UTC) - record.created_at >= FAILED_STAGE_RETRY_AFTER)
-        ):
-            record = None
-        if record is None:
-            if self._calls >= self._max_calls:
-                self._budget_exhausted = True
-                return None, ("Достигнут предел обращений при исправлении разбора",)
-            self._calls += 1
-            started = monotonic()
-            response = ""
-            try:
-                response = client.complete_json(instructions, canonical_json(payload), schema)
-                _answer, errors = self._parse(response, record_type, validate)
-            except (RuntimeError, OSError) as error:
-                errors = (str(error) or "Не удалось получить разбор вакансии",)
-            record = StageRecord(
-                key,
-                stage,
-                client.request_identity,
-                request,
-                response,
-                fingerprint(response),
-                errors,
-                datetime.now(UTC),
-                monotonic() - started,
-            )
-            self._cache.put(record)
-        self._stages.append(record)
-        if not record.response_text:
-            return None, record.errors or ("Модель вернула пустой ответ",)
-        return self._parse(record.response_text, record_type, validate)
-
-    @staticmethod
-    def _parse[T: BaseModel](
-        response: str,
-        record_type: type[T],
-        validate: Callable[[T], tuple[str, ...]],
-    ) -> tuple[T | None, tuple[str, ...]]:
-        try:
-            answer = record_type.model_validate_json(response)
-        except ValidationError as error:
-            messages = tuple(
-                f"Поле {'.'.join(map(str, item['loc'])) or 'ответ'}: {item['msg']}"
-                for item in error.errors(include_input=False)
-            )
-            return None, messages
-        errors = validate(answer)
-        return (None, errors) if errors else (answer, ())
 
     def _result(
         self,

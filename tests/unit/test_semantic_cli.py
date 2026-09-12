@@ -47,7 +47,7 @@ def test_cli_reads_or_analyzes_without_preparing_queue(
     )
     report = json.loads(output.read_text(encoding="utf-8"))
     assert report["status"] == ("ALLOW" if command == "analyze" else "REVIEW")
-    assert client.calls == (2 if command == "analyze" else 0)
+    assert client.calls == (1 if command == "analyze" else 0)
     assert report["hh_actions"] == 0
     database = create_database(settings)
     try:

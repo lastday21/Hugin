@@ -552,7 +552,7 @@ class BackgroundProcessService:
         from hugin.repositories.vacancies import _to_record
         from hugin.services.decision_evidence import fingerprint
         from hugin.services.semantic_results import StoredSelection, decision_from_stored
-        from hugin.services.semantic_snapshot import selection_snapshot, source_lines
+        from hugin.services.semantic_snapshot import selection_snapshot, selection_source_lines
 
         relevant = [
             (tracked, vacancy, direction)
@@ -570,6 +570,7 @@ class BackgroundProcessService:
                 and direction.scoring_config["semantic_selection"].get("enabled", True)
             }
         stages = {}
+        assessments: dict[int, list[SemanticStageModel]] = {}
         for row in self._session.scalars(
             select(SemanticStageModel)
             .where(
@@ -579,6 +580,8 @@ class BackgroundProcessService:
             .order_by(SemanticStageModel.id)
         ):
             stages[(row.vacancy_id, row.cache_key)] = row
+            if row.stage == "assess":
+                assessments.setdefault(row.vacancy_id, []).append(row)
         templates, result = {}, {}
         for tracked, vacancy, direction in relevant:
             identity = (direction.id, vacancy.id)
@@ -591,7 +594,12 @@ class BackgroundProcessService:
                 template = templates[direction.id]
                 if template is None:
                     continue
-                lines = source_lines(_to_record(vacancy))
+                lines = selection_source_lines(
+                    self._session,
+                    self._account_id,
+                    _to_record(vacancy),
+                    previous_stages=assessments.get(vacancy.id, ()),
+                )
                 snapshot = replace(
                     template,
                     vacancy_id=vacancy.id,
