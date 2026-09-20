@@ -67,7 +67,7 @@ def test_structured_analysis_has_its_own_schema_and_no_letter_instruction(
             stderr="",
         )
 
-    monkeypatch.setattr("hugin.adapters.codex_cli.subprocess.run", run)
+    monkeypatch.setattr("hugin.adapters.codex_cli.run_cli", run)
     client = make_client(tmp_path)
     assert client.complete_json("Правила", "Вакансия", schema) == '{"entries": []}'
     assert not paths[0].exists()
@@ -94,7 +94,7 @@ def test_structured_analysis_rejects_tool_use_and_cleans_schema(
             stderr="",
         )
 
-    monkeypatch.setattr("hugin.adapters.codex_cli.subprocess.run", run)
+    monkeypatch.setattr("hugin.adapters.codex_cli.run_cli", run)
     with pytest.raises(CodexCliError, match="инструмент"):
         make_client(tmp_path).complete_json("Правила", "Вакансия", {})
     assert not paths[0].exists()
@@ -111,7 +111,7 @@ def test_client_uses_subscription_login_without_api_key(
         calls.append((command, kwargs))
         return SimpleNamespace(returncode=0, stdout="Здравствуйте!\n\nГотовое письмо.\n", stderr="")
 
-    monkeypatch.setattr("hugin.adapters.codex_cli.subprocess.run", run)
+    monkeypatch.setattr("hugin.adapters.codex_cli.run_cli", run)
 
     result = make_client(tmp_path).complete("Правила", "Данные вакансии")
 
@@ -141,7 +141,7 @@ def test_client_reads_text_and_token_usage_from_json_events(
         )
     )
     monkeypatch.setattr(
-        "hugin.adapters.codex_cli.subprocess.run",
+        "hugin.adapters.codex_cli.run_cli",
         lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout=stdout, stderr=""),
     )
     executable = tmp_path / "codex.cmd"
@@ -186,7 +186,7 @@ def test_client_reports_safe_failure(
     message: str,
 ) -> None:
     monkeypatch.setattr(
-        "hugin.adapters.codex_cli.subprocess.run",
+        "hugin.adapters.codex_cli.run_cli",
         lambda *_args, **_kwargs: SimpleNamespace(
             returncode=return_code,
             stdout=stdout,
@@ -206,7 +206,7 @@ def test_client_reports_timeout(
         del kwargs
         raise subprocess.TimeoutExpired(command, 180)
 
-    monkeypatch.setattr("hugin.adapters.codex_cli.subprocess.run", timeout)
+    monkeypatch.setattr("hugin.adapters.codex_cli.run_cli", timeout)
 
     with pytest.raises(CodexCliError, match="Истекло время"):
         make_client(tmp_path).complete("Правила", "Задание")
@@ -229,7 +229,7 @@ def test_recruiter_reply_prompt_requests_an_answer(
         calls.append(kwargs)
         return SimpleNamespace(returncode=0, stdout="Готов обсудить вопрос.", stderr="")
 
-    monkeypatch.setattr("hugin.adapters.codex_cli.subprocess.run", run)
+    monkeypatch.setattr("hugin.adapters.codex_cli.run_cli", run)
     executable = tmp_path / "codex.cmd"
     executable.touch()
     client = CodexCliClient(
@@ -255,7 +255,7 @@ def test_reply_requirement_prompt_requests_only_a_decision(
         calls.append(kwargs)
         return SimpleNamespace(returncode=0, stdout="NO_REPLY_REQUIRED", stderr="")
 
-    monkeypatch.setattr("hugin.adapters.codex_cli.subprocess.run", run)
+    monkeypatch.setattr("hugin.adapters.codex_cli.run_cli", run)
     executable = tmp_path / "codex.cmd"
     executable.touch()
     client = CodexCliClient(
@@ -324,7 +324,7 @@ def test_failed_call_preserves_reported_usage_without_inventing_missing_values(
             stderr="Authorization: Bearer test-private-token",
         )
 
-    monkeypatch.setattr("hugin.adapters.codex_cli.subprocess.run", run)
+    monkeypatch.setattr("hugin.adapters.codex_cli.run_cli", run)
     journal = OperationJournal(tmp_path)
     client = CodexCliClient(tmp_path / "codex.cmd", tmp_path / "runtime", journal=journal)
     with pytest.raises(CodexCliError):

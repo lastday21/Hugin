@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 import shutil
+import signal
 import subprocess
+import sys
+import tempfile
+import time
+from contextlib import suppress
 from pathlib import Path
 from uuid import uuid4
 
@@ -13,6 +19,188 @@ from hugin.diagnostics import OperationJournal
 
 class CodexCliError(RuntimeError):
     pass
+
+
+class _WindowsProcessJob:
+    def __init__(self) -> None:
+        if sys.platform != "win32":
+            raise RuntimeError("Windows process job is unavailable")
+        from ctypes import wintypes
+
+        self._kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        self._kernel.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+        self._kernel.CreateJobObjectW.restype = wintypes.HANDLE
+        self._kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        self._kernel.OpenProcess.restype = wintypes.HANDLE
+        self._kernel.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        self._kernel.AssignProcessToJobObject.restype = wintypes.BOOL
+        self._kernel.QueryInformationJobObject.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            ctypes.c_void_p,
+        ]
+        self._kernel.QueryInformationJobObject.restype = wintypes.BOOL
+        self._kernel.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+        self._kernel.TerminateJobObject.restype = wintypes.BOOL
+        self._kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        self._kernel.CloseHandle.restype = wintypes.BOOL
+        self._handle = self._kernel.CreateJobObjectW(None, None)
+        if not self._handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+
+    def assign(self, pid: int) -> None:
+        handle = self._kernel.OpenProcess(0x0100 | 0x0001, False, pid)
+        if not handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            if not self._kernel.AssignProcessToJobObject(self._handle, handle):
+                raise ctypes.WinError(ctypes.get_last_error())
+        finally:
+            self._kernel.CloseHandle(handle)
+
+    def active(self) -> bool:
+        accounting = (ctypes.c_uint64 * 6)()
+        if not self._kernel.QueryInformationJobObject(
+            self._handle, 1, accounting, ctypes.sizeof(accounting), None
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return bool(accounting[5] & 0xFFFFFFFF)
+
+    def start(self, pid: int) -> None:
+        from ctypes import wintypes
+
+        class ThreadEntry(ctypes.Structure):
+            _fields_ = [
+                ("size", wintypes.DWORD),
+                ("usage", wintypes.DWORD),
+                ("thread_id", wintypes.DWORD),
+                ("process_id", wintypes.DWORD),
+                ("base_priority", wintypes.LONG),
+                ("delta_priority", wintypes.LONG),
+                ("flags", wintypes.DWORD),
+            ]
+
+        self._kernel.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+        self._kernel.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+        self._kernel.Thread32First.argtypes = [wintypes.HANDLE, ctypes.POINTER(ThreadEntry)]
+        self._kernel.Thread32First.restype = wintypes.BOOL
+        self._kernel.Thread32Next.argtypes = [wintypes.HANDLE, ctypes.POINTER(ThreadEntry)]
+        self._kernel.Thread32Next.restype = wintypes.BOOL
+        self._kernel.OpenThread.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        self._kernel.OpenThread.restype = wintypes.HANDLE
+        self._kernel.ResumeThread.argtypes = [wintypes.HANDLE]
+        self._kernel.ResumeThread.restype = wintypes.DWORD
+        snapshot = self._kernel.CreateToolhelp32Snapshot(4, 0)
+        if snapshot == ctypes.c_void_p(-1).value:
+            raise ctypes.WinError(ctypes.get_last_error())
+        entry = ThreadEntry()
+        entry.size = ctypes.sizeof(entry)
+        try:
+            available = self._kernel.Thread32First(snapshot, ctypes.byref(entry))
+            while available:
+                if entry.process_id == pid:
+                    handle = self._kernel.OpenThread(2, False, entry.thread_id)
+                    if not handle:
+                        raise ctypes.WinError(ctypes.get_last_error())
+                    try:
+                        if self._kernel.ResumeThread(handle) == 0xFFFFFFFF:
+                            raise ctypes.WinError(ctypes.get_last_error())
+                        return
+                    finally:
+                        self._kernel.CloseHandle(handle)
+                available = self._kernel.Thread32Next(snapshot, ctypes.byref(entry))
+            raise OSError("Не найден поток запуска программы создания текста")
+        finally:
+            self._kernel.CloseHandle(snapshot)
+
+    def stop(self) -> None:
+        if not self._kernel.TerminateJobObject(self._handle, 1):
+            raise ctypes.WinError(ctypes.get_last_error())
+
+    def close(self) -> None:
+        self._kernel.CloseHandle(self._handle)
+
+
+def run_cli(
+    command: list[str], *, input: str, timeout: float, env: dict[str, str]
+) -> subprocess.CompletedProcess[str]:
+    if sys.platform != "win32":
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            start_new_session=True,
+        )
+        try:
+            stdout, stderr = process.communicate(input.encode("utf-8"), timeout=timeout)
+        except BaseException:
+            with suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=5)
+            raise
+        return subprocess.CompletedProcess(
+            command,
+            process.returncode,
+            stdout.decode("utf-8", errors="replace"),
+            stderr.decode("utf-8", errors="replace"),
+        )
+    with (
+        tempfile.TemporaryFile() as incoming,
+        tempfile.TemporaryFile() as outgoing,
+        tempfile.TemporaryFile() as errors,
+    ):
+        incoming.write(input.encode("utf-8"))
+        incoming.seek(0)
+        job = _WindowsProcessJob()
+        process: subprocess.Popen[bytes] | None = None
+        deadline = time.monotonic() + timeout
+        try:
+            process = subprocess.Popen(
+                command,
+                stdin=incoming,
+                stdout=outgoing,
+                stderr=errors,
+                env=env,
+                creationflags=subprocess.CREATE_NO_WINDOW | 0x00000004,
+            )
+            job.assign(process.pid)
+            if time.monotonic() >= deadline:
+                raise subprocess.TimeoutExpired(command, timeout)
+            job.start(process.pid)
+            process.wait(timeout=max(0, deadline - time.monotonic()))
+            while job.active():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(command, timeout)
+                time.sleep(min(0.02, remaining))
+        except BaseException as error:
+            with suppress(OSError):
+                job.stop()
+            if process is not None:
+                if process.poll() is None:
+                    process.kill()
+                process.wait(timeout=5)
+            if isinstance(error, subprocess.TimeoutExpired):
+                outgoing.seek(0)
+                errors.seek(0)
+                raise subprocess.TimeoutExpired(
+                    command, timeout, output=outgoing.read(), stderr=errors.read()
+                ) from None
+            raise
+        finally:
+            job.close()
+        outgoing.seek(0)
+        errors.seek(0)
+        return subprocess.CompletedProcess(
+            command,
+            process.returncode,
+            outgoing.read().decode("utf-8", errors="replace"),
+            errors.read().decode("utf-8", errors="replace"),
+        )
 
 
 def default_codex_cli_path() -> Path:
@@ -166,19 +354,11 @@ class CodexCliClient:
         environment.pop("OPENAI_API_KEY", None)
         environment.pop("CODEX_API_KEY", None)
         try:
-            result = subprocess.run(
+            result = run_cli(
                 command,
                 input=prompt,
-                capture_output=True,
-                text=True,
                 timeout=self._timeout_seconds,
-                check=False,
-                encoding="utf-8",
-                errors="replace",
                 env=environment,
-                creationflags=(
-                    getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
-                ),
             )
         except subprocess.TimeoutExpired as error:
             failure = CodexCliError("Истекло время ожидания ответа модели")

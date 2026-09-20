@@ -33,7 +33,7 @@ def test_codex_failure_keeps_raw_response_out_of_public_journal(
             raise OSError("unavailable")
         return SimpleNamespace(returncode=1 if failure == "nonzero" else 0, stdout=raw, stderr="")
 
-    monkeypatch.setattr("hugin.adapters.codex_cli.subprocess.run", run)
+    monkeypatch.setattr("hugin.adapters.codex_cli.run_cli", run)
     journal = OperationJournal(tmp_path)
     with pytest.raises(CodexCliError):
         CodexCliClient(executable, tmp_path / "runtime", journal=journal).complete("rule", "input")
