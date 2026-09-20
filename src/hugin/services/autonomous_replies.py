@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import hashlib
+import json
+from base64 import urlsafe_b64encode
 from collections.abc import Callable, Collection
 from dataclasses import dataclass
 
@@ -41,6 +44,7 @@ from hugin.services.recruiter_reply_policy import (
     repeated_incoming_already_answered,
     requested_external_action_kind,
     unresolved_action_position_before_invitation_reminder,
+    verified_experience_reply_is_safe,
 )
 from hugin.services.recruiter_reply_requirement import (
     ReplyRequirement,
@@ -52,9 +56,28 @@ _BLOCKING_INVITATION_TITLES = (
     "Приглашение на собеседование",
     "Задание от работодателя",
 )
-_GENERATED_REPLY_APPROVAL_KEY = "model_safe_v1"
+_GENERATED_REPLY_APPROVAL_KEY = "model_safe_v2"
+_CHECKLIST_APPROVAL_PREFIX = "checklist_v1:"
 _SALARY_EXPECTATION_APPROVAL_KEY = "salary_expectation_120_net"
 _SALARY_EXPECTATION_REPLY = "Мои зарплатные ожидания — 120 000 рублей на руки."
+
+
+def _checklist_approval_key(
+    incoming_id: int, incoming_body: str, message_id: int, body: str, version: int
+) -> str:
+    payload = json.dumps(
+        [incoming_id, incoming_body, message_id, body, version], ensure_ascii=False
+    ).encode("utf-8")
+    digest = urlsafe_b64encode(hashlib.sha256(payload).digest()).decode("ascii").rstrip("=")
+    return _CHECKLIST_APPROVAL_PREFIX + digest
+
+
+def _verified_checklist_approval(
+    state: ApplicationState, incoming: RecruiterMessageModel, message: RecruiterMessageModel
+) -> bool:
+    return message.reply_template_key == _checklist_approval_key(
+        incoming.id, incoming.body, message.id, message.body, message.version
+    ) and verified_experience_reply_is_safe(state, incoming.body, message.body)
 
 
 @dataclass(frozen=True, slots=True)
@@ -299,7 +322,15 @@ class AutonomousReplyService:
                     RecruiterReplyDisposition.AMBIGUOUS,
                 }
             )
+            checklist_send_blocked = (
+                recovered_before_reminder
+                or application_id in blocked_applications
+                or disposition is not RecruiterReplyDisposition.REVIEW_DRAFT
+            )
             if outgoing is not None and outgoing.id > incoming.id:
+                checklist_reply_is_safe = _verified_checklist_approval(
+                    application_state, incoming, outgoing
+                )
                 generated_reply_is_safe = (
                     outgoing.reply_template_key == _GENERATED_REPLY_APPROVAL_KEY
                     and classify_recruiter_reply(
@@ -324,6 +355,7 @@ class AutonomousReplyService:
                     and outgoing.auto_send_approved
                     and (
                         generated_reply_is_safe
+                        or checklist_reply_is_safe
                         or salary_reply_is_safe
                         or (
                             template is not None
@@ -332,7 +364,10 @@ class AutonomousReplyService:
                         )
                     )
                     and policy.auto_send_approved_replies
-                    and not automatic_send_blocked
+                    and (
+                        not automatic_send_blocked
+                        or (checklist_reply_is_safe and not checklist_send_blocked)
+                    )
                     and outgoing.content_hash is not None
                 ):
                     confirmed = communications.confirm_outgoing_retry(
@@ -491,11 +526,12 @@ class AutonomousReplyService:
                     model = model_factory()
                 if can_continue is not None and not can_continue():
                     break
-                draft = RecruiterReplyService(self._session, model).generate(
+                reviewed = RecruiterReplyService(self._session, model).generate_reviewed(
                     account_id=account_id,
                     application_id=application_id,
                     incoming_message_id=incoming.id,
                 )
+                draft = reviewed.message
             except (
                 CodexCliError,
                 CommunicationStateError,
@@ -511,12 +547,26 @@ class AutonomousReplyService:
                     incoming.body,
                     draft.body,
                 )
+                checklist_reply_is_safe = (
+                    reviewed.review.supported
+                    and reviewed.review.complete
+                    and not reviewed.review.questions
+                    and not checklist_send_blocked
+                    and verified_experience_reply_is_safe(
+                        application_state, incoming.body, draft.body
+                    )
+                )
                 if (
                     policy.auto_send_approved_replies
                     and (can_continue is None or can_continue())
                     and incoming.id in auto_send_incoming_ids
-                    and not automatic_send_blocked
-                    and generated_disposition is RecruiterReplyDisposition.AUTOMATIC_DRAFT
+                    and (
+                        checklist_reply_is_safe
+                        or (
+                            not automatic_send_blocked
+                            and generated_disposition is RecruiterReplyDisposition.AUTOMATIC_DRAFT
+                        )
+                    )
                     and draft.content_hash is not None
                 ):
                     approved_draft = communications.approve_outgoing_for_automatic_send(
@@ -524,7 +574,17 @@ class AutonomousReplyService:
                         message_id=draft.id,
                         content_version=draft.content_version,
                         content_hash=draft.content_hash,
-                        approval_key=_GENERATED_REPLY_APPROVAL_KEY,
+                        approval_key=(
+                            _checklist_approval_key(
+                                incoming.id,
+                                incoming.body,
+                                draft.id,
+                                draft.body,
+                                draft.content_version,
+                            )
+                            if checklist_reply_is_safe
+                            else _GENERATED_REPLY_APPROVAL_KEY
+                        ),
                     )
                     confirmed = communications.confirm_outgoing_draft(
                         account_id=account_id,
@@ -630,6 +690,9 @@ class AutonomousReplyService:
                 or not is_simple_salary_expectation_question(incoming.body)
                 or not is_exact_120_net_salary_response(message.body)
             ):
+                return False
+        elif message.reply_template_key.startswith(_CHECKLIST_APPROVAL_PREFIX):
+            if not _verified_checklist_approval(application.state, incoming, message):
                 return False
         elif message.reply_template_key == _GENERATED_REPLY_APPROVAL_KEY:
             disposition = classify_recruiter_reply(

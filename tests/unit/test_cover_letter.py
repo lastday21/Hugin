@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 
 import pytest
 from sqlalchemy import select
@@ -428,7 +429,7 @@ def test_prepare_saves_quality_score_and_corrects_letter_once(settings: Settings
             assert letter.text == _without_generic_closing(_alternative_letter())
             assert letter.quality_score == 9
             assert letter.quality_passed is True
-            assert letter.quality_version == "cover_letter_quality_v1"
+            assert letter.quality_version == "cover_letter_quality_v4"
             assert letter.quality_model_name == judge.model_name
             assert letter.quality_checked_at is not None
             assert letter.quality_details is not None
@@ -721,7 +722,22 @@ def test_legacy_ready_letter_is_rebuilt_before_sending(settings: Settings) -> No
         database.close()
 
 
-def test_related_publication_reuses_sent_letter_without_models(settings: Settings) -> None:
+@pytest.mark.parametrize(
+    "change",
+    [
+        "unchanged",
+        "blank_lines",
+        "conditions",
+        "profile",
+        "duties",
+        "revise",
+        "invalid_review",
+        "no_judge",
+    ],
+)
+def test_related_publication_checks_old_letter_before_rewriting(
+    settings: Settings, change: str
+) -> None:
     upgrade_database(settings)
     database = create_database(settings)
     try:
@@ -732,7 +748,15 @@ def test_related_publication_reuses_sent_letter_without_models(settings: Setting
             )
             source_writer = FakeModel([_letter()])
             source_writer.model_name = "old-writer"
-            CoverLetterService(session, source_writer).prepare(
+            first = session.get(VacancyModel, vacancy_ids[0])
+            second = session.get(VacancyModel, vacancy_ids[1])
+            assert first is not None and second is not None
+            second.description = first.description
+            second.responsibilities = first.responsibilities
+            second.required_qualifications = first.required_qualifications
+            session.flush()
+            source_judge = FakeModel([_quality_response()])
+            CoverLetterService(session, source_writer, quality_model=source_judge).prepare(
                 account_id=account_id,
                 direction_name="Python backend",
                 vacancy_hh_id="letter-1",
@@ -740,14 +764,29 @@ def test_related_publication_reuses_sent_letter_without_models(settings: Setting
             source = session.scalar(select(CoverLetterModel))
             assert source is not None
             source.state = CoverLetterState.SENT
+            if change == "blank_lines":
+                second.description = "\n\n" + (first.description or "").replace("\n", "\n\n")
+            if change in {"conditions", "revise", "invalid_review", "no_judge"}:
+                second.employment = "Частичная занятость"
+            elif change == "profile":
+                fact = session.scalar(
+                    select(VerifiedFactModel).where(VerifiedFactModel.allow_in_letters.is_(True))
+                )
+                assert fact is not None
+                fact.content = fact.content.replace(
+                    "Разрабатывал серверные", "Разрабатывал и сопровождал серверные"
+                )
+            elif change == "duties":
+                second.responsibilities = (
+                    "Развивать серверные интеграции и автоматические проверки."
+                )
 
-            target_application = ApplicationRepository(session).create_apply_intent(
+            target_application = ApplicationRepository(session).get_by_key(
                 account_id,
                 vacancy_ids[1],
                 resume_id,
-                direction_id,
             )
-            QueueTaskRepository(session).enqueue(target_application.id, 85)
+            assert target_application is not None
             tracked = session.scalar(
                 select(DirectionVacancyModel).where(
                     DirectionVacancyModel.direction_id == direction_id,
@@ -758,16 +797,56 @@ def test_related_publication_reuses_sent_letter_without_models(settings: Setting
             tracked.state = VacancyState.QUEUED
             session.flush()
 
-            unused_writer = FakeModel([])
+            unused_writer = FakeModel(
+                [_alternative_letter()] if change in {"revise", "no_judge"} else []
+            )
             unused_writer.model_name = "new-writer"
-            result = CoverLetterService(session, unused_writer).prepare(
+            responses = [] if change in {"unchanged", "blank_lines"} else [_quality_response()]
+            if change == "revise":
+                responses.insert(0, _quality_response(hard_failure="Условия работы изменились"))
+            elif change == "invalid_review":
+                responses = ["invalid JSON"]
+            judge = FakeModel(responses)
+            service = CoverLetterService(
+                session, unused_writer, quality_model=None if change == "no_judge" else judge
+            )
+            result = service.prepare(
                 account_id=account_id,
                 direction_name="Python backend",
                 vacancy_hh_id="letter-2",
             )
 
+            if change in {"revise", "no_judge"}:
+                assert result.generated == 1
+                assert len(unused_writer.prompts) == 1
+                assert len(judge.prompts) == (2 if change == "revise" else 0)
+                return
+            if change == "invalid_review":
+                assert result.failed == 1
+                assert result.reused == 0
+                assert unused_writer.prompts == []
+                assert len(judge.prompts) == 1
+                judge.responses.append(_quality_response())
+                retry = service.prepare(
+                    account_id=account_id,
+                    direction_name="Python backend",
+                    vacancy_hh_id="letter-2",
+                )
+                assert retry.failed == 0
+                assert retry.already_ready == 1
+                assert unused_writer.prompts == []
+                assert len(judge.prompts) == 2
+                return
             assert result.reused == 1
             assert unused_writer.prompts == []
+            assert len(judge.prompts) == (0 if change in {"unchanged", "blank_lines"} else 1)
+            if change == "conditions":
+                assert "Частичная занятость" in judge.prompts[0][1]
+            elif change == "profile":
+                assert "Разрабатывал и сопровождал серверные" in judge.prompts[0][1]
+            elif change == "duties":
+                assert second.responsibilities is not None
+                assert second.responsibilities in judge.prompts[0][1]
             target = session.scalar(
                 select(CoverLetterModel).where(CoverLetterModel.id != source.id)
             )
@@ -776,6 +855,27 @@ def test_related_publication_reuses_sent_letter_without_models(settings: Setting
             assert target.reused_from_id == source.id
             assert target.model_name == "old-writer"
             assert target.generation_mode is CoverLetterGenerationMode.DUPLICATE_REUSE
+            assert target.quality_passed is True
+            assert target.quality_details == source.quality_details
+            if change == "unchanged":
+                service.validate_for_submission(
+                    application_id=target.application_id, letter_id=target.id
+                )
+                for field, value in (
+                    ("address", "Новый адрес"),
+                    ("salary_from", Decimal(0)),
+                    ("salary_to", Decimal(200000)),
+                    ("salary_currency", "USD"),
+                    ("salary_gross", False),
+                ):
+                    previous = getattr(second, field)
+                    assert previous != value
+                    setattr(second, field, value)
+                    with pytest.raises(ValueError, match="изменились"):
+                        service.validate_for_submission(
+                            application_id=target.application_id, letter_id=target.id
+                        )
+                    setattr(second, field, previous)
     finally:
         database.close()
 
@@ -1733,10 +1833,10 @@ def test_repeated_vacancy_focus_failure_stops_after_one_correction(
         database.close()
 
 
-def test_related_publication_is_not_prepared_twice(settings: Settings) -> None:
+def test_distinct_publication_numbers_get_separate_preparations(settings: Settings) -> None:
     upgrade_database(settings)
     database = create_database(settings)
-    model = FakeModel([_letter()])
+    model = FakeModel([_letter(), _alternative_letter()])
     try:
         with database.sessions.begin() as session:
             account_id, _, _, vacancy_ids = _prepare_data(session, with_duplicate=True)
@@ -1745,13 +1845,13 @@ def test_related_publication_is_not_prepared_twice(settings: Settings) -> None:
                 direction_name="Python backend",
             )
 
-            assert result.generated == 1
+            assert result.generated == 2
             assert result.reused == 0
-            assert len(model.prompts) == 1
+            assert len(model.prompts) == 2
             letters = list(session.scalars(select(CoverLetterModel).order_by(CoverLetterModel.id)))
             applications = list(session.scalars(select(ApplicationModel)))
-            assert len(letters) == 1
-            assert len(applications) == 1
+            assert len(letters) == 2
+            assert len(applications) == 2
             assert applications[0].vacancy_id == vacancy_ids[0]
             assert letters[0].application_id == applications[0].id
     finally:
@@ -2985,9 +3085,9 @@ def test_prompt_normalization_and_context_selection() -> None:
     assert "1–2 наиболее подходящих проекта" in prompt
     assert "не смешивай сведения разных должностей и проектов" in prompt
     assert "нет требуемой технологии" in prompt
-    assert "Прямого опыта с ..." in prompt
+    assert "отсутствие сведений не означает отсутствие опыта" in prompt
     assert "подтвержденный пример" in prompt
-    assert "не ставь эту фразу в начало или конец письма" in prompt
+    assert "НУЖНО УТОЧНИТЬ" in prompt
     assert "не заменяй прямой ответ" in prompt
     assert "Особенность структуры именно этого письма" in prompt
     assert "Перед ответом молча проверь готовый текст" in prompt
@@ -3304,7 +3404,7 @@ def test_relevant_but_unconfirmed_technology_is_rejected(
     assert error.value.code == "UNCONFIRMED_SPECIALIST_TERM"
 
 
-def test_honest_absence_of_unconfirmed_technology_is_allowed() -> None:
+def test_confirmed_absence_of_technology_is_allowed() -> None:
     text = (
         "Здравствуйте!\n\nПрямого опыта с Airflow у меня пока нет. Разрабатывал серверные "
         "приложения на Python и FastAPI, работал с PostgreSQL и настраивал автоматические "
@@ -3316,7 +3416,11 @@ def test_honest_absence_of_unconfirmed_technology_is_allowed() -> None:
     vacancy = _vacancy()
     vacancy.description = "Откликайся и опиши опыт работы с Airflow."
 
-    validate_cover_letter(text, vacancy, _fact())
+    facts = (
+        *_fact(),
+        _SelectedFact(2, "work_experience", "Прямого опыта с Airflow у меня пока нет."),
+    )
+    validate_cover_letter(text, vacancy, facts)
 
 
 def test_letter_listing_several_missing_key_technologies_is_rejected() -> None:
@@ -3370,7 +3474,40 @@ def test_marketplace_experience_request_accepts_honest_answer() -> None:
     vacancy = _vacancy()
     vacancy.description = "Откликайся и опиши опыт ИМЕННО С ИНТЕГРАЦИЕЙ ДЛЯ МАРКЕТПЛЕЙСОВ."
 
-    validate_cover_letter(text, vacancy, _fact())
+    facts = (
+        *_fact(),
+        _SelectedFact(
+            2, "work_experience", "Прямого опыта интеграций с маркетплейсами у меня пока нет."
+        ),
+    )
+    validate_cover_letter(text, vacancy, facts)
+
+
+@pytest.mark.parametrize("topic", ["PI", "Flutter", "Google Sheets API", "fintech"])
+def test_unknown_experience_cannot_be_denied_in_letter(topic: str) -> None:
+    text = _letter().replace(
+        "Здравствуйте!", f"Здравствуйте!\n\nПрямого опыта с {topic} у меня пока нет."
+    )
+    with pytest.raises(CoverLetterValidationError) as error:
+        validate_cover_letter(text, _vacancy(), _fact())
+    assert error.value.code == "UNCONFIRMED_NEGATIVE_EXPERIENCE"
+
+
+def test_missing_experience_answer_requests_a_fact_instead_of_a_denial() -> None:
+    vacancy = _vacancy()
+    vacancy.description = "Откликайся и опиши опыт работы с Airflow."
+    with pytest.raises(CoverLetterValidationError) as error:
+        validate_cover_letter(_letter(), vacancy, _fact())
+    assert error.value.code == "MISSING_REQUIRED_EXPERIENCE_ANSWER"
+    assert "уточнить" in str(error.value)
+    assert "опыта пока нет" not in str(error.value)
+
+
+def test_long_clarification_marker_cannot_be_sent() -> None:
+    text = _letter() + "\n[НУЖНО УТОЧНИТЬ: " + "подробности опыта " * 8 + "]"
+    with pytest.raises(CoverLetterValidationError) as error:
+        validate_cover_letter(text, _vacancy(), _fact())
+    assert error.value.code == "PLACEHOLDER"
 
 
 def test_specialist_term_boundaries_do_not_match_storage() -> None:

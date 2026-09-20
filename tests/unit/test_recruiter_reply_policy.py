@@ -13,7 +13,9 @@ from hugin.services.recruiter_reply_policy import (
     classify_recruiter_reply,
     repeated_incoming_already_answered,
     requested_external_action_kind,
+    requires_review_draft,
     unresolved_action_position_before_invitation_reminder,
+    verified_experience_reply_is_safe,
 )
 
 
@@ -22,6 +24,156 @@ class HistoryMessage:
     body: str
     direction: MessageDirection
     state: RecruiterMessageState
+
+
+@pytest.mark.parametrize(
+    ("technical", "scheduling"),
+    [
+        ("Разрабатывал серверную часть приложения.", "Готов обсудить через час."),
+        ("Python использовал в серверной части CartCase.", "Готов работать 20 часов в неделю."),
+        ("Обработал датасет на Python.", "Подтверждаю дату 25 сентября."),
+        ("Работал с датасетами.", "Какие даты вам подходят?"),
+        ("Настроил среду разработки.", "Могу в среду."),
+        ("Работал в среде разработки PyCharm.", "Могу по средам."),
+        ("Среда разработки настроена.", "Среда подходит."),
+        ("Использовал средства автоматизации.", "Встреча в среду в 15:00."),
+    ],
+)
+def test_technical_terms_are_not_scheduling(technical: str, scheduling: str) -> None:
+    incoming = "Ответьте на чек-лист об опыте: Python."
+    assert not requires_review_draft(technical)
+    assert verified_experience_reply_is_safe(ApplicationState.APPLIED, incoming, technical)
+    assert requires_review_draft(scheduling)
+    assert not verified_experience_reply_is_safe(ApplicationState.APPLIED, incoming, scheduling)
+    assert requires_review_draft(technical + " " + scheduling)
+    assert (
+        classify_recruiter_reply(ApplicationState.APPLIED, "Расскажите об опыте.", technical)
+        is RecruiterReplyDisposition.AUTOMATIC_DRAFT
+    )
+    assert (
+        classify_recruiter_reply(ApplicationState.APPLIED, "Расскажите об опыте.", scheduling)
+        is RecruiterReplyDisposition.REVIEW_DRAFT
+    )
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Выбор дат",
+        "С датой определился",
+        "По датам согласен",
+        "Обсудим даты",
+        "На час",
+        "Через два часа",
+        "О часе",
+        "За часом",
+        "Рабочие часы",
+        "Двадцать часов",
+        "По часам",
+        "Работа часами",
+        "В часах",
+        "Часовой пояс",
+        "В среду",
+        "По средам",
+        "До среды",
+        "К среде",
+        "Между средой и пятницей",
+    ],
+)
+def test_scheduling_word_forms_remain_for_review(text: str) -> None:
+    assert requires_review_draft(text)
+
+
+def test_confirmation_code_remains_manual() -> None:
+    assert (
+        classify_recruiter_reply(ApplicationState.APPLIED, "Пришлите код подтверждения.")
+        is RecruiterReplyDisposition.MANUAL
+    )
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        "Пришлите паспорт.",
+        "Выполните тестовое задание.",
+        "Заполните форму https://example.com/form.",
+        "Напишите в Telegram.",
+        "Когда удобно собеседование?",
+        "Какая зарплата вас устроит?",
+        "Позвоните по номеру +7 999 123 45 67.",
+    ],
+)
+@pytest.mark.parametrize("in_response", [False, True])
+def test_verified_checklist_preserves_other_restrictions(extra: str, in_response: bool) -> None:
+    incoming = "Ответьте на чек-лист об опыте: Python; SQL."
+    response = "Использовал Python и SQL в CartCase."
+    assert verified_experience_reply_is_safe(ApplicationState.APPLIED, incoming, response)
+    assert not verified_experience_reply_is_safe(
+        ApplicationState.APPLIED,
+        incoming + (" " + extra if not in_response else ""),
+        response + (" " + extra if in_response else ""),
+    )
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "Просим ответить на чек-лист об опыте: [ ] Python; [ ] Написание кода; "
+        "[ ] Разработка тестов и выполнение заданий команды.",
+        "Заполните здесь анкету об опыте: какой код вы писали на Python?",
+    ),
+)
+def test_experience_questionnaire_can_be_prepared_without_external_action(text: str) -> None:
+    assert classify_recruiter_reply(ApplicationState.APPLIED, text) is (
+        RecruiterReplyDisposition.REVIEW_DRAFT
+    )
+    assert requested_external_action_kind(text) is None
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "Заполните анкету об опыте на сайте https://example.com/form",
+        "Ответьте на чек-лист об опыте и выполните тестовое задание.",
+        "Ответьте на вопросы об опыте и пришлите паспорт.",
+        "Заполните анкету об опыте в нашем боте Telegram.",
+    ),
+)
+def test_questionnaire_does_not_hide_external_actions(text: str) -> None:
+    assert classify_recruiter_reply(ApplicationState.APPLIED, text) is (
+        RecruiterReplyDisposition.MANUAL
+    )
+
+
+def test_missing_candidate_fact_cannot_be_sent_automatically() -> None:
+    assert (
+        classify_recruiter_reply(
+            ApplicationState.APPLIED,
+            "Какой у вас опыт с PostgreSQL?",
+            "[НУЖНО УТОЧНИТЬ: опыт работы с PostgreSQL]",
+        )
+        is RecruiterReplyDisposition.REVIEW_DRAFT
+    )
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "У вас есть опыт работы в fintech",
+        "У вас опыт работы с PostgreSQL",
+        "Есть у вас опыт с Java",
+    ],
+)
+def test_direct_experience_question_does_not_need_a_question_mark(text: str) -> None:
+    assert classify_recruiter_reply(ApplicationState.APPLIED, text) is (
+        RecruiterReplyDisposition.AUTOMATIC_DRAFT
+    )
+    assert (
+        classify_recruiter_reply(
+            ApplicationState.APPLIED, text, "[НУЖНО УТОЧНИТЬ: есть ли такой опыт]"
+        )
+        is RecruiterReplyDisposition.REVIEW_DRAFT
+    )
 
 
 @pytest.mark.parametrize(

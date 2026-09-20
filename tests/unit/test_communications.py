@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 from typing import Never
 
@@ -18,7 +19,12 @@ from hugin.database import (
     downgrade_database,
     upgrade_database,
 )
-from hugin.database.models import CandidateProfileModel, IncidentModel, VerifiedFactModel
+from hugin.database.models import (
+    CandidateProfileModel,
+    IncidentModel,
+    RecruiterMessageModel,
+    VerifiedFactModel,
+)
 from hugin.domain.communications import (
     CommunicationNotFoundError,
     CommunicationStateError,
@@ -58,8 +64,68 @@ class ReplyModel:
     def complete(self, _system_prompt: str, _user_prompt: str) -> str:
         return "Здравствуйте! Готов обсудить вопрос."
 
+    def complete_json(self, system_prompt: str, user_prompt: str, schema: dict[str, object]) -> str:
+        return json.dumps(
+            {"supported": True, "complete": True, "questions": [], "reason": "Проверено"}
+        )
 
-class UnsafeReplyModel:
+
+def test_experience_checklist_prepares_once_and_preserves_existing_draft(
+    settings: Settings,
+) -> None:
+    class IncompleteReplyModel(ReplyModel):
+        def complete_json(
+            self, system_prompt: str, user_prompt: str, schema: dict[str, object]
+        ) -> str:
+            return json.dumps(
+                {
+                    "supported": True,
+                    "complete": False,
+                    "questions": ["Уточните опыт SQL"],
+                    "reason": "Не хватает ответа",
+                }
+            )
+
+    database = create_database(settings)
+    try:
+        with database.sessions.begin() as session:
+            account_id, application_id = create_application(
+                session, account_label="Перечень вопросов", vacancy_hh_id="experience-checklist"
+            )
+            communications = CommunicationService(session, RecordingMessageSender())
+            incoming = communications.save_incoming(
+                application_id=application_id,
+                hh_id="checklist",
+                body="Ответьте на чек-лист об опыте: [ ] Написание кода Python; [ ] SQL.",
+            )
+            service = AutonomousReplyService(session)
+            batch = service.prepare(
+                account_id=account_id,
+                incoming_message_ids=(incoming.id,),
+                model_factory=IncompleteReplyModel,
+            )
+            assert batch.drafts_created == 1 and batch.approved == ()
+            draft = next(
+                m
+                for m in communications.messages(account_id)
+                if m.direction is MessageDirection.OUTGOING
+            )
+            edited = communications.edit_outgoing_draft(
+                account_id=account_id, message_id=draft.id, body="Мой сохранённый черновик"
+            )
+            repeated = service.prepare(
+                account_id=account_id,
+                incoming_message_ids=(incoming.id,),
+                model_factory=IncompleteReplyModel,
+            )
+            assert repeated.drafts_created == 0 and repeated.approved == ()
+            actual = next(m for m in communications.messages(account_id) if m.id == edited.id)
+            assert actual.body == edited.body and actual.content_version == edited.content_version
+    finally:
+        database.close()
+
+
+class UnsafeReplyModel(ReplyModel):
     model_name = "unsafe-reply-test"
 
     def complete(self, _system_prompt: str, _user_prompt: str) -> str:
@@ -1125,7 +1191,7 @@ def test_hh_invitation_reminder_prepares_draft_for_unanswered_question(
     upgrade_database(settings)
     database = create_database(settings)
 
-    class ReminderReplyModel:
+    class ReminderReplyModel(ReplyModel):
         model_name = "reminder-reply-test"
 
         def __init__(self) -> None:
@@ -1624,6 +1690,148 @@ def test_new_safe_question_gets_model_reply_approved_for_send(
                 content_version=approved.content_version,
                 content_hash=approved.content_hash,
             )
+            stored = session.get(RecruiterMessageModel, approved.message_id)
+            assert stored is not None
+            stored.reply_template_key = "model_safe_v1"
+            session.flush()
+            assert not AutonomousReplyService(session).approved_for_send(
+                account_id=account_id,
+                message_id=approved.message_id,
+                content_version=approved.content_version,
+                content_hash=approved.content_hash,
+            )
+    finally:
+        database.close()
+
+
+@pytest.mark.parametrize("review_result", ["complete", "incomplete", "unsupported", "invalid"])
+@pytest.mark.parametrize(
+    "change",
+    ["question", "draft", "failed", "unknown", "disabled", "disabled_initial", "backlog", "none"],
+)
+def test_verified_experience_checklist_has_automatic_path(
+    settings: Settings,
+    review_result: str,
+    change: str,
+) -> None:
+    complete = review_result == "complete"
+
+    class ChecklistModel(ReplyModel):
+        def complete(self, _system_prompt: str, _user_prompt: str) -> str:
+            return "Python и SQL использовал при разработке серверной части CartCase."
+
+        def complete_json(
+            self, system_prompt: str, user_prompt: str, schema: dict[str, object]
+        ) -> str:
+            if review_result == "invalid":
+                return "не JSON"
+            return json.dumps(
+                {
+                    "supported": review_result != "unsupported",
+                    "complete": complete,
+                    "questions": [] if complete else ["Уточните опыт SQL"],
+                    "reason": "Проверены факты",
+                }
+            )
+
+    database = create_database(settings)
+    try:
+        with database.sessions.begin() as session:
+            account_id, application_id = create_application(
+                session, account_label="Проверенная анкета", vacancy_hh_id="verified-checklist"
+            )
+            profile = CandidateProfileModel(account_id=account_id, display_name="Кандидат")
+            session.add(profile)
+            session.flush()
+            session.add(
+                VerifiedFactModel(
+                    profile_id=profile.id,
+                    category="project",
+                    content="Python и SQL использовал при разработке серверной части CartCase.",
+                    source_type="user",
+                    state=ConfirmationState.CONFIRMED,
+                    allow_in_messages=True,
+                )
+            )
+            session.flush()
+            communications = CommunicationService(session, RecordingMessageSender())
+            incoming = communications.save_incoming(
+                application_id=application_id,
+                hh_id="verified-checklist",
+                body="Ответьте на чек-лист об опыте: Python; SQL.",
+            )
+            service = AutonomousReplyService(session)
+            if change == "disabled_initial":
+                AutonomyPolicyService(session).update(
+                    {**DEFAULT_AUTONOMY_POLICY, "auto_send_approved_replies": False}
+                )
+            batch = service.prepare(
+                account_id=account_id,
+                incoming_message_ids=() if change == "backlog" else (incoming.id,),
+                include_backlog=change == "backlog",
+                model_factory=ChecklistModel,
+            )
+            assert batch.drafts_created == int(review_result in {"complete", "incomplete"})
+            assert batch.failed == int(review_result in {"unsupported", "invalid"})
+            assert len(batch.approved) == int(
+                complete and change not in {"backlog", "disabled_initial"}
+            )
+            if complete and change not in {"backlog", "disabled_initial"}:
+                approved = batch.approved[0]
+                assert service.approved_for_send(
+                    account_id=account_id,
+                    message_id=approved.message_id,
+                    content_version=approved.content_version,
+                    content_hash=approved.content_hash,
+                )
+                stored_incoming = session.get(RecruiterMessageModel, incoming.id)
+                assert stored_incoming is not None
+                if change == "question":
+                    stored_incoming.body += " Расскажите также об опыте Java."
+                elif change == "draft":
+                    edited = communications.edit_outgoing_draft(
+                        account_id=account_id,
+                        message_id=approved.message_id,
+                        body="Мой исправленный ответ о Python.",
+                    )
+                    communications.confirm_outgoing_draft(
+                        account_id=account_id,
+                        message_id=edited.id,
+                        content_version=edited.content_version,
+                        content_hash=edited.content_hash or "",
+                    )
+                    assert not service.approved_for_send(
+                        account_id=account_id,
+                        message_id=edited.id,
+                        content_version=edited.content_version,
+                        content_hash=edited.content_hash or "",
+                    )
+                elif change in {"failed", "unknown"}:
+                    outgoing = session.get(RecruiterMessageModel, approved.message_id)
+                    assert outgoing is not None
+                    outgoing.state = (
+                        RecruiterMessageState.FAILED
+                        if change == "failed"
+                        else RecruiterMessageState.UNKNOWN_RESULT
+                    )
+                elif change == "disabled":
+                    AutonomyPolicyService(session).update(
+                        {**DEFAULT_AUTONOMY_POLICY, "auto_send_approved_replies": False}
+                    )
+                session.flush()
+                repeated = service.prepare(
+                    account_id=account_id,
+                    incoming_message_ids=(incoming.id,),
+                    model_factory=ChecklistModel,
+                )
+                assert repeated.drafts_created == 0
+                assert len(repeated.approved) == int(change in {"none", "failed"})
+                assert service.approved_for_send(
+                    account_id=account_id,
+                    message_id=approved.message_id,
+                    content_version=approved.content_version,
+                    content_hash=approved.content_hash,
+                ) == (change in {"none", "failed"})
     finally:
         database.close()
 

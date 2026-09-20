@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from decimal import Decimal
 
 import pytest
 
@@ -91,24 +92,58 @@ def test_quality_assessment_contains_vacancy_facts_and_letter() -> None:
     assert len(model.prompts) == 1
     system_prompt = model.prompts[0][0]
     assert "Не оценивай пригодность кандидата" in system_prompt
-    assert "Не оценивай, насколько опыт и проекты соответствуют" in system_prompt
-    assert "качественно построенное, точное и естественное" in system_prompt
-    assert "сами факты подходят вакансии" in system_prompt
+    assert "ответило на прямые вопросы вакансии" in system_prompt
+    assert "Отсутствие сведений не означает отсутствие опыта" in system_prompt
+    assert "подменяет основную роль несвязанным опытом" in system_prompt
     prompt = model.prompts[0][1]
     assert "Развивать серверные интеграции" in prompt
     assert "Реализовал интеграцию на FastAPI" in prompt
     assert "Текст письма" in prompt
 
 
+def test_perfect_model_score_cannot_approve_an_unsupported_denial() -> None:
+    quality = assess_cover_letter_quality(
+        FakeModel(_response()), _vacancy(), (), "Прямого опыта с Flutter у меня пока нет."
+    )
+    assert not quality.passed
+    assert quality.hard_failure is not None
+    assert "Отрицание опыта" in quality.hard_failure
+
+
+def test_confirmed_denial_does_not_override_model_quality() -> None:
+    denial = "Прямого опыта с Flutter у меня пока нет."
+    quality = assess_cover_letter_quality(
+        FakeModel(_response()), _vacancy(), (QualityFact(1, "experience", denial),), denial
+    )
+    assert quality.passed
+
+
 def test_quality_prompt_is_valid_json_payload() -> None:
+    vacancy = _vacancy()
+    vacancy.description = (
+        "При отклике приложите 1–2 проекта, где вы работали с Django и PostgreSQL."
+    )
+    vacancy.employer_name = "Компания"
+    vacancy.employment = "Частичная занятость"
+    vacancy.work_format = "Удалённо"
+    vacancy.salary_from = Decimal(120000)
+    vacancy.salary_currency = "RUR"
+    vacancy.salary_gross = False
     prompt = build_quality_prompt(
-        _vacancy(),
+        vacancy,
         (QualityFact(1, "work_experience", "Работал с PostgreSQL."),),
         "Проверяемое письмо",
     )
 
     payload = json.loads(prompt.split("\n", maxsplit=1)[1])
     assert payload["vacancy"]["title"] == "Python-разработчик"
+    assert payload["vacancy"]["description"] == vacancy.description
+    assert payload["vacancy"]["employer_name"] == "Компания"
+    assert payload["vacancy"]["employment"] == "Частичная занятость"
+    assert payload["vacancy"]["work_format"] == "Удалённо"
+    assert payload["vacancy"]["salary_from"] == "120000"
+    assert payload["vacancy"]["salary_currency"] == "RUR"
+    assert payload["vacancy"]["salary_gross"] is False
     assert payload["confirmed_facts"][0]["id"] == 1
     assert payload["letter"] == "Проверяемое письмо"
 

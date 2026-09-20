@@ -94,9 +94,12 @@ _REVIEW_DRAFT_PATTERN = re.compile(
     r"переезд\w*|командиров\w*|"
     r"собеседован\w*|интервью\w*|встреч\w*|созвон\w*|"
     r"пообщ\w*|поговор\w*|разговор\w*|слот\w*|календар\w*|брон\w*|"
-    r"дат\w*|врем\w*|час\w*|график\w*|удобн\w*|"
+    r"дат(?:[аыуе]|ой|ою|ам|ами|ах)?|врем\w*|"
+    r"час(?:[ауеы]|ом|ов\w*|ам|ами|ах)?|график\w*|удобн\w*|"
     r"сегодня|завтра|послезавтра|"
-    r"понедельник\w*|вторник\w*|сред\w*|четверг\w*|"
+    r"понедельник\w*|вторник\w*|"
+    r"сред(?:[ауеы]|ой|ою|ам|ами|ах)(?!\s+(?:разработки|выполнения|исполнения|программирования)\b)|"
+    r"четверг\w*|"
     r"пятниц\w*|суббот\w*|воскрес\w*|"
     r"январ\w*|феврал\w*|март\w*|апрел\w*|ма[йяе]\w*|июн\w*|"
     r"июл\w*|август\w*|сентябр\w*|октябр\w*|ноябр\w*|декабр\w*|"
@@ -190,6 +193,7 @@ _REVIEW_DRAFT_STRUCTURE = re.compile(
 
 _REPLY_REQUEST_PATTERN = re.compile(
     r"[?？]|"
+    r"^(?:у\s+вас\s+(?:есть\s+)?|есть\s+у\s+вас\s+)опыт\b|"
     r"\b(?:подскажите|расскажите|уточните|ответьте|ответить|напишите|пришлите|направьте|"
     r"опишите|укажите|подтвердите|выберите|предоставьте|сообщите)\b|"
     r"\b(?:готовы|можете|хотели|интересно|рассматриваете|доступны|есть)\s+ли\b|"
@@ -198,6 +202,24 @@ _REPLY_REQUEST_PATTERN = re.compile(
     r"what|when|where|why|how)\b",
     re.I,
 )
+
+_QUESTIONNAIRE_PATTERN = re.compile(r"\b(?:чек[ -]?лист\w*|анкет\w*|опрос\w*)\b|\[\s*\]", re.I)
+_EXPERIENCE_PATTERN = re.compile(r"\b(?:опыт\w*|навык\w*|проект\w*)\b", re.I)
+_QUESTIONNAIRE_EXTERNAL_PATTERN = re.compile(
+    r"https?://|www\.|\b(?:сайт\w*|бот\w*|telegram|whatsapp|макс|zoom|skype|teams|"
+    r"паспорт\w*|документ\w*|банк\w*|карт\w*|оплат\w*|секрет\w*|парол\w*)\b|"
+    r"\b(?:пройд\w*|пройти|выполните|выполнить|решите|решить|пришлите|отправьте)\b"
+    r".{0,70}\b(?:тест\w*|задани\w*|код\w*)\b",
+    re.I | re.S,
+)
+
+
+def is_experience_questionnaire(text: str) -> bool:
+    return (
+        _QUESTIONNAIRE_PATTERN.search(text) is not None
+        and _EXPERIENCE_PATTERN.search(text) is not None
+        and _QUESTIONNAIRE_EXTERNAL_PATTERN.search(text) is None
+    )
 
 
 def classify_recruiter_reply(
@@ -210,6 +232,10 @@ def classify_recruiter_reply(
     normalized = " ".join(incoming_text.split())
     if not normalized or _is_no_reply_message(normalized):
         return RecruiterReplyDisposition.NO_REPLY
+    if "НУЖНО УТОЧНИТЬ" in proposed_response.upper():
+        return RecruiterReplyDisposition.REVIEW_DRAFT
+    if is_experience_questionnaire(normalized):
+        return RecruiterReplyDisposition.REVIEW_DRAFT
     if is_simple_salary_expectation_question(normalized) and (
         not proposed_response or is_exact_120_net_salary_response(proposed_response)
     ):
@@ -226,6 +252,23 @@ def classify_recruiter_reply(
     if _REPLY_REQUEST_PATTERN.search(normalized) is not None:
         return RecruiterReplyDisposition.AUTOMATIC_DRAFT
     return RecruiterReplyDisposition.AMBIGUOUS
+
+
+def verified_experience_reply_is_safe(
+    application_state: ApplicationState, incoming_text: str, proposed_response: str
+) -> bool:
+    return bool(
+        proposed_response.strip()
+        and is_experience_questionnaire(incoming_text)
+        and classify_recruiter_reply(application_state, incoming_text, proposed_response)
+        is RecruiterReplyDisposition.REVIEW_DRAFT
+        and "НУЖНО УТОЧНИТЬ" not in proposed_response.upper()
+        and not requires_review_draft(incoming_text, proposed_response)
+        and not requires_manual_action(incoming_text, proposed_response)
+        and not _MANUAL_ACTION_PATTERN.search(proposed_response)
+        and not _MANUAL_ACTION_STRUCTURE.search(incoming_text)
+        and not _MANUAL_ACTION_STRUCTURE.search(proposed_response)
+    )
 
 
 def _is_no_reply_message(text: str) -> bool:
@@ -350,7 +393,8 @@ def _direct_reply_state(
 
 def requires_manual_action(*texts: str) -> bool:
     return any(
-        _EXTERNAL_ACTION_REQUEST_PATTERN.search(text) is not None
+        not is_experience_questionnaire(text)
+        and _EXTERNAL_ACTION_REQUEST_PATTERN.search(text) is not None
         and (
             _MANUAL_ACTION_PATTERN.search(text) is not None
             or _MANUAL_ACTION_STRUCTURE.search(text) is not None

@@ -175,11 +175,33 @@ def test_manual_reply_model_can_be_found_by_application_number(settings: Setting
         model_name = "recorded-reply"
 
         def complete(self, system_prompt: str, user_prompt: str) -> str:
+            return self._record(system_prompt, user_prompt, "Thank you, available tomorrow.")
+
+        def complete_json(
+            self,
+            system_prompt: str,
+            user_prompt: str,
+            schema: dict[str, object],
+        ) -> str:
+            return self._record(
+                system_prompt,
+                user_prompt,
+                json.dumps(
+                    {
+                        "supported": True,
+                        "complete": True,
+                        "questions": [],
+                        "reason": "Grounded",
+                    }
+                ),
+            )
+
+        def _record(self, system_prompt: str, user_prompt: str, response: str) -> str:
             run = journal.start("model", "model.complete")
             run.save_evidence("request", system_prompt=system_prompt, user_prompt=user_prompt)
-            run.save_evidence("response", text="Thank you, available tomorrow.")
+            run.save_evidence("response", text=response)
             run.succeed()
-            return "Thank you, available tomorrow."
+            return response
 
     try:
         with database.sessions.begin() as session:
@@ -195,8 +217,8 @@ def test_manual_reply_model_can_be_found_by_application_number(settings: Setting
             report = OperationTraceService(session, data_dir=settings.data_dir).application(
                 application_id
             )
-            assert report["counts"]["journal"] == 2
-            assert report["counts"]["model_evidence"] == 2
+            assert report["counts"]["journal"] == 4
+            assert report["counts"]["model_evidence"] == 4
     finally:
         database.close()
 
