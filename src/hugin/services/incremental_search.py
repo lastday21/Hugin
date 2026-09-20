@@ -82,7 +82,6 @@ class IncrementalSearchCycle(BackgroundSearchCycle):
                             DirectionVacancyModel.direction_id == direction_id,
                             VacancyModel.details_fetched_at.is_(None),
                             VacancyModel.availability == VacancyAvailability.ACTIVE,
-                            VacancyModel.duplicate_of_id.is_(None),
                             or_(
                                 VacancyModel.published_at.is_(None),
                                 VacancyModel.published_at >= datetime.now(UTC) - MAX_VACANCY_AGE,

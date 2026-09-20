@@ -35,7 +35,7 @@ from hugin.services.vacancy_duties import TechnicalDuty, technical_duty_evidence
 from hugin.services.vacancy_fit import FitAssessment, assess_fit, unsupported_administration
 from hugin.services.vacancy_skills import skill_terms
 
-RULES_VERSION = "python_it_v71"
+RULES_VERSION = "python_it_v72"
 MAX_VACANCY_AGE = timedelta(days=30)
 NET_SALARY_FACTOR = 0.87
 
@@ -2744,6 +2744,18 @@ class VacancyAnalysisService:
             results.append(result)
         return tuple(results)
 
+    def link_republication(self, vacancy_id: int) -> VacancyRecord:
+        stored = self._refresh_duplicate_family(self._vacancies.get(vacancy_id))
+        candidates = self._vacancies.list_duplicate_candidates(stored)
+        duplicate = self._duplicates.find(stored, candidates)
+        if duplicate is not None:
+            self._refresh_duplicate_family(duplicate.canonical)
+            stored = self._vacancies.mark_duplicate(
+                stored.id, duplicate.canonical.id, duplicate.similarity
+            )
+            stored = self._refresh_duplicate_family(stored)
+        return stored
+
     def _apply(
         self,
         direction: DirectionRecord,
@@ -2753,38 +2765,11 @@ class VacancyAnalysisService:
         *,
         synchronize_route_conflict: bool = True,
     ) -> VacancyAnalysisResult:
-        stored = self._refresh_duplicate_family(self._vacancies.get(stored.id))
+        stored = self.link_republication(stored.id)
         tracked = self._directions.get_tracked_vacancy(direction.id, stored.id)
         rules = self._rules[direction.scope]
-        if stored.duplicate_of_id is not None and stored.availability is VacancyAvailability.ACTIVE:
-            with suppress(LookupError):
-                canonical = self._vacancies.get(stored.duplicate_of_id)
-                if (
-                    canonical.availability is not VacancyAvailability.ACTIVE
-                    and not self._vacancies.duplicate_family_has_sent_or_live_application(
-                        direction.account_id,
-                        stored.id,
-                    )
-                ):
-                    stored = self._vacancies.promote_duplicate(stored.id)
-        candidates = self._vacancies.list_duplicate_candidates(stored)
-        duplicate = self._duplicates.find(stored, candidates)
-        if duplicate is not None:
-            self._refresh_duplicate_family(duplicate.canonical)
-            stored = self._vacancies.mark_duplicate(
-                stored.id,
-                duplicate.canonical.id,
-                duplicate.similarity,
-            )
-            stored = self._refresh_duplicate_family(stored)
-        canonical_hh_id = duplicate.canonical.hh_id if duplicate is not None else None
-        if stored.duplicate_of_id is not None and canonical_hh_id is None:
-            with suppress(LookupError):
-                canonical_hh_id = self._vacancies.get(stored.duplicate_of_id).hh_id
-        is_duplicate = stored.duplicate_of_id is not None
         manual_accept = (
             vacancy.availability is VacancyAvailability.ACTIVE
-            and not is_duplicate
             and tracked.rules_details.get("manual_override") == "ACCEPT"
             and tracked.rules_version == RULES_VERSION
             and not rules._is_too_old(vacancy.published_at)
@@ -2804,7 +2789,7 @@ class VacancyAnalysisService:
         rule_evaluation = evaluation
         route_conflict = (
             self._routing_conflict(direction, stored, vacancy, evaluation)
-            if not manual_accept and not is_duplicate
+            if not manual_accept
             else None
         )
         if route_conflict is not None:
@@ -2842,20 +2827,6 @@ class VacancyAnalysisService:
                     "вакансия возвращена вручную; соответствие задачам требует проверки",
                     (),
                 ),
-            )
-        if is_duplicate:
-            duplicate_reasons = ["дубликат вакансии"]
-            if canonical_hh_id is not None:
-                duplicate_reasons.append(f"основная публикация: {canonical_hh_id}")
-            evaluation = RuleEvaluation(
-                evaluation.score,
-                RuleCategory.REJECTED,
-                (
-                    *evaluation.reasons,
-                    *duplicate_reasons,
-                ),
-                evaluation.components,
-                None,
             )
         if vacancy.availability is not VacancyAvailability.ACTIVE:
             state = VacancyState.CLOSED

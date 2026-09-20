@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Sequence
-from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import Literal
 
@@ -20,7 +19,6 @@ from hugin.database.models import (
     DirectionSearchQueryModel,
     DirectionVacancyModel,
     HhAccountModel,
-    SemanticStageModel,
     SystemStateModel,
     VacancyModel,
 )
@@ -31,6 +29,7 @@ from hugin.domain.time import as_utc, day_start_utc, timezone_by_name
 from hugin.domain.vacancies import VacancyAvailability
 from hugin.repositories.applications import ApplicationRepository
 from hugin.repositories.tasks import SystemStateRepository
+from hugin.services.application_selection_gate import ApplicationSelectionGate
 from hugin.services.autonomy import AutonomyPolicyService
 from hugin.services.vacancy_analysis import MAX_VACANCY_AGE, RULES_VERSION
 
@@ -358,6 +357,9 @@ class BackgroundProcessService:
             )
             if sent >= settings.hh_apply_daily_limit:
                 return f"Достигнут дневной предел откликов ({settings.hh_apply_daily_limit})"
+            waiting = ApplicationSelectionGate(self._session).blocking_reason(self._account_id, now)
+            if waiting is not None:
+                return waiting
             next_apply = self._session.scalar(
                 select(SystemStateModel.next_apply_at).where(SystemStateModel.id == 1)
             )
@@ -505,7 +507,7 @@ class BackgroundProcessService:
                 stage = "unavailable"
             elif vacancy_id in uncertain:
                 stage = "review"
-            elif vacancy.duplicate_of_id is not None or (
+            elif (
                 vacancy.published_at is not None
                 and as_utc(vacancy.published_at) < oldest_publication
             ):
@@ -537,7 +539,8 @@ class BackgroundProcessService:
         return {
             "total": len(grouped),
             "scope": "Уникальные вакансии активных направлений; "
-            "подходит хотя бы одному направлению. Дубли и публикации старше 30 дней отсеяны. "
+            "подходит хотя бы одному направлению. Публикации старше 30 дней отсеяны. "
+            "Новые номера повторных публикаций рассматриваются отдельно. "
             "Пройденный отбор не означает подготовленного письма. "
             "Внешняя выдача сюда не входит.",
             "stages": [
@@ -548,84 +551,9 @@ class BackgroundProcessService:
     def semantic_statuses(
         self, rows: Sequence[Row[tuple[DirectionVacancyModel, VacancyModel, CareerDirectionModel]]]
     ) -> dict[tuple[int, int], str]:
-        from hugin.repositories.directions import _direction_record
-        from hugin.repositories.vacancies import _to_record
-        from hugin.services.decision_evidence import fingerprint
-        from hugin.services.semantic_results import StoredSelection, decision_from_stored
-        from hugin.services.semantic_snapshot import selection_snapshot, selection_source_lines
+        from hugin.services.selection_status import semantic_statuses
 
-        relevant = [
-            (tracked, vacancy, direction)
-            for tracked, vacancy, direction in rows
-            if isinstance(direction.scoring_config.get("semantic_selection"), dict)
-            and direction.scoring_config["semantic_selection"].get("enabled", True)
-            and vacancy.details_fetched_at is not None
-            and tracked.rules_version == RULES_VERSION
-        ]
-        if not relevant:
-            return {
-                (direction.id, vacancy.id): "PENDING"
-                for tracked, vacancy, direction in rows
-                if isinstance(direction.scoring_config.get("semantic_selection"), dict)
-                and direction.scoring_config["semantic_selection"].get("enabled", True)
-            }
-        stages = {}
-        assessments: dict[int, list[SemanticStageModel]] = {}
-        for row in self._session.scalars(
-            select(SemanticStageModel)
-            .where(
-                SemanticStageModel.account_id == self._account_id,
-                SemanticStageModel.vacancy_id.in_({vacancy.id for _, vacancy, _ in relevant}),
-            )
-            .order_by(SemanticStageModel.id)
-        ):
-            stages[(row.vacancy_id, row.cache_key)] = row
-            if row.stage == "assess":
-                assessments.setdefault(row.vacancy_id, []).append(row)
-        templates, result = {}, {}
-        for tracked, vacancy, direction in relevant:
-            identity = (direction.id, vacancy.id)
-            result[identity] = "PENDING"
-            try:
-                if direction.id not in templates:
-                    templates[direction.id] = selection_snapshot(
-                        self._session, _direction_record(direction), _to_record(vacancy)
-                    )
-                template = templates[direction.id]
-                if template is None:
-                    continue
-                lines = selection_source_lines(
-                    self._session,
-                    self._account_id,
-                    _to_record(vacancy),
-                    previous_stages=assessments.get(vacancy.id, ()),
-                )
-                snapshot = replace(
-                    template,
-                    vacancy_id=vacancy.id,
-                    lines=lines,
-                    request={**template.request, "source": [line.model_dump() for line in lines]},
-                )
-                evidence = tracked.rules_details.get("semantic_selection")
-                if not isinstance(evidence, dict) or evidence.get("key") != snapshot.key:
-                    continue
-                stage = stages.get((vacancy.id, snapshot.key))
-                if (
-                    stage is None
-                    or stage.stage != "selection"
-                    or fingerprint(stage.request) != snapshot.key
-                    or fingerprint(stage.response_text) != stage.response_sha256
-                ):
-                    continue
-                stored = StoredSelection.model_validate_json(stage.response_text)
-                if stored.retryable:
-                    continue
-                result[identity] = decision_from_stored(snapshot, stored).status
-                if tracked.rules_details.get("manual_override") == "ACCEPT":
-                    result[identity] = "ALLOW"
-            except ValueError:
-                continue
-        return result
+        return semantic_statuses(self._session, self._account_id, rows)
 
     def _last_search(self) -> dict[str, object] | None:
         observations = []

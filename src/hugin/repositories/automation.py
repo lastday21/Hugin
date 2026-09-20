@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from datetime import UTC, datetime, timedelta
 from typing import cast
 
@@ -24,6 +26,16 @@ from hugin.domain.directions import DirectionScope
 from hugin.domain.time import as_utc
 
 CLAIMABLE_STATES = (AutomationJobState.WAITING, AutomationJobState.FAILED)
+
+
+def search_configuration_key(query: DirectionSearchQueryModel) -> str:
+    payload = {
+        name: getattr(query, name)
+        for name in ("query", "area", "filters", "regions", "work_formats")
+    }
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
 
 
 def _optional_utc(value: datetime | None) -> datetime | None:
@@ -189,6 +201,13 @@ class AutomationJobRepository:
         model = self._session.scalar(statement)
         if model is None:
             return None
+        if model.kind is AutomationJobKind.SEARCH:
+            query = self._session.get(DirectionSearchQueryModel, model.search_query_id)
+            if query is not None:
+                model.last_result = {
+                    **model.last_result,
+                    "running_search_configuration": search_configuration_key(query),
+                }
         model.state = AutomationJobState.RUNNING
         model.last_started_at = selected_at
         model.heartbeat_at = selected_at
@@ -213,7 +232,13 @@ class AutomationJobRepository:
         finished_at = as_utc(now or datetime.now(UTC))
         model = self._running_model(job_key)
         model.state = AutomationJobState.WAITING
-        delay = 15 if result and result.get("continuation") is True else model.interval_seconds
+        delay = (
+            15
+            if model.kind is AutomationJobKind.SEARCH
+            and result
+            and result.get("continuation") is True
+            else model.interval_seconds
+        )
         model.next_run_at = finished_at + timedelta(seconds=delay)
         model.last_finished_at = finished_at
         model.last_success_at = finished_at
@@ -221,7 +246,24 @@ class AutomationJobRepository:
         model.consecutive_failures = 0
         model.last_error_code = None
         model.last_error_message = None
+        previous_result = model.last_result
         model.last_result = dict(result or {})
+        if model.kind is AutomationJobKind.SEARCH:
+            for key in ("completed_search_at", "completed_search_configuration"):
+                if key in previous_result:
+                    model.last_result[key] = previous_result[key]
+            query = self._session.get(DirectionSearchQueryModel, model.search_query_id)
+            if (
+                query is not None
+                and result
+                and result.get("continuation") is not True
+                and previous_result.get("running_search_configuration")
+                == search_configuration_key(query)
+            ):
+                model.last_result["completed_search_at"] = finished_at.isoformat()
+                model.last_result["completed_search_configuration"] = search_configuration_key(
+                    query
+                )
         model.updated_at = finished_at
         self._session.flush()
         return _job_record(model)

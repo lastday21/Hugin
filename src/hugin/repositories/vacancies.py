@@ -287,7 +287,6 @@ class VacancyRepository:
                 VacancyModel.id != vacancy.id,
                 VacancyModel.duplicate_of_id.is_(None),
                 VacancyModel.details_fetched_at.is_not(None),
-                VacancyModel.availability == VacancyAvailability.ACTIVE,
                 func.lower(VacancyModel.employer_name) == vacancy.employer_name.casefold(),
             )
             .order_by(
@@ -404,6 +403,28 @@ class VacancyRepository:
         exclude_application_id: int | None = None,
     ) -> bool:
         family_ids = self.duplicate_family_ids(vacancy_id)
+        return self._has_sent_or_live_application(
+            account_id, family_ids, exclude_application_id=exclude_application_id
+        )
+
+    def vacancy_has_sent_or_live_application(
+        self,
+        account_id: int,
+        vacancy_id: int,
+        *,
+        exclude_application_id: int | None = None,
+    ) -> bool:
+        return self._has_sent_or_live_application(
+            account_id, (vacancy_id,), exclude_application_id=exclude_application_id
+        )
+
+    def _has_sent_or_live_application(
+        self,
+        account_id: int,
+        vacancy_ids: tuple[int, ...],
+        *,
+        exclude_application_id: int | None,
+    ) -> bool:
         live_task_states = (
             TaskState.PENDING,
             TaskState.RUNNING,
@@ -428,7 +449,7 @@ class VacancyRepository:
                 .where(
                     ApplicationModel.account_id == account_id,
                     ApplicationModel.id != exclude_application_id,
-                    ApplicationModel.vacancy_id.in_(family_ids),
+                    ApplicationModel.vacancy_id.in_(vacancy_ids),
                     or_(
                         ApplicationModel.state.in_(sent_states),
                         ApplicationTaskModel.state.in_(live_task_states),

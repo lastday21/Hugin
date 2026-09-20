@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlalchemy.orm import Session
@@ -42,7 +42,11 @@ def create_claim(session: Session, suffix: str = "one") -> ApplyJob:
     directions.attach_resume(direction.id, resume.id)
     vacancy = VacancyRepository(session).upsert(
         VacancyData(
-            f"result-{suffix}", "Python developer", f"https://hh.ru/vacancy/result-{suffix}"
+            f"result-{suffix}",
+            "Python developer",
+            f"https://hh.ru/vacancy/result-{suffix}",
+            description="Develop Python APIs",
+            details_fetched_at=datetime.now(UTC),
         )
     )
     directions.track_vacancy(direction.id, vacancy.id)

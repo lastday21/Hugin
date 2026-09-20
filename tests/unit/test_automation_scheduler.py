@@ -14,6 +14,7 @@ from hugin.domain import (
     TaskState,
     VacancyData,
 )
+from hugin.domain.automation import AutomationJobResult
 from hugin.domain.directions import DirectionScope
 from hugin.repositories import (
     AccountRepository,
@@ -28,6 +29,43 @@ from hugin.services.application_automation import ApplicationAutomationService
 from hugin.services.automation import AutomationSchedulerService
 
 pytestmark = pytest.mark.integration
+
+
+def test_message_continuation_respects_interval_and_manual_check_can_override(
+    settings: Settings,
+) -> None:
+    account_id, _ = seed_search_query(settings)
+    database = create_database(settings)
+    now = datetime(2026, 9, 13, tzinfo=UTC)
+    try:
+        with database.sessions.begin() as session:
+            scheduler = AutomationSchedulerService(session)
+            scheduler.ensure_account_jobs(account_id, now, message_interval_minutes=10)
+            job = scheduler.claim_due(now, allowed_kinds=(AutomationJobKind.MESSAGES,))
+            assert job is not None
+            result: AutomationJobResult = {
+                "continuation": True,
+                "message_page": 3,
+                "message_offset": 6,
+            }
+            completed = scheduler.complete(job.key, result, now)
+            assert completed.next_run_at == now + timedelta(minutes=10)
+            assert completed.last_result == result
+            assert (
+                scheduler.claim_due(
+                    now + timedelta(minutes=1), allowed_kinds=(AutomationJobKind.MESSAGES,)
+                )
+                is None
+            )
+            forced = scheduler.claim_due(
+                now + timedelta(minutes=1),
+                allowed_kinds=(AutomationJobKind.MESSAGES,),
+                force_synchronization=True,
+                account_id=account_id,
+            )
+            assert forced is not None and forced.last_result == result
+    finally:
+        database.close()
 
 
 def seed_search_query(settings: Settings) -> tuple[int, int]:
@@ -512,7 +550,8 @@ def test_search_pause_finishes_running_job_then_disables_and_resumes(
             assert completed.state is AutomationJobState.DISABLED
             assert completed.next_run_at is None
             assert completed.last_success_at == finished_at
-            assert completed.last_result == {"found": 3}
+            assert completed.last_result["found"] == 3
+            assert completed.last_result["completed_search_at"] == finished_at.isoformat()
 
         with database.sessions.begin() as session:
             scheduler = AutomationSchedulerService(session)

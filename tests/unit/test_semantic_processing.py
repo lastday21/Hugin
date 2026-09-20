@@ -275,6 +275,52 @@ def edit_fact(settings: Settings, fact_id: int) -> None:
         database.close()
 
 
+def test_new_publication_reuses_archived_assessment_before_model(settings: Settings) -> None:
+    from hugin.database.models import VacancyModel
+    from hugin.domain.vacancies import VacancyAvailability
+
+    account_id, direction_id, vacancy_id, _, fact_id = seed(settings)
+    initial_database = create_database(settings)
+    try:
+        with initial_database.sessions.begin() as session:
+            original = session.get(VacancyModel, vacancy_id)
+            assert original is not None
+            original.employer_name = "Повторная публикация"
+    finally:
+        initial_database.close()
+    client = Client()
+    processor = SemanticSelectionProcessor(settings, client_factory=lambda *_: client)
+    assert processor.process(account_id, direction_id, vacancy_id).model_calls == 1
+    database = create_database(settings)
+    try:
+        with database.sessions.begin() as session:
+            original = session.get(VacancyModel, vacancy_id)
+            assert original is not None
+            original.availability = VacancyAvailability.ARCHIVED
+            fresh = VacancyRepository(session).upsert(
+                VacancyData(
+                    "republished-semantic",
+                    original.title,
+                    "https://hh.ru/vacancy/republished-semantic",
+                    description=original.description,
+                    employer_name=original.employer_name,
+                    details_fetched_at=datetime.now(UTC),
+                )
+            )
+            DirectionRepository(session).track_vacancy(direction_id, fresh.id)
+            fresh_id = fresh.id
+        result = processor.process(account_id, direction_id, fresh_id)
+        assert result.applied and result.status == "MATCH"
+        assert result.model_calls == 0
+        assert client.calls == 1
+        with database.sessions() as session:
+            assert VacancyRepository(session).get(fresh_id).duplicate_of_id == vacancy_id
+        edit_fact(settings, fact_id)
+        assert processor.process(account_id, direction_id, fresh_id).model_calls == 1
+    finally:
+        database.close()
+
+
 def test_pending_then_allowed_and_cached_with_profile_change_guard(settings: Settings) -> None:
     account_id, direction_id, vacancy_id, resume_id, fact_id = seed(settings)
     database = create_database(settings)

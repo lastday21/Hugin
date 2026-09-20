@@ -1923,6 +1923,9 @@ function AttentionView({
                           {question.source && (
                             <small>{sourceNames[question.source] ?? question.source}</small>
                           )}
+                          {question.source_question && (
+                            <p>Сохранённый ответ на вопрос: «{question.source_question}»</p>
+                          )}
                         </>
                       ) : null}
                       {(!question.answer || form.state === "REVIEW_REQUIRED") && (

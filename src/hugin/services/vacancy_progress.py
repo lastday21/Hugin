@@ -282,8 +282,6 @@ class VacancyProgressService:
             )
         if vacancy.availability != VacancyAvailability.ACTIVE:
             return "unavailable", STAGES["unavailable"][1]
-        if vacancy.duplicate_of_id is not None:
-            return "rejected", "Вакансия объединена с другой карточкой как дубль."
         if vacancy.published_at and as_utc(vacancy.published_at) < observed_at - MAX_VACANCY_AGE:
             return "rejected", "Публикация старше допустимого срока поиска."
         active = [(tracked, direction) for tracked, _, direction in links if direction.is_active]

@@ -110,8 +110,7 @@ def test_reanalysis_separates_wrong_duplicate_family_and_preserves_real_send_his
                 direction_name=direction.name,
             )
             eligible = [item for item in results if item.evaluation.accepted]
-            assert len(eligible) == 1
-            assert eligible[0].vacancy.id in {first.id, second.id}
+            assert {item.vacancy.id for item in eligible} == {first.id, second.id}
             assert repository.duplicate_family_ids(first.id) == (first.id, second.id)
             assert repository.duplicate_family_ids(root.id) == (root.id,)
             for member in (first, second):
@@ -145,7 +144,7 @@ def test_reanalysis_separates_wrong_duplicate_family_and_preserves_real_send_his
                 direction_name=direction.name,
                 include_stretch=False,
             )
-            assert prepared.created == (0 if sent_on == "member" else 1)
+            assert prepared.created == (1 if sent_on == "member" else 2)
     finally:
         database.close()
 
@@ -186,12 +185,12 @@ def test_collection_tracks_changes_discoveries_duplicates_and_rejected(
 
             assert [result.evaluation.category for result in results] == [
                 RuleCategory.MATCH,
-                RuleCategory.REJECTED,
+                RuleCategory.MATCH,
                 RuleCategory.REJECTED,
             ]
-            assert results[1].state is VacancyState.FILTERED_OUT
+            assert results[1].state is VacancyState.ANALYZED
             assert results[1].vacancy.duplicate_of_id == results[0].vacancy.id
-            assert "дубликат вакансии" in results[1].evaluation.reasons
+            assert "дубликат вакансии" not in results[1].evaluation.reasons
 
             directions.record_discovery(
                 direction_id=direction.id,
@@ -221,18 +220,19 @@ def test_collection_tracks_changes_discoveries_duplicates_and_rejected(
             assert len(repository.list_discoveries(updated.id)) == 1
 
             review = VacancyReviewService(session)
-            review.restore(
-                account_id=account.id,
-                direction_name="Python backend",
-                hh_id="101",
-            )
+            with pytest.raises(ValueError, match="не находится в списке отклонённых"):
+                review.restore(
+                    account_id=account.id,
+                    direction_name="Python backend",
+                    hh_id="101",
+                )
             rechecked = service.reanalyze(
                 account_external_id="account-vacancies",
                 direction_name="Python backend",
             )
             duplicate = next(item for item in rechecked if item.vacancy.hh_id == "101")
-            assert duplicate.evaluation.category is RuleCategory.REJECTED
-            assert duplicate.state is VacancyState.FILTERED_OUT
+            assert duplicate.evaluation.category is RuleCategory.MATCH
+            assert duplicate.state is VacancyState.ANALYZED
 
             rejected = review.list_rejected(
                 account_id=account.id,
@@ -407,7 +407,7 @@ def test_manual_acceptance_recalculates_priority_after_vacancy_and_profile_chang
         database.close()
 
 
-def test_exact_body_repost_with_changed_title_is_not_queued_twice(
+def test_exact_body_repost_with_new_number_is_queued_once_per_number(
     settings: Settings,
 ) -> None:
     upgrade_database(settings)
@@ -440,8 +440,18 @@ def test_exact_body_repost_with_changed_title_is_not_queued_twice(
                 direction_name=direction.name,
                 include_stretch=True,
             )
-            assert prepared.created == 1
-            assert session.scalar(select(func.count(ApplicationModel.id))) == 1
+            assert prepared.created == 2
+            assert session.scalar(select(func.count(ApplicationModel.id))) == 2
+            assert (
+                ApplicationAutomationService(session)
+                .prepare(
+                    account_external_id=account.external_id,
+                    direction_name=direction.name,
+                    include_stretch=True,
+                )
+                .created
+                == 0
+            )
     finally:
         database.close()
 
@@ -519,14 +529,14 @@ def test_duplicate_detection_does_not_depend_on_detail_fetch_order(
                     vacancy_ids=(earlier.id,),
                     include_stretch=False,
                 )
-                == 0
+                == 1
             )
-            assert session.scalar(select(func.count(ApplicationModel.id))) == 1
+            assert session.scalar(select(func.count(ApplicationModel.id))) == 2
     finally:
         database.close()
 
 
-def test_reanalysis_promotes_active_duplicate_with_archived_canonical(
+def test_reanalysis_allows_new_number_linked_to_archived_canonical(
     settings: Settings,
 ) -> None:
     upgrade_database(settings)
@@ -574,7 +584,9 @@ def test_reanalysis_promotes_active_duplicate_with_archived_canonical(
 
             stored = vacancies.get(duplicate.id)
             assert stored.duplicate_of_id == canonical.id
-            assert vacancies.list_duplicate_candidates(stored) == []
+            assert [item.id for item in vacancies.list_duplicate_candidates(stored)] == [
+                canonical.id
+            ]
 
             reanalyzed = VacancyAnalysisService(session).reanalyze(
                 account_external_id=account.external_id,
@@ -586,9 +598,9 @@ def test_reanalysis_promotes_active_duplicate_with_archived_canonical(
             assert result.evaluation.category is RuleCategory.MATCH
             assert result.evaluation.accepted
             assert result.state is VacancyState.ANALYZED
-            assert result.vacancy.duplicate_of_id is None
-            assert vacancies.get(duplicate.id).duplicate_of_id is None
-            assert vacancies.get(canonical.id).duplicate_of_id == duplicate.id
+            assert result.vacancy.duplicate_of_id == canonical.id
+            assert vacancies.get(duplicate.id).duplicate_of_id == canonical.id
+            assert vacancies.get(canonical.id).duplicate_of_id is None
             assert canonical_result.evaluation.category is RuleCategory.REJECTED
             assert canonical_result.state is VacancyState.CLOSED
             assert (
@@ -610,7 +622,7 @@ def test_reanalysis_promotes_active_duplicate_with_archived_canonical(
         database.close()
 
 
-def test_reanalysis_uses_updated_duplicate_family_after_promotion(
+def test_reanalysis_keeps_archived_root_and_allows_each_active_number(
     settings: Settings,
 ) -> None:
     upgrade_database(settings)
@@ -657,13 +669,13 @@ def test_reanalysis_uses_updated_duplicate_family_after_promotion(
             by_id = {item.vacancy.id: item for item in results}
 
             assert by_id[first_active.id].evaluation.category is RuleCategory.MATCH
-            assert by_id[first_active.id].vacancy.duplicate_of_id is None
+            assert by_id[first_active.id].vacancy.duplicate_of_id == old_canonical.id
             assert by_id[old_canonical.id].evaluation.category is RuleCategory.REJECTED
             assert by_id[old_canonical.id].state is VacancyState.CLOSED
-            assert by_id[later_active.id].evaluation.category is RuleCategory.REJECTED
-            assert by_id[later_active.id].state is VacancyState.FILTERED_OUT
-            assert vacancies.get(old_canonical.id).duplicate_of_id == first_active.id
-            assert vacancies.get(later_active.id).duplicate_of_id == first_active.id
+            assert by_id[later_active.id].evaluation.category is RuleCategory.MATCH
+            assert by_id[later_active.id].state is VacancyState.ANALYZED
+            assert vacancies.get(old_canonical.id).duplicate_of_id is None
+            assert vacancies.get(later_active.id).duplicate_of_id == old_canonical.id
 
             prepared = ApplicationAutomationService(session).prepare_for_account_id(
                 account_id=account.id,
@@ -671,15 +683,16 @@ def test_reanalysis_uses_updated_duplicate_family_after_promotion(
                 include_stretch=False,
             )
 
-            assert prepared.created == 1
-            application = session.scalar(select(ApplicationModel))
-            assert application is not None
-            assert application.vacancy_id == first_active.id
+            assert prepared.created == 2
+            assert set(session.scalars(select(ApplicationModel.vacancy_id))) == {
+                first_active.id,
+                later_active.id,
+            }
     finally:
         database.close()
 
 
-def test_reanalysis_keeps_duplicate_blocked_when_family_has_sent_application(
+def test_reanalysis_allows_new_number_after_sending_to_archived_family_member(
     settings: Settings,
 ) -> None:
     upgrade_database(settings)
@@ -743,8 +756,8 @@ def test_reanalysis_keeps_duplicate_blocked_when_family_has_sent_application(
             )
             result = next(item for item in reanalyzed if item.vacancy.id == duplicate.id)
 
-            assert result.evaluation.category is RuleCategory.REJECTED
-            assert result.state is VacancyState.FILTERED_OUT
+            assert result.evaluation.category is RuleCategory.MATCH
+            assert result.state is VacancyState.ANALYZED
             assert vacancies.get(duplicate.id).duplicate_of_id == canonical.id
             assert (
                 ApplicationAutomationService(session)
@@ -754,9 +767,9 @@ def test_reanalysis_keeps_duplicate_blocked_when_family_has_sent_application(
                     include_stretch=False,
                 )
                 .created
-                == 0
+                == 1
             )
-            assert session.scalar(select(func.count(ApplicationModel.id))) == 1
+            assert session.scalar(select(func.count(ApplicationModel.id))) == 2
     finally:
         database.close()
 

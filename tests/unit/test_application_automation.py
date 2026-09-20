@@ -65,6 +65,7 @@ from hugin.services.application_automation import ApplicationAutomationService, 
 from hugin.services.application_reconciliation import ApplicationReconciliationService
 from hugin.services.autonomy import AutonomyPolicyService
 from hugin.services.cover_letter import MANUAL_REVIEW_MODEL, CoverLetterService
+from hugin.services.cover_letter_quality import QUALITY_RUBRIC_VERSION
 from hugin.services.hh_sync import HhSynchronizationService
 from hugin.services.queue import QueueService
 from hugin.services.vacancy_analysis import (
@@ -76,7 +77,7 @@ from hugin.services.vacancy_analysis import (
 pytestmark = pytest.mark.integration
 
 
-def _assert_duplicate_history_blocks_submission(
+def _assert_other_publication_does_not_block_submission(
     session: Session, application_id: int, allowed: Callable[[], bool]
 ) -> None:
     applications = ApplicationRepository(session)
@@ -112,10 +113,17 @@ def _assert_duplicate_history_blocks_submission(
                     QueueTaskRepository(session).transition(task.id, TaskState.RUNNING)
                     QueueTaskRepository(session).transition(task.id, task_state)
             session.flush()
-            assert not allowed()
+            assert allowed()
             vacancies.unlink_duplicate(other.id, reason="distinct_job", rules_version=RULES_VERSION)
             assert allowed()
             vacancies.mark_duplicate(original.id, other.id, 1.0)
+            assert allowed()
+            another_resume = ResumeRepository(session).upsert(
+                current.account_id, "another-resume-for-same-number", "Другое резюме"
+            )
+            earlier_model.resume_id = another_resume.id
+            earlier_model.vacancy_id = original.id
+            session.flush()
             assert not allowed()
             transaction.rollback()
         assert allowed()
@@ -247,6 +255,7 @@ def test_form_preflight_claims_only_task_without_current_letter(
                     "preflight-vacancy",
                     "Python backend",
                     "https://hh.ru/vacancy/preflight-vacancy",
+                    details_fetched_at=datetime.now(UTC),
                 )
             )
             directions.track_vacancy(direction.id, vacancy.id)
@@ -310,6 +319,7 @@ def test_form_preflight_claims_only_task_without_current_letter(
                     "preflight-closed",
                     "Python backend",
                     "https://hh.ru/vacancy/preflight-closed",
+                    details_fetched_at=datetime.now(UTC),
                 )
             )
             directions.track_vacancy(direction.id, closed_vacancy.id)
@@ -383,6 +393,7 @@ def test_supervised_form_preflight_claims_exact_task_while_paused(
                     "supervised-preflight-vacancy",
                     "Python backend",
                     "https://hh.ru/vacancy/supervised-preflight-vacancy",
+                    details_fetched_at=datetime.now(UTC),
                 )
             )
             directions.track_vacancy(direction.id, vacancy.id)
@@ -446,10 +457,20 @@ def test_automation_prepares_claims_and_records_results(settings: Settings) -> N
             directions.attach_resume(direction.id, resume.id)
             vacancies = VacancyRepository(session)
             match = vacancies.upsert(
-                VacancyData("100", "Python developer", "https://hh.ru/vacancy/100")
+                VacancyData(
+                    "100",
+                    "Python developer",
+                    "https://hh.ru/vacancy/100",
+                    details_fetched_at=datetime.now(UTC),
+                )
             )
             stretch = vacancies.upsert(
-                VacancyData("200", "AI Agent Engineer", "https://hh.ru/vacancy/200")
+                VacancyData(
+                    "200",
+                    "AI Agent Engineer",
+                    "https://hh.ru/vacancy/200",
+                    details_fetched_at=datetime.now(UTC),
+                )
             )
             directions.track_vacancy(direction.id, match.id)
             directions.track_vacancy(direction.id, stretch.id)
@@ -568,7 +589,12 @@ def test_automation_prepares_claims_and_records_results(settings: Settings) -> N
             SystemStateRepository(session).set_next_apply_at(None)
 
             already_vacancy = vacancies.upsert(
-                VacancyData("already", "Python", "https://hh.ru/vacancy/already")
+                VacancyData(
+                    "already",
+                    "Python",
+                    "https://hh.ru/vacancy/already",
+                    details_fetched_at=datetime.now(UTC),
+                )
             )
             directions.track_vacancy(direction.id, already_vacancy.id)
             directions.apply_rules(
@@ -600,7 +626,12 @@ def test_automation_prepares_claims_and_records_results(settings: Settings) -> N
             assert service.applied_since(account.id, datetime(2026, 1, 1, tzinfo=UTC)) == 1
 
             uncertain_vacancy = vacancies.upsert(
-                VacancyData("300", "Python engineer", "https://hh.ru/vacancy/300")
+                VacancyData(
+                    "300",
+                    "Python engineer",
+                    "https://hh.ru/vacancy/300",
+                    details_fetched_at=datetime.now(UTC),
+                )
             )
             directions.track_vacancy(direction.id, uncertain_vacancy.id)
             directions.apply_rules(
@@ -708,7 +739,12 @@ def test_automation_prepares_claims_and_records_results(settings: Settings) -> N
             )
 
             closed_vacancy = vacancies.upsert(
-                VacancyData("400", "Closed Python role", "https://hh.ru/vacancy/400")
+                VacancyData(
+                    "400",
+                    "Closed Python role",
+                    "https://hh.ru/vacancy/400",
+                    details_fetched_at=datetime.now(UTC),
+                )
             )
             directions.track_vacancy(direction.id, closed_vacancy.id)
             directions.apply_rules(
@@ -750,7 +786,12 @@ def test_automation_prepares_claims_and_records_results(settings: Settings) -> N
             )
 
             auth_vacancy = vacancies.upsert(
-                VacancyData("500", "Protected Python role", "https://hh.ru/vacancy/500")
+                VacancyData(
+                    "500",
+                    "Protected Python role",
+                    "https://hh.ru/vacancy/500",
+                    details_fetched_at=datetime.now(UTC),
+                )
             )
             directions.track_vacancy(direction.id, auth_vacancy.id)
             directions.apply_rules(
@@ -795,7 +836,12 @@ def test_retry_after_schedules_next_run_and_account_warning_blocks_queue(
             resume = ResumeRepository(session).upsert(account.id, "resume-1", "Python")
             direction = DirectionRepository(session).create(account.id, "ИТ")
             vacancy = VacancyRepository(session).upsert(
-                VacancyData("retry", "Python", "https://hh.ru/vacancy/retry")
+                VacancyData(
+                    "retry",
+                    "Python",
+                    "https://hh.ru/vacancy/retry",
+                    details_fetched_at=datetime.now(UTC),
+                )
             )
             directions = DirectionRepository(session)
             directions.track_vacancy(direction.id, vacancy.id)
@@ -841,6 +887,7 @@ def test_retry_after_schedules_next_run_and_account_warning_blocks_queue(
                     "account-warning",
                     "Python",
                     "https://hh.ru/vacancy/account-warning",
+                    details_fetched_at=datetime.now(UTC),
                 )
             )
             directions.track_vacancy(direction.id, warning_vacancy.id)
@@ -891,6 +938,7 @@ def test_repeated_failure_stops_after_second_attempt(settings: Settings) -> None
                     "retry-limit",
                     "Python-разработчик",
                     "https://hh.ru/vacancy/retry-limit",
+                    details_fetched_at=datetime.now(UTC),
                 )
             )
             directions = DirectionRepository(session)
@@ -963,6 +1011,7 @@ def test_temporary_network_failure_remains_scheduled_after_second_attempt(
                     "network-retry",
                     "Python-разработчик",
                     "https://hh.ru/vacancy/network-retry",
+                    details_fetched_at=datetime.now(UTC),
                 )
             )
             directions = DirectionRepository(session)
@@ -987,6 +1036,7 @@ def test_temporary_network_failure_remains_scheduled_after_second_attempt(
                     "following-network-retry",
                     "Python-разработчик",
                     "https://hh.ru/vacancy/following-network-retry",
+                    details_fetched_at=datetime.now(UTC),
                 )
             )
             directions.track_vacancy(direction.id, following_vacancy.id)
@@ -1070,6 +1120,7 @@ def test_temporary_network_failure_stops_after_five_attempts(
                     "bounded-network-retry",
                     "Python-разработчик",
                     "https://hh.ru/vacancy/bounded-network-retry",
+                    details_fetched_at=datetime.now(UTC),
                 )
             )
             directions = DirectionRepository(session)
@@ -1147,6 +1198,7 @@ def test_priority_guard_sees_scheduled_application_work(settings: Settings) -> N
                     "scheduled-guard",
                     "Python-разработчик",
                     "https://hh.ru/vacancy/scheduled-guard",
+                    details_fetched_at=datetime.now(UTC),
                 )
             )
             directions = DirectionRepository(session)
@@ -1197,7 +1249,12 @@ def test_rule_change_skips_and_can_restore_pending_task(settings: Settings) -> N
             direction = directions.create(account.id, "Python backend")
             directions.attach_resume(direction.id, resume.id)
             vacancy = VacancyRepository(session).upsert(
-                VacancyData("rules", "Python backend", "https://hh.ru/vacancy/rules")
+                VacancyData(
+                    "rules",
+                    "Python backend",
+                    "https://hh.ru/vacancy/rules",
+                    details_fetched_at=datetime.now(UTC),
+                )
             )
             directions.track_vacancy(direction.id, vacancy.id)
             directions.apply_rules(
@@ -1292,6 +1349,7 @@ def test_rule_change_skips_actionable_task_waiting_for_user(
                     f"rules-{task_state.value}",
                     "Python backend",
                     f"https://hh.ru/vacancy/rules-{task_state.value}",
+                    details_fetched_at=datetime.now(UTC),
                 )
             )
             directions.track_vacancy(direction.id, vacancy.id)
@@ -1355,6 +1413,7 @@ def test_routed_pending_application_moves_to_target_direction(
                     "routed-vacancy",
                     "Junior Data-инженер",
                     "https://hh.ru/vacancy/routed-vacancy",
+                    details_fetched_at=datetime.now(UTC),
                 )
             )
             directions.track_vacancy(source.id, vacancy.id)
@@ -1454,6 +1513,7 @@ def test_prepare_recovers_letter_task_stopped_for_missing_evidence(
                     "letter-recovery-vacancy",
                     "Python backend разработчик",
                     "https://hh.ru/vacancy/letter-recovery-vacancy",
+                    details_fetched_at=datetime.now(UTC),
                 )
             )
             directions.track_vacancy(direction.id, vacancy.id)
@@ -1503,7 +1563,7 @@ def test_prepare_recovers_letter_task_stopped_for_missing_evidence(
         database.close()
 
 
-def test_prepare_promotes_sendable_duplicate_when_family_has_no_application(
+def test_prepare_keeps_publication_link_and_creates_separate_application(
     settings: Settings,
 ) -> None:
     upgrade_database(settings)
@@ -1559,8 +1619,8 @@ def test_prepare_promotes_sendable_duplicate_when_family_has_no_application(
             )
 
             assert prepared.created == 1
-            assert vacancies.get(current.id).duplicate_of_id is None
-            assert vacancies.get(canonical.id).duplicate_of_id == current.id
+            assert vacancies.get(current.id).duplicate_of_id == canonical.id
+            assert vacancies.get(canonical.id).duplicate_of_id is None
             application = ApplicationRepository(session).get_by_key(
                 account.id,
                 current.id,
@@ -1699,6 +1759,7 @@ def test_background_claim_and_submit_guard_require_the_same_current_letter(
                         "обработки ошибок и контроля целостности данных."
                     ),
                     key_skills=("Python",),
+                    details_fetched_at=datetime.now(UTC),
                 )
             )
             directions.track_vacancy(direction.id, vacancy.id)
@@ -1794,7 +1855,7 @@ def test_background_claim_and_submit_guard_require_the_same_current_letter(
             letter.failure_reason = None
             letter.quality_score = 10
             letter.quality_passed = True
-            letter.quality_version = "cover_letter_quality_v1"
+            letter.quality_version = QUALITY_RUBRIC_VERSION
             letter.context_hash = CoverLetterService(session).current_context_hash(application.id)
             session.flush()
             job = service.claim_exact_prepared(
@@ -1812,7 +1873,25 @@ def test_background_claim_and_submit_guard_require_the_same_current_letter(
                 resume_title=resume.title,
             )
 
-            _assert_duplicate_history_blocks_submission(
+            with session.begin_nested() as observation:
+                arriving = VacancyRepository(session).upsert(
+                    VacancyData(
+                        "arrived-before-submit",
+                        "Python developer",
+                        "https://hh.ru/vacancy/arrived-before-submit",
+                    )
+                )
+                directions.track_vacancy(direction.id, arriving.id)
+                assert not service.background_submission_is_allowed(
+                    task.id,
+                    letter_id=letter.id,
+                    letter_sha256=job.cover_letter_sha256,
+                    resume_hh_id=resume.hh_id,
+                    resume_title=resume.title,
+                )
+                observation.rollback()
+
+            _assert_other_publication_does_not_block_submission(
                 session,
                 application.id,
                 lambda: service.background_submission_is_allowed(
@@ -1915,6 +1994,7 @@ def test_supervised_claim_requires_exact_letter_and_excludes_worker(
                         "обработки ошибок и контроля целостности данных."
                     ),
                     key_skills=("Python",),
+                    details_fetched_at=datetime.now(UTC),
                 )
             )
             directions.track_vacancy(direction.id, vacancy.id)
@@ -1971,7 +2051,7 @@ def test_supervised_claim_requires_exact_letter_and_excludes_worker(
                 model_name=MANUAL_REVIEW_MODEL,
                 quality_score=10,
                 quality_passed=True,
-                quality_version="cover_letter_quality_v1",
+                quality_version=QUALITY_RUBRIC_VERSION,
                 state=CoverLetterState.READY,
             )
             session.add(letter)
@@ -2007,6 +2087,7 @@ def test_supervised_claim_requires_exact_letter_and_excludes_worker(
                         f"supervised-counted-{index}",
                         "Python backend",
                         f"https://hh.ru/vacancy/supervised-counted-{index}",
+                        details_fetched_at=datetime.now(UTC),
                     )
                 )
                 counted_application = ApplicationRepository(session).create_apply_intent(
@@ -2128,7 +2209,7 @@ def test_supervised_claim_requires_exact_letter_and_excludes_worker(
                 resume_title=resume.title,
             )
 
-            _assert_duplicate_history_blocks_submission(
+            _assert_other_publication_does_not_block_submission(
                 session,
                 application.id,
                 lambda: service.supervised_submission_is_allowed(

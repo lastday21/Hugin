@@ -3,8 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from hugin.database.models import ApplicationModel, ApplicationTaskModel
 from hugin.domain.tasks import (
     ApplicationPolicyRecord,
     SystemState,
@@ -28,6 +30,7 @@ class QueueStatus:
 
 class QueueService:
     def __init__(self, session: Session) -> None:
+        self._session = session
         self._tasks = QueueTaskRepository(session)
         self._system = SystemStateRepository(session)
         self._settings = ApplicationSettingsRepository(session)
@@ -50,9 +53,28 @@ class QueueService:
             return None
         if system.next_apply_at is not None and system.next_apply_at > selected_at:
             return None
+        from hugin.services.application_selection_gate import ApplicationSelectionGate
+
+        accounts = (
+            select(ApplicationModel.account_id)
+            .join(ApplicationTaskModel)
+            .where(ApplicationTaskModel.state.in_((TaskState.PENDING, TaskState.RETRY_SCHEDULED)))
+            .distinct()
+        )
+        if account_id is not None:
+            accounts = accounts.where(ApplicationModel.account_id == account_id)
+        if direction_id is not None:
+            accounts = accounts.where(ApplicationModel.direction_id == direction_id)
+        gate = ApplicationSelectionGate(self._session)
+        blocked = frozenset(
+            identity
+            for identity in self._session.scalars(accounts)
+            if gate.blocking_reason(identity, selected_at) is not None
+        )
         return self._tasks.claim_next(
             selected_at,
             account_id=account_id,
+            excluded_account_ids=blocked,
             direction_id=direction_id,
             require_ready_cover_letter=require_ready_cover_letter,
             cover_letter_instruction_version=cover_letter_instruction_version,

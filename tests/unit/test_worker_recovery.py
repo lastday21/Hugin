@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import threading
-from datetime import datetime
+from datetime import UTC, datetime
 
 import pytest
 
@@ -51,7 +51,13 @@ def test_stop_and_restart_preserve_result_without_repeating_external_handler(
             direction = directions.create(account.id, "Python backend")
             directions.attach_resume(direction.id, resume.id)
             vacancy = VacancyRepository(session).upsert(
-                VacancyData("worker-recovery", "Python developer", "https://hh.ru/vacancy/test")
+                VacancyData(
+                    "worker-recovery",
+                    "Python developer",
+                    "https://hh.ru/vacancy/test",
+                    description="Develop Python APIs",
+                    details_fetched_at=datetime.now(UTC),
+                )
             )
             directions.track_vacancy(direction.id, vacancy.id)
             directions.apply_rules(

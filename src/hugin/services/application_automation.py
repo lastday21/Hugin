@@ -61,6 +61,7 @@ from hugin.repositories.tasks import (
 from hugin.repositories.vacancies import VacancyRepository
 from hugin.services.ai_prompts import AiPromptSettingsService
 from hugin.services.application_exposure import application_profile_snapshot
+from hugin.services.application_selection_gate import ApplicationSelectionGate
 from hugin.services.autonomy import AutonomyPolicyService
 from hugin.services.cover_letter import CoverLetterService
 from hugin.services.cover_letter_quality import QUALITY_RUBRIC_VERSION
@@ -232,21 +233,13 @@ class ApplicationAutomationService:
         vacancy = self._vacancies.get(tracked.vacancy_id)
         if not self._semantic_selection_current(direction, vacancy, resume.id):
             return 0, 1
-        if vacancy.duplicate_of_id is not None:
-            if self._vacancies.duplicate_family_has_sent_or_live_application(
-                account.id,
-                vacancy.id,
-            ):
-                return 0, 1
-            vacancy = self._vacancies.promote_duplicate(vacancy.id)
-
         current = self._applications.get_by_key(account.id, tracked.vacancy_id, resume.id)
         if current is None:
             current = self._applications.get_for_account_vacancy(
                 account.id,
                 tracked.vacancy_id,
             )
-        if self._vacancies.duplicate_family_has_sent_or_live_application(
+        if self._vacancies.vacancy_has_sent_or_live_application(
             account.id, vacancy.id, exclude_application_id=current.id if current else None
         ):
             return 0, 1
@@ -495,7 +488,6 @@ class ApplicationAutomationService:
                 ApplicationTaskModel.state == TaskState.RUNNING,
                 ApplicationModel.state == ApplicationState.APPLYING,
                 VacancyModel.availability == VacancyAvailability.ACTIVE,
-                VacancyModel.duplicate_of_id.is_(None),
                 DirectionVacancyModel.state == VacancyState.QUEUED,
                 DirectionVacancyModel.rules_version == RULES_VERSION,
                 DirectionVacancyModel.rules_details["category"]
@@ -521,7 +513,7 @@ class ApplicationAutomationService:
         letter, resume, application = row
         if not self._application_selection_current(application):
             return False
-        if self._vacancies.duplicate_family_has_sent_or_live_application(
+        if self._vacancies.vacancy_has_sent_or_live_application(
             application.account_id, application.vacancy_id, exclude_application_id=application.id
         ):
             return False
@@ -603,7 +595,6 @@ class ApplicationAutomationService:
                 ApplicationTaskModel.state == TaskState.RUNNING,
                 ApplicationModel.state == ApplicationState.APPLYING,
                 VacancyModel.availability == VacancyAvailability.ACTIVE,
-                VacancyModel.duplicate_of_id.is_(None),
                 DirectionVacancyModel.state == VacancyState.QUEUED,
                 DirectionVacancyModel.rules_version == RULES_VERSION,
                 DirectionVacancyModel.rules_details["category"].as_string().in_(allowed_categories),
@@ -625,9 +616,13 @@ class ApplicationAutomationService:
         if row is None:
             return False
         letter, resume, application = row
+        if ApplicationSelectionGate(self._session).blocking_reason(
+            application.account_id, selected_at
+        ):
+            return False
         if not self._application_selection_current(application):
             return False
-        if self._vacancies.duplicate_family_has_sent_or_live_application(
+        if self._vacancies.vacancy_has_sent_or_live_application(
             application.account_id, application.vacancy_id, exclude_application_id=application.id
         ):
             return False
@@ -697,7 +692,6 @@ class ApplicationAutomationService:
                 ApplicationTaskModel.state.in_((TaskState.PENDING, TaskState.RETRY_SCHEDULED)),
                 ApplicationModel.state == ApplicationState.APPLYING,
                 VacancyModel.availability == VacancyAvailability.ACTIVE,
-                VacancyModel.duplicate_of_id.is_(None),
                 DirectionVacancyModel.state == VacancyState.QUEUED,
                 DirectionVacancyModel.rules_version == RULES_VERSION,
                 CoverLetterModel.id == letter_id,
@@ -1066,7 +1060,6 @@ class ApplicationAutomationService:
                 CareerDirectionModel.is_active.is_(True),
                 ResumeModel.is_active.is_(True),
                 VacancyModel.availability == VacancyAvailability.ACTIVE,
-                VacancyModel.duplicate_of_id.is_(None),
                 DirectionVacancyModel.state == VacancyState.QUEUED,
                 DirectionVacancyModel.rules_version == RULES_VERSION,
                 DirectionVacancyModel.rules_details["category"].as_string().in_(allowed_categories),
@@ -1087,6 +1080,8 @@ class ApplicationAutomationService:
         now: datetime | None = None,
     ) -> ApplyJob | None:
         selected_at = as_utc(now or datetime.now(UTC))
+        if ApplicationSelectionGate(self._session).blocking_reason(account_id, selected_at):
+            return None
         system = self._system.lock()
         if (
             system.state is not SystemState.RUNNING
@@ -1120,7 +1115,6 @@ class ApplicationAutomationService:
         )
         if (
             vacancy.availability is not VacancyAvailability.ACTIVE
-            or vacancy.duplicate_of_id is not None
             or not resume.is_active
             or tracked.state is not VacancyState.QUEUED
             or tracked.rules_version != RULES_VERSION
@@ -1257,7 +1251,6 @@ class ApplicationAutomationService:
                 ApplicationModel.account_id == account_id,
                 ApplicationModel.state == ApplicationState.APPLYING,
                 VacancyModel.availability == VacancyAvailability.ACTIVE,
-                VacancyModel.duplicate_of_id.is_(None),
                 ResumeModel.is_active.is_(True),
                 DirectionVacancyModel.state == VacancyState.QUEUED,
                 DirectionVacancyModel.rules_version == RULES_VERSION,

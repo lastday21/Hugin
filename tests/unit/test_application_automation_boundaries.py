@@ -47,6 +47,7 @@ def queued_jobs(session: Session, count: int = 2) -> tuple[ApplyJob, ...]:
                 f"boundary-{index}",
                 "Python developer",
                 f"https://hh.ru/vacancy/boundary-{index}",
+                details_fetched_at=datetime.now(UTC),
             )
         )
         directions.track_vacancy(direction.id, vacancy.id)

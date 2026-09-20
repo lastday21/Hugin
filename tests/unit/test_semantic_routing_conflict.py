@@ -251,7 +251,7 @@ def test_new_rules_reapply_old_routes_from_saved_model_stages(
 ) -> None:
     import hugin.services.vacancy_analysis as analysis
 
-    assert RULES_VERSION == "python_it_v71"
+    assert RULES_VERSION != "python_it_v70"
     case = routing_case(settings)
     with monkeypatch.context() as previous_version:
         previous_version.setattr(analysis, "RULES_VERSION", "python_it_v70")

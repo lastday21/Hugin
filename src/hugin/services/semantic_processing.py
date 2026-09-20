@@ -79,7 +79,7 @@ class SemanticSelectionProcessor:
         try:
             with database.sessions.begin() as session:
                 direction = DirectionRepository(session).get_for_account(account_id, direction_id)
-                vacancy = VacancyRepository(session).get(vacancy_id)
+                vacancy = VacancyAnalysisService(session).link_republication(vacancy_id)
                 snapshot = selection_snapshot(session, direction, vacancy)
                 if snapshot is None:
                     return ProcessingResult("DISABLED", 0, False, None)

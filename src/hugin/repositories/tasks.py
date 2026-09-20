@@ -136,6 +136,7 @@ class QueueTaskRepository:
         now: datetime | None = None,
         *,
         account_id: int | None = None,
+        excluded_account_ids: frozenset[int] = frozenset(),
         direction_id: int | None = None,
         require_ready_cover_letter: bool = False,
         exclude_ready_cover_letter: bool = False,
@@ -170,7 +171,6 @@ class QueueTaskRepository:
                 ApplicationTaskModel.scheduled_at <= selected_at,
                 ApplicationModel.state == ApplicationState.APPLYING,
                 VacancyModel.availability == VacancyAvailability.ACTIVE,
-                VacancyModel.duplicate_of_id.is_(None),
                 or_(
                     ApplicationModel.direction_id.is_(None),
                     CareerDirectionModel.is_active.is_(True),
@@ -185,6 +185,8 @@ class QueueTaskRepository:
         )
         if account_id is not None:
             statement = statement.where(ApplicationModel.account_id == account_id)
+        if excluded_account_ids:
+            statement = statement.where(ApplicationModel.account_id.not_in(excluded_account_ids))
         if direction_id is not None:
             statement = statement.where(ApplicationModel.direction_id == direction_id)
         if vacancy_rules_version is not None or vacancy_rule_categories is not None:
@@ -331,11 +333,8 @@ class QueueTaskRepository:
                 .not_in(tuple(allowed_categories))
             )
         tasks = tuple(
-            self._session.execute(
-                select(
-                    ApplicationTaskModel.id,
-                    VacancyModel.duplicate_of_id,
-                )
+            self._session.scalars(
+                select(ApplicationTaskModel.id)
                 .join(
                     ApplicationModel,
                     ApplicationModel.id == ApplicationTaskModel.application_id,
@@ -356,18 +355,15 @@ class QueueTaskRepository:
                     ApplicationTaskModel.state.in_(ELIGIBILITY_CHECKED_STATES),
                     or_(
                         *rules_ineligible,
-                        VacancyModel.duplicate_of_id.is_not(None),
                     ),
                 )
             )
         )
-        for task_id, duplicate_of_id in tasks:
+        for task_id in tasks:
             self.transition(
                 task_id,
                 TaskState.SKIPPED,
-                error_code=(
-                    "VACANCY_DUPLICATE" if duplicate_of_id is not None else "VACANCY_RULES_CHANGED"
-                ),
+                error_code="VACANCY_RULES_CHANGED",
             )
         return len(tasks)
 

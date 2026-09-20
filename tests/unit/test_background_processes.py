@@ -260,7 +260,9 @@ def test_funnel_existing_exclusions_never_wait_but_keep_uncertain_and_sent_prece
         assert funnel["total"] == 1
         return next(str(item["key"]) for item in funnel["stages"] if item["count"] == 1)
 
-    assert stage() == "rejected"
+    assert stage() == (
+        ("ready" if has_details else "awaiting_details") if exclusion == "duplicate" else "rejected"
+    )
     resume = ResumeRepository(session).upsert(service._account_id, "exclusion-resume", "Python")
     application = ApplicationModel(
         account_id=service._account_id,

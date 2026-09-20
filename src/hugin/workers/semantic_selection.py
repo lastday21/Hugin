@@ -103,7 +103,6 @@ class SemanticSelectionWorker:
                 HhAccountModel.is_active.is_(True),
                 VacancyModel.availability == VacancyAvailability.ACTIVE,
                 VacancyModel.details_fetched_at.is_not(None),
-                VacancyModel.duplicate_of_id.is_(None),
                 or_(
                     VacancyModel.published_at.is_(None),
                     VacancyModel.published_at >= datetime.now(UTC) - MAX_VACANCY_AGE,
