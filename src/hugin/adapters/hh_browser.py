@@ -1757,6 +1757,9 @@ class VisibleHhBrowser:
                 ) from error
             raise
 
+    def is_closed(self) -> bool:
+        return self._page is None or self._page.is_closed()
+
     def is_open(self) -> bool:
         page = self._page
         if page is None or page.is_closed():

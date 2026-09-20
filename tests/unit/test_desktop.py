@@ -14,6 +14,7 @@ from typing import ClassVar
 from urllib.error import URLError
 
 import pytest
+from playwright.sync_api import Error as PlaywrightError
 
 from hugin import desktop
 from hugin.adapters.notification_credentials import NotificationGatewayCredentials
@@ -252,6 +253,113 @@ def test_bridge_opens_manual_hh_login_and_restores_work(
         ("unblocked", "messages:1"),
         "closed",
     ]
+
+
+@pytest.mark.parametrize("warning", [False, True])
+def test_manual_login_cancel_or_account_warning_never_resumes_work(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    warning: bool,
+) -> None:
+    class LoginBrowser:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            self.open = True
+
+        def __enter__(self) -> LoginBrowser:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            self.open = False
+
+        def open_login(self) -> None:
+            pass
+
+        def is_open(self) -> bool:
+            return self.open
+
+        def authentication_status(self) -> LoginStatus:
+            return LoginStatus.ACCOUNT_WARNING if warning else LoginStatus.MANUAL_ACTION_REQUIRED
+
+        def wait_for_authentication(self) -> bool:
+            self.open = False
+            return False
+
+    monkeypatch.setattr(desktop, "VisibleHhBrowser", LoginBrowser)
+    monkeypatch.setattr(
+        desktop.DesktopBridge,
+        "_resume_after_hh_login",
+        lambda _self: pytest.fail("Cancelled login must not resume work"),
+    )
+    bridge = desktop.DesktopBridge(Settings(environment="test", data_dir=tmp_path))
+    result = bridge.login_hh()
+    assert result["status"] == ("ACCOUNT_WARNING" if warning else "CANCELLED")
+    assert result["message"] == (
+        "hh.ru показал предупреждение безопасности аккаунта"
+        if warning
+        else "Окно hh.ru закрыто до завершения входа"
+    )
+
+
+@pytest.mark.parametrize("stage", ["open", "status", "wait"])
+@pytest.mark.parametrize("closed", [True, False])
+def test_manual_login_handles_browser_closing_during_operation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stage: str,
+    closed: bool,
+) -> None:
+    failure = PlaywrightError("Target page, context or browser has been closed")
+
+    class LoginBrowser:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            self.open = True
+            self.probe_failed = False
+
+        def __enter__(self) -> LoginBrowser:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            self.open = False
+
+        def fail_at(self, current: str) -> None:
+            if stage == current:
+                self.open = not closed
+                self.probe_failed = True
+                raise failure
+
+        def is_closed(self) -> bool:
+            return not self.open
+
+        def open_login(self) -> None:
+            self.fail_at("open")
+
+        def is_open(self) -> bool:
+            return self.open and not self.probe_failed
+
+        def authentication_status(self) -> LoginStatus:
+            self.fail_at("status")
+            return LoginStatus.MANUAL_ACTION_REQUIRED
+
+        def wait_for_authentication(self) -> bool:
+            self.fail_at("wait")
+            return False
+
+    monkeypatch.setattr(desktop, "VisibleHhBrowser", LoginBrowser)
+    monkeypatch.setattr(
+        desktop.DesktopBridge,
+        "_resume_after_hh_login",
+        lambda _self: pytest.fail("Closed or failed login must not resume work"),
+    )
+    bridge = desktop.DesktopBridge(Settings(environment="test", data_dir=tmp_path))
+    if closed:
+        assert bridge.login_hh() == {
+            "status": "CANCELLED",
+            "message": "Окно hh.ru закрыто до завершения входа",
+        }
+    else:
+        with pytest.raises(PlaywrightError) as raised:
+            bridge.login_hh()
+        assert raised.value is failure
 
 
 def test_bridge_keeps_saved_form_open_without_submitting(

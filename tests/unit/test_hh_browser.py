@@ -531,6 +531,17 @@ def test_browser_detects_closed_window_before_page_flag_updates(tmp_path: Path) 
     assert not browser.is_open()
 
 
+def test_browser_closure_is_not_inferred_from_navigation_probe_failure(tmp_path: Path) -> None:
+    page = FakePage()
+    browser = make_browser(page, tmp_path)
+    page.window_probe_error = Error("Execution context was destroyed during navigation")
+
+    assert not browser.is_open()
+    assert not browser.is_closed()
+    page.closed = True
+    assert browser.is_closed()
+
+
 def test_aborted_login_redirect_is_accepted_for_authenticated_page(tmp_path: Path) -> None:
     page = FakePage("https://ufa.hh.ru/applicant/resumes")
     page.goto_error = Error("net::ERR_ABORTED")

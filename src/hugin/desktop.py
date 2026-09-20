@@ -19,6 +19,7 @@ from urllib.parse import urlsplit
 from urllib.request import ProxyHandler, build_opener
 from uuid import uuid4
 
+from playwright.sync_api import Error as PlaywrightError
 from sqlalchemy import select
 
 from hugin.adapters.codex_cli import CodexCliError, configured_codex_cli_client
@@ -191,18 +192,22 @@ class DesktopBridge:
                 ),
             ) as browser,
         ):
-            browser.open_login()
-            while browser.is_open():
-                status = browser.authentication_status()
-                if status is LoginStatus.AUTHENTICATED:
-                    self._resume_after_hh_login()
-                    return self._result("READY", "Вход в hh.ru выполнен")
-                if status is LoginStatus.ACCOUNT_WARNING:
-                    return self._result(
-                        "ACCOUNT_WARNING",
-                        "hh.ru показал предупреждение безопасности аккаунта",
-                    )
-                browser.wait_for_authentication()
+            try:
+                browser.open_login()
+                while browser.is_open():
+                    status = browser.authentication_status()
+                    if status is LoginStatus.AUTHENTICATED:
+                        self._resume_after_hh_login()
+                        return self._result("READY", "Вход в hh.ru выполнен")
+                    if status is LoginStatus.ACCOUNT_WARNING:
+                        return self._result(
+                            "ACCOUNT_WARNING",
+                            "hh.ru показал предупреждение безопасности аккаунта",
+                        )
+                    browser.wait_for_authentication()
+            except PlaywrightError:
+                if not browser.is_closed():
+                    raise
         return self._result("CANCELLED", "Окно hh.ru закрыто до завершения входа")
 
     def _resume_after_hh_login(self) -> None:
