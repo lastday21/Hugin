@@ -23,7 +23,7 @@ from typing import BinaryIO
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 from hugin.diagnostics import OperationJournal
-from hugin.domain.screening_questions import sensitive_question_text
+from hugin.domain.screening_questions import is_fixed_choice, sensitive_question_text
 
 if sys.platform == "win32":
     import msvcrt
@@ -2820,8 +2820,15 @@ class VisibleHhBrowser:
             or any(
                 field.has_attachment
                 or field.has_external_action
-                or field.has_test_assignment
-                or _DANGEROUS_SCREENING_QUESTION.search(sensitive_question_text(field.question))
+                or (
+                    not is_fixed_choice(field.field_type, field.options)
+                    and (
+                        field.has_test_assignment
+                        or _DANGEROUS_SCREENING_QUESTION.search(
+                            sensitive_question_text(field.question)
+                        )
+                    )
+                )
                 for field in form.fields
             )
         )

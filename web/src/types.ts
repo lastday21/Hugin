@@ -366,6 +366,7 @@ export interface FormQuestion {
   options: string[];
   answer: string | null;
   source: string | null;
+  source_question?: string | null;
 }
 
 export interface FormAnswerInput {

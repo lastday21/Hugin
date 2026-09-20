@@ -207,6 +207,7 @@ class FormQuestionResponse(BaseModel):
     options: tuple[str, ...]
     answer: str | None
     source: AnswerSource | None
+    source_question: str | None = None
 
 
 class FormDraftResponse(BaseModel):

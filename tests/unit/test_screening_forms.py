@@ -13,6 +13,7 @@ from hugin.database.models import (
     ApplicationModel,
     ApplicationTaskModel,
     CandidateProfileModel,
+    CareerDirectionModel,
     CoverLetterModel,
     ScreeningAnswerModel,
     ScreeningFormModel,
@@ -25,6 +26,7 @@ from hugin.domain import (
     ConfirmationState,
     HhScreeningField,
     HhScreeningForm,
+    HhScreeningSubmission,
     ScreeningFormState,
     VacancyData,
 )
@@ -40,7 +42,99 @@ from hugin.repositories import (
 )
 from hugin.repositories.vacancies import VacancyRepository
 from hugin.services.autonomy import AutonomyPolicyService
-from hugin.services.screening_forms import ScreeningDraftService
+from hugin.services.screening_forms import ScreeningDraftService, StoredScreeningSubmission
+
+
+@pytest.mark.parametrize(
+    "condition",
+    ["current", "expired", "other_direction", "changed_basis", "outdated_bank", "revoked"],
+)
+def test_rephrased_salary_reuse_keeps_scope_freshness_and_tax_basis(
+    settings: Settings, condition: str
+) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    try:
+        with database.sessions.begin() as session:
+            account = AccountRepository(session).create("Кандидат", "rephrase")
+            resume = ResumeRepository(session).upsert(account.id, "resume", "Python")
+            session.add(CandidateProfileModel(account_id=account.id, display_name="Кандидат"))
+            applications = []
+            for index in range(2):
+                vacancy = VacancyRepository(session).upsert(
+                    VacancyData(
+                        f"rephrase-{index}", "Python", f"https://hh.ru/vacancy/rephrase-{index}"
+                    )
+                )
+                applications.append(
+                    ApplicationRepository(session).create_apply_intent(
+                        account.id, vacancy.id, resume.id
+                    )
+                )
+            service = ScreeningDraftService(session)
+            original_question = (
+                "Какие у тебя зарплатные ожидания? (укажи вилку до вычета налогов — gross)"
+            )
+            original = service.capture(
+                applications[0].id,
+                HhScreeningForm(
+                    (HhScreeningField("salary", original_question, "textarea", is_required=True),)
+                ),
+            )
+            service.save_confirmed_answers(
+                account.id, original.form_id, {"salary": "140 000–180 000 рублей gross."}
+            )
+            fact = session.scalar(select(VerifiedFactModel))
+            assert fact is not None
+            if condition == "expired":
+                fact.actual_at = datetime.now(UTC) - timedelta(days=31)
+            if condition == "outdated_bank":
+                template = session.scalar(select(AnswerTemplateModel))
+                assert template is not None
+                fact.content = "120 000 рублей на руки."
+                template.answer_text = fact.content
+                template.is_active = False
+            if condition == "revoked":
+                template = session.scalar(select(AnswerTemplateModel))
+                assert template is not None
+                template.is_active = False
+            if condition == "other_direction":
+                direction = CareerDirectionModel(account_id=account.id, name="Иное")
+                session.add(direction)
+                session.flush()
+                fact.direction_id = direction.id
+            session.flush()
+            question = "Укажите ваши зарплатные ожидания в гросс (до вычета НДФЛ), пожалуйста."
+            if condition == "changed_basis":
+                question = "Укажите ваши зарплатные ожидания на руки, пожалуйста."
+            draft = service.capture(
+                applications[1].id,
+                HhScreeningForm(
+                    (HhScreeningField("salary", question, "textarea", is_required=True),)
+                ),
+            )
+            submission = service.get_auto_submission(applications[1].id)
+            if condition in {"changed_basis", "revoked"}:
+                assert draft.questions[0].answer is None
+            else:
+                assert draft.questions[0].answer == "140 000–180 000 рублей gross."
+                assert draft.questions[0].source is AnswerSource.BANK
+                assert draft.questions[0].source_question == original_question
+            assert (submission is not None) == (condition == "current")
+            if submission is not None:
+                assert service.auto_submission_allowed(submission)
+            if condition in {"expired", "other_direction", "outdated_bank"}:
+                stored = session.scalar(
+                    select(ScreeningAnswerModel)
+                    .join(ScreeningQuestionModel)
+                    .where(ScreeningQuestionModel.form_id == draft.form_id)
+                )
+                assert stored is not None
+                stored.is_confirmed = True
+                session.flush()
+                assert service.get_auto_submission(applications[1].id) is None
+    finally:
+        database.close()
 
 
 @pytest.mark.parametrize(
@@ -73,6 +167,47 @@ def test_separate_words_for_salary_use_existing_salary_fact() -> None:
         )
         == "salary_expectation"
     )
+
+
+@pytest.mark.parametrize("field_type", ["radio", "select"])
+@pytest.mark.parametrize(
+    "question",
+    [
+        "Готовы ли прислать документы, подтверждающие опыт (СТД с Госуслуг)?",
+        "Есть ли опыт тестирования банковских приложений?",
+        "Готовы ли к материальной ответственности?",
+    ],
+)
+def test_ready_choices_are_not_blocked_by_question_words(field_type: str, question: str) -> None:
+    field = HhScreeningField("choice", question, field_type, options=("Да", "Нет"))
+    assert not ScreeningDraftService._prohibited(field)
+    assert not VisibleHhBrowser._screening_form_is_dangerous(HhScreeningForm((field,)))
+
+
+@pytest.mark.parametrize("flag", ["has_attachment", "has_external_action"])
+def test_ready_choices_do_not_execute_separate_actions(flag: str) -> None:
+    field = HhScreeningField(
+        "choice",
+        "Готовы предоставить документы?",
+        "radio",
+        options=("Да", "Нет"),
+        has_attachment=flag == "has_attachment",
+        has_external_action=flag == "has_external_action",
+    )
+    assert ScreeningDraftService._prohibited(field)
+    assert VisibleHhBrowser._screening_form_is_dangerous(HhScreeningForm((field,)))
+
+
+def test_test_experience_choice_is_not_a_test_assignment() -> None:
+    field = HhScreeningField(
+        "experience",
+        "Есть ли опыт написания автотестов?",
+        "radio",
+        options=("Да", "Нет"),
+        has_test_assignment=True,
+    )
+    assert not ScreeningDraftService._prohibited(field)
+    assert not VisibleHhBrowser._screening_form_is_dangerous(HhScreeningForm((field,)))
 
 
 pytestmark = pytest.mark.integration
@@ -400,8 +535,39 @@ def test_data_accuracy_confirmation_is_not_answered_from_experience_fact(
         database.close()
 
 
-def test_pending_salary_question_is_reconciled_from_confirmed_profile_fact(
+@pytest.mark.parametrize(
+    ("question", "answer", "expected"),
+    [
+        (
+            "Пожалуйста, уточните Ваши зарплатные ожидания из расчета "
+            "стабильной ежемесячной суммы на руки.",
+            "120 000 рублей на руки в месяц",
+            True,
+        ),
+        ("Ваши зарплатные ожидания на руки за час?", "120 000 рублей на руки в месяц", False),
+        ("Ваши зарплатные ожидания на руки за год?", "120 000 рублей на руки в месяц", False),
+        ("Ваши минимальные зарплатные ожидания на руки?", "120 000 рублей на руки", False),
+        ("Ваши зарплатные ожидания на руки в долларах?", "120 000 рублей на руки", False),
+        (
+            "Ваши зарплатные ожидания на руки при занятости 20 часов?",
+            "120 000 рублей на руки",
+            False,
+        ),
+        ("Ваши зарплатные ожидания на испытательный срок?", "120 000 рублей на руки", False),
+        ("Ваши зарплатные ожидания на руки в месяц?", "120 000 рублей на руки", False),
+        ("Ваши зарплатные ожидания на руки за час?", "1500 рублей на руки в час", True),
+        (
+            "Ваши зарплатные ожидания на руки за час?",
+            "120 000 рублей на руки в месяц при занятости 20 часов",
+            False,
+        ),
+    ],
+)
+def test_pending_salary_question_keeps_confirmed_profile_units_and_conditions(
     settings: Settings,
+    question: str,
+    answer: str,
+    expected: bool,
 ) -> None:
     upgrade_database(settings)
     database = create_database(settings)
@@ -439,10 +605,7 @@ def test_pending_salary_question_is_reconciled_from_confirmed_profile_fact(
                     fields=(
                         HhScreeningField(
                             "salary",
-                            (
-                                "Пожалуйста, уточните Ваши зарплатные ожидания из расчета "
-                                "стабильной ежемесячной суммы на руки."
-                            ),
+                            question,
                             "textarea",
                             is_required=True,
                         ),
@@ -455,7 +618,7 @@ def test_pending_salary_question_is_reconciled_from_confirmed_profile_fact(
                 VerifiedFactModel(
                     profile_id=profile.id,
                     category="salary_expectation",
-                    content="120 000 рублей на руки",
+                    content=answer,
                     source_type="user",
                     source_reference="profile-question:salary_expectation",
                     actual_at=datetime.now(UTC),
@@ -465,11 +628,43 @@ def test_pending_salary_question_is_reconciled_from_confirmed_profile_fact(
             )
             session.flush()
 
-            assert service.reconcile_pending_answers(account.id) == 1
+            assert service.reconcile_pending_answers(account.id) == int(expected)
+            if not expected:
+                assert service.get_auto_submission(application.id) is None
+                assert tasks.get(task.id).state is TaskState.INPUT_REQUIRED
+                stored_answer = session.scalar(select(ScreeningAnswerModel))
+                stored_fact = session.scalar(select(VerifiedFactModel))
+                stored_form = session.get(ScreeningFormModel, draft.form_id)
+                assert stored_answer is not None and stored_fact is not None
+                assert stored_form is not None
+                stored_answer.answer_text = answer
+                stored_answer.source = AnswerSource.PROFILE
+                stored_answer.verified_fact_id = stored_fact.id
+                stored_answer.is_confirmed = True
+                stored_answer.confirmed_at = datetime.now(UTC)
+                stored_form.state = ScreeningFormState.CONFIRMED
+                stored_form.confirmed_at = datetime.now(UTC)
+                session.flush()
+                old_submission = StoredScreeningSubmission(
+                    stored_form.id,
+                    application.id,
+                    HhScreeningSubmission(stored_form.version_hash, (("salary", answer),)),
+                )
+                assert not service.auto_submission_allowed(old_submission)
+                assert service.get_auto_submission(application.id) is None
+                reopened = service.capture(
+                    application.id,
+                    HhScreeningForm(
+                        fields=(HhScreeningField("salary", question, "textarea", is_required=True),)
+                    ),
+                )
+                assert reopened.state is ScreeningFormState.REVIEW_REQUIRED
+                assert reopened.questions[0].answer == answer
+                return
             assert service.list_pending(account.id) == ()
             submission = service.get_auto_submission(application.id)
             assert submission is not None
-            assert submission.payload.answers == (("salary", "120 000 рублей на руки"),)
+            assert submission.payload.answers == (("salary", answer),)
             assert tasks.get(task.id).state is TaskState.RETRY_SCHEDULED
     finally:
         database.close()
@@ -575,12 +770,29 @@ def test_explicit_assignment_is_never_a_simple_form(question: str) -> None:
 
 
 @pytest.mark.parametrize(
-    "question",
-    ("Почему хотите работать у нас?", "Расскажите о своей последней задаче"),
+    ("question", "field_type", "options", "answer"),
+    [
+        ("Почему хотите работать у нас?", "textarea", (), "Разрабатываю приложения на Python."),
+        (
+            "Расскажите о своей последней задаче",
+            "textarea",
+            (),
+            "Разрабатываю приложения на Python.",
+        ),
+        (
+            "Готовы ли прислать документы, подтверждающие опыт (СТД с Госуслуг)?",
+            "radio",
+            ("Да", "Нет"),
+            "Да",
+        ),
+    ],
 )
 def test_user_confirmation_releases_nonstandard_form_and_survives_recapture(
     settings: Settings,
     question: str,
+    field_type: str,
+    options: tuple[str, ...],
+    answer: str,
 ) -> None:
     database = create_database(settings)
     try:
@@ -609,13 +821,23 @@ def test_user_confirmation_releases_nonstandard_form_and_survives_recapture(
             tasks.transition(task.id, TaskState.INPUT_REQUIRED)
             service = ScreeningDraftService(session)
             form = HhScreeningForm(
-                (HhScreeningField("details", question, "textarea", is_required=True),)
+                (
+                    HhScreeningField(
+                        "details", question, field_type, options=options, is_required=True
+                    ),
+                )
             )
             draft = service.capture(application.id, form)
+            if options:
+                stored = session.get(ScreeningFormModel, draft.form_id)
+                assert stored is not None
+                stored.submission_block_reason = (
+                    f"Вопрос «{question}» требует действий непосредственно на hh.ru."
+                )
             saved = service.save_confirmed_answers(
                 account.id,
                 draft.form_id,
-                {"details": "Разрабатываю приложения на Python."},
+                {"details": answer},
             )
             assert saved.state is ScreeningFormState.CONFIRMED
             assert tasks.get(task.id).state is TaskState.RETRY_SCHEDULED
@@ -733,8 +955,11 @@ def test_confirmed_form_answer_is_scoped_reused_and_requeues_application(
             )
             assert stored_answer is not None
             stored_answer.source = AnswerSource.PROFILE
+            saved_reference = fact.source_reference
+            fact.source_reference = None
             session.flush()
             assert not service.auto_submission_allowed(submission)
+            fact.source_reference = saved_reference
             stored_answer.source = AnswerSource.USER
             session.flush()
             fact.actual_at = datetime.now(UTC) - timedelta(days=31)
@@ -755,6 +980,11 @@ def test_confirmed_form_answer_is_scoped_reused_and_requeues_application(
                 account.id,
                 other_vacancy.id,
                 resume.id,
+            )
+            saved_question = service.capture(other_application.id, form)
+            assert saved_question.questions[0].source is AnswerSource.BANK
+            assert (
+                saved_question.questions[0].source_question == "Какой формат работы вам подходит?"
             )
             unrelated = service.capture(
                 other_application.id,

@@ -22,6 +22,7 @@ from hugin.database.models import (
     VacancyModel,
     VerifiedFactModel,
 )
+from hugin.domain.answer_reuse import reusable_question_key, salary_profile_answer_is_compatible
 from hugin.domain.applications import ApplicationState, EventPayload
 from hugin.domain.content import (
     AnswerSource,
@@ -36,7 +37,11 @@ from hugin.domain.hh import (
     HhScreeningSubmission,
     screening_form_hash,
 )
-from hugin.domain.screening_questions import INDUSTRY_EXCLUSIONS, sensitive_question_text
+from hugin.domain.screening_questions import (
+    INDUSTRY_EXCLUSIONS,
+    is_fixed_choice,
+    sensitive_question_text,
+)
 from hugin.domain.tasks import TaskState
 from hugin.domain.time import as_utc
 from hugin.domain.vacancies import VacancyAvailability
@@ -55,6 +60,7 @@ class ScreeningDraftQuestion:
     options: tuple[str, ...]
     answer: str | None
     source: AnswerSource | None
+    source_question: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -340,6 +346,7 @@ class ScreeningDraftService:
                 field,
                 templates,
                 facts,
+                application=application,
                 policy=policy,
                 now=confirmed_at,
             )
@@ -520,6 +527,7 @@ class ScreeningDraftService:
                     self._stored_field(question),
                     templates,
                     facts,
+                    application=application,
                     policy=policy,
                     now=selected_at,
                 )
@@ -950,6 +958,12 @@ class ScreeningDraftService:
             )
         if cls._is_screening_fact(fact) and answer.source is AnswerSource.PROFILE:
             return False
+        if (
+            answer.source is AnswerSource.PROFILE
+            and fact.category == "salary_expectation"
+            and not salary_profile_answer_is_compatible(question.question_text, fact.content)
+        ):
+            return False
         compatible_answer = (
             cls._compatible_answer(cls._stored_field(question), answer.answer_text)
             if answer.answer_text is not None
@@ -1015,7 +1029,32 @@ class ScreeningDraftService:
             )
             .where(ScreeningQuestionModel.form_id == form.id)
             .order_by(ScreeningQuestionModel.position, ScreeningQuestionModel.id)
+        ).all()
+        bank_fact_ids = {
+            answer.verified_fact_id
+            for _, answer in rows
+            if answer is not None
+            and answer.source is AnswerSource.BANK
+            and answer.verified_fact_id is not None
+        }
+        source_questions = (
+            {
+                (template.verified_fact_id, template.answer_text.strip()): template.question_pattern
+                for template in self._session.scalars(
+                    select(AnswerTemplateModel)
+                    .where(AnswerTemplateModel.verified_fact_id.in_(bank_fact_ids))
+                    .order_by(AnswerTemplateModel.id.desc())
+                )
+            }
+            if bank_fact_ids
+            else {}
         )
+        if bank_fact_ids:
+            for original_question, original_answer in self._history(application):
+                source_questions.setdefault(
+                    (original_answer.verified_fact_id, (original_answer.answer_text or "").strip()),
+                    original_question.question_text,
+                )
         questions = tuple(
             ScreeningDraftQuestion(
                 field_key=question.field_key,
@@ -1025,6 +1064,13 @@ class ScreeningDraftService:
                 options=tuple(question.options),
                 answer=answer.answer_text if answer is not None else None,
                 source=answer.source if answer is not None else None,
+                source_question=(
+                    source_questions.get(
+                        (answer.verified_fact_id, (answer.answer_text or "").strip())
+                    )
+                    if answer is not None and answer.source is AnswerSource.BANK
+                    else None
+                ),
             )
             for question, answer in rows
         )
@@ -1072,8 +1118,6 @@ class ScreeningDraftService:
         return None
 
     def _stored_block_reason(self, form: ScreeningFormModel) -> str | None:
-        if form.submission_block_reason:
-            return form.submission_block_reason
         fields = tuple(
             self._stored_field(question)
             for question in self._session.scalars(
@@ -1082,6 +1126,15 @@ class ScreeningDraftService:
                 .order_by(ScreeningQuestionModel.position, ScreeningQuestionModel.id)
             )
         )
+        if form.submission_block_reason:
+            obsolete_choice_reasons = {
+                f"Вопрос «{field.question}» требует действий непосредственно на hh.ru."
+                for field in fields
+                if is_fixed_choice(field.field_type, field.options) and not self._prohibited(field)
+            }
+            if form.submission_block_reason not in obsolete_choice_reasons:
+                return form.submission_block_reason
+            form.submission_block_reason = None
         restored = HhScreeningForm(fields)
         reason = self._form_block_reason(restored)
         if reason:
@@ -1199,13 +1252,6 @@ class ScreeningDraftService:
                         | (VerifiedFactModel.resume_id == application.resume_id)
                     )
                 ),
-                (
-                    (VerifiedFactModel.id.is_(None))
-                    | (
-                        (VerifiedFactModel.direction_id.is_(None))
-                        | (VerifiedFactModel.direction_id == application.direction_id)
-                    )
-                ),
             )
             .order_by(AnswerTemplateModel.id)
         )
@@ -1223,6 +1269,7 @@ class ScreeningDraftService:
                     VerifiedFactModel.profile_id == profile_id,
                     VerifiedFactModel.state == ConfirmationState.CONFIRMED,
                     VerifiedFactModel.allow_in_forms.is_(True),
+                    VerifiedFactModel.category != "screening_answer",
                     or_(
                         VerifiedFactModel.source_reference.is_(None),
                         VerifiedFactModel.source_reference.not_like("screening:%"),
@@ -1246,6 +1293,7 @@ class ScreeningDraftService:
         templates: tuple[tuple[AnswerTemplateModel, VerifiedFactModel | None], ...],
         facts: tuple[VerifiedFactModel, ...],
         *,
+        application: ApplicationModel,
         policy: AutonomyPolicy,
         now: datetime,
     ) -> _ResolvedAnswer | None:
@@ -1256,10 +1304,17 @@ class ScreeningDraftService:
             if answer is not None:
                 return _ResolvedAnswer(answer, AnswerSource.PROFILE, None, True)
         normalized_question = self._normalize(field.question)
+        question_key = reusable_question_key(field.question)
+        matches: list[tuple[bool, _ResolvedAnswer]] = []
         for template, fact in templates:
+            in_scope = fact is not None and (
+                fact.direction_id is None or fact.direction_id == application.direction_id
+            )
             fact_allowed = fact is not None and (
                 fact.state == ConfirmationState.CONFIRMED
                 and fact.allow_in_forms
+                and in_scope
+                and template.answer_text.strip() == fact.content.strip()
                 and self._fact_is_current(
                     fact,
                     field.question,
@@ -1267,21 +1322,58 @@ class ScreeningDraftService:
                     now=now,
                 )
             )
-            if self._normalize(template.question_pattern) == normalized_question:
+            exact = self._normalize(template.question_pattern) == normalized_question
+            equivalent = question_key is not None and (
+                reusable_question_key(template.question_pattern) == question_key
+            )
+            if exact or equivalent:
+                if fact is not None and (
+                    fact.state != ConfirmationState.CONFIRMED
+                    or not fact.allow_in_forms
+                    or template.answer_text.strip() != fact.content.strip()
+                ):
+                    continue
                 answer = self._compatible_answer(field, template.answer_text)
                 if answer is not None:
-                    return _ResolvedAnswer(
-                        answer,
-                        AnswerSource.BANK,
-                        template.verified_fact_id,
-                        fact_allowed,
+                    matches.append(
+                        (
+                            in_scope,
+                            _ResolvedAnswer(
+                                answer,
+                                AnswerSource.BANK,
+                                template.verified_fact_id,
+                                fact_allowed,
+                            ),
+                        )
                     )
 
+        if matches:
+            preferred = [item for scoped, item in matches if scoped] or [
+                item for _, item in matches
+            ]
+            confirmed = [item for item in preferred if item.confirmed]
+            preferred = confirmed or preferred
+            if len({item.text for item in preferred}) == 1:
+                return preferred[-1]
+            return None
+
+        historical = self._historical_answer(field, application)
+        if historical is not None:
+            return historical
+
+        if DANGEROUS_QUESTION.search(
+            sensitive_question_text(field.question)
+        ) or SERIOUS_OBLIGATION.search(field.question):
+            return None
         category = self._question_key(field.question) or self._fact_category(field.question)
         if category is None:
             return None
         for fact in facts:
             if fact.category != category:
+                continue
+            if category == "salary_expectation" and not salary_profile_answer_is_compatible(
+                field.question, fact.content
+            ):
                 continue
             answer = self._compatible_answer(field, fact.content)
             if answer is not None:
@@ -1295,6 +1387,55 @@ class ScreeningDraftService:
                         policy,
                         now=now,
                     ),
+                )
+        return None
+
+    def _history(
+        self, application: ApplicationModel
+    ) -> tuple[tuple[ScreeningQuestionModel, ScreeningAnswerModel], ...]:
+        rows = self._session.execute(
+            select(ScreeningQuestionModel, ScreeningAnswerModel)
+            .join(
+                ScreeningAnswerModel, ScreeningAnswerModel.question_id == ScreeningQuestionModel.id
+            )
+            .join(ScreeningFormModel, ScreeningFormModel.id == ScreeningQuestionModel.form_id)
+            .join(ApplicationModel, ApplicationModel.id == ScreeningFormModel.application_id)
+            .join(VerifiedFactModel, VerifiedFactModel.id == ScreeningAnswerModel.verified_fact_id)
+            .where(
+                ApplicationModel.account_id == application.account_id,
+                ApplicationModel.resume_id == application.resume_id,
+                ApplicationModel.id != application.id,
+                ScreeningAnswerModel.source == AnswerSource.USER,
+                ScreeningAnswerModel.is_confirmed.is_(True),
+                ScreeningAnswerModel.confirmed_at.is_not(None),
+                ScreeningAnswerModel.answer_text.is_not(None),
+                VerifiedFactModel.state == ConfirmationState.CONFIRMED,
+                VerifiedFactModel.allow_in_forms.is_(True),
+                ~select(AnswerTemplateModel.id)
+                .where(
+                    AnswerTemplateModel.verified_fact_id == ScreeningAnswerModel.verified_fact_id,
+                    AnswerTemplateModel.answer_text == ScreeningAnswerModel.answer_text,
+                    AnswerTemplateModel.is_active.is_(False),
+                )
+                .exists(),
+            )
+            .order_by(ScreeningAnswerModel.confirmed_at.desc(), ScreeningAnswerModel.id.desc())
+        )
+        return tuple((question, answer) for question, answer in rows)
+
+    def _historical_answer(
+        self, field: HhScreeningField, application: ApplicationModel
+    ) -> _ResolvedAnswer | None:
+        key = reusable_question_key(field.question)
+        if key is None:
+            return None
+        for question, answer in self._history(application):
+            if reusable_question_key(question.question_text) != key:
+                continue
+            compatible = self._compatible_answer(field, answer.answer_text or "")
+            if compatible is not None:
+                return _ResolvedAnswer(
+                    compatible, AnswerSource.BANK, answer.verified_fact_id, False
                 )
         return None
 
@@ -1321,7 +1462,9 @@ class ScreeningDraftService:
 
     @staticmethod
     def _is_screening_fact(fact: VerifiedFactModel) -> bool:
-        return bool(fact.source_reference and fact.source_reference.startswith("screening:"))
+        return fact.category == "screening_answer" or bool(
+            fact.source_reference and fact.source_reference.startswith("screening:")
+        )
 
     def _form_for_account(self, account_id: int, form_id: int) -> ScreeningFormModel:
         form = self._session.scalar(
@@ -1460,9 +1603,14 @@ class ScreeningDraftService:
         return bool(
             field.has_attachment
             or field.has_external_action
-            or field.has_test_assignment
-            or DANGEROUS_QUESTION.search(question)
-            or SERIOUS_OBLIGATION.search(field.question)
+            or (
+                not is_fixed_choice(field.field_type, field.options)
+                and (
+                    field.has_test_assignment
+                    or DANGEROUS_QUESTION.search(question)
+                    or SERIOUS_OBLIGATION.search(field.question)
+                )
+            )
         )
 
     @staticmethod
