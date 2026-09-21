@@ -15,6 +15,13 @@ LINES = [
     SourceLine(id=2, field="description", text="Обязательна самостоятельная разработка на Ruby"),
 ]
 FACTS = [ProfileFact(id=7, category="project", content="Создал сервис на Python и PostgreSQL")]
+CORE_DUTY: dict[str, Any] = {
+    "task": "Разработка API на Python",
+    "source_line_ids": [1],
+    "support": "confirmed",
+    "profile_fact_ids": [7],
+    "reason": "Такая разработка подтверждена проектом",
+}
 ANSWER: dict[str, Any] = {
     "fit": "direct",
     "profession": "applied_python",
@@ -24,6 +31,7 @@ ANSWER: dict[str, Any] = {
     "profile_fact_ids": [7],
     "gaps": [],
     "blocker": None,
+    "core_duties": [CORE_DUTY],
 }
 
 
@@ -100,6 +108,14 @@ def test_missing_tool_remains_an_explicit_gap_in_an_allowed_role() -> None:
     assert any("Опыт нового средства не подтверждён" in reason for reason in result.reasons)
 
 
+def test_transferable_core_work_is_not_full_direct_correspondence() -> None:
+    answer = RoleAssessment.model_validate(
+        {**ANSWER, "core_duties": [{**CORE_DUTY, "support": "transferable"}]}
+    )
+    result = assess_role(LINES, FACTS, answer)
+    assert result.status == "REVIEW" and result.fit_tier is None
+
+
 def test_unclear_profession_can_only_have_low_priority() -> None:
     answer = RoleAssessment.model_validate({**ANSWER, "fit": "possible", "profession": "unclear"})
     assert assess_role(LINES, FACTS, answer).fit_tier is FitTier.POSSIBLE
@@ -118,3 +134,86 @@ def test_preferred_skills_cannot_be_the_only_ground_for_rejection() -> None:
         {**ANSWER, "fit": "reject", "blocker": {"source_line_ids": [3], "reason": "Нет Ruby"}}
     )
     assert assess_role(lines, FACTS, answer).status == "REVIEW"
+
+
+@pytest.mark.parametrize("fit", ["direct", "related", "possible"])
+def test_shared_skill_cannot_replace_an_unsupported_core_profession(fit: str) -> None:
+    answer = RoleAssessment.model_validate(
+        {
+            **ANSWER,
+            "fit": fit,
+            "core_duties": [
+                CORE_DUTY,
+                {
+                    "task": "Самостоятельная разработка Ruby",
+                    "source_line_ids": [2],
+                    "support": "unsupported",
+                    "profile_fact_ids": [],
+                    "reason": "Опыт основной Ruby-разработки не подтверждён Python-проектом",
+                },
+            ],
+        }
+    )
+    assert assess_role(LINES, FACTS, answer).status == "REVIEW"
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"source_line_ids": [0]},
+        {"source_line_ids": [99]},
+        {"source_line_ids": [1, 1]},
+        {"profile_fact_ids": []},
+        {"profile_fact_ids": [999]},
+        {"profile_fact_ids": [7, 7]},
+        {"task": " "},
+        {"reason": " "},
+    ],
+)
+def test_core_duties_require_valid_source_and_specific_profile_support(
+    changes: dict[str, Any],
+) -> None:
+    answer = RoleAssessment.model_validate(
+        {
+            **ANSWER,
+            "core_duties": [{**CORE_DUTY, **changes}],
+        }
+    )
+    assert assess_role(LINES, FACTS, answer).status == "REVIEW"
+
+
+def test_transferable_core_allows_learning_a_new_tool() -> None:
+    answer = RoleAssessment.model_validate(
+        {
+            **ANSWER,
+            "fit": "possible",
+            "core_duties": [
+                {
+                    **CORE_DUTY,
+                    "support": "transferable",
+                    "reason": "Python API подтверждены; новый фреймворк осваивается",
+                }
+            ],
+            "gaps": ["Новый фреймворк не подтверждён"],
+        }
+    )
+    assert assess_role(LINES, FACTS, answer).status == "ALLOW"
+
+
+@pytest.mark.parametrize("fit", ["direct", "related", "possible"])
+def test_matching_tools_cannot_allow_an_unconfirmed_professional_basis(fit: str) -> None:
+    answer = RoleAssessment.model_validate(
+        {
+            **ANSWER,
+            "fit": fit,
+            "core_duties": [{**CORE_DUTY, "support": "tools_only"}],
+        }
+    )
+    decision = assess_role(LINES, FACTS, answer)
+    assert decision.status == "REVIEW"
+    assert decision.fit_tier is None
+
+
+def test_an_assessment_without_daily_work_cannot_enter_the_current_queue() -> None:
+    answer = RoleAssessment.model_validate({**ANSWER, "core_duties": []})
+    assert assess_role(LINES, FACTS, answer).status == "REVIEW"

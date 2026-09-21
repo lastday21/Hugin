@@ -137,10 +137,16 @@ def stored_decision(
 ) -> SemanticDecision:
     if stored.errors:
         return SemanticDecision("REVIEW", None, tuple(stored.errors))
-    if version == ROLE_SELECTION_VERSION:
+    if version in {"whole_role_v2", "whole_role_v3", ROLE_SELECTION_VERSION}:
         if stored.assessment is None:
             return SemanticDecision("REVIEW", None, ("Нет общей оценки вакансии",))
-        return assess_role(lines, facts, stored.assessment)
+        return assess_role(
+            lines,
+            facts,
+            stored.assessment,
+            require_core_duties=version != "whole_role_v2",
+            require_confirmed_direct=version == ROLE_SELECTION_VERSION,
+        )
     if version != SEMANTIC_SELECTION_VERSION:
         return SemanticDecision("REVIEW", None, ("Неизвестная версия профессиональной оценки",))
     if stored.errors or stored.extraction is None or stored.matching is None:

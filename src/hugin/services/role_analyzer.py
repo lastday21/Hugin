@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from pydantic import Field
+
 from hugin.services.semantic_analyzer import (
     AnalysisResult,
     StageAnalyzer,
@@ -11,6 +13,7 @@ from hugin.services.semantic_analyzer import (
 from hugin.services.semantic_role import (
     ROLE_BODY_FIELDS,
     ROLE_INSTRUCTIONS,
+    CoreDuty,
     RoleAssessment,
     assess_role,
     role_errors,
@@ -20,6 +23,8 @@ from hugin.services.semantic_selection import ProfileFact, SemanticDecision, Sou
 
 def assessment_type(lines: list[SourceLine], facts: list[ProfileFact]) -> type[RoleAssessment]:
     class CaseAssessment(RoleAssessment):
+        core_duties: list[CoreDuty] = Field(min_length=1, max_length=12)
+
         @classmethod
         def model_json_schema(cls, *args: Any, **kwargs: Any) -> dict[str, Any]:
             schema = super().model_json_schema(*args, **kwargs)
@@ -29,6 +34,11 @@ def assessment_type(lines: list[SourceLine], facts: list[ProfileFact]) -> type[R
             schema["$defs"]["RoleBlocker"]["properties"]["source_line_ids"]["items"]["enum"] = [
                 line.id for line in lines if line.field in ROLE_BODY_FIELDS and line.text.strip()
             ]
+            duties = schema["$defs"]["CoreDuty"]["properties"]
+            duties["source_line_ids"]["items"]["enum"] = [
+                line.id for line in lines if line.field in ROLE_BODY_FIELDS and line.text.strip()
+            ]
+            duties["profile_fact_ids"]["items"]["enum"] = [fact.id for fact in facts]
             return schema
 
     return CaseAssessment

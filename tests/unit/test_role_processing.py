@@ -35,6 +35,15 @@ class RoleClient:
         if self.callback is not None:
             self.callback()
         answer: dict[str, Any] = {
+            "core_duties": [
+                {
+                    "task": "Создание API на Python",
+                    "source_line_ids": [1],
+                    "support": "confirmed",
+                    "profile_fact_ids": [payload["profile"]["facts"][0]["id"]],
+                    "reason": "Подтверждено проектом",
+                }
+            ],
             "fit": "direct",
             "profession": "applied_python",
             "role": "Создание API на Python",

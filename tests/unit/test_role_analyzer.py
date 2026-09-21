@@ -140,7 +140,19 @@ def test_long_evidence_lists_are_preserved_and_schema_limits_known_references(re
 
 
 def test_each_request_schema_uses_its_own_source_and_profile_numbers() -> None:
-    client = Client(ANSWER, {**ANSWER, "source_line_ids": [11], "profile_fact_ids": [17]})
+    next_answer = {
+        **ANSWER,
+        "source_line_ids": [11],
+        "profile_fact_ids": [17],
+        "core_duties": [
+            {
+                **ANSWER["core_duties"][0],
+                "source_line_ids": [11],
+                "profile_fact_ids": [17],
+            }
+        ],
+    }
+    client = Client(ANSWER, next_answer)
     analyzer = RoleAnalyzer(client, MemoryStageCache())
     assert analyzer.analyze(LINES, FACTS).decision.status == "ALLOW"
     assert (
@@ -153,3 +165,58 @@ def test_each_request_schema_uses_its_own_source_and_profile_numbers() -> None:
     schemas = [cast(dict[str, Any], call[2]) for call in client.calls]
     assert schemas[0]["properties"]["source_line_ids"]["items"]["enum"] == [0, 1, 2]
     assert schemas[1]["properties"]["source_line_ids"]["items"]["enum"] == [10, 11, 12]
+
+
+@pytest.mark.parametrize("support", ["confirmed", "transferable"])
+def test_supported_daily_work_is_allowed_with_its_own_evidence(support: str) -> None:
+    answer = {
+        **ANSWER,
+        "fit": "direct" if support == "confirmed" else "related",
+        "core_duties": [
+            {
+                "task": "Разрабатывать Python API",
+                "source_line_ids": [1],
+                "support": support,
+                "profile_fact_ids": [7],
+                "reason": "Создание Python-сервиса подтверждает основу для разработки API",
+            }
+        ],
+    }
+    result = RoleAnalyzer(Client(answer), MemoryStageCache()).analyze(LINES, FACTS)
+    assert result.decision.status == "ALLOW"
+    assert result.model_calls == 1
+    assert result.assessment is not None
+
+
+def test_transferred_work_cannot_receive_direct_priority_or_trigger_extra_calls() -> None:
+    answer = {
+        **ANSWER,
+        "core_duties": [{**ANSWER["core_duties"][0], "support": "transferable"}],
+    }
+    client = Client(answer)
+    analyzer = RoleAnalyzer(client, MemoryStageCache())
+    result = analyzer.analyze(LINES, FACTS)
+    assert result.decision.status == "REVIEW"
+    assert result.model_calls == 1
+    assert analyzer.analyze(LINES, FACTS).decision.status == "REVIEW"
+    assert len(client.calls) == 1
+
+
+def test_general_tools_do_not_replace_the_required_professional_work() -> None:
+    answer = {
+        **ANSWER,
+        "fit": "reject",
+        "core_duties": [
+            {
+                "task": "Самостоятельно разрабатывать Ruby-сервисы",
+                "source_line_ids": [2],
+                "support": "tools_only",
+                "profile_fact_ids": [7],
+                "reason": "Python API подтверждены, основа Ruby-разработки не подтверждена",
+            }
+        ],
+        "blocker": {"source_line_ids": [2], "reason": "Обязательна другая основная разработка"},
+    }
+    result = RoleAnalyzer(Client(answer), MemoryStageCache()).analyze(LINES, FACTS)
+    assert result.decision.status == "REJECT"
+    assert result.model_calls == 1

@@ -253,6 +253,15 @@ class Client:
         return json.dumps(
             {
                 "fit": "direct",
+                "core_duties": [
+                    {
+                        "task": "Создание API на Python",
+                        "source_line_ids": [1],
+                        "support": "confirmed",
+                        "profile_fact_ids": [payload["profile"]["facts"][0]["id"]],
+                        "reason": "Подтверждено проектом",
+                    }
+                ],
                 "profession": "applied_python",
                 "role": "Python API",
                 "reason": "Подтверждено проектом",
@@ -1015,7 +1024,7 @@ def test_one_call_finishes_selection_and_repeat_reuses_saved_result(
     assert processor.process(account_id, direction_id, vacancy_id, max_calls=1).model_calls == 0
 
 
-def test_evaluation_uses_oldest_unfinished_description_before_new_publication(
+def test_evaluation_uses_new_publication_before_old_unfinished_description(
     settings: Settings,
 ) -> None:
     from datetime import timedelta
@@ -1047,7 +1056,7 @@ def test_evaluation_uses_oldest_unfinished_description_before_new_publication(
             BackgroundProcessService(session, account).set_enabled("evaluation", True)
         worker = SemanticSelectionWorker(settings, account_id=account)
         with database.sessions.begin() as session:
-            assert worker._next(session) == (direction, first_id)
+            assert worker._next(session) == (direction, newer.id)
     finally:
         database.close()
 

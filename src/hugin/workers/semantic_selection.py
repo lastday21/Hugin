@@ -110,9 +110,11 @@ class SemanticSelectionWorker:
             )
             .order_by(
                 (VacancyModel.id == runtime.cursor_vacancy_id).desc(),
+                VacancyModel.published_at.desc().nullslast(),
+                VacancyModel.created_at.desc(),
+                VacancyModel.details_fetched_at.desc(),
                 DirectionVacancyModel.analyzed_at.asc().nullsfirst(),
-                VacancyModel.details_fetched_at,
-                VacancyModel.id,
+                VacancyModel.id.desc(),
                 DirectionVacancyModel.direction_id,
             )
         )
