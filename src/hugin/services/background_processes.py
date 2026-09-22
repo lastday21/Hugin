@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Literal
 
-from sqlalchemy import Row, select
+from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, load_only
 
 from hugin.database.models import (
     ApplicationModel,
@@ -31,6 +30,7 @@ from hugin.repositories.applications import ApplicationRepository
 from hugin.repositories.tasks import SystemStateRepository
 from hugin.services.application_selection_gate import ApplicationSelectionGate
 from hugin.services.autonomy import AutonomyPolicyService
+from hugin.services.selection_status import SelectionEvidence, SelectionRows
 from hugin.services.vacancy_analysis import MAX_VACANCY_AGE, RULES_VERSION
 
 ProcessKey = Literal["search", "evaluation", "applications", "synchronization", "replies"]
@@ -440,11 +440,22 @@ class BackgroundProcessService:
         return prefix + f"{label}: {self._local_time(next_run, settings)}"
 
     def _funnel(self) -> dict[str, object]:
-        rows = self._session.execute(
+        records = self._session.execute(
             select(
                 DirectionVacancyModel,
                 VacancyModel,
                 CareerDirectionModel,
+                DirectionVacancyModel.rules_details["category"],
+                DirectionVacancyModel.rules_details["semantic_selection"]["key"],
+                DirectionVacancyModel.rules_details["manual_override"],
+            )
+            .options(
+                load_only(DirectionVacancyModel.rules_version),
+                load_only(
+                    VacancyModel.availability,
+                    VacancyModel.published_at,
+                    VacancyModel.details_fetched_at,
+                ),
             )
             .join(VacancyModel, VacancyModel.id == DirectionVacancyModel.vacancy_id)
             .join(
@@ -455,6 +466,15 @@ class BackgroundProcessService:
                 CareerDirectionModel.is_active.is_(True),
             )
         ).all()
+        rows = [(tracked, vacancy, direction) for tracked, vacancy, direction, *_ in records]
+        evidence: SelectionEvidence = {
+            (direction.id, vacancy.id): {
+                "category": category,
+                "semantic_selection": {"key": key},
+                "manual_override": override,
+            }
+            for tracked, vacancy, direction, category, key, override in records
+        }
         grouped = defaultdict(list)
         for tracked, vacancy, direction in rows:
             grouped[vacancy.id].append((tracked, vacancy, direction))
@@ -487,7 +507,7 @@ class BackgroundProcessService:
                 TaskState.INPUT_REQUIRED,
             }:
                 uncertain.add(vacancy_id)
-        semantic = self.semantic_statuses(rows)
+        semantic = self.semantic_statuses(rows, evidence_by_identity=evidence)
         labels = {
             "sent": "Отправлены",
             "unavailable": "Недоступны",
@@ -517,7 +537,7 @@ class BackgroundProcessService:
             else:
                 states = []
                 for tracked, _, direction in links:
-                    category = tracked.rules_details.get("category")
+                    category = evidence[(direction.id, vacancy_id)].get("category")
                     status = semantic.get((direction.id, vacancy_id), "DISABLED")
                     if tracked.rules_version != RULES_VERSION or status == "PENDING":
                         states.append("awaiting_evaluation")
@@ -549,11 +569,16 @@ class BackgroundProcessService:
         }
 
     def semantic_statuses(
-        self, rows: Sequence[Row[tuple[DirectionVacancyModel, VacancyModel, CareerDirectionModel]]]
+        self,
+        rows: SelectionRows,
+        *,
+        evidence_by_identity: SelectionEvidence | None = None,
     ) -> dict[tuple[int, int], str]:
         from hugin.services.selection_status import semantic_statuses
 
-        return semantic_statuses(self._session, self._account_id, rows)
+        return semantic_statuses(
+            self._session, self._account_id, rows, evidence_by_identity=evidence_by_identity
+        )
 
     def _last_search(self) -> dict[str, object] | None:
         observations = []

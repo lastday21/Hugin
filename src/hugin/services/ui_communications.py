@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from sqlalchemy import func, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, load_only
 
 from hugin.database.models import (
     ApplicationEventModel,
@@ -171,6 +171,15 @@ class UiCommunicationService:
                     ApplicationModel,
                     VacancyModel,
                 )
+                .options(
+                    load_only(ApplicationModel.state),
+                    load_only(
+                        VacancyModel.hh_id,
+                        VacancyModel.title,
+                        VacancyModel.employer_name,
+                        VacancyModel.source_url,
+                    ),
+                )
                 .join(
                     ApplicationModel,
                     ApplicationModel.id == RecruiterMessageModel.application_id,
@@ -252,6 +261,15 @@ class UiCommunicationService:
 
         invitation_rows = self._session.execute(
             select(InvitationModel, ApplicationModel, VacancyModel)
+            .options(
+                load_only(ApplicationModel.state),
+                load_only(
+                    VacancyModel.hh_id,
+                    VacancyModel.title,
+                    VacancyModel.employer_name,
+                    VacancyModel.source_url,
+                ),
+            )
             .join(ApplicationModel, ApplicationModel.id == InvitationModel.application_id)
             .join(VacancyModel, VacancyModel.id == ApplicationModel.vacancy_id)
             .where(
@@ -317,6 +335,14 @@ class UiCommunicationService:
         )
         rows = self._session.execute(
             select(ApplicationModel, VacancyModel, confirmations.c.confirmed_at)
+            .options(
+                load_only(ApplicationModel.state),
+                load_only(
+                    VacancyModel.title,
+                    VacancyModel.employer_name,
+                    VacancyModel.source_url,
+                ),
+            )
             .join(VacancyModel, VacancyModel.id == ApplicationModel.vacancy_id)
             .join(confirmations, confirmations.c.application_id == ApplicationModel.id)
             .where(ApplicationModel.account_id == account_id)

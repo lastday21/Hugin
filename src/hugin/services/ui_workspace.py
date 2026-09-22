@@ -6,7 +6,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 from sqlalchemy import case, func, or_, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, load_only
 
 from hugin.database.models import (
     ApplicationEventModel,
@@ -643,7 +643,20 @@ class UiWorkspaceService:
                 CareerDirectionModel,
                 letter_state,
                 form_state,
-                DirectionVacancyModel,
+                DirectionVacancyModel.rules_score,
+                DirectionVacancyModel.rules_details["fit_tier"],
+                DirectionVacancyModel.rules_details["fit_reason"],
+            )
+            .options(
+                load_only(ApplicationModel.id),
+                load_only(
+                    VacancyModel.hh_id,
+                    VacancyModel.title,
+                    VacancyModel.employer_name,
+                    VacancyModel.region,
+                    VacancyModel.source_url,
+                ),
+                load_only(ResumeModel.title),
             )
             .join(ApplicationModel, ApplicationModel.id == ApplicationTaskModel.application_id)
             .join(VacancyModel, VacancyModel.id == ApplicationModel.vacancy_id)
@@ -682,13 +695,9 @@ class UiWorkspaceService:
                 if direction is not None
                 else "Без направления",
                 state=task.state.value,
-                priority=(
-                    tracking.rules_score
-                    if tracking is not None and tracking.rules_score is not None
-                    else task.priority_score
-                ),
-                fit_tier=stored_fit_tier(tracking.rules_details) if tracking else None,
-                fit_reason=tracking.rules_details.get("fit_reason") if tracking else None,
+                priority=(rules_score if rules_score is not None else task.priority_score),
+                fit_tier=stored_fit_tier({"fit_tier": fit_tier}),
+                fit_reason=fit_reason,
                 scheduled_at=task.scheduled_at,
                 last_error=_queue_error_text(task.last_error_code),
                 letter_state=stored_letter_state.value if stored_letter_state is not None else None,
@@ -702,14 +711,31 @@ class UiWorkspaceService:
                 direction,
                 stored_letter_state,
                 stored_form_state,
-                tracking,
+                rules_score,
+                fit_tier,
+                fit_reason,
             ) in rows
         )
 
     def rejected(self, account_id: int, limit: int = 1000) -> tuple[UiRejectedVacancy, ...]:
         self._account(account_id)
         rows = self._session.execute(
-            select(VacancyModel, DirectionVacancyModel, CareerDirectionModel)
+            select(
+                VacancyModel,
+                DirectionVacancyModel.rules_score,
+                DirectionVacancyModel.rules_details["reasons"],
+                DirectionVacancyModel.rules_details["category"],
+                CareerDirectionModel,
+            )
+            .options(
+                load_only(
+                    VacancyModel.hh_id,
+                    VacancyModel.title,
+                    VacancyModel.employer_name,
+                    VacancyModel.region,
+                    VacancyModel.source_url,
+                )
+            )
             .join(
                 DirectionVacancyModel,
                 DirectionVacancyModel.vacancy_id == VacancyModel.id,
@@ -722,7 +748,11 @@ class UiWorkspaceService:
                 CareerDirectionModel.account_id == account_id,
                 DirectionVacancyModel.state == VacancyState.FILTERED_OUT,
             )
-            .order_by(DirectionVacancyModel.updated_at.desc())
+            .order_by(
+                DirectionVacancyModel.updated_at.desc(),
+                DirectionVacancyModel.direction_id,
+                DirectionVacancyModel.vacancy_id,
+            )
             .limit(limit)
         )
         return tuple(
@@ -733,14 +763,12 @@ class UiWorkspaceService:
                 region=vacancy.region or "Регион не указан",
                 source_url=vacancy.source_url,
                 direction=_direction_name(direction),
-                score=tracking.rules_score,
-                reasons=self._reasons(tracking.rules_details),
-                decision_reasons=self._decision_reasons(tracking.rules_details),
-                decision_state=(
-                    "REVIEW" if tracking.rules_details.get("category") == "REVIEW" else "REJECTED"
-                ),
+                score=score,
+                reasons=self._reasons({"reasons": reasons}),
+                decision_reasons=self._decision_reasons({"reasons": reasons}),
+                decision_state="REVIEW" if category == "REVIEW" else "REJECTED",
             )
-            for vacancy, tracking, direction in rows
+            for vacancy, score, reasons, category, direction in rows
         )
 
     def sent(self, account_id: int, limit: int = 100) -> tuple[UiSentApplication, ...]:
@@ -766,6 +794,17 @@ class UiWorkspaceService:
                 ResumeModel,
                 CareerDirectionModel,
                 applied_at,
+            )
+            .options(
+                load_only(ApplicationModel.state),
+                load_only(
+                    VacancyModel.hh_id,
+                    VacancyModel.title,
+                    VacancyModel.employer_name,
+                    VacancyModel.region,
+                    VacancyModel.source_url,
+                ),
+                load_only(ResumeModel.title),
             )
             .join(VacancyModel, VacancyModel.id == ApplicationModel.vacancy_id)
             .join(ResumeModel, ResumeModel.id == ApplicationModel.resume_id)

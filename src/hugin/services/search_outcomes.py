@@ -3,9 +3,11 @@ from __future__ import annotations
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import Text, case, cast, func, select
 from sqlalchemy.orm import Session
+from sqlalchemy.sql.elements import ColumnElement
 
 from hugin.database.models import (
     ApplicationEventModel,
@@ -64,6 +66,15 @@ class SearchOutcomes:
     comparison_limitations: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True, slots=True)
+class OutcomeEvent:
+    id: int
+    application_id: int
+    event_type: ApplicationEventType
+    created_at: datetime
+    payload: dict[str, object]
+
+
 class SearchOutcomeService:
     def __init__(self, session: Session) -> None:
         self._session = session
@@ -71,16 +82,130 @@ class SearchOutcomeService:
     def snapshot(self, account_id: int, *, now: datetime | None = None) -> SearchOutcomes:
         AccountRepository(self._session).get(account_id)
         measured_at = as_utc(now or datetime.now(UTC))
-        events: dict[int, list[ApplicationEventModel]] = defaultdict(list)
-        for event in self._session.scalars(
-            select(ApplicationEventModel)
+        events: dict[int, list[OutcomeEvent]] = defaultdict(list)
+        legacy_json = cast(ApplicationEventModel.payload, Text).op("~")(
+            r"\\u(0000|[dD][89aAbBcCdDeEfF][0-9a-fA-F]{2})"
+        )
+        account_events = (
+            select(
+                ApplicationEventModel.id,
+                ApplicationEventModel.application_id,
+                ApplicationEventModel.event_type,
+                ApplicationEventModel.created_at,
+                ApplicationEventModel.payload["source"].label("source"),
+                ApplicationEventModel.payload["hh_status"].label("hh_status"),
+                ApplicationEventModel.payload["state"].label("state"),
+                ApplicationEventModel.payload["rules_version"].label("rules_version"),
+                ApplicationEventModel.payload["snapshot_missing"].label("snapshot_missing"),
+                ApplicationEventModel.payload["outcome_context"].label("outcome_context"),
+            )
             .join(ApplicationModel)
             .where(
                 ApplicationModel.account_id == account_id,
                 ApplicationEventModel.created_at <= measured_at,
+                ~legacy_json,
             )
-            .order_by(ApplicationEventModel.created_at, ApplicationEventModel.id)
+            .cte("account_events")
+            .prefix_with("MATERIALIZED")
+        )
+        context = account_events.c.outcome_context
+        profile = context["profile"]
+        vacancy = context["vacancy"]
+
+        def content_presence(value: ColumnElement[Any]) -> ColumnElement[Any]:
+            return case(
+                (
+                    func.json_typeof(value) == "string",
+                    func.to_json(cast(value, Text) != '""'),
+                ),
+                else_=value,
+            )
+
+        summary_context = case(
+            (
+                func.json_typeof(context) == "object",
+                func.json_build_object(
+                    "schema_version",
+                    context["schema_version"],
+                    "letter_sha256",
+                    context["letter_sha256"],
+                    "profile",
+                    case(
+                        (
+                            func.json_typeof(profile) == "object",
+                            func.json_build_object(
+                                "resume_content",
+                                content_presence(profile["resume_content"]),
+                                "resume_content_sha256",
+                                profile["resume_content_sha256"],
+                                "profile_facts_sha256",
+                                profile["profile_facts_sha256"],
+                            ),
+                        ),
+                        else_=profile,
+                    ),
+                    "vacancy",
+                    case(
+                        (
+                            func.json_typeof(vacancy) == "object",
+                            func.json_build_object(
+                                "description",
+                                content_presence(vacancy["description"]),
+                                "description_sha256",
+                                vacancy["description_sha256"],
+                                "details_fetched_at",
+                                vacancy["details_fetched_at"],
+                            ),
+                        ),
+                        else_=vacancy,
+                    ),
+                ),
+            ),
+            else_=context,
+        )
+        event_rows = []
+        for row in self._session.execute(
+            select(
+                account_events.c.id,
+                account_events.c.application_id,
+                account_events.c.event_type,
+                account_events.c.created_at,
+                func.json_build_object(
+                    "source",
+                    account_events.c.source,
+                    "hh_status",
+                    account_events.c.hh_status,
+                    "state",
+                    account_events.c.state,
+                    "rules_version",
+                    account_events.c.rules_version,
+                    "snapshot_missing",
+                    account_events.c.snapshot_missing,
+                    "outcome_context",
+                    summary_context,
+                ),
+            ).order_by(account_events.c.created_at, account_events.c.id)
         ):
+            event_rows.append(OutcomeEvent(*row))
+        event_rows.extend(
+            OutcomeEvent(*row)
+            for row in self._session.execute(
+                select(
+                    ApplicationEventModel.id,
+                    ApplicationEventModel.application_id,
+                    ApplicationEventModel.event_type,
+                    ApplicationEventModel.created_at,
+                    ApplicationEventModel.payload,
+                )
+                .join(ApplicationModel)
+                .where(
+                    ApplicationModel.account_id == account_id,
+                    ApplicationEventModel.created_at <= measured_at,
+                    legacy_json,
+                )
+            )
+        )
+        for event in sorted(event_rows, key=lambda item: (item.created_at, item.id)):
             events[event.application_id].append(event)
         observations: dict[int, list[ApplicationStatusObservationModel]] = defaultdict(list)
         for observation in self._session.scalars(
@@ -97,7 +222,7 @@ class SearchOutcomeService:
             )
         ):
             observations[observation.application_id].append(observation)
-        sent: dict[int, ApplicationEventModel] = {}
+        sent: dict[int, OutcomeEvent] = {}
         other_sends: set[int] = set()
         for app_id, history in events.items():
             for event in history:
@@ -256,7 +381,7 @@ class SearchOutcomeService:
         )
 
 
-def _has_outcome_context(event: ApplicationEventModel) -> bool:
+def _has_outcome_context(event: OutcomeEvent) -> bool:
     context = event.payload.get("outcome_context")
     if not isinstance(context, dict) or context.get("schema_version") != 1:
         return False
