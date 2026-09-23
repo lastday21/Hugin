@@ -119,9 +119,16 @@ def test_revoked_permission_after_button_readiness_blocks_the_request(
             no_wait_after: bool = False,
             timeout: int | None = None,
             trial: bool = False,
+            position: dict[str, float] | None = None,
         ) -> None:
             nonlocal ready
-            super().click(force=force, no_wait_after=no_wait_after, timeout=timeout, trial=trial)
+            super().click(
+                force=force,
+                no_wait_after=no_wait_after,
+                timeout=timeout,
+                trial=trial,
+                position=position,
+            )
             if trial:
                 ready = False
 
@@ -207,8 +214,15 @@ def test_worker_stop_during_button_trial_revokes_the_actual_browser_permission(
             no_wait_after: bool = False,
             timeout: int | None = None,
             trial: bool = False,
+            position: dict[str, float] | None = None,
         ) -> None:
-            super().click(force=force, no_wait_after=no_wait_after, timeout=timeout, trial=trial)
+            super().click(
+                force=force,
+                no_wait_after=no_wait_after,
+                timeout=timeout,
+                trial=trial,
+                position=position,
+            )
             if trial:
                 worker.stop()
 

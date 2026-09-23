@@ -308,7 +308,11 @@ const externalLinks = Array.from(description?.querySelectorAll('a[href]') || [])
     }
 });
 const externalApplicationText = /(?:forms\\.gle|docs\\.google\\.com\\/forms)/iu.test(bodyText);
-const structuredPublicationDate = (() => {
+const structuredVacancy = (() => {
+    const result = {publicationDate: '', region: ''};
+    const pathParts = window.location.pathname.split('/');
+    const vacancyPosition = pathParts.indexOf('vacancy');
+    const vacancyId = vacancyPosition >= 0 ? pathParts[vacancyPosition + 1] : '';
     for (const script of document.querySelectorAll('script[type="application/ld+json"]')) {
         try {
             const pending = [JSON.parse(script.textContent || 'null')];
@@ -324,8 +328,19 @@ const structuredPublicationDate = (() => {
                 if (types.some((value) => (
                     typeof value === 'string' && value.toLocaleLowerCase('en-US') === 'jobposting'
                 ))) {
+                    const identifier = candidate.identifier?.value;
+                    if (vacancyId && identifier != null && String(identifier) !== vacancyId) {
+                        continue;
+                    }
                     const value = candidate.datePosted || candidate.datePublished;
-                    if (typeof value === 'string' && value.trim()) return value.trim();
+                    const locality = candidate.jobLocation?.address?.addressLocality;
+                    if (!result.publicationDate && typeof value === 'string') {
+                        result.publicationDate = value.trim();
+                    }
+                    if (!result.region && typeof locality === 'string') {
+                        result.region = locality.trim();
+                    }
+                    if (result.publicationDate && result.region) return result;
                 }
                 pending.push(...Object.values(candidate).filter((value) => (
                     value && typeof value === 'object'
@@ -335,7 +350,7 @@ const structuredPublicationDate = (() => {
             continue;
         }
     }
-    return '';
+    return result;
 })();
 const visiblePublicationDate = bodyText
     .split('\\n')
@@ -371,7 +386,8 @@ return ({
         .map((element) => (element.textContent || '').trim())
         .filter(Boolean),
     region: (
-        document.querySelector('[data-qa="vacancy-view-location"]')?.textContent || ''
+        document.querySelector('[data-qa="vacancy-view-location"]')?.textContent?.trim() ||
+        structuredVacancy.region
     ).trim(),
     address: (
         document.querySelector('[data-qa="vacancy-view-raw-address"]')?.textContent || ''
@@ -387,7 +403,7 @@ return ({
             ?.getAttribute('datetime') ||
         document.querySelector('[data-qa="vacancy-creation-time"] time[datetime]')
             ?.getAttribute('datetime') ||
-        structuredPublicationDate ||
+        structuredVacancy.publicationDate ||
         document.querySelector('[data-qa="vacancy-view-creation-time"]')?.textContent ||
         document.querySelector('[data-qa="vacancy-creation-time"]')?.textContent ||
         visiblePublicationDate ||
@@ -2189,6 +2205,7 @@ class VisibleHhBrowser:
 
     @staticmethod
     def _close_recruiter_chat(page: Page, vacancy_id: str) -> None:
+        VisibleHhBrowser._dismiss_negotiation_promotion(page)
         close = page.locator('[data-qa="chatik-close-chatik"]')
         if close.count() != 1:
             raise _HhChatReadError(
@@ -2196,13 +2213,50 @@ class VisibleHhBrowser:
                 f"Переписка вакансии {vacancy_id} не показала кнопку закрытия",
             )
         try:
-            close.first.click(no_wait_after=True)
+            close.first.click(no_wait_after=True, timeout=5_000)
         except PlaywrightError as error:
             raise _HhChatReadError(
                 "HH_CHAT_CLOSE_FAILED",
                 f"Не удалось закрыть переписку вакансии {vacancy_id}",
             ) from error
         page.wait_for_timeout(500)
+
+    @staticmethod
+    def _dismiss_negotiation_promotion(page: Page) -> None:
+        promotion = page.locator(
+            '[data-qa="magritte-alert"]:has(a[href^="/applicant-services/hhpro"]):visible'
+        )
+        if promotion.count() != 1 or not promotion.is_visible():
+            return
+        try:
+            text = " ".join(promotion.inner_text().split())
+            if not text.startswith("Теперь вы можете усилить свой отклик. Попробуйте скорее"):
+                return
+            other_alerts = page.locator(
+                '[data-qa="magritte-alert"]:not(:has(a[href^="/applicant-services/hhpro"])):visible'
+            )
+            overlay = page.locator(
+                'div[class*="magritte-overlay"]:visible:has('
+                '+ div [data-qa="magritte-alert"]:visible a[href^="/applicant-services/hhpro"])'
+            )
+            if (
+                other_alerts.count()
+                or page.locator('div[class*="magritte-overlay"]:visible').count() != 1
+                or overlay.count() != 1
+            ):
+                raise HhSyncRetryableError(
+                    "HH_PAGE_OBSTRUCTED",
+                    "Предложение hh.ru перекрыто другим окном; чтение приостановлено",
+                    retry_after_seconds=60,
+                )
+            overlay.click(position={"x": 5, "y": 5}, timeout=3_000)
+            promotion.wait_for(state="hidden", timeout=3_000)
+        except PlaywrightError as error:
+            raise HhSyncRetryableError(
+                "HH_PAGE_OBSTRUCTED",
+                "Предложение hh.ru усилить отклик не закрылось; чтение приостановлено",
+                retry_after_seconds=60,
+            ) from error
 
     @staticmethod
     def _negotiations_payload(page: Page) -> list[dict[object, object]]:
@@ -3410,6 +3464,7 @@ class VisibleHhBrowser:
             raise HhSyncBlockedError("CAPTCHA_REQUIRED", "hh.ru запросил проверку")
         if not self.is_authenticated():
             raise HhSyncBlockedError("AUTH_REQUIRED", "Требуется повторный вход в hh.ru")
+        self._dismiss_negotiation_promotion(page)
         return page
 
     def _vacancy_id_from_negotiation_card(

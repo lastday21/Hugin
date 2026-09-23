@@ -15,7 +15,7 @@ from typing import cast
 from urllib.request import Request
 
 import pytest
-from playwright.sync_api import Error, Frame, Locator, Page, Response, TimeoutError
+from playwright.sync_api import Error, Frame, Locator, Page, Response, TimeoutError, sync_playwright
 
 from hugin.adapters import hh_browser as browser_module
 from hugin.adapters.hh_browser import VisibleHhBrowser
@@ -104,6 +104,7 @@ class FakeLocator:
         no_wait_after: bool = False,
         timeout: int | None = None,
         trial: bool = False,
+        position: dict[str, float] | None = None,
     ) -> None:
         assert timeout is None or timeout > 0
         self.force_clicks.append(force)
@@ -126,9 +127,9 @@ class FakeLocator:
             self.on_fill(value)
 
     def wait_for(self, *, state: str, timeout: int) -> None:
-        assert state in {"attached", "visible"}
+        assert state in {"attached", "visible", "hidden"}
         assert timeout > 0
-        if self.wait_error:
+        if self.wait_error and (state != "hidden" or self.visible):
             raise TimeoutError("wait")
 
     def all(self) -> list[FakeLocator]:
@@ -949,6 +950,80 @@ def test_structured_job_posting_date_is_parsed_with_timezone() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("visible_region", "structured_region", "expected_region"),
+    [("", "Москва", "Москва"), ("Санкт-Петербург", "Москва", "Санкт-Петербург"), ("", "", "")],
+)
+def test_details_script_reads_job_posting_city_without_guessing_from_address(
+    visible_region: str, structured_region: str, expected_region: str
+) -> None:
+    posting = {
+        "@type": "JobPosting",
+        "datePosted": "2026-09-27T00:35:48.472+03:00",
+        "jobLocation": {"@type": "Place", "address": {"addressLocality": structured_region}},
+    }
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch()
+        try:
+            page = browser.new_page()
+            page.set_content(
+                '<h1 data-qa="vacancy-title">Python developer</h1>'
+                f'<span data-qa="vacancy-view-location">{visible_region}</span>'
+                '<span data-qa="vacancy-view-raw-address">улица Примерная, 1</span>'
+                f'<script type="application/ld+json">{json.dumps(posting)}</script>'
+            )
+            payload = page.evaluate(browser_module.VACANCY_DETAILS_SCRIPT)
+            assert payload["region"] == expected_region
+            assert payload["address"] == "улица Примерная, 1"
+            assert payload["publishedAt"] == posting["datePosted"]
+        finally:
+            browser.close()
+
+
+@pytest.mark.parametrize(
+    ("region_first", "include_other"), [(True, False), (False, False), (True, True)]
+)
+def test_details_script_keeps_split_fields_for_the_current_vacancy(
+    region_first: bool, include_other: bool
+) -> None:
+    region = {
+        "@type": "JobPosting",
+        "identifier": {"value": 123},
+        "jobLocation": {"address": {"addressLocality": "Москва"}},
+    }
+    date = {
+        "@type": "JobPosting",
+        "identifier": {"value": 123},
+        "datePosted": "2026-09-27T00:35:48.472+03:00",
+    }
+    postings = [region, date] if region_first else [date, region]
+    if include_other:
+        postings.insert(
+            0,
+            {
+                "@type": "JobPosting",
+                "identifier": {"value": 999},
+                "datePosted": "2000-01-01",
+                "jobLocation": {"address": {"addressLocality": "Казань"}},
+            },
+        )
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch()
+        try:
+            page = browser.new_page()
+            html = '<h1 data-qa="vacancy-title">Python developer</h1>' + "".join(
+                f'<script type="application/ld+json">{json.dumps(posting)}</script>'
+                for posting in postings
+            )
+            page.route("https://hh.ru/vacancy/123", lambda route: route.fulfill(body=html))
+            page.goto("https://hh.ru/vacancy/123")
+            payload = page.evaluate(browser_module.VACANCY_DETAILS_SCRIPT)
+            assert payload["region"] == "Москва"
+            assert payload["publishedAt"] == date["datePosted"]
+        finally:
+            browser.close()
+
+
 def test_publication_date_without_year_is_not_in_the_future() -> None:
     parsed = VisibleHhBrowser._date_time("Вакансия опубликована 31 декабря")
 
@@ -1298,6 +1373,168 @@ def test_recruiter_messages_open_negotiations_once_for_all_chats(
     assert page.goto_calls == [("https://hh.ru/applicant/negotiations", "domcontentloaded")]
     assert page.opened_vacancy_ids == ["101", "202"]
     assert close.clicked == 2
+
+
+@pytest.mark.parametrize("delayed", [False, True])
+def test_recruiter_messages_dismiss_known_promotion_without_opening_paid_service(
+    tmp_path: Path, delayed: bool
+) -> None:
+    page = FakePage("https://hh.ru/applicant/resumes")
+    page.negotiations_payload = [
+        {"vacancyHref": f"/vacancy/{number}", "chatAvailable": True} for number in (101, 202)
+    ]
+    promotion = FakeLocator(
+        visible=not delayed,
+        text="Теперь вы\u00a0можете усилить свой отклик. Попробуйте\u00a0скорее Попробовать",
+    )
+    selector = '[data-qa="magritte-alert"]:has(a[href^="/applicant-services/hhpro"]):visible'
+    page.locators[selector] = promotion
+    paid_service = FakeLocator()
+    page.locators['a[href^="/applicant-services/hhpro"]'] = paid_service
+    page.frames = [
+        cast(
+            Frame,
+            FakeFrame(
+                messages_payloads=[
+                    [
+                        {
+                            "vacancyId": "101",
+                            "messageId": "one",
+                            "direction": "INCOMING",
+                            "body": "Первое",
+                        }
+                    ],
+                    [
+                        {
+                            "vacancyId": "202",
+                            "messageId": "two",
+                            "direction": "INCOMING",
+                            "body": "Второе",
+                        }
+                    ],
+                ]
+            ),
+        )
+    ]
+
+    def close_chat() -> None:
+        if promotion.visible:
+            raise TimeoutError("promotion intercepts pointer events")
+
+    close = FakeLocator(on_click=close_chat)
+    page.locators['[data-qa="chatik-close-chatik"]'] = close
+    overlay = FakeLocator(on_click=lambda: setattr(promotion, "visible", False))
+    page.locators['div[class*="magritte-overlay"]:visible'] = overlay
+    page.locators[
+        'div[class*="magritte-overlay"]:visible:has('
+        '+ div [data-qa="magritte-alert"]:visible a[href^="/applicant-services/hhpro"])'
+    ] = overlay
+    browser = make_browser(page, tmp_path)
+    if delayed:
+        read_messages = browser._read_chat_messages
+
+        def reveal_promotion(
+            page: Page, frame: Frame, vacancy_id: str
+        ) -> list[dict[object, object]]:
+            result = read_messages(page, frame, vacancy_id)
+            promotion.visible = True
+            return result
+
+        browser._read_chat_messages = reveal_promotion  # type: ignore[method-assign]
+
+    result = browser.read_recruiter_messages(("101", "202"))
+
+    assert [message.vacancy_id for message in result.messages] == ["101", "202"]
+    assert not result.failures
+    assert result.scan_complete
+    assert not page.keyboard.pressed
+    assert overlay.clicked == (2 if delayed else 1)
+    assert close.clicked == 2
+    assert not paid_service.clicked
+
+
+def test_known_negotiation_promotion_that_does_not_close_stops_the_pass(tmp_path: Path) -> None:
+    page = FakePage("https://hh.ru/applicant/resumes")
+    page.locators[
+        '[data-qa="magritte-alert"]:has(a[href^="/applicant-services/hhpro"]):visible'
+    ] = FakeLocator(
+        visible=True,
+        wait_error=True,
+        text="Теперь вы можете усилить свой отклик. Попробуйте скорее",
+    )
+    with pytest.raises(HhSyncRetryableError) as captured:
+        make_browser(page, tmp_path).read_recruiter_messages(("101",))
+    assert captured.value.code == "HH_PAGE_OBSTRUCTED"
+    assert not page.opened_vacancy_ids
+
+
+def test_known_promotion_ignoring_escape_is_closed_by_clicking_outside(tmp_path: Path) -> None:
+    page = FakePage("https://hh.ru/applicant/resumes")
+    promotion = FakeLocator(
+        visible=True,
+        wait_error=True,
+        text="Теперь вы можете усилить свой отклик. Попробуйте скорее",
+    )
+    page.locators[
+        '[data-qa="magritte-alert"]:has(a[href^="/applicant-services/hhpro"]):visible'
+    ] = promotion
+    overlay = FakeLocator(on_click=lambda: setattr(promotion, "visible", False))
+    page.locators['div[class*="magritte-overlay"]:visible'] = overlay
+    page.locators[
+        'div[class*="magritte-overlay"]:visible:has('
+        '+ div [data-qa="magritte-alert"]:visible a[href^="/applicant-services/hhpro"])'
+    ] = overlay
+
+    result = make_browser(page, tmp_path).read_recruiter_messages(("101",))
+
+    assert result.scan_complete
+    assert not result.failures
+    assert not page.keyboard.pressed
+    assert overlay.clicked == 1
+    assert not overlay.force_clicks[0]
+
+
+def test_other_negotiation_alert_is_not_dismissed(tmp_path: Path) -> None:
+    page = FakePage("https://hh.ru/applicant/resumes")
+    page.locators[
+        '[data-qa="magritte-alert"]:has(a[href^="/applicant-services/hhpro"]):visible'
+    ] = FakeLocator(visible=True, text="Подтвердите новые условия сервиса")
+    make_browser(page, tmp_path).read_recruiter_messages(("101",))
+    assert not page.keyboard.pressed
+
+
+def test_known_promotion_with_another_alert_does_not_close_either(tmp_path: Path) -> None:
+    page = FakePage("https://hh.ru/applicant/resumes")
+    page.locators[
+        '[data-qa="magritte-alert"]:has(a[href^="/applicant-services/hhpro"]):visible'
+    ] = FakeLocator(visible=True, text="Теперь вы можете усилить свой отклик. Попробуйте скорее")
+    page.locators[
+        '[data-qa="magritte-alert"]:not(:has(a[href^="/applicant-services/hhpro"])):visible'
+    ] = FakeLocator(visible=True, text="Подтвердите условия")
+    with pytest.raises(HhSyncRetryableError):
+        make_browser(page, tmp_path).read_recruiter_messages(("101",))
+    assert not page.keyboard.pressed
+
+
+@pytest.mark.parametrize("hidden_old_promotion", [False, True])
+def test_known_promotion_does_not_click_an_unrelated_overlay(
+    tmp_path: Path, hidden_old_promotion: bool
+) -> None:
+    page = FakePage("https://hh.ru/applicant/resumes")
+    page.locators[
+        '[data-qa="magritte-alert"]:has(a[href^="/applicant-services/hhpro"]):visible'
+    ] = FakeLocator(visible=True, text="Теперь вы можете усилить свой отклик. Попробуйте скорее")
+    unrelated_overlay = FakeLocator()
+    page.locators['div[class*="magritte-overlay"]:visible'] = unrelated_overlay
+    if hidden_old_promotion:
+        page.locators[
+            'div[class*="magritte-overlay"]:visible:has('
+            '+ div [data-qa="magritte-alert"] a[href^="/applicant-services/hhpro"])'
+        ] = unrelated_overlay
+    with pytest.raises(HhSyncRetryableError):
+        make_browser(page, tmp_path).read_recruiter_messages(("101",))
+    assert not page.keyboard.pressed
+    assert not unrelated_overlay.clicked
 
 
 def test_recruiter_messages_ignore_stale_frame_when_next_chat_opens(
