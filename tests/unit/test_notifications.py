@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import event, func, select
 from sqlalchemy.orm import Session
 
 from hugin.core.settings import Settings
@@ -197,7 +197,25 @@ def test_notification_collection_delivery_and_retry_are_idempotent(
         with database.sessions.begin() as session:
             service = NotificationService(session)
             assert service.collect(account_id, now) == 10
-            assert service.collect(account_id, now) == 0
+            repeated_inserts: list[str] = []
+
+            def count_repeated_inserts(
+                _connection: object,
+                _cursor: object,
+                statement: str,
+                _parameters: object,
+                _context: object,
+                _executemany: object,
+            ) -> None:
+                if "INSERT INTO notifications" in statement:
+                    repeated_inserts.append(statement)
+
+            event.listen(database.engine, "before_cursor_execute", count_repeated_inserts)
+            try:
+                assert service.collect(account_id, now) == 0
+            finally:
+                event.remove(database.engine, "before_cursor_execute", count_repeated_inserts)
+            assert repeated_inserts == []
             failed_jobs = session.scalars(
                 select(AutomationJobModel).where(
                     AutomationJobModel.last_error_code == "CAPTCHA_REQUIRED"

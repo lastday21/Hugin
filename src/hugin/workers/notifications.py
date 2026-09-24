@@ -27,6 +27,7 @@ _NOTIFICATION_CHANNEL_SCOPE_IDS = {
     NotificationChannel.EMAIL: 3,
 }
 _EMAIL_DELIVERY_INTERVAL = timedelta(minutes=5)
+_COLLECTION_INTERVAL = timedelta(seconds=10)
 
 
 class NotificationChannelNotConfigured(RuntimeError):
@@ -54,6 +55,7 @@ class NotificationWorker:
         self._journal = journal or OperationJournal(settings.data_dir)
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._last_collection_at: datetime | None = None
 
     @property
     def running(self) -> bool:
@@ -74,6 +76,7 @@ class NotificationWorker:
             starting.fail(error)
             raise
         self._stop.clear()
+        self._last_collection_at = None
         self._thread = threading.Thread(
             target=self._run,
             name="hugin-notifications",
@@ -109,13 +112,24 @@ class NotificationWorker:
 
     def run_once(self, now: datetime | None = None) -> bool:
         selected_at = now or datetime.now(UTC)
+        last_collection = self._last_collection_at
+        collect_due = (
+            last_collection is None
+            or selected_at < last_collection
+            or selected_at - last_collection >= _COLLECTION_INTERVAL
+        )
         database = create_database(self._settings)
+        collected = False
         try:
             with database.sessions.begin() as session:
-                NotificationService(session).collect(self._account_id, selected_at)
+                if collect_due:
+                    NotificationService(session).collect(self._account_id, selected_at)
+                    collected = True
                 notification = CommunicationRepository(session).claim_due_notification(selected_at)
         finally:
             database.close()
+        if collected:
+            self._last_collection_at = selected_at
         if notification is None:
             return False
 

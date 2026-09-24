@@ -216,6 +216,59 @@ def test_worker_retries_failed_delivery(
     assert recorded[0][0] == "failed"
 
 
+def test_worker_collects_periodically_but_claims_due_on_each_poll(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    collected: list[datetime] = []
+    claimed: list[datetime] = []
+
+    class Sessions:
+        def begin(self) -> object:
+            class Context:
+                def __enter__(self) -> object:
+                    return object()
+
+                def __exit__(self, *_args: object) -> None:
+                    pass
+
+            return Context()
+
+    class Database:
+        sessions = Sessions()
+
+        def close(self) -> None:
+            pass
+
+    class Service:
+        def __init__(self, _session: object) -> None:
+            pass
+
+        def collect(self, _account_id: int, now: datetime) -> int:
+            collected.append(now)
+            return 0
+
+    class Repository:
+        def __init__(self, _session: object) -> None:
+            pass
+
+        def claim_due_notification(self, now: datetime) -> None:
+            claimed.append(now)
+            return None
+
+    monkeypatch.setattr(worker_module, "create_database", lambda _settings: Database())
+    monkeypatch.setattr(worker_module, "NotificationService", Service)
+    monkeypatch.setattr(worker_module, "CommunicationRepository", Repository)
+    worker = worker_module.NotificationWorker(Settings(environment="test", data_dir=tmp_path))
+    started = datetime(2026, 7, 27, 8, 0, tzinfo=UTC)
+
+    for seconds in (0, 2, 9, 10):
+        assert not worker.run_once(started + timedelta(seconds=seconds))
+
+    assert collected == [started, started + timedelta(seconds=10)]
+    assert claimed == [started + timedelta(seconds=value) for value in (0, 2, 9, 10)]
+
+
 @pytest.mark.integration
 def test_delivery_failure_creates_visible_incident(settings: Settings) -> None:
     upgrade_database(settings)

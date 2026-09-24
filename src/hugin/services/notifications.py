@@ -39,8 +39,16 @@ class NotificationService:
         self._session = session
         self._applications = ApplicationRepository(session)
         self._communications = CommunicationRepository(session)
+        self._known_keys: set[str] | None = None
 
     def collect(self, account_id: int, now: datetime | None = None) -> int:
+        self._known_keys = set(self._session.scalars(select(NotificationModel.deduplication_key)))
+        try:
+            return self._collect(account_id, now)
+        finally:
+            self._known_keys = None
+
+    def _collect(self, account_id: int, now: datetime | None = None) -> int:
         selected_at = now or datetime.now(UTC)
         created = 0
 
@@ -293,6 +301,8 @@ class NotificationService:
         created = 0
         for channel in channels:
             key = f"{source_key}:{selected_event}:{channel.value}"[:128]
+            if self._known_keys is not None and key in self._known_keys:
+                continue
             before = self._session.scalar(
                 select(func.count())
                 .select_from(NotificationModel)
@@ -315,6 +325,8 @@ class NotificationService:
                 incident_id=incident_id,
             )
             created += int(not before)
+            if self._known_keys is not None:
+                self._known_keys.add(key)
         return created
 
     def _enqueue_daily_summary(
