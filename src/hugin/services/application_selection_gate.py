@@ -29,8 +29,8 @@ class ApplicationSelectionGate:
     def blocking_reason(self, account_id: int, now: datetime | None = None) -> str | None:
         now = as_utc(now or datetime.now(UTC))
         settings = self._session.get(ApplicationSettingsModel, 1)
+        day_start = day_start_utc(settings.timezone_name if settings else "UTC", now)
         if settings is not None and settings.search_enabled:
-            day_start = day_start_utc(settings.timezone_name, now)
             queries = self._session.execute(
                 select(DirectionSearchQueryModel, AutomationJobModel)
                 .join(CareerDirectionModel)
@@ -46,7 +46,7 @@ class ApplicationSelectionGate:
                 )
             )
             for query, job in queries:
-                raw = job.last_result.get("completed_search_at") if job is not None else None
+                raw = job.last_result.get("fresh_search_at") if job is not None else None
                 try:
                     completed = (
                         as_utc(datetime.fromisoformat(raw)) if isinstance(raw, str) else None
@@ -57,10 +57,10 @@ class ApplicationSelectionGate:
                     completed is None
                     or completed < day_start
                     or completed > now
-                    or job.last_result.get("completed_search_configuration")
+                    or job.last_result.get("fresh_search_configuration")
                     != search_configuration_key(query)
                 ):
-                    return "Ожидает завершения сегодняшнего поиска по всем активным запросам"
+                    return "Ожидает просмотра свежих страниц всех активных запросов"
 
         rows = self._session.execute(
             select(DirectionVacancyModel, VacancyModel, CareerDirectionModel)
@@ -89,6 +89,10 @@ class ApplicationSelectionGate:
                 or_(
                     VacancyModel.published_at.is_(None),
                     VacancyModel.published_at >= now - MAX_VACANCY_AGE,
+                ),
+                or_(
+                    VacancyModel.created_at >= day_start,
+                    VacancyModel.published_at >= day_start,
                 ),
             )
             .order_by(DirectionVacancyModel.analyzed_at.asc().nullsfirst())

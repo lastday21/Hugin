@@ -232,10 +232,10 @@ def test_unknown_result_does_not_stop_other_applications(settings: Settings) -> 
         database.close()
 
 
-def test_queue_prefers_rule_score_before_freshness(settings: Settings) -> None:
+def test_queue_prefers_recent_vacancy_within_fit_tier(settings: Settings) -> None:
     upgrade_database(settings)
     database = create_database(settings)
-    now = datetime(2026, 7, 22, 12, 0, tzinfo=UTC)
+    now = datetime.now(UTC)
 
     try:
         with database.sessions.begin() as session:
@@ -252,8 +252,8 @@ def test_queue_prefers_rule_score_before_freshness(settings: Settings) -> None:
                 published_at=now - timedelta(hours=1),
             )
             repository = QueueTaskRepository(session)
-            expected = repository.enqueue(older, 100, now)
-            repository.enqueue(newer, 20, now)
+            repository.enqueue(older, 100, now)
+            expected = repository.enqueue(newer, 20, now)
 
             claimed = repository.claim_next(now)
 

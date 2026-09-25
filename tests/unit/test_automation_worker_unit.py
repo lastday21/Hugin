@@ -538,14 +538,29 @@ def test_worker_defers_search_without_recording_failure(
     assert not scheduler.blocked
 
 
+@pytest.mark.parametrize(
+    "previous",
+    [
+        {"message_baseline_initialized": True},
+        {
+            "next_step": "search",
+            "continuation": False,
+            "cursor_details_before": 3002,
+            "round_complete": True,
+        },
+    ],
+)
 def test_worker_keeps_previous_result_when_job_is_deferred(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    previous: AutomationJobResult,
 ) -> None:
     now = datetime(2026, 7, 26, 8, 0, tzinfo=UTC)
     job = replace(
-        make_job(AutomationJobKind.MESSAGES),
-        last_result={"message_baseline_initialized": True},
+        make_job(
+            AutomationJobKind.SEARCH if "next_step" in previous else AutomationJobKind.MESSAGES
+        ),
+        last_result=previous,
     )
     scheduler = FakeScheduler(job)
     patch_worker_storage(monkeypatch, scheduler)
@@ -559,7 +574,7 @@ def test_worker_keeps_previous_result_when_job_is_deferred(
 
     worker = AutomationWorker(
         Settings(environment="test", data_dir=tmp_path),
-        handlers={AutomationJobKind.MESSAGES: defer},
+        handlers={job.kind: defer},
     )
 
     assert worker.run_once(now)
@@ -568,7 +583,7 @@ def test_worker_keeps_previous_result_when_job_is_deferred(
             job.key,
             60,
             {
-                "message_baseline_initialized": True,
+                **previous,
                 "deferred": True,
                 "reason": "APPLICATION_READY",
             },

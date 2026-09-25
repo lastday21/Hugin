@@ -1,5 +1,5 @@
 from copy import deepcopy
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlalchemy import func, select
@@ -8,14 +8,23 @@ from hugin.core.settings import Settings
 from hugin.database import create_database
 from hugin.database.models import (
     ApplicationModel,
+    ApplicationSettingsModel,
     CandidateProfileModel,
     DirectionSearchQueryModel,
     VacancyModel,
 )
 from hugin.domain import SearchRegion, VacancyData
+from hugin.domain.automation import AutomationJobKind
 from hugin.domain.hh import HhProfileData, HhResumeData
 from hugin.domain.vacancies import VacancySearchResult
-from hugin.repositories import AccountRepository, DirectionRepository, ResumeRepository
+from hugin.repositories import (
+    AccountRepository,
+    DirectionRepository,
+    ResumeRepository,
+    VacancyRepository,
+)
+from hugin.services.application_selection_gate import ApplicationSelectionGate
+from hugin.services.automation import AutomationSchedulerService
 from hugin.services.incremental_search import IncrementalSearchCycle
 
 pytestmark = pytest.mark.integration
@@ -73,7 +82,7 @@ class Browser:
         )
 
 
-def seed(settings: Settings) -> tuple[int, int]:
+def seed(settings: Settings, *, regions: tuple[SearchRegion, ...] | None = None) -> tuple[int, int]:
     with create_database(settings).sessions.begin() as s:
         a = AccountRepository(s).create("Test", "incremental")
         r = ResumeRepository(s).upsert(a.id, "resume", "Python")
@@ -84,7 +93,10 @@ def seed(settings: Settings) -> tuple[int, int]:
         )
         dirs.attach_resume(d.id, r.id)
         q = dirs.add_query(
-            d.id, "Python", regions=(SearchRegion("1", "Москва"),), schedule_minutes=120
+            d.id,
+            "Python",
+            regions=regions or (SearchRegion("1", "Москва"),),
+            schedule_minutes=120,
         )
         return a.id, q.id
 
@@ -104,9 +116,130 @@ def test_incremental_search_alternates_page_and_bounded_details_without_preparin
     third = cycle.run(account_id=account, search_query_id=query, browser=browser, progress=second)
     assert browser.pages[-1][2] == 1
     assert third["coverage_exhausted"] is False
+    cycle.run(account_id=account, search_query_id=query, browser=browser, progress=third)
+    assert {url.rsplit("/", 1)[-1] for url in browser.details[-3:]} == {"105", "106", "107"}
     with create_database(settings).sessions() as s:
         assert s.scalar(select(func.count()).select_from(ApplicationModel)) == 0
         assert s.scalar(select(func.count()).select_from(VacancyModel)) == 8
+
+
+def test_incremental_search_opens_republished_card_once(settings: Settings) -> None:
+    account, query = seed(settings)
+    yesterday = datetime.now(UTC) - timedelta(days=1)
+    with create_database(settings).sessions.begin() as session:
+        stored_query = session.get(DirectionSearchQueryModel, query)
+        assert stored_query is not None
+        vacancy = VacancyRepository(session).upsert(
+            VacancyData(
+                "100",
+                "Python",
+                "https://hh.ru/vacancy/100",
+                published_at=yesterday,
+                description="Develop Python API",
+                details_fetched_at=yesterday + timedelta(minutes=1),
+            )
+        )
+        DirectionRepository(session).track_vacancy(stored_query.direction_id, vacancy.id)
+    browser = Browser()
+    cycle = IncrementalSearchCycle(settings, page_limit=1, detail_limit=4)
+
+    first = cycle.run(account_id=account, search_query_id=query, browser=browser)
+    second = cycle.run(account_id=account, search_query_id=query, browser=browser, progress=first)
+    assert second["details_loaded"] == 3
+    third = cycle.run(account_id=account, search_query_id=query, browser=browser, progress=second)
+    assert third["details_loaded"] == 1
+    assert browser.details.count("https://hh.ru/vacancy/100") == 1
+
+    fourth = cycle.run(account_id=account, search_query_id=query, browser=browser, progress=third)
+    assert fourth["pages_loaded"] == 1
+    assert browser.details.count("https://hh.ru/vacancy/100") == 1
+
+
+def test_new_round_reads_fresh_page_before_one_backlog_chunk(settings: Settings) -> None:
+    account, query = seed(settings)
+    with create_database(settings).sessions.begin() as session:
+        stored_query = session.get(DirectionSearchQueryModel, query)
+        assert stored_query is not None
+        older = VacancyRepository(session).upsert(
+            VacancyData("older-backlog", "Python", "https://hh.ru/vacancy/older-backlog")
+        )
+        DirectionRepository(session).track_vacancy(stored_query.direction_id, older.id)
+    browser = Browser()
+    cycle = IncrementalSearchCycle(settings, page_limit=1, detail_limit=3)
+    first = cycle.run(account_id=account, search_query_id=query, browser=browser)
+    assert len(browser.pages) == 1 and not browser.details
+    second = cycle.run(account_id=account, search_query_id=query, browser=browser, progress=first)
+    assert second["details_loaded"] == 3 and second["continuation"] is False
+    third = cycle.run(account_id=account, search_query_id=query, browser=browser, progress=second)
+    assert third["details_loaded"] == 2 and third["backlog_processed"] is True
+    assert third["continuation"] is True and len(browser.pages) == 1
+    fourth = cycle.run(account_id=account, search_query_id=query, browser=browser, progress=third)
+    assert fourth["pages_loaded"] == 1 and len(browser.pages) == 2
+
+
+def test_first_pages_of_all_regions_precede_deeper_pages(settings: Settings) -> None:
+    account, query = seed(
+        settings,
+        regions=(SearchRegion("1", "Москва"), SearchRegion("2", "Санкт-Петербург")),
+    )
+    browser = Browser()
+    cycle = IncrementalSearchCycle(settings, page_limit=2, detail_limit=1)
+    progress = None
+    for _ in range(5):
+        progress = cycle.run(
+            account_id=account, search_query_id=query, browser=browser, progress=progress
+        )
+    assert browser.pages == [("Python", "1", 0), ("Python", "2", 0), ("Python", "1", 1)]
+    assert progress is not None and progress["fresh_search_at"]
+
+
+def test_fresh_page_sweep_unlocks_selection_gate_without_deep_pages(settings: Settings) -> None:
+    account, query = seed(
+        settings,
+        regions=(SearchRegion("1", "Москва"), SearchRegion("2", "Санкт-Петербург")),
+    )
+    browser = Browser()
+    browser.empty = True
+    cycle = IncrementalSearchCycle(settings, page_limit=3)
+    database = create_database(settings)
+    now = datetime.now(UTC)
+    progress = None
+    try:
+        with database.sessions.begin() as session:
+            options = session.get(ApplicationSettingsModel, 1)
+            assert options is not None
+            options.resource_saving_mode = False
+            scheduler = AutomationSchedulerService(session)
+            scheduler.ensure_search_job(
+                account_id=account, search_query_id=query, interval_minutes=120, now=now
+            )
+        for step in range(2):
+            selected_at = now + timedelta(seconds=step * 16)
+            with database.sessions.begin() as session:
+                scheduler = AutomationSchedulerService(session)
+                job = scheduler.claim_due(selected_at, allowed_kinds=(AutomationJobKind.SEARCH,))
+                assert job is not None
+            progress = cycle.run(
+                account_id=account, search_query_id=query, browser=browser, progress=progress
+            )
+            with database.sessions.begin() as session:
+                completed = AutomationSchedulerService(session).complete(
+                    job.key, progress, selected_at
+                )
+                blocked = ApplicationSelectionGate(session).blocking_reason(account, selected_at)
+                assert (blocked is None) is (step == 1), {
+                    key: completed.last_result.get(key)
+                    for key in (
+                        "fresh_search_at",
+                        "fresh_search_configuration",
+                        "running_search_configuration",
+                        "observed_page",
+                        "exhausted_mask",
+                    )
+                }
+        assert browser.pages == [("Python", "1", 0), ("Python", "2", 0)]
+    finally:
+        database.close()
 
 
 def test_failed_page_does_not_advance_and_finished_round_returns_to_fresh_search(
@@ -123,6 +256,13 @@ def test_failed_page_does_not_advance_and_finished_round_returns_to_fresh_search
     second = cycle.run(account_id=account, search_query_id=query, browser=browser, progress=first)
     assert second["continuation"] is False
     third = cycle.run(account_id=account, search_query_id=query, browser=browser, progress=second)
+    assert third["details_loaded"] == 1 and third["backlog_processed"] is True
+    assert third["continuation"] is True
+    assert len(browser.pages) == 2
+    for _ in range(3):
+        third = cycle.run(
+            account_id=account, search_query_id=query, browser=browser, progress=third
+        )
     assert [p[2] for p in browser.pages] == [0, 0, 0]
     assert third["new_vacancies"] == 0 and third["new_links"] == 0
 
@@ -163,14 +303,15 @@ def test_changed_search_conditions_reset_position(settings: Settings, changed: s
         account_id=account, search_query_id=query, browser=browser, progress=previous
     )
     assert result["cursor_signature"] != previous["cursor_signature"]
-    assert result["observed_page"] == 1
+    assert result["observed_page"] == 1 and result["page_index"] == 1
+    assert "backlog_processed" not in result
     assert len(browser.pages) == 2
     assert browser.pages[-1] == (
         "Backend" if changed == "query" else "Python",
         "2" if changed == "region" else "1",
         0,
     )
-    assert browser.details == []
+    assert len(browser.details) == 0
 
 
 def test_failed_later_page_retries_same_position_without_mutating_progress(
@@ -239,15 +380,15 @@ def test_failed_descriptions_do_not_starve_older_card_across_search_turn(
     assert failed["details_failed"] == 3
     assert failed["details_loaded"] == 0
     assert len(browser.details) == 3
-    searched = cycle.run(
-        account_id=account, search_query_id=query, browser=browser, progress=failed
-    )
-    assert searched["new_vacancies"] == 0
-    resumed = cycle.run(
-        account_id=account, search_query_id=query, browser=browser, progress=searched
-    )
-    assert browser.details[3] == oldest_url
+    resumed = cycle.run(account_id=account, search_query_id=query, browser=browser, progress=failed)
+    assert resumed["backlog_processed"] is True and resumed["details_failed"] == 3
+    for _ in range(3):
+        resumed = cycle.run(
+            account_id=account, search_query_id=query, browser=browser, progress=resumed
+        )
+    assert oldest_url in browser.details
     assert resumed["details_loaded"] == 1
+    assert len(browser.pages) == 2
     with create_database(settings).sessions() as session:
         oldest = session.scalar(select(VacancyModel).where(VacancyModel.source_url == oldest_url))
         assert oldest is not None and oldest.details_fetched_at is not None

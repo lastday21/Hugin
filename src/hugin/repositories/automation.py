@@ -249,10 +249,23 @@ class AutomationJobRepository:
         previous_result = model.last_result
         model.last_result = dict(result or {})
         if model.kind is AutomationJobKind.SEARCH:
-            for key in ("completed_search_at", "completed_search_configuration"):
+            for key in (
+                "completed_search_at",
+                "completed_search_configuration",
+                "fresh_search_at",
+                "fresh_search_configuration",
+            ):
                 if key in previous_result:
-                    model.last_result[key] = previous_result[key]
+                    model.last_result.setdefault(key, previous_result[key])
             query = self._session.get(DirectionSearchQueryModel, model.search_query_id)
+            if (
+                query is not None
+                and result
+                and result.get("fresh_search_at") != previous_result.get("fresh_search_at")
+                and previous_result.get("running_search_configuration")
+                == search_configuration_key(query)
+            ):
+                model.last_result["fresh_search_configuration"] = search_configuration_key(query)
             if (
                 query is not None
                 and result

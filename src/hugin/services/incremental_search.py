@@ -31,13 +31,22 @@ class IncrementalSearchCycle(BackgroundSearchCycle):
         external_id, direction_name, tasks = self._tasks(account_id, search_query_id)
         if not tasks:
             return {"continuation": False, "reason": "Нет активных вариантов поиска"}
-        signature = fingerprint([(t.query, t.area, t.filters) for t in tasks])
+        signature = fingerprint(
+            ["fresh_pages_first_v1", [(t.query, t.area, t.filters) for t in tasks]]
+        )
         previous = dict(progress or {})
         if previous.get("cursor_signature") != signature:
             previous = {}
         variant = self._index(previous.get("variant_index")) % len(tasks)
         page = min(self._index(previous.get("page_index")), self._page_limit - 1)
         stage = previous.get("next_step", "search")
+        if (
+            stage == "search"
+            and previous.get("continuation") is False
+            and previous.get("backlog_processed") is not True
+        ):
+            stage = "backlog"
+        exhausted_mask = self._index(previous.get("exhausted_mask")) & ((1 << len(tasks)) - 1)
         result: AutomationJobResult = {
             "cursor_signature": signature,
             "variant_index": variant,
@@ -50,6 +59,7 @@ class IncrementalSearchCycle(BackgroundSearchCycle):
             "new_vacancies": 0,
             "new_links": 0,
             "queued": 0,
+            "exhausted_mask": exhausted_mask,
         }
         # Последнее наблюдение выдачи отделено от счётчиков текущего хода.
         for key, value in previous.items():
@@ -57,6 +67,9 @@ class IncrementalSearchCycle(BackgroundSearchCycle):
                 "coverage_exhausted",
                 "coverage_page_limit",
                 "cursor_details_before",
+                "cursor_backlog_before",
+                "fresh_search_at",
+                "fresh_search_configuration",
             }:
                 result[key] = value
         if not allowed():
@@ -73,14 +86,17 @@ class IncrementalSearchCycle(BackgroundSearchCycle):
                 if direction is None:
                     raise LookupError("Направление поиска не найдено")
                 direction_id = direction.id
-            if stage == "details":
+            if stage in {"details", "backlog"}:
                 with database.sessions() as session:
                     candidates = (
                         select(VacancyModel)
                         .join(DirectionVacancyModel)
                         .where(
                             DirectionVacancyModel.direction_id == direction_id,
-                            VacancyModel.details_fetched_at.is_(None),
+                            or_(
+                                VacancyModel.details_fetched_at.is_(None),
+                                VacancyModel.published_at > VacancyModel.details_fetched_at,
+                            ),
                             VacancyModel.availability == VacancyAvailability.ACTIVE,
                             or_(
                                 VacancyModel.published_at.is_(None),
@@ -90,19 +106,25 @@ class IncrementalSearchCycle(BackgroundSearchCycle):
                         .order_by(VacancyModel.id.desc())
                         .limit(min(self._detail_limit, 3))
                     )
-                    before = self._index(previous.get("cursor_details_before"))
+                    cursor_key = (
+                        "cursor_backlog_before" if stage == "backlog" else "cursor_details_before"
+                    )
+                    before = self._index(previous.get(cursor_key))
                     pending = tuple(
                         session.scalars(
                             candidates.where(VacancyModel.id < before) if before else candidates
                         )
                     )
-                    if not pending and before:
+                    if not pending and before and stage == "details":
                         pending = tuple(session.scalars(candidates))
+                if stage == "backlog" and not pending:
+                    stage = "search"
+                    result.pop("cursor_backlog_before", None)
                 loaded = failed = 0
                 for vacancy in pending:
                     if not allowed():
                         break
-                    result["cursor_details_before"] = vacancy.id
+                    result[cursor_key] = vacancy.id
                     try:
                         details = browser.read_vacancy_details(vacancy.source_url)
                     except VacancyUnavailableError as error:
@@ -120,12 +142,16 @@ class IncrementalSearchCycle(BackgroundSearchCycle):
                         stored = VacancyRepository(session).upsert(details)
                         DirectionRepository(session).track_vacancy(direction_id, stored.id)
                     loaded += 1
-                result.update(
-                    details_loaded=loaded,
-                    details_failed=failed,
-                    continuation=previous.get("round_complete") is not True,
-                )
-                return result
+                if stage != "search":
+                    result.update(
+                        details_loaded=loaded,
+                        details_failed=failed,
+                        continuation=stage == "backlog"
+                        or previous.get("round_complete") is not True,
+                    )
+                    if stage == "backlog":
+                        result.update(backlog_processed=True, next_step="search")
+                    return result
             task = tasks[variant]
             found = browser.search_vacancies(
                 task.query, area=task.area, filters=task.filters, page_number=page
@@ -157,8 +183,17 @@ class IncrementalSearchCycle(BackgroundSearchCycle):
                     vacancies=found.vacancies,
                 )
             exhausted = not found.vacancies
-            variant_done = exhausted or page + 1 >= self._page_limit
-            round_complete = variant_done and variant + 1 >= len(tasks)
+            if exhausted:
+                exhausted_mask |= 1 << variant
+            next_slot = page * len(tasks) + variant + 1
+            while next_slot < self._page_limit * len(tasks):
+                next_variant = next_slot % len(tasks)
+                if not exhausted_mask & (1 << next_variant):
+                    break
+                next_slot += 1
+            round_complete = next_slot >= self._page_limit * len(tasks)
+            next_page, next_variant = (0, 0) if round_complete else divmod(next_slot, len(tasks))
+            first_pages_complete = page == 0 and (round_complete or next_page > 0)
             result.update(
                 pages_loaded=1,
                 new_vacancies=len(set(ids) - existing),
@@ -170,11 +205,16 @@ class IncrementalSearchCycle(BackgroundSearchCycle):
                 observed_at=datetime.now(UTC).isoformat(),
                 coverage_exhausted=exhausted,
                 coverage_page_limit=self._page_limit,
-                next_step="details",
-                variant_index=(variant + 1) % len(tasks) if variant_done else variant,
-                page_index=0 if variant_done else page + 1,
+                next_step="search" if exhausted else "details",
+                continuation=not round_complete if exhausted else True,
+                variant_index=next_variant,
+                page_index=next_page,
+                exhausted_mask=0 if round_complete else exhausted_mask,
                 round_complete=round_complete,
             )
+            if first_pages_complete:
+                result["fresh_search_at"] = datetime.now(UTC).isoformat()
+            result.pop("cursor_details_before", None)
             return result
         finally:
             database.close()

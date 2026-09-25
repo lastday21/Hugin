@@ -60,7 +60,7 @@ def test_later_stronger_vacancy_is_evaluated_before_spending_ready_slot(settings
         database.close()
 
 
-def test_search_round_must_complete_today_with_current_query(settings: Settings) -> None:
+def test_fresh_search_must_complete_today_with_current_query(settings: Settings) -> None:
     account_id, query_id = seed_search_query(settings)
     database = create_database(settings)
     now = datetime(2026, 9, 20, 9, tzinfo=UTC)
@@ -82,7 +82,11 @@ def test_search_round_must_complete_today_with_current_query(settings: Settings)
             assert gate.blocking_reason(account_id, now) is not None
             later = now + timedelta(seconds=16)
             assert scheduler.claim_due(later, allowed_kinds=(AutomationJobKind.SEARCH,)) is not None
-            scheduler.complete(job.key, {"continuation": False}, later)
+            scheduler.complete(
+                job.key,
+                {"continuation": True, "fresh_search_at": later.isoformat()},
+                later,
+            )
             assert gate.blocking_reason(account_id, later) is None
             later += timedelta(hours=3)
             assert scheduler.claim_due(later, allowed_kinds=(AutomationJobKind.SEARCH,)) is not None
@@ -97,11 +101,19 @@ def test_search_round_must_complete_today_with_current_query(settings: Settings)
             assert scheduler.claim_due(later, allowed_kinds=(AutomationJobKind.SEARCH,)) is not None
             query.query = "Запрос изменён во время поиска"
             session.flush()
-            scheduler.complete(job.key, {"continuation": False}, later)
+            scheduler.complete(
+                job.key,
+                {"continuation": True, "fresh_search_at": later.isoformat()},
+                later,
+            )
             assert gate.blocking_reason(account_id, later) is not None
             later += timedelta(hours=3)
             assert scheduler.claim_due(later, allowed_kinds=(AutomationJobKind.SEARCH,)) is not None
-            scheduler.complete(job.key, {"continuation": False}, later)
+            scheduler.complete(
+                job.key,
+                {"continuation": True, "fresh_search_at": later.isoformat()},
+                later,
+            )
             assert gate.blocking_reason(account_id, later) is None
             assert gate.blocking_reason(account_id, later + timedelta(days=1)) is not None
             query.is_active = False
@@ -120,6 +132,16 @@ def test_all_fresh_vacancies_need_details_and_current_evaluation(settings: Setti
             assert ApplicationSelectionGate(session).blocking_reason(account) is not None
         processor.process(account, direction, vacancy)
         with database.sessions.begin() as session:
+            assert ApplicationSelectionGate(session).blocking_reason(account) is None
+            older = VacancyRepository(session).upsert(
+                VacancyData("older", "Разработчик", "https://hh.ru/vacancy/older")
+            )
+            DirectionRepository(session).track_vacancy(direction, older.id)
+            stored_older = session.get(VacancyModel, older.id)
+            assert stored_older is not None
+            stored_older.created_at = datetime.now(UTC) - timedelta(days=2)
+            stored_older.published_at = stored_older.created_at
+            session.flush()
             assert ApplicationSelectionGate(session).blocking_reason(account) is None
             pending = VacancyRepository(session).upsert(
                 VacancyData("late", "Разработчик", "https://hh.ru/vacancy/late")

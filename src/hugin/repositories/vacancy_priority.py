@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from sqlalchemy import case, func
@@ -11,12 +12,15 @@ from hugin.database.models import ApplicationTaskModel, DirectionVacancyModel, V
 def vacancy_ordering() -> tuple[ColumnElement[Any], ...]:
     details = DirectionVacancyModel.rules_details
     tier = details["fit_tier"].as_string()
+    recent_publication = VacancyModel.published_at >= datetime.now(UTC) - timedelta(days=1)
     return (
         case((tier == "1", 1), (tier == "2", 2), else_=3),
+        case((recent_publication, 0), else_=1),
         func.coalesce(
             DirectionVacancyModel.rules_score, ApplicationTaskModel.priority_score, -1
         ).desc(),
         func.coalesce(details["location_priority"].as_float(), -1).desc(),
         func.coalesce(details["experience_priority"].as_float(), -1).desc(),
+        VacancyModel.published_at.desc().nullslast(),
         VacancyModel.id.asc(),
     )

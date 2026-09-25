@@ -254,7 +254,7 @@ def test_unavailable_vacancy_closes_running_preflight_but_not_running_submit(
         database.close()
 
 
-def test_detail_refresh_prioritizes_ready_tasks_and_skips_finished_work(
+def test_detail_refresh_prioritizes_unread_tasks_and_skips_finished_work(
     settings: Settings,
 ) -> None:
     upgrade_database(settings)
@@ -350,13 +350,49 @@ def test_detail_refresh_prioritizes_ready_tasks_and_skips_finished_work(
 
             assert [vacancy.hh_id for vacancy in pending] == [
                 "ready-never",
-                "ready-old",
                 "new-unassigned",
-                "old-unassigned",
             ]
             assert finished_id not in {vacancy.id for vacancy in pending}
-            assert old_unassigned_id in {vacancy.id for vacancy in pending}
+            assert old_unassigned_id not in {vacancy.id for vacancy in pending}
             assert new_unassigned_id in {vacancy.id for vacancy in pending}
+    finally:
+        database.close()
+
+
+def test_republished_vacancy_needs_new_details_but_unchanged_vacancy_does_not(
+    settings: Settings,
+) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    now = datetime.now(UTC)
+    try:
+        with database.sessions.begin() as session:
+            account = AccountRepository(session).create("Main account")
+            direction = DirectionRepository(session).create(account.id, "Backend")
+            vacancies = VacancyRepository(session)
+            for hh_id in ("unchanged", "republished"):
+                vacancy = vacancies.upsert(
+                    VacancyData(
+                        hh_id=hh_id,
+                        title="Python developer",
+                        source_url=f"https://hh.ru/vacancy/{hh_id}",
+                        published_at=now - timedelta(days=4),
+                        description="Разработка на Python",
+                        details_fetched_at=now - timedelta(days=3),
+                    )
+                )
+                DirectionRepository(session).track_vacancy(direction.id, vacancy.id)
+            vacancies.upsert(
+                VacancyData(
+                    hh_id="republished",
+                    title="Python developer",
+                    source_url="https://hh.ru/vacancy/republished",
+                    published_at=now,
+                )
+            )
+
+            pending = vacancies.list_pending_for_direction(direction.id, limit=10)
+            assert [vacancy.hh_id for vacancy in pending] == ["republished"]
     finally:
         database.close()
 

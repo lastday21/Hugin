@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import datetime
 from decimal import Decimal
 from enum import StrEnum
 
@@ -522,7 +522,6 @@ class VacancyRepository:
     ) -> list[VacancyRecord]:
         if limit < 1:
             raise ValueError("limit must be positive")
-        refresh_before = datetime.now(UTC) - timedelta(hours=24)
         ready_task_exists = exists(
             select(ApplicationTaskModel.id)
             .join(
@@ -578,7 +577,7 @@ class VacancyRepository:
                 or_(ready_task_exists, ~terminal_application_exists),
                 (
                     VacancyModel.details_fetched_at.is_(None)
-                    | (VacancyModel.details_fetched_at < refresh_before)
+                    | (VacancyModel.published_at > VacancyModel.details_fetched_at)
                 ),
             )
             .order_by(
