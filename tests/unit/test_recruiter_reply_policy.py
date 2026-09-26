@@ -98,6 +98,9 @@ def test_confirmation_code_remains_manual() -> None:
         "Выполните тестовое задание.",
         "Заполните форму https://example.com/form.",
         "Напишите в Telegram.",
+        "Можете подключиться к Teams?",
+        "Зарегистрируйтесь в Telegram.",
+        "Свяжитесь по Telegram.",
         "Когда удобно собеседование?",
         "Какая зарплата вас устроит?",
         "Позвоните по номеру +7 999 123 45 67.",
@@ -195,6 +198,11 @@ def test_direct_experience_question_does_not_need_a_question_mark(text: str) -> 
         "Компания рассмотрит ваше резюме и позже сообщит решение.",
         "Ваше резюме находится на этапе рассмотрения.",
         "Thank you, but we will not be moving forward with your application.",
+        "К сожалению, сейчас мы не готовы пригласить вас на дальнейшее интервью. "
+        "Мы свяжемся с вами, когда у нас возникнет такая потребность.",
+        "Не готовы пригласить вас на интервью. Возможно, вернёмся к вашей кандидатуре, "
+        "когда у нас возникнет такая потребность.",
+        "Диалог об этой вакансии продолжить не сможем. Желаем вам успехов.",
     ),
 )
 def test_messages_without_required_reply_do_not_reach_model(text: str) -> None:
@@ -250,6 +258,19 @@ def test_question_before_closing_or_after_hh_reminder_still_requires_reply(
             "Уточните, готовы ли вы продолжить?",
             RecruiterReplyDisposition.AUTOMATIC_DRAFT,
         ),
+        (
+            "Мы свяжемся с вами, когда возникнет такая потребность. "
+            "Но уточните, есть ли опыт интеграций?",
+            RecruiterReplyDisposition.AUTOMATIC_DRAFT,
+        ),
+        (
+            "Диалог об этой вакансии продолжить не сможем, но рассматриваете ли вы другую позицию?",
+            RecruiterReplyDisposition.AUTOMATIC_DRAFT,
+        ),
+        (
+            "Мы вернёмся к этому позже, уточните, когда возникнет потребность.",
+            RecruiterReplyDisposition.AUTOMATIC_DRAFT,
+        ),
     ),
 )
 def test_closing_message_does_not_hide_follow_up_request(
@@ -257,6 +278,65 @@ def test_closing_message_does_not_hide_follow_up_request(
     expected: RecruiterReplyDisposition,
 ) -> None:
     assert classify_recruiter_reply(ApplicationState.APPLIED, text) is expected
+
+
+@pytest.mark.parametrize(
+    "closing",
+    (
+        "Диалог об этой вакансии продолжить не сможем.",
+        "Мы свяжемся с вами, когда возникнет такая потребность.",
+    ),
+)
+@pytest.mark.parametrize(
+    "action",
+    (
+        "Заполните анкету для кадрового резерва.",
+        "Пройдите тестовое задание.",
+        "Загрузите документы на сайт.",
+        "Подключитесь к Teams.",
+        "Просьба заполнить анкету для кадрового резерва.",
+        "Необходимо пройти тестовое задание.",
+        "Перешлите документы по электронной почте.",
+        "Передайте документы по электронной почте.",
+        "Заполняйте анкету на сайте.",
+    ),
+)
+@pytest.mark.parametrize("action_first", [False, True])
+def test_closing_message_does_not_hide_external_action(
+    closing: str, action: str, action_first: bool
+) -> None:
+    text = f"{action} {closing}" if action_first else f"{closing} {action}"
+    assert (
+        classify_recruiter_reply(ApplicationState.APPLIED, text) is RecruiterReplyDisposition.MANUAL
+    )
+
+
+@pytest.mark.parametrize(
+    "closing",
+    (
+        "Диалог об этой вакансии продолжить не сможем.",
+        "Мы свяжемся с вами, когда возникнет такая потребность.",
+    ),
+)
+@pytest.mark.parametrize(
+    "status",
+    (
+        "Вы заполнили анкету для кадрового резерва.",
+        "Тестовое задание получено.",
+        "Вы переслали документы по электронной почте.",
+        "Вы передали документы по электронной почте.",
+        "Анкета на сайте заполнена.",
+    ),
+)
+@pytest.mark.parametrize("status_first", [False, True])
+def test_closing_message_with_completed_action_remains_without_reply(
+    closing: str, status: str, status_first: bool
+) -> None:
+    text = f"{status} {closing}" if status_first else f"{closing} {status}"
+    assert (
+        classify_recruiter_reply(ApplicationState.APPLIED, text)
+        is RecruiterReplyDisposition.NO_REPLY
+    )
 
 
 @pytest.mark.parametrize(
@@ -395,6 +475,107 @@ def test_substantive_question_can_get_automatic_draft(text: str) -> None:
     assert (
         classify_recruiter_reply(ApplicationState.VIEWED, text)
         is RecruiterReplyDisposition.AUTOMATIC_DRAFT
+    )
+
+
+@pytest.mark.parametrize(
+    ("incoming", "response"),
+    [
+        (
+            "Расскажите об опыте разработки на Python.",
+            "Писал код на Python для серверной части приложения.",
+        ),
+        ("Как вы проверяли приложения?", "Писал тесты и проверял обработку ошибок."),
+        (
+            "Расскажите о задачах автоматизации.",
+            "Автоматизировал работу с документами внутренних заказчиков.",
+        ),
+        (
+            "Есть опыт работы в банковской сфере?",
+            "Разрабатывал серверную часть приложения для банка.",
+        ),
+        ("How did you develop Python applications?", "I wrote Python code and automated tests."),
+        (
+            "Какие тесты вы выполняли?",
+            "Выполнял автоматические тесты для серверной части.",
+        ),
+        (
+            "Как вы работали с документами?",
+            "Отправлял документы во внутреннюю систему банка.",
+        ),
+        (
+            "Что вы автоматизировали?",
+            "Загружал документы и заполнял анкеты во внутренней системе.",
+        ),
+        (
+            "Как вы проверяете приложения?",
+            "В своей работе выполняю автоматические тесты для серверной части.",
+        ),
+        (
+            "Что вы автоматизируете?",
+            "В проекте отправляю документы во внутреннюю систему банка.",
+        ),
+    ],
+)
+def test_professional_terms_do_not_turn_supported_response_into_external_action(
+    incoming: str, response: str
+) -> None:
+    assert (
+        classify_recruiter_reply(ApplicationState.APPLIED, incoming, response)
+        is RecruiterReplyDisposition.AUTOMATIC_DRAFT
+    )
+    assert verified_experience_reply_is_safe(
+        ApplicationState.APPLIED, "Ответьте на чек-лист об опыте: Python.", response
+    )
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        "Пришлю выполненное тестовое задание.",
+        "Отправлю скан паспорта по почте.",
+        "Загружу документы по ссылке https://example.test/form.",
+        "Мой код из СМС: 123456.",
+        "Код доступа: 123456.",
+        "Мой пароль: example-password.",
+        "Номер банковской карты: 1234 5678 9012 3456.",
+        "Код для входа: 123456.",
+        "Мой одноразовый код: 123456.",
+        "Я вышлю документы.",
+        "Передам скан паспорта.",
+        "Предоставлю документы.",
+        "Буду выполнять тестовое задание.",
+        "Подключусь к Teams.",
+        "Зарегистрируюсь в Telegram.",
+        "Свяжусь по Telegram.",
+        "Мой СМС-код: 123456.",
+        "SMS-код: 123456.",
+        "Отправляю вам документы.",
+        "Выполняю ваше тестовое задание.",
+        "Отправляю скан паспорта.",
+        "Вам отправляю документы.",
+        "Ваше тестовое задание выполняю.",
+        "Скан паспорта отправляю.",
+        "Отправляю документы в Telegram.",
+        "Загружаю документы на сайт.",
+        "I am sending you the requested documents.",
+        "Отправляю:\n- скан паспорта.",
+        "Загружаю документы\nна ваш сайт.",
+        "Мой СМС‑код: 123456.",
+        "Мой СМС–код: 123456.",
+        "Мой СМС — код: 123456.",
+        "SMS_code: 123456.",
+    ],
+)
+def test_professional_question_does_not_allow_external_commitments_or_private_data(
+    response: str,
+) -> None:
+    assert (
+        classify_recruiter_reply(ApplicationState.APPLIED, "Расскажите об опыте.", response)
+        is not RecruiterReplyDisposition.AUTOMATIC_DRAFT
+    )
+    assert not verified_experience_reply_is_safe(
+        ApplicationState.APPLIED, "Ответьте на чек-лист об опыте: Python.", response
     )
 
 

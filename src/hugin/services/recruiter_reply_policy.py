@@ -48,6 +48,12 @@ _NO_REPLY_PATTERNS = tuple(
         r"\bк сожалению\b.{0,250}\b(?:не готовы|не можем|не сможем|не пригласим|отказ)",
         r"\b(?:не готовы|не можем|не сможем)\b.{0,180}\b"
         r"(?:пригласить|предложить|продолжить|рассматривать)",
+        r"\b(?:диалог|общение|обсуждение)\s+"
+        r"(?:(?:по|об|о)\s+(?:этой|данной)\s+вакансии\s+)?продолжить\s+не\s+сможем\b",
+        r"\b(?:свяжемся|верн[её]мся)"
+        r"(?:\s+с\s+(?:вами|тобой)|\s+к\s+(?:вашей|твоей)\s+кандидатуре)?"
+        r"\s*,?\s*когда\s+(?:у\s+нас\s+)?(?:возникнет|появится|будет)"
+        r"\s+(?:такая\s+)?потребность\b",
         r"\b(?:приняли решение|остановили выбор|остановились)\b.{0,180}\b"
         r"(?:друг\w* кандидат|не продолжать)",
         r"\b(?:выбрали|нашли)\b.{0,120}\bдруг\w* кандидат",
@@ -163,6 +169,18 @@ _MANUAL_ACTION_STRUCTURE = re.compile(
     re.I,
 )
 
+_PRIVATE_DATA_PATTERN = re.compile(
+    r"\b(?:парол\w*|секрет\w*|пин[ -]?код\w*|cvv|cvc|password|secret|pin)\b|"
+    r"\bкод\w*\s+(?:(?:из|для)\s+)?"
+    r"(?:смс|sms|подтверждени\w*|доступ\w*|авторизаци\w*|вход\w*)\b|"
+    r"\b(?:одноразов\w*|проверочн\w*|секретн\w*)\s+код\w*\b|"
+    r"\b(?:смс|sms)[\W_]+(?:код\w*|code)\b|"
+    r"\b(?:verification|confirmation|access|sms|login|one[ -]time)\s+code\b|"
+    r"\b(?:номер\w*|реквизит\w*)\s+(?:банковск\w*\s+)?(?:карт\w*|сч[её]т\w*|паспорт\w*)\b|"
+    r"\b(?:card|account|passport)\s+(?:number|details)\b",
+    re.I,
+)
+
 _FORM_ACTION_PATTERN = re.compile(
     r"\b(?:анкет\w*|опрос\w*|questionnaire|survey|forms?)\b",
     re.I,
@@ -175,13 +193,45 @@ _TEST_ACTION_PATTERN = re.compile(
 
 _EXTERNAL_ACTION_REQUEST_PATTERN = re.compile(
     r"\b(?:"
-    r"заполн\w*|прой(?:д|т)\w*|выполн\w*|пришл\w*|отправ\w*|направ\w*|"
-    r"загруз\w*|прикреп\w*|подпиш\w*|зарегистр\w*|перейд\w*|"
-    r"открой\w*|выбер\w*|заброниру\w*|подключ\w*|напиш\w*\s+в|"
-    r"свяж\w*\s+по|"
-    r"fill|complete|pass|submit|send|upload|attach|sign|register|"
+    r"(?:"
+    r"(?:заполн|выполн|отправ|направ|предостав|прикреп|подключ)"
+    r"(?:и(?:те)?|ь(?:те)?|ить|у|ю|лю|им|ишь|ит|ят)|"
+    r"(?:заполня|выполня|отправля|направля|предоставля|прикрепля|подключа|"
+    r"загружа|подписыва|пересыла)(?:й(?:те)?|ть)|"
+    r"прой(?:д(?:и(?:те)?|у|[её]м|[её]шь|[её]т|ут)|ти)|"
+    r"(?:пришл|вышл|перешл)(?:и(?:те)?|ю|[её]м|[её]шь|[её]т|ют)|"
+    r"(?:при|вы|пере)слать|переда(?:й(?:те)?|ть|м|дим|шь|ст|дут)|"
+    r"загруз(?:и(?:те)?|ить|им|ишь|ит|ят)|загружу|"
+    r"подпиш(?:и(?:те)?|у|ем|ешь|ет|ут)|подписать|"
+    r"зарегистриру(?:й(?:те)?|ю|ем|ешь|ет|ют)|зарегистрироваться|"
+    r"перей(?:д(?:и(?:те)?|у|[её]м|[её]шь|[её]т|ут)|ти)|"
+    r"откро(?:й(?:те)?|ю|ем|ешь|ет|ют)|открыть|"
+    r"выбер(?:и(?:те)?|у|ем|ешь|ет|ут)|выбрать|"
+    r"заброниру(?:й(?:те)?|ю|ем|ешь|ет|ют)|забронировать"
+    r")(?:ся|сь)?|"
+    r"(?:напиш(?:и(?:те)?|у|ем|ешь|ет|ут)|написать)\s+в|"
+    r"(?:свяж(?:и(?:те)?|у|ем|ешь|ет|ут)(?:ся|сь)?|связаться)\s+по|"
+    r"fill|complete|pass|submit|send|forward|provide|upload|attach|sign|register|"
     r"follow|open|choose|book|join|contact"
     r")\b",
+    re.I,
+)
+
+_PRESENT_EXTERNAL_ACTION_PATTERN = re.compile(
+    r"\b(?:выполняю|заполняю|отправляю|направляю|предоставляю|прикрепляю|загружаю|"
+    r"sending|uploading|attaching|providing|completing)\b",
+    re.I,
+)
+
+_EXTERNAL_ACTION_CONTEXT_PATTERN = re.compile(
+    r"\b(?:вам|ваш\w*|паспорт\w*|выписк\w*|тестов\w*\s+задани\w*|"
+    r"telegram|whatsapp|zoom|skype|teams|сайт\w*|почт\w*|you|your|passport|"
+    r"test\s+assignment|email)\b",
+    re.I,
+)
+
+_IMMEDIATE_EXTERNAL_CONNECTION_PATTERN = re.compile(
+    r"\b(?:подключаюсь|регистрируюсь|связываюсь)\b",
     re.I,
 )
 
@@ -195,10 +245,15 @@ _REPLY_REQUEST_PATTERN = re.compile(
     r"[?？]|"
     r"^(?:у\s+вас\s+(?:есть\s+)?|есть\s+у\s+вас\s+)опыт\b|"
     r"\b(?:подскажите|расскажите|уточните|ответьте|ответить|напишите|пришлите|направьте|"
-    r"опишите|укажите|подтвердите|выберите|предоставьте|сообщите)\b|"
+    r"опишите|укажите|подтвердите|выберите|предоставьте|сообщите|"
+    r"заполни(?:те)?|пройди(?:те)?|загрузи(?:те)?|подключись|подключитесь|"
+    r"открой(?:те)?|перейди(?:те)?|скачай(?:те)?|установи(?:те)?|"
+    r"выполни(?:те)?|отправь(?:те)?|прикрепи(?:те)?|подпиши(?:те)?|"
+    r"зарегистрируйся|зарегистрируйтесь|оплати(?:те)?|просим)\b|"
     r"\b(?:готовы|можете|хотели|интересно|рассматриваете|доступны|есть)\s+ли\b|"
     r"\b(?:какой|какая|какие|каково|сколько|когда|где|почему|как)\b|"
-    r"\b(?:could you|can you|would you|please (?:tell|send|share|confirm|describe)|"
+    r"\b(?:could you|can you|would you|please (?:tell|send|share|confirm|describe|"
+    r"complete|fill|upload|attach|join|register|follow|open|install|sign)|"
     r"what|when|where|why|how)\b",
     re.I,
 )
@@ -240,10 +295,7 @@ def classify_recruiter_reply(
         not proposed_response or is_exact_120_net_salary_response(proposed_response)
     ):
         return RecruiterReplyDisposition.AUTOMATIC_DRAFT
-    if proposed_response and (
-        _MANUAL_ACTION_PATTERN.search(proposed_response) is not None
-        or _MANUAL_ACTION_STRUCTURE.search(proposed_response) is not None
-    ):
+    if proposed_response and _unsafe_response(proposed_response):
         return RecruiterReplyDisposition.MANUAL
     if requires_manual_action(normalized, proposed_response):
         return RecruiterReplyDisposition.MANUAL
@@ -265,7 +317,7 @@ def verified_experience_reply_is_safe(
         and "НУЖНО УТОЧНИТЬ" not in proposed_response.upper()
         and not requires_review_draft(incoming_text, proposed_response)
         and not requires_manual_action(incoming_text, proposed_response)
-        and not _MANUAL_ACTION_PATTERN.search(proposed_response)
+        and not _unsafe_response(proposed_response)
         and not _MANUAL_ACTION_STRUCTURE.search(incoming_text)
         and not _MANUAL_ACTION_STRUCTURE.search(proposed_response)
     )
@@ -277,7 +329,7 @@ def _is_no_reply_message(text: str) -> bool:
         for pattern in (_HH_INVITATION_REMINDER_PATTERN, *_NO_REPLY_PATTERNS)
         if (match := pattern.search(text)) is not None
     ]
-    if not closing_spans:
+    if not closing_spans or requires_manual_action(text):
         return False
     return all(
         any(start <= request.start() and request.end() <= end for start, end in closing_spans)
@@ -394,13 +446,34 @@ def _direct_reply_state(
 def requires_manual_action(*texts: str) -> bool:
     return any(
         not is_experience_questionnaire(text)
-        and _EXTERNAL_ACTION_REQUEST_PATTERN.search(text) is not None
         and (
-            _MANUAL_ACTION_PATTERN.search(text) is not None
-            or _MANUAL_ACTION_STRUCTURE.search(text) is not None
+            (
+                _EXTERNAL_ACTION_REQUEST_PATTERN.search(text) is not None
+                and (
+                    _MANUAL_ACTION_PATTERN.search(text) is not None
+                    or _MANUAL_ACTION_STRUCTURE.search(text) is not None
+                )
+            )
+            or any(
+                (
+                    _PRESENT_EXTERNAL_ACTION_PATTERN.search(sentence) is not None
+                    and _EXTERNAL_ACTION_CONTEXT_PATTERN.search(sentence) is not None
+                )
+                or _IMMEDIATE_EXTERNAL_CONNECTION_PATTERN.search(sentence) is not None
+                for sentence in re.split(r"[.!?]", text)
+            )
         )
         for text in texts
         if text
+    )
+
+
+def _unsafe_response(text: str) -> bool:
+    text = text.translate(str.maketrans("‐‑‒–—−", "------"))
+    return bool(
+        _PRIVATE_DATA_PATTERN.search(text)
+        or _MANUAL_ACTION_STRUCTURE.search(text)
+        or requires_manual_action(text)
     )
 
 
