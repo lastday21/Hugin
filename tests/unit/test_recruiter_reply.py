@@ -30,8 +30,10 @@ from hugin.services.ai_prompts import (
     QWEN3_AI_MODEL,
     AiPromptSettingsService,
 )
+from hugin.services.background_processes import BackgroundProcessService
 from hugin.services.communications import CommunicationService, RecordingMessageSender
 from hugin.services.recruiter_reply import RecruiterReplyService
+from hugin.workers.replies import ReplyWorker
 from tests.unit.test_communications import create_application
 
 pytestmark = pytest.mark.integration
@@ -263,8 +265,10 @@ def test_reply_facts_respect_application_scope(settings: Settings, scoped_direct
         database.close()
 
 
-def test_generated_reply_uses_only_allowed_facts_and_remains_draft(
+@pytest.mark.parametrize("previous_sent", [True, False])
+def test_generated_reply_keeps_history_and_reuses_only_current_draft(
     settings: Settings,
+    previous_sent: bool,
 ) -> None:
     upgrade_database(settings)
     database = create_database(settings)
@@ -324,7 +328,27 @@ def test_generated_reply_uses_only_allowed_facts_and_remains_draft(
                     ("experience", "screening:17"),
                 )
             )
-            CommunicationService(session, RecordingMessageSender()).save_incoming(
+            communications = CommunicationService(session, RecordingMessageSender())
+            previous_draft = communications.create_outgoing_draft(
+                application_id=application_id,
+                body="[НУЖНО УТОЧНИТЬ: Лишнее старое уточнение]",
+            )
+            previous_draft_model = session.get(RecruiterMessageModel, previous_draft.id)
+            assert previous_draft_model is not None
+            previous_draft_model.created_at = datetime(2026, 7, 27, 8, 0, tzinfo=UTC)
+            sent = communications.create_outgoing_draft(
+                application_id=application_id,
+                body="Прежний отправленный ответ",
+            )
+            sent_model = session.get(RecruiterMessageModel, sent.id)
+            assert sent_model is not None
+            sent_model.state = (
+                RecruiterMessageState.SENT
+                if previous_sent
+                else RecruiterMessageState.REVIEW_REQUIRED
+            )
+            sent_model.created_at = datetime(2026, 7, 27, 8, 30, tzinfo=UTC)
+            incoming = communications.save_incoming(
                 application_id=application_id,
                 hh_id="incoming-reply",
                 body="Добрый день! Готовы рассмотреть переезд?",
@@ -343,12 +367,18 @@ def test_generated_reply_uses_only_allowed_facts_and_remains_draft(
             )
 
             assert draft.state is RecruiterMessageState.REVIEW_REQUIRED
+            assert draft.id > incoming.id
             assert draft.body == model.response
             assert draft.confirmed_at is None
             assert "Отвечай тепло" in model.prompts[0][0]
             assert "Центральной России" in model.prompts[0][1]
             assert "500 тысяч" not in model.prompts[0][1]
             assert "Ответ без контекста" not in model.prompts[0][1]
+            assert "Лишнее старое уточнение" not in model.prompts[0][1]
+            assert ("Прежний отправленный ответ" in model.prompts[0][1]) is previous_sent
+            assert previous_draft_model.body == previous_draft.body
+            assert previous_draft_model.state is RecruiterMessageState.REVIEW_REQUIRED
+            assert sent_model.body == sent.body
             assert "Готовы рассмотреть переезд?" in model.prompts[0][1]
             assert tuple(
                 session.scalars(
@@ -366,6 +396,15 @@ def test_generated_reply_uses_only_allowed_facts_and_remains_draft(
             assert edited.id == draft.id
             assert edited.content_version == 2
             assert edited.state is RecruiterMessageState.REVIEW_REQUIRED
+            sent_reply = communications.confirm_and_send(
+                account_id=account_id,
+                message_id=edited.id,
+                content_version=edited.content_version,
+                content_hash=edited.content_hash or "",
+            )
+            assert sent_reply.state is RecruiterMessageState.SENT
+            BackgroundProcessService(session, account_id).set_enabled("replies", True)
+            assert ReplyWorker(settings, account_id=account_id)._claim(session) is None
     finally:
         database.close()
 

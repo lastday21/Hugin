@@ -51,6 +51,13 @@ SYSTEM_PROMPT = """Ты помогаешь кандидату подготови
 [НУЖНО УТОЧНИТЬ: конкретный вопрос кандидату]. Не обращай этот вопрос к работодателю.
 Отсутствие сведений не означает отсутствие опыта. В перечне вопросов ответь на каждый пункт,
 сохрани порядок и отдельно пометь неизвестное. Не ставь минус или ноль вместо неизвестного.
+Если способы или технологии предложены как альтернативы («или», «/»), достаточно описать
+подтверждённый опыт одного подходящего варианта. Не требуй уточнений о другом варианте,
+если работодатель не требует оба. Когда явно требуются оба варианта, ответь по каждому.
+Сам знак «/» не доказывает альтернативу: учитывай смысл вопроса и обязательные требования.
+Отвечай на последнее сообщение работодателя. Перечень технологий в вакансии не добавляет
+новые вопросы к этому сообщению. Например, вопрос «REST API / webhooks?» допускает точный
+ответ об интеграциях через REST API, даже если вакансия также упоминает webhooks.
 Отрицание опыта повторяй только отдельным предложением из подтверждённого факта,
 сохраняя его формулировку, условия и время.
 Не принимай решения по условиям, датам и договорённостям за кандидата.
@@ -96,6 +103,7 @@ class RecruiterReplyService:
         account_id: int,
         application_id: int,
         incoming_message_id: int | None = None,
+        preserve_existing_draft: bool = False,
     ) -> ReviewedRecruiterReply:
         application_row = self._session.execute(
             select(ApplicationModel, VacancyModel)
@@ -116,7 +124,11 @@ class RecruiterReplyService:
         messages = tuple(
             self._session.scalars(
                 select(RecruiterMessageModel)
-                .where(RecruiterMessageModel.application_id == application.id)
+                .where(
+                    RecruiterMessageModel.application_id == application.id,
+                    (RecruiterMessageModel.direction == MessageDirection.INCOMING)
+                    | (RecruiterMessageModel.state == RecruiterMessageState.SENT),
+                )
                 .order_by(RecruiterMessageModel.created_at, RecruiterMessageModel.id)
             )
         )
@@ -233,7 +245,12 @@ class RecruiterReplyService:
                     f"<rejected_response>{escape(denial)}</rejected_response>"
                 )
 
-        if outgoing is None or outgoing.state is RecruiterMessageState.SENT:
+        if (
+            preserve_existing_draft
+            or outgoing is None
+            or outgoing.state is RecruiterMessageState.SENT
+            or outgoing.id < latest_incoming.id
+        ):
             draft = communications.create_outgoing_draft(
                 application_id=application.id,
                 body=body,

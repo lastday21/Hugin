@@ -56,28 +56,51 @@ _BLOCKING_INVITATION_TITLES = (
     "Приглашение на собеседование",
     "Задание от работодателя",
 )
-_GENERATED_REPLY_APPROVAL_KEY = "model_safe_v2"
+_GENERATED_REPLY_APPROVAL_PREFIX = "model_safe_v3:"
 _CHECKLIST_APPROVAL_PREFIX = "checklist_v1:"
 _SALARY_EXPECTATION_APPROVAL_KEY = "salary_expectation_120_net"
 _SALARY_EXPECTATION_REPLY = "Мои зарплатные ожидания — 120 000 рублей на руки."
 
 
-def _checklist_approval_key(
-    incoming_id: int, incoming_body: str, message_id: int, body: str, version: int
+def _reply_approval_key(
+    prefix: str, incoming_id: int, incoming_body: str, message_id: int, body: str, version: int
 ) -> str:
     payload = json.dumps(
         [incoming_id, incoming_body, message_id, body, version], ensure_ascii=False
     ).encode("utf-8")
     digest = urlsafe_b64encode(hashlib.sha256(payload).digest()).decode("ascii").rstrip("=")
-    return _CHECKLIST_APPROVAL_PREFIX + digest
+    return prefix + digest
 
 
 def _verified_checklist_approval(
     state: ApplicationState, incoming: RecruiterMessageModel, message: RecruiterMessageModel
 ) -> bool:
-    return message.reply_template_key == _checklist_approval_key(
-        incoming.id, incoming.body, message.id, message.body, message.version
+    return message.reply_template_key == _reply_approval_key(
+        _CHECKLIST_APPROVAL_PREFIX,
+        incoming.id,
+        incoming.body,
+        message.id,
+        message.body,
+        message.version,
     ) and verified_experience_reply_is_safe(state, incoming.body, message.body)
+
+
+def _verified_generated_approval(
+    state: ApplicationState, incoming: RecruiterMessageModel, message: RecruiterMessageModel
+) -> bool:
+    return (
+        message.reply_template_key
+        == _reply_approval_key(
+            _GENERATED_REPLY_APPROVAL_PREFIX,
+            incoming.id,
+            incoming.body,
+            message.id,
+            message.body,
+            message.version,
+        )
+        and classify_recruiter_reply(state, incoming.body, message.body)
+        is RecruiterReplyDisposition.AUTOMATIC_DRAFT
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -327,18 +350,41 @@ class AutonomousReplyService:
                 or application_id in blocked_applications
                 or disposition is not RecruiterReplyDisposition.REVIEW_DRAFT
             )
+            preserve_existing_draft = False
             if outgoing is not None and outgoing.id > incoming.id:
+                approval_prefix = next(
+                    (
+                        prefix
+                        for prefix in (_GENERATED_REPLY_APPROVAL_PREFIX, _CHECKLIST_APPROVAL_PREFIX)
+                        if (outgoing.reply_template_key or "").startswith(prefix)
+                    ),
+                    None,
+                )
+                preserve_existing_draft = (
+                    outgoing.auto_send_approved
+                    and outgoing.state
+                    in {RecruiterMessageState.CONFIRMED, RecruiterMessageState.FAILED}
+                    and approval_prefix is not None
+                    and any(
+                        previous.direction is MessageDirection.INCOMING
+                        and previous.id < incoming.id
+                        and outgoing.reply_template_key
+                        == _reply_approval_key(
+                            approval_prefix,
+                            previous.id,
+                            previous.body,
+                            outgoing.id,
+                            outgoing.body,
+                            outgoing.version,
+                        )
+                        for previous in conversation
+                    )
+                )
                 checklist_reply_is_safe = _verified_checklist_approval(
                     application_state, incoming, outgoing
                 )
-                generated_reply_is_safe = (
-                    outgoing.reply_template_key == _GENERATED_REPLY_APPROVAL_KEY
-                    and classify_recruiter_reply(
-                        application_state,
-                        incoming.body,
-                        outgoing.body,
-                    )
-                    is RecruiterReplyDisposition.AUTOMATIC_DRAFT
+                generated_reply_is_safe = _verified_generated_approval(
+                    application_state, incoming, outgoing
                 )
                 salary_reply_is_safe = (
                     outgoing.reply_template_key == _SALARY_EXPECTATION_APPROVAL_KEY
@@ -385,7 +431,8 @@ class AutonomousReplyService:
                             content_version=confirmed.content_version,
                         )
                     )
-                continue
+                if not preserve_existing_draft:
+                    continue
             if incoming.id not in eligible_incoming_ids:
                 continue
             if exact_salary_reply is not None:
@@ -530,6 +577,7 @@ class AutonomousReplyService:
                     account_id=account_id,
                     application_id=application_id,
                     incoming_message_id=incoming.id,
+                    preserve_existing_draft=preserve_existing_draft,
                 )
                 draft = reviewed.message
             except (
@@ -575,15 +623,16 @@ class AutonomousReplyService:
                         content_version=draft.content_version,
                         content_hash=draft.content_hash,
                         approval_key=(
-                            _checklist_approval_key(
+                            _reply_approval_key(
+                                _CHECKLIST_APPROVAL_PREFIX
+                                if checklist_reply_is_safe
+                                else _GENERATED_REPLY_APPROVAL_PREFIX,
                                 incoming.id,
                                 incoming.body,
                                 draft.id,
                                 draft.body,
                                 draft.content_version,
                             )
-                            if checklist_reply_is_safe
-                            else _GENERATED_REPLY_APPROVAL_KEY
                         ),
                     )
                     confirmed = communications.confirm_outgoing_draft(
@@ -694,13 +743,8 @@ class AutonomousReplyService:
         elif message.reply_template_key.startswith(_CHECKLIST_APPROVAL_PREFIX):
             if not _verified_checklist_approval(application.state, incoming, message):
                 return False
-        elif message.reply_template_key == _GENERATED_REPLY_APPROVAL_KEY:
-            disposition = classify_recruiter_reply(
-                application.state,
-                incoming.body,
-                message.body,
-            )
-            if disposition is not RecruiterReplyDisposition.AUTOMATIC_DRAFT:
+        elif message.reply_template_key.startswith(_GENERATED_REPLY_APPROVAL_PREFIX):
+            if not _verified_generated_approval(application.state, incoming, message):
                 return False
         else:
             template = policy.matching_reply_template(incoming.body)

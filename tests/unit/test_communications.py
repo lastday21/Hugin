@@ -1653,8 +1653,10 @@ def test_simple_salary_question_from_backlog_gets_exact_automatic_reply(
         database.close()
 
 
+@pytest.mark.parametrize("new_question_during_generation", [False, True])
 def test_new_safe_question_gets_model_reply_approved_for_send(
     settings: Settings,
+    new_question_during_generation: bool,
 ) -> None:
     upgrade_database(settings)
     database = create_database(settings)
@@ -1675,9 +1677,19 @@ def test_new_safe_question_gets_model_reply_approved_for_send(
                 body="Подскажите, предложение для вас ещё актуально?",
             )
 
+            class QuestionAwareModel(ReplyModel):
+                def complete(self, system_prompt: str, user_prompt: str) -> str:
+                    if new_question_during_generation:
+                        CommunicationService(session, RecordingMessageSender()).save_incoming(
+                            application_id=application_id,
+                            hh_id="incoming-safe-model-new",
+                            body="Хотите обсудить предложение?",
+                        )
+                    return super().complete(system_prompt, user_prompt)
+
             batch = AutonomousReplyService(session).prepare(
                 account_id=account_id,
-                model_factory=ReplyModel,
+                model_factory=QuestionAwareModel,
                 incoming_message_ids=(incoming.id,),
             )
 
@@ -1689,10 +1701,37 @@ def test_new_safe_question_gets_model_reply_approved_for_send(
                 message_id=approved.message_id,
                 content_version=approved.content_version,
                 content_hash=approved.content_hash,
-            )
+            ) is (not new_question_during_generation)
             stored = session.get(RecruiterMessageModel, approved.message_id)
             assert stored is not None
-            stored.reply_template_key = "model_safe_v1"
+            if new_question_during_generation:
+                original_key = stored.reply_template_key
+                follow_up = next(
+                    m
+                    for m in CommunicationService(session, RecordingMessageSender()).messages(
+                        account_id
+                    )
+                    if m.hh_id == "incoming-safe-model-new"
+                )
+                resumed = AutonomousReplyService(session).prepare(
+                    account_id=account_id,
+                    model_factory=ReplyModel,
+                    incoming_message_ids=(follow_up.id,),
+                )
+                assert resumed.drafts_created == 1
+                assert len(resumed.approved) == 1
+                current = resumed.approved[0]
+                assert current.message_id > stored.id
+                assert stored.reply_template_key == original_key
+                assert stored.body == "Здравствуйте! Готов обсудить вопрос."
+                assert stored.state is RecruiterMessageState.CONFIRMED
+                assert AutonomousReplyService(session).approved_for_send(
+                    account_id=account_id,
+                    message_id=current.message_id,
+                    content_version=current.content_version,
+                    content_hash=current.content_hash,
+                )
+            stored.reply_template_key = "model_safe_v2"
             session.flush()
             assert not AutonomousReplyService(session).approved_for_send(
                 account_id=account_id,
