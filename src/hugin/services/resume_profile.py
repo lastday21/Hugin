@@ -578,6 +578,8 @@ class ProfileQuestionService:
         fact.content = value
         fact.state = ConfirmationState.CONFIRMED
         fact.allow_in_forms = True
+        if any(common.key == key for common in COMMON_QUESTIONS):
+            fact.allow_in_messages = True
         fact.actual_at = answered_at
         self._session.flush()
 

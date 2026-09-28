@@ -138,6 +138,98 @@ def test_rephrased_salary_reuse_keeps_scope_freshness_and_tax_basis(
 
 
 @pytest.mark.parametrize(
+    "condition", ["current", "other_direction", "revoked", "changed_conditions"]
+)
+@pytest.mark.parametrize(
+    ("original_question", "rephrased_question", "different_question", "answer"),
+    [
+        (
+            "На какой уровень ты себя оцениваешь как AI-инженер?",
+            "Как ты оцениваешь свой уровень как AI-инженер?",
+            "Как ты оцениваешь свой уровень как ML-инженер?",
+            "Junior",
+        ),
+        (
+            "Есть ли у тебя возможность официального оформления?",
+            "У тебя есть возможность официального оформления?",
+            "У тебя есть возможность официального оформления в другой стране?",
+            "Да",
+        ),
+        (
+            "В указанных в резюме компаниях вы оформлены по ТК РФ? "
+            "(если нет, то распишите, в каких компаниях и как оформлены)",
+            "Оформлены ли вы по ТК РФ в указанных в резюме компаниях? "
+            "(если нет, то распишите, в каких компаниях и как оформлены)",
+            "Оформлены ли вы по ГПХ в указанных в резюме компаниях? "
+            "(если нет, то распишите, в каких компаниях и как оформлены)",
+            "Да",
+        ),
+    ],
+)
+def test_rephrased_question_reuses_only_allowed_scoped_answer(
+    settings: Settings,
+    condition: str,
+    original_question: str,
+    rephrased_question: str,
+    different_question: str,
+    answer: str,
+) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    try:
+        with database.sessions.begin() as session:
+            account = AccountRepository(session).create("Кандидат", "ai-level")
+            resume = ResumeRepository(session).upsert(account.id, "resume", "Python")
+            session.add(CandidateProfileModel(account_id=account.id, display_name="Кандидат"))
+            applications = []
+            for index in range(2):
+                vacancy = VacancyRepository(session).upsert(
+                    VacancyData(f"ai-{index}", "AI", f"https://hh.ru/vacancy/ai-{index}")
+                )
+                applications.append(
+                    ApplicationRepository(session).create_apply_intent(
+                        account.id, vacancy.id, resume.id
+                    )
+                )
+            service = ScreeningDraftService(session)
+            original = service.capture(
+                applications[0].id,
+                HhScreeningForm((HhScreeningField("level", original_question, "textarea"),)),
+            )
+            service.save_confirmed_answers(account.id, original.form_id, {"level": answer})
+            fact = session.scalar(select(VerifiedFactModel))
+            assert fact is not None
+            if condition == "other_direction":
+                direction = CareerDirectionModel(account_id=account.id, name="Иное")
+                session.add(direction)
+                session.flush()
+                fact.direction_id = direction.id
+            if condition == "revoked":
+                template = session.scalar(select(AnswerTemplateModel))
+                assert template is not None
+                template.is_active = False
+            session.flush()
+            question = (
+                different_question if condition == "changed_conditions" else rephrased_question
+            )
+            draft = service.capture(
+                applications[1].id,
+                HhScreeningForm((HhScreeningField("level", question, "textarea"),)),
+            )
+            if condition in {"revoked", "changed_conditions"}:
+                assert draft.questions[0].answer is None
+            else:
+                assert draft.questions[0].answer == answer
+                assert draft.questions[0].source is AnswerSource.BANK
+                assert draft.questions[0].source_question == original_question
+            assert draft.questions[0].is_confirmed == (condition == "current")
+            if "AI-инженер" in original_question:
+                assert service.get_auto_submission(applications[1].id) is None
+    finally:
+        database.close()
+
+
+@pytest.mark.parametrize(
     ("question", "prohibited"),
     [
         (

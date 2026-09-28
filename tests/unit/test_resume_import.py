@@ -27,9 +27,18 @@ from tests.unit.test_resume_documents import write_resume
 pytestmark = pytest.mark.integration
 
 
+@pytest.mark.parametrize(
+    ("question_key", "answer_text"),
+    [
+        ("salary_expectation", "от 180 000 рублей после вычета налогов"),
+        ("work_schedule", "любой"),
+    ],
+)
 def test_resume_import_is_idempotent_and_questions_are_reusable(
     settings: Settings,
     tmp_path: Path,
+    question_key: str,
+    answer_text: str,
 ) -> None:
     local_settings = settings.model_copy(update={"data_dir": tmp_path / "data"})
     source = tmp_path / "Резюме ИТ.docx"
@@ -111,26 +120,28 @@ def test_resume_import_is_idempotent_and_questions_are_reusable(
 
             ProfileQuestionService(session).answer(
                 account.id,
-                "salary_expectation",
-                "от 180 000 рублей после вычета налогов",
+                question_key,
+                answer_text,
             )
             answer = session.scalar(
-                select(AnswerTemplateModel).where(AnswerTemplateModel.key == "salary_expectation")
+                select(AnswerTemplateModel).where(AnswerTemplateModel.key == question_key)
             )
             question = session.scalar(
-                select(ProfileQuestionModel).where(ProfileQuestionModel.key == "salary_expectation")
+                select(ProfileQuestionModel).where(ProfileQuestionModel.key == question_key)
             )
             assert answer is not None
-            assert answer.answer_text == "от 180 000 рублей после вычета налогов"
+            assert answer.answer_text == answer_text
             assert answer.verified_fact_id is not None
             answer_fact = session.get(VerifiedFactModel, answer.verified_fact_id)
             assert answer_fact is not None
             assert answer_fact.actual_at is not None
+            assert answer_fact.allow_in_forms and answer_fact.allow_in_messages
+            assert not answer_fact.allow_in_letters
             assert question is not None
             assert question.state is ProfileQuestionState.ANSWERED
 
             ResumeImportService(session, local_settings.data_dir).import_file(account.id, source)
-            assert "salary_expectation" not in {
+            assert question_key not in {
                 item.key for item in ProfileQuestionService(session).list_pending(account.id)
             }
     finally:

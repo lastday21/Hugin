@@ -61,6 +61,7 @@ class ScreeningDraftQuestion:
     answer: str | None
     source: AnswerSource | None
     source_question: str | None = None
+    is_confirmed: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -1064,6 +1065,7 @@ class ScreeningDraftService:
                 options=tuple(question.options),
                 answer=answer.answer_text if answer is not None else None,
                 source=answer.source if answer is not None else None,
+                is_confirmed=answer.is_confirmed if answer is not None else False,
                 source_question=(
                     source_questions.get(
                         (answer.verified_fact_id, (answer.answer_text or "").strip())

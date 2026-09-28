@@ -208,6 +208,7 @@ class FormQuestionResponse(BaseModel):
     answer: str | None
     source: AnswerSource | None
     source_question: str | None = None
+    is_confirmed: bool = False
 
 
 class FormDraftResponse(BaseModel):

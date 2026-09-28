@@ -32,6 +32,53 @@ _SALARY_PERIODS = (
     ("month", r"\b(?:в|за)\s+месяц\b|/\s*месяц\b|\bежемесячн\w*"),
     ("year", r"\b(?:в|за)\s+год\b|/\s*год\b|\bежегодн\w*"),
 )
+_AI_ENGINEER = re.compile(r"\bкак\s+(?:ai|ии)\s+инженер(?:а|ом|у|е)?\b")
+_SELF_LEVEL = re.compile(r"\bуров(?:ень|ня|ню|не|нем)\b")
+_SELF_EVALUATION = re.compile(r"\b(?:оценива(?:ешь|ете)|оцени(?:те)?|себя)\b")
+_SELF_SUBJECT = re.compile(r"\bсебя\b|\b(?:свой|ваш|твой)\s+уровень\b")
+_OFFICIAL_EMPLOYMENT_AVAILABILITY = re.compile(
+    r"(?:есть ли у (?:вас|тебя)|у (?:вас|тебя) есть(?: ли)?) "
+    r"возможность официального оформления"
+)
+_RESUME_EMPLOYMENT = re.compile(
+    r"(?:в указанных в резюме компаниях (?:вы|ты) оформлены по тк рф|"
+    r"оформлены ли (?:вы|ты) по тк рф в указанных в резюме компаниях)"
+    r"(?P<explanation> если нет то распишите в каких компаниях и как оформлены)?"
+)
+_LLM_DEVELOPMENT_EXPERIENCE = re.compile(
+    r"(?:был ли у (?:тебя|вас) опыт разработки|"
+    r"занимался ли ты разработкой|занимались ли вы разработкой) "
+    r"ai функций или решений с использованием llm"
+)
+_LLM_TOOLS_EXPERIENCE = re.compile(
+    r"(?:с какими llm провайдерами и ai инструментами (?:ты работал|вы работали)|"
+    r"какие llm провайдеры и ai инструменты (?:ты использовал|вы использовали))"
+    r"(?P<examples> например .+)?"
+)
+_CANDIDATE_READINESS = re.compile(r"(?:готовы ли (?:вы )?|вы готовы )(?P<action>.+)")
+_BUSINESS_DEVELOPMENT = (
+    r"(?:ты работаешь|вы работаете) разработчиком над реальными продуктами и проектами для бизнеса"
+)
+_BUSINESS_DEVELOPMENT_YEARS = re.compile(
+    rf"(?:сколько лет {_BUSINESS_DEVELOPMENT}|{_BUSINESS_DEVELOPMENT} сколько лет)"
+)
+_AI_CODING_FREQUENCY = re.compile(
+    r"(?:как часто (?:ты используешь|вы используете)|"
+    r"ты как часто используешь|вы как часто используете) ai инструменты для разработки"
+    r"(?P<examples> .+)?"
+)
+_RESUME_OFFICIAL_EXPERIENCE = (
+    r"соответствует ли опыт указанный в (?:твоем|вашем) резюме официальному оформлению "
+    r"если нет кратко (?:укажи|укажите) какой опыт был официальным"
+)
+_FINAL_STAGE_REFERENCE_NOTICE = (
+    r"на финальных этапах мы можем запросить корпоративную почту или рекомендации "
+    r"с последних мест работы"
+)
+_RESUME_EXPERIENCE_WITH_NOTICE = re.compile(
+    rf"(?:{_RESUME_OFFICIAL_EXPERIENCE} {_FINAL_STAGE_REFERENCE_NOTICE}|"
+    rf"{_FINAL_STAGE_REFERENCE_NOTICE} {_RESUME_OFFICIAL_EXPERIENCE})"
+)
 
 
 def reusable_question_key(question: str) -> tuple[str, ...] | None:
@@ -39,6 +86,31 @@ def reusable_question_key(question: str) -> tuple[str, ...] | None:
     text = question.casefold().replace("ё", "е")
     text = re.sub(r"[^\w\s$€₽]", " ", text)
     text = " ".join(text.split())
+    if _BUSINESS_DEVELOPMENT_YEARS.fullmatch(text):
+        return ("business_product_development_duration", "years")
+    if coding := _AI_CODING_FREQUENCY.fullmatch(text):
+        return ("ai_coding_tools_frequency", coding["examples"] or "")
+    if _RESUME_EXPERIENCE_WITH_NOTICE.fullmatch(text):
+        return ("resume_experience_employment", "final_stage_reference_notice")
+    if _LLM_DEVELOPMENT_EXPERIENCE.fullmatch(text):
+        return ("llm_development_experience",)
+    if tools := _LLM_TOOLS_EXPERIENCE.fullmatch(text):
+        return ("used_llm_providers_and_ai_tools", tools["examples"] or "")
+    if readiness := _CANDIDATE_READINESS.fullmatch(text):
+        return ("candidate_readiness", readiness["action"])
+    if _OFFICIAL_EMPLOYMENT_AVAILABILITY.fullmatch(text):
+        return ("official_employment_availability",)
+    if employment := _RESUME_EMPLOYMENT.fullmatch(text):
+        return (
+            "resume_employment",
+            "tk_rf",
+            "with_explanation" if employment["explanation"] else "without_explanation",
+        )
+    if _AI_ENGINEER.search(text) and _SELF_LEVEL.search(text) and _SELF_SUBJECT.search(text):
+        remaining = _AI_ENGINEER.sub(" ", _SELF_LEVEL.sub(" ", text))
+        remaining = _SELF_EVALUATION.sub(" ", remaining)
+        if not _INTRO.sub(" ", remaining).strip():
+            return ("self_assessed_level", "ai_engineer")
     if _SALARY.search(text):
         gross, net = bool(_GROSS.search(text)), bool(_NET.search(text))
         if gross and net:
