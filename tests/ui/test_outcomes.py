@@ -4,6 +4,7 @@ import socket
 import time
 from collections.abc import Iterator
 from copy import deepcopy
+from datetime import UTC, datetime
 from pathlib import Path
 from threading import Thread
 
@@ -15,8 +16,16 @@ from sqlalchemy import func, select
 from hugin.api.app import create_app
 from hugin.core.settings import Settings
 from hugin.database import create_database
-from hugin.database.models import ApplicationModel, ApplicationOutcomeModel, RecruiterMessageModel
+from hugin.database.models import (
+    ApplicationModel,
+    ApplicationOutcomeModel,
+    CandidateProfileModel,
+    RecruiterMessageModel,
+    VacancyModel,
+    VerifiedFactModel,
+)
 from hugin.domain.applications import ApplicationState
+from hugin.domain.content import ConfirmationState
 from hugin.domain.vacancies import VacancyData
 from hugin.repositories import AccountRepository, ApplicationRepository, ResumeRepository
 from hugin.repositories.vacancies import VacancyRepository
@@ -45,6 +54,7 @@ def local_ui(settings: Settings) -> Iterator[tuple[str, int]]:
                 application_id=app.id,
                 hh_id="message-ui",
                 body="Собеседование согласовано на 10 сентября, 14:00 по Екатеринбургу.",
+                received_at=datetime(2026, 9, 5, 9, 5, tzinfo=UTC),
             )
             CommunicationService(session, RecordingMessageSender()).save_invitation(
                 application_id=app.id, hh_id="invitation-ui", title="Приглашение на собеседование"
@@ -102,6 +112,13 @@ def test_record_result_reload_conflict_and_mobile(
         expect(page.get_by_role("heading", name="Результат поиска")).to_be_visible()
         expect(page.locator(".outcome-totals dd").first).to_have_text("0")
         page.get_by_role("button", name="Общение", exact=True).click()
+        conversation_time = page.get_by_role("list", name="Переписки").locator("time")
+        expect(conversation_time).to_be_visible()
+        expect(conversation_time).to_contain_text("5 сент.")
+        expect(conversation_time).to_contain_text("14:05")
+        expect(page.locator(".message-thread small").first).to_have_text(
+            conversation_time.inner_text()
+        )
         page.locator(".outcome-editor summary").click()
         page.get_by_label("Подтверждение приглашения на собеседование", exact=True).fill(
             "Сообщение работодателя от 5 сентября"
@@ -149,6 +166,7 @@ def test_record_result_reload_conflict_and_mobile(
             page.get_by_label("Подтверждение приглашения на собеседование", exact=True)
         ).to_have_value("Другое окно сохранило подтверждение")
         page.set_viewport_size({"width": 390, "height": 844})
+        expect(conversation_time).to_be_visible()
         page.screenshot(path=str(tmp_path / "outcome-editor-mobile.png"), full_page=True)
         assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
         page.get_by_role("button", name="Главная", exact=True).click()
@@ -178,6 +196,168 @@ def test_record_result_reload_conflict_and_mobile(
             assert session.scalar(select(func.count()).select_from(RecruiterMessageModel)) == 1
     finally:
         database.close()
+
+
+def test_conversation_search_finds_older_messages_and_preserves_reply(
+    settings: Settings, local_ui: tuple[str, int], tmp_path: Path
+) -> None:
+    address, application_id = local_ui
+    database = create_database(settings)
+    try:
+        with database.sessions.begin() as session:
+            application = session.get(ApplicationModel, application_id)
+            assert application is not None
+            vacancy = session.get(VacancyModel, application.vacancy_id)
+            assert vacancy is not None
+            vacancy.employer_name = "Кошелёк Altin"
+            message = CommunicationService(session, RecordingMessageSender()).save_incoming(
+                application_id=application_id,
+                hh_id="older-fintech-question",
+                body="У вас есть опыт работы в fintech?",
+                received_at=datetime(2026, 9, 5, 9, 0, tzinfo=UTC),
+            )
+            stored = session.get(RecruiterMessageModel, message.id)
+            assert stored is not None
+            stored.created_at = datetime(2026, 9, 5, 9, 0, tzinfo=UTC)
+            profile = CandidateProfileModel(account_id=application.account_id, display_name="Иван")
+            session.add(profile)
+            session.flush()
+            for category, content in (
+                ("work_format", "Рассматриваю офис и удалённую работу"),
+                ("office_format", "Санкт-Петербург, Екатеринбург, Казань; кроме Москвы"),
+            ):
+                session.add(
+                    VerifiedFactModel(
+                        profile_id=profile.id,
+                        category=category,
+                        content=content,
+                        source_type="user",
+                        state=ConfirmationState.CONFIRMED,
+                    )
+                )
+    finally:
+        database.close()
+    errors: list[str] = []
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
+        context = browser.new_context(viewport={"width": 1360, "height": 1000})
+        page = context.new_page()
+        page.on("pageerror", lambda error: errors.append(str(error)))
+        page.goto(address)
+        page.get_by_role("button", name="Общение", exact=True).click()
+        conversations = page.get_by_role("list", name="Переписки")
+        expect(conversations.locator("small")).to_contain_text("Собеседование согласовано")
+        draft = page.get_by_label("Черновик ответа", exact=True)
+        draft.fill("Мой ответ остаётся в выбранной переписке")
+        search = page.get_by_role("searchbox", name="Поиск по перепискам")
+        search.fill("  FINTECH  ")
+        expect(conversations.get_by_role("button")).to_have_count(1)
+        expect(conversations.locator("small")).to_contain_text("У вас есть опыт работы в fintech?")
+        expect(page.get_by_text("Найдено переписок: 1 из 1.", exact=True)).to_be_visible()
+        expect(draft).to_have_value("Мой ответ остаётся в выбранной переписке")
+        search.fill("несуществующая компания")
+        expect(conversations.get_by_role("button")).to_have_count(0)
+        expect(
+            page.get_by_text("Переписок по этому запросу не найдено.", exact=True)
+        ).to_be_visible()
+        expect(draft).to_have_value("Мой ответ остаётся в выбранной переписке")
+        page.get_by_role("button", name="Очистить поиск переписок").click()
+        expect(conversations.locator("small")).to_contain_text(
+            "Мой ответ остаётся в выбранной переписке"
+        )
+        search.fill("altin")
+        expect(conversations.get_by_role("button")).to_have_count(1)
+        search.fill("разработчик python")
+        expect(conversations.get_by_role("button")).to_have_count(1)
+        page.set_viewport_size({"width": 390, "height": 844})
+        expect(search).to_be_visible()
+        assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+        page.screenshot(path=str(tmp_path / "conversation-search-mobile.png"), full_page=True)
+        page.get_by_role("button", name="Профиль", exact=True).click()
+        expect(page.get_by_text("Предпочтительный формат работы", exact=True)).to_be_visible()
+        expect(page.get_by_text("Условия работы в офисе", exact=True)).to_be_visible()
+        expect(page.get_by_text("office format", exact=True)).to_have_count(0)
+        assert not errors
+        browser.close()
+
+
+def test_outcome_draft_survives_delayed_refresh_and_conflict(
+    local_ui: tuple[str, int],
+) -> None:
+    address, application_id = local_ui
+    held: list[tuple[Route, dict[str, object]]] = []
+    hold_refresh = False
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
+        context = browser.new_context(viewport={"width": 1360, "height": 1000})
+
+        def route_request(route: Route) -> None:
+            if not route.request.url.startswith(address + "/"):
+                route.abort()
+            elif "/api/forms/reconcile" in route.request.url:
+                route.fulfill(json=[])
+            elif hold_refresh and "/api/communications?" in route.request.url:
+                held.append((route, route.fetch().json()))
+                page.evaluate("window.heldOutcomeRefresh = true")
+            else:
+                route.continue_()
+
+        context.route("**/*", route_request)
+        page = context.new_page()
+        page.goto(address)
+        refresh = page.get_by_role("button", name="Обновить данные", exact=True)
+        expect(refresh).to_be_enabled()
+        page.get_by_role("button", name="Общение", exact=True).click()
+        page.locator(".outcome-editor summary").click()
+        field = page.get_by_label("Подтверждение приглашения на собеседование", exact=True)
+        field.fill("Мой несохранённый текст")
+        hold_refresh = True
+        refresh.click()
+        page.wait_for_function("window.heldOutcomeRefresh === true")
+        assert len(held) == 1
+        saved = (
+            context.request.get(address + "/api/communications")
+            .json()["outcomes"]
+            .get(
+                str(application_id),
+                {
+                    "revision": 0,
+                    "interview_at": None,
+                    "interview_evidence": "",
+                    "rejection_reason": "",
+                    "rejection_evidence": "",
+                },
+            )
+        )
+        saved.pop("recorded_at", None)
+        saved["interview_evidence"] = "Другое окно сохранило подтверждение"
+        session_key = context.request.get(address + "/api/session").json()["key"]
+        response = context.request.put(
+            f"{address}/api/communications/applications/{application_id}/outcome",
+            headers={"X-Hugin-Session": session_key},
+            data=saved,
+        )
+        assert response.status == 200
+        field.fill("Мой новый несохранённый текст")
+        hold_refresh = False
+        route, stale = held.pop()
+        route.fulfill(json=stale)
+        expect(refresh).to_be_enabled()
+        expect(field).to_have_value("Мой новый несохранённый текст")
+        page.get_by_role("button", name="Сохранить результат", exact=True).click()
+        expect(
+            page.get_by_text(
+                "Результат уже изменён. Обновите сведения перед сохранением.", exact=True
+            )
+        ).to_be_visible()
+        expect(field).to_have_value("Мой новый несохранённый текст")
+        page.get_by_role("button", name="Обновить сведения", exact=True).click()
+        load_saved = page.get_by_role("button", name="Загрузить сохранённое", exact=True)
+        expect(load_saved).to_be_visible()
+        expect(field).to_have_value("Мой новый несохранённый текст")
+        load_saved.click()
+        expect(field).to_have_value("Другое окно сохранило подтверждение")
+        browser.close()
 
 
 def test_record_result_for_sent_application_without_conversation(
@@ -313,6 +493,7 @@ def test_delayed_form_check_does_not_replace_a_saved_answer(
             "options": [],
             "answer": None,
             "source": None,
+            "is_confirmed": False,
         }
         for key, text in (("experience", "Опишите опыт"), ("other", "Уточните сведения"))
     ]
@@ -357,6 +538,7 @@ def test_delayed_form_check_does_not_replace_a_saved_answer(
         def save_answer(route: Route) -> None:
             questions[0]["answer"] = saved_answer
             questions[0]["source"] = "MANUAL"
+            questions[0]["is_confirmed"] = True
             stored["answered_count"] = 1
             stored["unanswered_count"] = 1
             route.fulfill(json=stored)

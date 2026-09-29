@@ -367,6 +367,7 @@ export interface FormQuestion {
   answer: string | null;
   source: string | null;
   source_question?: string | null;
+  is_confirmed: boolean;
 }
 
 export interface FormAnswerInput {

@@ -1889,7 +1889,7 @@ function AttentionView({
                 </button>
               </div>
               <div className="form-progress">
-                <span>{plural(form.answered_count, "ответ", "ответа", "ответов")} готово</span>
+                <span>{plural(form.answered_count, "ответ", "ответа", "ответов")} сохранено</span>
                 <span>
                   {plural(form.unanswered_count, "вопрос", "вопроса", "вопросов")} без ответа
                 </span>
@@ -1926,9 +1926,17 @@ function AttentionView({
                           {question.source_question && (
                             <p>Сохранённый ответ на вопрос: «{question.source_question}»</p>
                           )}
+                          {!question.is_confirmed && (
+                            <p>
+                              Сохранённый ответ ещё не подтверждён для этой анкеты. Проверьте его
+                              актуальность и условия вопроса.
+                            </p>
+                          )}
                         </>
                       ) : null}
-                      {(!question.answer || form.state === "REVIEW_REQUIRED") && (
+                      {(!question.answer ||
+                        !question.is_confirmed ||
+                        form.state === "REVIEW_REQUIRED") && (
                         <FormQuestionEditor
                           formId={form.form_id}
                           question={question}
@@ -1994,6 +2002,7 @@ function FormQuestionEditor({
       {question.options.length ? (
         <select
           value={answer}
+          disabled={saving}
           aria-label={`Ответ на вопрос: ${question.question}`}
           onChange={(event) => setAnswer(event.target.value)}
         >
@@ -2009,6 +2018,7 @@ function FormQuestionEditor({
           rows={2}
           maxLength={4000}
           value={answer}
+          disabled={saving}
           aria-label={`Ответ на вопрос: ${question.question}`}
           placeholder="Введите подтверждённый ответ"
           onChange={(event) => setAnswer(event.target.value)}
@@ -2056,6 +2066,8 @@ function CommunicationsView({
   onOutcomeSaved: () => void;
 }) {
   const [draft, setDraft] = useState("");
+  const [conversationSearch, setConversationSearch] = useState("");
+  const conversationSearchRef = useRef<HTMLInputElement>(null);
   const [replyMode, setReplyMode] = useState<"manual" | "ai">("manual");
   const [outcomeApplicationId, setOutcomeApplicationId] = useState<number | null>(null);
   const [busy, setBusy] = useState(false);
@@ -2078,6 +2090,14 @@ function CommunicationsView({
   );
   const outcomeApplication = communications.sent_applications.find(
     (application) => application.application_id === outcomeApplicationId,
+  );
+  const normalizedConversationSearch = conversationSearch.trim().toLocaleLowerCase("ru-RU");
+  const filteredConversations = useMemo(
+    () => communications.conversations.filter((conversation) =>
+      [conversation.company, conversation.vacancy_title, ...conversation.messages.map((message) => message.body)]
+        .some((text) => text.toLocaleLowerCase("ru-RU").includes(normalizedConversationSearch)),
+    ),
+    [communications.conversations, normalizedConversationSearch],
   );
 
   useEffect(() => {
@@ -2391,6 +2411,34 @@ function CommunicationsView({
         )}
       </details>
 
+      {tab === "messages" && (
+        <div className="list-toolbar">
+          <div className="search-field">
+            <label className="sr-only" htmlFor="conversation-search">Поиск по перепискам</label>
+            <Search size={18} aria-hidden="true" />
+            <input
+              ref={conversationSearchRef}
+              id="conversation-search"
+              type="search"
+              value={conversationSearch}
+              placeholder="Компания, вакансия или текст сообщения"
+              onChange={(event) => setConversationSearch(event.target.value)}
+            />
+            {conversationSearch && (
+              <button type="button" aria-label="Очистить поиск переписок" onClick={() => {
+                setConversationSearch("");
+                conversationSearchRef.current?.focus();
+              }}>
+                <X size={17} aria-hidden="true" />
+              </button>
+            )}
+          </div>
+          <p className="communications-note" role="status">
+            Найдено переписок: {filteredConversations.length} из {communications.conversations.length}.
+          </p>
+        </div>
+      )}
+
       {tab === "messages" ? (
         <section
           id="messages-panel"
@@ -2401,8 +2449,14 @@ function CommunicationsView({
           {communications.conversations.length ? (
             <>
               <ul className="conversation-list" aria-label="Переписки">
-                {communications.conversations.map((conversation) => {
+                {!filteredConversations.length && (
+                  <li className="empty-state"><p>Переписок по этому запросу не найдено.</p></li>
+                )}
+                {filteredConversations.map((conversation) => {
                   const latest = conversation.messages.at(-1);
+                  const matchedMessage = normalizedConversationSearch
+                    ? conversation.messages.find((message) => message.body.toLocaleLowerCase("ru-RU").includes(normalizedConversationSearch))
+                    : undefined;
                   return (
                     <li key={conversation.application_id}>
                       <button
@@ -2421,7 +2475,14 @@ function CommunicationsView({
                           )}
                         </span>
                         <span>{conversation.vacancy_title}</span>
-                        <small>{latest?.body ?? "Сообщений пока нет"}</small>
+                        {latest && (
+                          <time className="conversation-time" dateTime={latest.occurred_at} title="Последнее сообщение">
+                            {formatDate(latest.occurred_at, true)}
+                          </time>
+                        )}
+                        <small>{matchedMessage
+                          ? `Найдено в сообщении: ${matchedMessage.body}`
+                          : latest?.body ?? "Сообщений пока нет"}</small>
                       </button>
                     </li>
                   );
@@ -2661,7 +2722,12 @@ const profileCategoryNames: Record<string, string> = {
   location: "Место проживания",
   citizenship: "Гражданство",
   employment: "Занятость",
-  work_format: "Формат работы",
+  work_format: "Предпочтительный формат работы",
+  office_format: "Условия работы в офисе",
+  fintech_experience: "Опыт в финансовой сфере",
+  llm_current_usage: "Текущее использование языковых моделей",
+  rest_production_experience: "Опыт внешних интеграций через REST API",
+  transactions_study: "Изучение транзакций в текущем проекте",
   mobility: "Переезд",
   email: "Электронная почта",
   phone: "Телефон",
@@ -3138,7 +3204,7 @@ function ProfileView({
             <span className="eyebrow">Частые вопросы</span>
             <h2 id="answers-title">Сохранённые ответы</h2>
             <p>
-              Ответ подставляется только при точном совпадении вопроса. Ответы не считаются
+              Сохранённый ответ используется, если вопрос и его условия совпадают. Ответы не считаются
               общими сведениями об опыте или навыках.
             </p>
           </div>

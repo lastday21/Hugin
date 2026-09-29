@@ -1578,6 +1578,12 @@ ol {
   -webkit-line-clamp: 2;
 }
 
+.conversation-time {
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
 .conversation-panel {
   display: grid;
   grid-template-rows: auto minmax(0, 1fr) auto;

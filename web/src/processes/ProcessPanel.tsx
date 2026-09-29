@@ -83,11 +83,10 @@ export function ProcessPanel({ data, loadError, onSaved, onRefresh }: {
           {data.processes.map((process) => <article className={`process-row process-${process.state}`} key={process.key}>
             <div>
               <h3>{process.name}</h3>
-              <p><strong>{stateNames[process.state]}</strong>{["error", "blocked", "interrupted", "stopping"].includes(process.state) && <> · {process.reason}</>}</p>
+              <p><strong>{stateNames[process.state]}</strong> · {process.reason}</p>
               <details>
                 <summary>Подробности</summary>
                 <p>{descriptions[process.key]}</p>
-                <p>{process.reason}</p>
                 <p>Начало: {dateText(process.last_started_at)}<br />Завершение: {dateText(process.last_finished_at)}</p>
               </details>
             </div>
