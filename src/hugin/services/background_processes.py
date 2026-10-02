@@ -335,6 +335,10 @@ class BackgroundProcessService:
         if key in {"search", "synchronization"}:
             return self._job_waiting_reason(key, settings, now)
         if key == "evaluation":
+            if ApplicationSelectionGate(self._session).fresh_search_pending(
+                self._account_id, now, due_only=True
+            ):
+                return "Сначала просмотр свежих страниц; затем оценка сохранённых вакансий"
             stages = funnel.get("stages")
             pending = (
                 next(

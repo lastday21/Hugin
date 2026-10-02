@@ -105,6 +105,10 @@ class SemanticSelectionWorker:
                 VacancyModel.details_fetched_at.is_not(None),
                 or_(
                     VacancyModel.published_at.is_(None),
+                    VacancyModel.published_at <= VacancyModel.details_fetched_at,
+                ),
+                or_(
+                    VacancyModel.published_at.is_(None),
                     VacancyModel.published_at >= datetime.now(UTC) - MAX_VACANCY_AGE,
                 ),
             )

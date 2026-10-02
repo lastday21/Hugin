@@ -6,11 +6,15 @@ from datetime import UTC, datetime
 from sqlalchemy import or_, select
 
 from hugin.database import create_database
-from hugin.database.models import DirectionVacancyModel, VacancyModel
+from hugin.database.models import ApplicationSettingsModel, DirectionVacancyModel, VacancyModel
 from hugin.domain.automation import AutomationJobResult
+from hugin.domain.search_progress import fresh_search_today, search_time
+from hugin.domain.time import day_start_utc
 from hugin.domain.vacancies import VacancyAvailability, VacancyData, VacancyUnavailableError
 from hugin.repositories.directions import DirectionRepository
 from hugin.repositories.vacancies import VacancyRepository
+from hugin.services.application_selection_gate import ApplicationSelectionGate
+from hugin.services.background_processes import BackgroundProcessService
 from hugin.services.decision_evidence import fingerprint
 from hugin.services.job_search import JobSearchSyncService
 from hugin.services.search_cycle import BackgroundSearchCycle, SearchCycleBrowser
@@ -18,6 +22,15 @@ from hugin.services.vacancy_analysis import MAX_VACANCY_AGE
 
 
 class IncrementalSearchCycle(BackgroundSearchCycle):
+    _CURSOR_FIELDS = (
+        "variant_index",
+        "page_index",
+        "next_step",
+        "round_complete",
+        "cursor_details_before",
+        "cursor_backlog_before",
+    )
+
     def run(
         self,
         *,
@@ -37,6 +50,34 @@ class IncrementalSearchCycle(BackgroundSearchCycle):
         previous = dict(progress or {})
         if previous.get("cursor_signature") != signature:
             previous = {}
+        now = datetime.now(UTC)
+        database = create_database(self._settings)
+        try:
+            with database.sessions() as session:
+                options = session.get(ApplicationSettingsModel, 1)
+                timezone_name = options.timezone_name if options is not None else "UTC"
+        finally:
+            database.close()
+        fresh_sweep = not fresh_search_today(previous, now, timezone_name)
+        started = search_time(previous.get("fresh_sweep_started_at"))
+        if fresh_sweep and (
+            started is None or not day_start_utc(timezone_name, now) <= started <= now
+        ):
+            if self._index(previous.get("page_index")) > 0:
+                for key in self._CURSOR_FIELDS:
+                    if key in previous:
+                        previous[f"resume_{key}"] = previous[key]
+            previous.update(
+                variant_index=0,
+                page_index=0,
+                next_step="search",
+                exhausted_mask=0,
+                round_complete=False,
+                continuation=True,
+                fresh_sweep_started_at=now.isoformat(),
+            )
+            previous.pop("cursor_details_before", None)
+            previous.pop("cursor_backlog_before", None)
         variant = self._index(previous.get("variant_index")) % len(tasks)
         page = min(self._index(previous.get("page_index")), self._page_limit - 1)
         stage = previous.get("next_step", "search")
@@ -63,13 +104,14 @@ class IncrementalSearchCycle(BackgroundSearchCycle):
         }
         # Последнее наблюдение выдачи отделено от счётчиков текущего хода.
         for key, value in previous.items():
-            if key.startswith("observed_") or key in {
+            if key.startswith(("observed_", "resume_")) or key in {
                 "coverage_exhausted",
                 "coverage_page_limit",
                 "cursor_details_before",
                 "cursor_backlog_before",
                 "fresh_search_at",
                 "fresh_search_configuration",
+                "fresh_sweep_started_at",
             }:
                 result[key] = value
         if not allowed():
@@ -86,6 +128,34 @@ class IncrementalSearchCycle(BackgroundSearchCycle):
                 if direction is None:
                     raise LookupError("Направление поиска не найдено")
                 direction_id = direction.id
+                fresh_ids: set[int] | None = None
+                processes = BackgroundProcessService(session, account_id)
+                gate = ApplicationSelectionGate(session)
+                if (
+                    not fresh_sweep
+                    and processes.enabled("applications")
+                    and processes.enabled("evaluation")
+                    and not gate.fresh_search_pending(account_id, now)
+                ):
+                    for key in ("round_complete", "backlog_processed"):
+                        if key in previous:
+                            result[key] = previous[key]
+                    current_details = gate.pending_details(account_id, now)
+                    if current_details:
+                        fresh_ids = current_details.get(direction_id)
+                        if not fresh_ids:
+                            return {
+                                **result,
+                                "next_step": str(stage),
+                                "reason": "Ожидает загрузки свежих вакансий других направлений",
+                            }
+                        stage = "details"
+                    elif gate.blocking_reason(account_id, now):
+                        return {
+                            **result,
+                            "next_step": str(stage),
+                            "reason": "Ожидает оценки свежих вакансий перед продолжением поиска",
+                        }
             if stage in {"details", "backlog"}:
                 with database.sessions() as session:
                     candidates = (
@@ -106,6 +176,8 @@ class IncrementalSearchCycle(BackgroundSearchCycle):
                         .order_by(VacancyModel.id.desc())
                         .limit(min(self._detail_limit, 3))
                     )
+                    if fresh_ids is not None:
+                        candidates = candidates.where(VacancyModel.id.in_(fresh_ids))
                     cursor_key = (
                         "cursor_backlog_before" if stage == "backlog" else "cursor_details_before"
                     )
@@ -146,7 +218,8 @@ class IncrementalSearchCycle(BackgroundSearchCycle):
                     result.update(
                         details_loaded=loaded,
                         details_failed=failed,
-                        continuation=stage == "backlog"
+                        continuation=fresh_ids is not None
+                        or stage == "backlog"
                         or previous.get("round_complete") is not True,
                     )
                     if stage == "backlog":
@@ -205,16 +278,28 @@ class IncrementalSearchCycle(BackgroundSearchCycle):
                 observed_at=datetime.now(UTC).isoformat(),
                 coverage_exhausted=exhausted,
                 coverage_page_limit=self._page_limit,
-                next_step="search" if exhausted else "details",
+                next_step="search"
+                if exhausted or (fresh_sweep and not first_pages_complete)
+                else "details",
                 continuation=not round_complete if exhausted else True,
                 variant_index=next_variant,
                 page_index=next_page,
                 exhausted_mask=0 if round_complete else exhausted_mask,
                 round_complete=round_complete,
             )
-            if first_pages_complete:
-                result["fresh_search_at"] = datetime.now(UTC).isoformat()
             result.pop("cursor_details_before", None)
+            if first_pages_complete:
+                result["fresh_search_at"] = (
+                    str(previous["fresh_sweep_started_at"])
+                    if fresh_sweep
+                    else datetime.now(UTC).isoformat()
+                )
+                result["fresh_sweep_started_at"] = None
+                if "resume_page_index" in result:
+                    for key in self._CURSOR_FIELDS:
+                        if f"resume_{key}" in result:
+                            result[key] = result.pop(f"resume_{key}")
+                    result.update(continuation=True, exhausted_mask=exhausted_mask)
             return result
         finally:
             database.close()

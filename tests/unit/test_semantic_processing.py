@@ -1057,6 +1057,17 @@ def test_evaluation_uses_new_publication_before_old_unfinished_description(
         worker = SemanticSelectionWorker(settings, account_id=account)
         with database.sessions.begin() as session:
             assert worker._next(session) == (direction, newer.id)
+            republished = session.get(VacancyModel, newer.id)
+            assert republished is not None
+            republished.details_fetched_at = now - timedelta(days=3)
+            session.flush()
+            assert worker._next(session) == (direction, first_id)
+            republished.details_fetched_at = now
+            BackgroundProcessService(session, account)._runtime(
+                "evaluation"
+            ).cursor_vacancy_id = None
+            session.flush()
+            assert worker._next(session) == (direction, newer.id)
     finally:
         database.close()
 
@@ -1167,7 +1178,7 @@ def test_evaluation_finishes_other_direction_before_leaving_saved_vacancy(
                     "https://hh.ru/vacancy/other-description",
                     description="Создавать API на Python",
                     details_fetched_at=datetime.now(UTC) - timedelta(hours=1),
-                    published_at=datetime.now(UTC),
+                    published_at=datetime.now(UTC) - timedelta(hours=2),
                 )
             )
             directions.track_vacancy(first_direction, newcomer.id)

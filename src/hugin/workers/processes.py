@@ -12,6 +12,7 @@ from hugin.database.models import BackgroundProcessRunModel, HhAccountModel
 from hugin.diagnostics import OperationJournal, operation_context
 from hugin.domain.time import as_utc
 from hugin.services.application_automation import ApplicationAutomationService
+from hugin.services.application_selection_gate import ApplicationSelectionGate
 from hugin.services.background_processes import PROCESS_KEYS, BackgroundProcessService, ProcessKey
 
 type ProcessStep = Callable[[int | None], bool]
@@ -111,6 +112,44 @@ class BackgroundProcessWorker:
                                 else None
                             )
                             if token is None and not service.enabled(key):
+                                continue
+                            gate = ApplicationSelectionGate(session)
+                            if (
+                                key in {"search", "evaluation"}
+                                and "applications" in self._steps
+                                and service.enabled("applications")
+                                and not gate.fresh_search_pending(self._account_id)
+                                and gate.blocking_reason(self._account_id) is None
+                                and ApplicationAutomationService(
+                                    session
+                                ).has_application_work_before_search(self._account_id)
+                            ):
+                                continue
+                            if (
+                                key in {"evaluation", "applications"}
+                                and "search" in self._steps
+                                and service.enabled("search")
+                                and gate.fresh_search_pending(self._account_id, due_only=True)
+                            ):
+                                continue
+                            if (
+                                key == "applications"
+                                and "evaluation" in self._steps
+                                and service.enabled("evaluation")
+                                and not gate.fresh_search_pending(self._account_id)
+                                and gate.blocking_reason(self._account_id)
+                            ):
+                                continue
+                            if (
+                                key == "search"
+                                and "evaluation" in self._steps
+                                and service.enabled("evaluation")
+                                and "applications" in self._steps
+                                and service.enabled("applications")
+                                and not gate.fresh_search_pending(self._account_id)
+                                and not gate.pending_details(self._account_id)
+                                and gate.blocking_reason(self._account_id)
+                            ):
                                 continue
                             service.started(key)
                         self._execute(key, token)

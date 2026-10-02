@@ -12,6 +12,238 @@ from hugin.workers.processes import BackgroundProcessWorker
 pytestmark = pytest.mark.integration
 
 
+@pytest.mark.parametrize(
+    "state", ["new", "queued", "delay", "review", "limit", "fresh_due", "retry_wait"]
+)
+def test_ready_applications_get_a_turn_before_search_adds_another_batch(
+    settings: Settings, state: str
+) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    from hugin.database.models import AutomationJobModel, DirectionSearchQueryModel
+    from hugin.domain.applications import ApplicationEventType, ApplicationState
+    from hugin.domain.directions import VacancyState
+    from hugin.domain.tasks import TaskState
+    from hugin.domain.vacancies import VacancyData
+    from hugin.repositories.applications import ApplicationRepository
+    from hugin.repositories.automation import search_configuration_key
+    from hugin.repositories.directions import DirectionRepository, ResumeRepository
+    from hugin.repositories.tasks import QueueTaskRepository, SystemStateRepository
+    from hugin.repositories.vacancies import VacancyRepository
+    from hugin.services.application_automation import ApplicationAutomationService
+    from hugin.services.automation import AutomationSchedulerService
+    from hugin.services.vacancy_analysis import RULES_VERSION
+    from tests.unit.test_automation_scheduler import seed_search_query
+
+    account_id, query_id = seed_search_query(settings)
+    database = create_database(settings)
+    now = datetime.now(UTC)
+    try:
+        with database.sessions.begin() as session:
+            service = BackgroundProcessService(session, account_id)
+            for key in PROCESS_KEYS:
+                service.set_enabled(key, True)
+            AutomationSchedulerService(session).ensure_configured_jobs(account_id, now)
+            query = session.get(DirectionSearchQueryModel, query_id)
+            job = session.get(AutomationJobModel, f"search:{query_id}")
+            assert query is not None and job is not None
+            if state != "fresh_due":
+                job.last_result = {
+                    "fresh_search_at": now.isoformat(),
+                    "fresh_search_configuration": search_configuration_key(query),
+                }
+            directions = DirectionRepository(session)
+            resume = ResumeRepository(session).upsert(account_id, "ready-resume", "Python")
+            directions.attach_resume(query.direction_id, resume.id)
+            vacancy = VacancyRepository(session).upsert(
+                VacancyData(
+                    "ready-before-depth",
+                    "Python",
+                    "https://hh.ru/vacancy/ready-before-depth",
+                    published_at=now,
+                    details_fetched_at=now,
+                )
+            )
+            directions.track_vacancy(query.direction_id, vacancy.id)
+            directions.apply_rules(
+                query.direction_id,
+                vacancy.id,
+                state=VacancyState.ANALYZED if state == "new" else VacancyState.QUEUED,
+                score=90,
+                details={"category": "MATCH"},
+                rules_version=RULES_VERSION,
+            )
+            if state != "new":
+                applications = ApplicationRepository(session)
+                application = applications.create_apply_intent(
+                    account_id,
+                    vacancy.id,
+                    resume.id,
+                    query.direction_id,
+                )
+                task = QueueTaskRepository(session).enqueue(
+                    application.id,
+                    90,
+                    now + timedelta(minutes=15) if state == "retry_wait" else now,
+                )
+                if state == "review":
+                    QueueTaskRepository(session).transition(task.id, TaskState.REVIEW_REQUIRED)
+                elif state == "limit":
+                    policy = ApplicationAutomationService(session).policy()
+                    for _ in range(policy.daily_limit):
+                        other = VacancyRepository(session).upsert(
+                            VacancyData(str(_), "Python", f"https://hh.ru/vacancy/{_}")
+                        )
+                        sent = applications.create_apply_intent(account_id, other.id, resume.id)
+                        applications.transition_state(sent.id, ApplicationState.APPLIED)
+                        applications.append_event(
+                            sent.id,
+                            ApplicationEventType.APPLIED,
+                            {"hh_status": "APPLIED", "external_confirmed": True},
+                        )
+                elif state == "delay":
+                    SystemStateRepository(session).set_next_apply_at(now + timedelta(seconds=60))
+        called: list[str] = []
+
+        def step(key: ProcessKey) -> Callable[[int | None], bool]:
+            def execute(_token: int | None) -> bool:
+                called.append(key)
+                return True
+
+            return execute
+
+        worker = BackgroundProcessWorker(
+            settings,
+            account_id=account_id,
+            steps={key: step(key) for key in PROCESS_KEYS},
+        )
+        assert worker.run_once()
+        assert called == (["applications"] if state in {"new", "queued", "delay"} else ["search"])
+        if state in {"new", "queued", "delay"}:
+            for _ in range(2):
+                assert worker.run_once()
+            assert called == ["applications", "synchronization", "replies"]
+    finally:
+        database.close()
+
+
+@pytest.mark.parametrize(
+    "search_state", ["due", "retry_wait", "fresh", "details", "evaluation", "details_paused"]
+)
+def test_fresh_search_runs_before_models_without_delaying_replies(
+    settings: Settings, search_state: str
+) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    from hugin.database.models import (
+        AutomationJobModel,
+        DirectionSearchQueryModel,
+        DirectionVacancyModel,
+        VacancyModel,
+    )
+    from hugin.domain.automation import AutomationJobState
+    from hugin.domain.vacancies import VacancyData
+    from hugin.repositories.automation import search_configuration_key
+    from hugin.repositories.directions import DirectionRepository
+    from hugin.repositories.vacancies import VacancyRepository
+    from hugin.services.automation import AutomationSchedulerService
+    from hugin.services.vacancy_analysis import RULES_VERSION
+    from tests.unit.test_automation_scheduler import seed_search_query
+
+    account_id, query_id = seed_search_query(settings)
+    database = create_database(settings)
+    now = datetime.now(UTC)
+    vacancy_id: int | None = None
+    try:
+        with database.sessions.begin() as session:
+            service = BackgroundProcessService(session, account_id)
+            for key in PROCESS_KEYS:
+                service.set_enabled(key, True)
+            AutomationSchedulerService(session).ensure_configured_jobs(account_id, now)
+            job = session.get(AutomationJobModel, f"search:{query_id}")
+            query = session.get(DirectionSearchQueryModel, query_id)
+            assert job is not None and query is not None
+            job.next_run_at = now - timedelta(seconds=1)
+            if search_state == "retry_wait":
+                job.state = AutomationJobState.FAILED
+                job.next_run_at = now + timedelta(minutes=1)
+            elif search_state in {"fresh", "details", "evaluation", "details_paused"}:
+                job.last_result = {
+                    "fresh_search_at": now.isoformat(),
+                    "fresh_search_configuration": search_configuration_key(query),
+                }
+                if search_state != "fresh":
+                    vacancy = VacancyRepository(session).upsert(
+                        VacancyData(
+                            "fresh-pending",
+                            "Python разработчик",
+                            "https://hh.ru/vacancy/fresh-pending",
+                            published_at=now,
+                            details_fetched_at=now if search_state == "evaluation" else None,
+                        )
+                    )
+                    vacancy_id = vacancy.id
+                    DirectionRepository(session).track_vacancy(query.direction_id, vacancy.id)
+                if search_state == "details_paused":
+                    service.set_enabled("evaluation", False)
+        called: list[str] = []
+
+        def step(key: ProcessKey) -> Callable[[int | None], bool]:
+            def execute(_token: int | None) -> bool:
+                called.append(key)
+                return True
+
+            return execute
+
+        worker = BackgroundProcessWorker(
+            settings, account_id=account_id, steps={key: step(key) for key in PROCESS_KEYS}
+        )
+        for _ in range(5):
+            assert worker.run_once()
+        expected = list(PROCESS_KEYS)
+        if search_state == "due":
+            expected = ["search", "synchronization", "replies", "search", "synchronization"]
+        elif search_state == "details":
+            expected = ["search", "evaluation", "synchronization", "replies", "search"]
+        elif search_state == "evaluation":
+            expected = ["evaluation", "synchronization", "replies", "evaluation", "synchronization"]
+        elif search_state == "details_paused":
+            expected = ["search", "applications", "synchronization", "replies", "search"]
+        assert called == expected
+        if search_state == "due":
+            with database.sessions.begin() as session:
+                job = session.get(AutomationJobModel, f"search:{query_id}")
+                query = session.get(DirectionSearchQueryModel, query_id)
+                assert job is not None and query is not None
+                job.last_result = {
+                    "fresh_search_at": datetime.now(UTC).isoformat(),
+                    "fresh_search_configuration": search_configuration_key(query),
+                }
+            for _ in range(4):
+                assert worker.run_once()
+            assert called[-4:] == ["replies", "search", "evaluation", "applications"]
+        elif search_state in {"details", "evaluation"}:
+            with database.sessions.begin() as session:
+                assert vacancy_id is not None
+                vacancy_row = session.get(VacancyModel, vacancy_id)
+                query = session.get(DirectionSearchQueryModel, query_id)
+                assert vacancy_row is not None and query is not None
+                tracked = session.get(DirectionVacancyModel, (query.direction_id, vacancy_id))
+                assert tracked is not None
+                vacancy_row.details_fetched_at = datetime.now(UTC)
+                tracked.rules_version = RULES_VERSION
+            for _ in range(4):
+                assert worker.run_once()
+            expected_resumed = (
+                ["replies", "search", "evaluation", "applications"]
+                if search_state == "evaluation"
+                else ["evaluation", "applications", "synchronization", "replies"]
+            )
+            assert called[-4:] == expected_resumed
+    finally:
+        database.close()
+
+
 def test_application_queue_advances_past_three_skipped_candidates(
     settings: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:

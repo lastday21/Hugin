@@ -21,9 +21,10 @@ from hugin.domain.automation import (
     AutomationJobResult,
     AutomationJobState,
 )
+from hugin.domain.search_progress import fresh_search_today
 from hugin.domain.tasks import SystemState, TaskState
 from hugin.domain.time import as_utc
-from hugin.repositories.automation import AutomationJobRepository
+from hugin.repositories.automation import AutomationJobRepository, search_configuration_key
 from hugin.repositories.tasks import SystemStateRepository
 from hugin.services.autonomy import AutonomyPolicyService
 
@@ -138,6 +139,24 @@ class AutomationSchedulerService:
                 )
                 if job.state is AutomationJobState.DISABLED:
                     job = self.enable(job.key, scheduled_at)
+                if (
+                    job.state is AutomationJobState.WAITING
+                    and job.last_result.get("continuation") is False
+                    and (
+                        not fresh_search_today(job.last_result, selected_at, settings.timezone_name)
+                        or job.last_result.get("fresh_search_configuration")
+                        != search_configuration_key(query)
+                    )
+                ):
+                    job = (
+                        self._jobs.schedule_soon(
+                            kind=AutomationJobKind.SEARCH,
+                            account_id=account_id,
+                            search_query_id=query.id,
+                            run_at=scheduled_at,
+                        )
+                        or job
+                    )
                 ensured.append(job)
                 active_keys.add(job.key)
 

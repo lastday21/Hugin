@@ -133,6 +133,16 @@ def test_all_fresh_vacancies_need_details_and_current_evaluation(settings: Setti
         processor.process(account, direction, vacancy)
         with database.sessions.begin() as session:
             assert ApplicationSelectionGate(session).blocking_reason(account) is None
+            original = session.get(VacancyModel, vacancy)
+            assert original is not None and original.details_fetched_at is not None
+            now = datetime.now(UTC)
+            original.details_fetched_at = now - timedelta(days=2)
+            original.published_at = now - timedelta(seconds=1)
+            session.flush()
+            assert "загрузки" in (ApplicationSelectionGate(session).blocking_reason(account) or "")
+            original.details_fetched_at = now
+            session.flush()
+            assert ApplicationSelectionGate(session).blocking_reason(account) is None
             older = VacancyRepository(session).upsert(
                 VacancyData("older", "Разработчик", "https://hh.ru/vacancy/older")
             )
@@ -147,6 +157,7 @@ def test_all_fresh_vacancies_need_details_and_current_evaluation(settings: Setti
                 VacancyData("late", "Разработчик", "https://hh.ru/vacancy/late")
             )
             DirectionRepository(session).track_vacancy(direction, pending.id)
+        assert processor.process(account, direction, vacancy).model_calls == 0
         with database.sessions.begin() as session:
             gate = ApplicationSelectionGate(session)
             assert "загрузки" in (gate.blocking_reason(account) or "")

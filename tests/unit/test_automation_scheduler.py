@@ -6,7 +6,11 @@ import pytest
 
 from hugin.core.settings import Settings
 from hugin.database import create_database, upgrade_database
-from hugin.database.models import ApplicationSettingsModel
+from hugin.database.models import (
+    ApplicationSettingsModel,
+    AutomationJobModel,
+    DirectionSearchQueryModel,
+)
 from hugin.domain import (
     AutomationJobKind,
     AutomationJobState,
@@ -25,6 +29,7 @@ from hugin.repositories import (
     SystemStateRepository,
     VacancyRepository,
 )
+from hugin.repositories.automation import search_configuration_key
 from hugin.services.application_automation import ApplicationAutomationService
 from hugin.services.automation import AutomationSchedulerService
 
@@ -191,6 +196,56 @@ def test_scheduler_processes_the_oldest_due_search_without_direction_starvation(
 
             assert claimed is not None
             assert claimed.search_query_id == adjacent_query.id
+    finally:
+        database.close()
+
+
+@pytest.mark.parametrize("reason", ["new_day", "changed_query"])
+def test_today_fresh_search_is_due_before_older_depth_continuation(
+    settings: Settings, reason: str
+) -> None:
+    account_id, query_id = seed_search_query(settings)
+    database = create_database(settings)
+    now = datetime(2026, 10, 1, 0, 5, tzinfo=UTC)
+    yesterday = now - timedelta(minutes=10)
+    try:
+        with database.sessions.begin() as session:
+            options = session.get(ApplicationSettingsModel, 1)
+            assert options is not None
+            options.timezone_name = "UTC"
+            options.resource_saving_mode = False
+            directions = DirectionRepository(session)
+            query = directions.get_query(query_id)
+            deeper_query = directions.add_query(query.direction_id, "Python API")
+            scheduler = AutomationSchedulerService(session)
+            scheduler.ensure_configured_jobs(account_id, yesterday)
+            fresh_job = session.get(AutomationJobModel, f"search:{query_id}")
+            deeper_job = session.get(AutomationJobModel, f"search:{deeper_query.id}")
+            assert fresh_job is not None and deeper_job is not None
+            deeper_model = session.get(DirectionSearchQueryModel, deeper_query.id)
+            assert deeper_model is not None
+            fresh_model = session.get(DirectionSearchQueryModel, query_id)
+            assert fresh_model is not None
+            fresh_job.last_result = {
+                "continuation": False,
+                "fresh_search_at": (yesterday if reason == "new_day" else now).isoformat(),
+                "fresh_search_configuration": search_configuration_key(fresh_model),
+            }
+            if reason == "changed_query":
+                fresh_model.query = "Другой запрос"
+            fresh_job.next_run_at = now + timedelta(hours=2)
+            deeper_job.last_result = {
+                "continuation": True,
+                "fresh_search_at": now.isoformat(),
+                "fresh_search_configuration": search_configuration_key(deeper_model),
+            }
+            deeper_job.next_run_at = yesterday
+            session.flush()
+            jobs = scheduler.ensure_configured_jobs(account_id, now)
+            refreshed = next(job for job in jobs if job.key == fresh_job.key)
+            assert refreshed.next_run_at == now
+            claimed = scheduler.claim_due(now, allowed_kinds=(AutomationJobKind.SEARCH,))
+            assert claimed is not None and claimed.key == fresh_job.key
     finally:
         database.close()
 

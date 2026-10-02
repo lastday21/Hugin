@@ -40,7 +40,7 @@ from hugin.domain.directions import (
 )
 from hugin.domain.hh import HhApplyResult, HhApplyStatus
 from hugin.domain.tasks import ApplicationPolicyRecord, SystemState, TaskRecord, TaskState
-from hugin.domain.time import as_utc
+from hugin.domain.time import as_utc, day_start_utc
 from hugin.domain.vacancies import VacancyAvailability, VacancyRecord
 from hugin.domain.vacancy_priority import vacancy_priority_key
 from hugin.repositories.applications import ApplicationRepository
@@ -1022,6 +1022,57 @@ class ApplicationAutomationService:
                 application.vacancy_id,
             ),
         )
+
+    def has_application_work_before_search(
+        self, account_id: int, now: datetime | None = None
+    ) -> bool:
+        selected_at = as_utc(now or datetime.now(UTC))
+        if not self.applications_enabled():
+            return False
+        policy = self.policy()
+        if (
+            self.applied_since(account_id, day_start_utc(policy.timezone_name, selected_at))
+            >= policy.daily_limit
+        ):
+            return False
+        include_stretch = self.stretch_automation_enabled()
+        if self.has_pending_application_work(
+            account_id=account_id, include_stretch=include_stretch, now=selected_at
+        ):
+            return True
+        candidates = self._session.execute(
+            select(DirectionVacancyModel.direction_id, DirectionVacancyModel.vacancy_id)
+            .join(CareerDirectionModel)
+            .join(VacancyModel)
+            .where(
+                CareerDirectionModel.account_id == account_id,
+                CareerDirectionModel.is_active.is_(True),
+                VacancyModel.availability == VacancyAvailability.ACTIVE,
+                DirectionVacancyModel.state == VacancyState.ANALYZED,
+                DirectionVacancyModel.rules_version == RULES_VERSION,
+                DirectionVacancyModel.rules_details["category"]
+                .as_string()
+                .in_(self._allowed_categories(include_stretch)),
+                ~select(ApplicationModel.id)
+                .where(
+                    ApplicationModel.account_id == account_id,
+                    ApplicationModel.vacancy_id == VacancyModel.id,
+                )
+                .exists(),
+            )
+        )
+        resumes: dict[int, ResumeRecord | None] = {}
+        for direction_id, vacancy_id in candidates:
+            if direction_id not in resumes:
+                resumes[direction_id] = self._active_resume(direction_id)
+            resume = resumes[direction_id]
+            if resume is not None and self._semantic_selection_current(
+                self._directions.get_for_account(account_id, direction_id),
+                self._vacancies.get(vacancy_id),
+                resume.id,
+            ):
+                return True
+        return False
 
     def has_pending_application_work(
         self,

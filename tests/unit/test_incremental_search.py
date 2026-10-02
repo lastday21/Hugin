@@ -123,6 +123,113 @@ def test_incremental_search_alternates_page_and_bounded_details_without_preparin
         assert s.scalar(select(func.count()).select_from(VacancyModel)) == 8
 
 
+def test_running_pipeline_finishes_current_selection_before_deeper_pages(
+    settings: Settings,
+) -> None:
+    from hugin.database.models import (
+        AutomationJobModel,
+        CareerDirectionModel,
+        DirectionVacancyModel,
+    )
+    from hugin.repositories.automation import search_configuration_key
+    from hugin.services.background_processes import BackgroundProcessService
+    from hugin.services.vacancy_analysis import RULES_VERSION
+
+    account, query = seed(settings)
+    browser = Browser()
+    cycle = IncrementalSearchCycle(settings, page_limit=3, detail_limit=3)
+    first = cycle.run(account_id=account, search_query_id=query, browser=browser)
+    database = create_database(settings)
+    try:
+        with database.sessions.begin() as session:
+            stored_query = session.get(DirectionSearchQueryModel, query)
+            assert stored_query is not None
+            direction = session.get(CareerDirectionModel, stored_query.direction_id)
+            assert direction is not None
+            direction.scoring_config = {}
+            service = BackgroundProcessService(session, account)
+            service.set_enabled("evaluation", True)
+            service.set_enabled("applications", True)
+            AutomationSchedulerService(session).ensure_configured_jobs(account)
+            job = session.get(AutomationJobModel, f"search:{query}")
+            assert job is not None
+            job.last_result = {
+                **first,
+                "fresh_search_configuration": search_configuration_key(stored_query),
+            }
+
+        browser.failed_detail_ids = {"103"}
+        second = cycle.run(
+            account_id=account, search_query_id=query, browser=browser, progress=first
+        )
+        assert second["details_loaded"] == 2 and second["details_failed"] == 1
+        third = IncrementalSearchCycle(settings, page_limit=3, detail_limit=3).run(
+            account_id=account, search_query_id=query, browser=browser, progress=second
+        )
+        assert len(browser.pages) == 1 and third["details_loaded"] == 1
+        browser.failed_detail_ids.clear()
+        fourth = cycle.run(
+            account_id=account, search_query_id=query, browser=browser, progress=third
+        )
+        assert fourth["details_loaded"] == 1 and len(browser.pages) == 1
+        assert browser.details.count("https://hh.ru/vacancy/103") == 2
+        assert all(
+            browser.details.count(f"https://hh.ru/vacancy/{i}") == 1 for i in (100, 101, 102)
+        )
+
+        with database.sessions.begin() as session:
+            directions = DirectionRepository(session)
+            other = directions.create(account, "Другой поиск")
+            other_query = directions.add_query(
+                other.id, "Данные", regions=(SearchRegion("1", "Москва"),)
+            )
+        browser.empty = True
+        other_progress = cycle.run(
+            account_id=account, search_query_id=other_query.id, browser=browser
+        )
+        browser.empty = False
+        with database.sessions.begin() as session:
+            AutomationSchedulerService(session).ensure_configured_jobs(account)
+            query_row = session.get(DirectionSearchQueryModel, other_query.id)
+            other_job = session.get(AutomationJobModel, f"search:{other_query.id}")
+            assert query_row is not None and other_job is not None
+            other_job.last_result = {
+                **other_progress,
+                "fresh_search_configuration": search_configuration_key(query_row),
+            }
+            vacancy = VacancyRepository(session).upsert(
+                VacancyData("other-fresh", "Python", "https://hh.ru/vacancy/other-fresh")
+            )
+            DirectionRepository(session).track_vacancy(other.id, vacancy.id)
+        page_count = len(browser.pages)
+        waiting = cycle.run(
+            account_id=account, search_query_id=query, browser=browser, progress=fourth
+        )
+        assert len(browser.pages) == page_count and waiting["details_loaded"] == 0
+        assert waiting["page_index"] == fourth["page_index"] == 1
+        loaded_other = cycle.run(
+            account_id=account,
+            search_query_id=other_query.id,
+            browser=browser,
+            progress=other_progress,
+        )
+        assert loaded_other["details_loaded"] == 1
+        waiting = cycle.run(
+            account_id=account, search_query_id=query, browser=browser, progress=waiting
+        )
+        assert len(browser.pages) == page_count and waiting["details_loaded"] == 0
+        with database.sessions.begin() as session:
+            for row in session.scalars(select(DirectionVacancyModel)):
+                row.rules_version = RULES_VERSION
+        resumed = cycle.run(
+            account_id=account, search_query_id=query, browser=browser, progress=waiting
+        )
+        assert len(browser.pages) == page_count + 1 and browser.pages[-1][2] == 1
+        assert resumed["observed_page"] == 2
+    finally:
+        database.close()
+
+
 def test_incremental_search_opens_republished_card_once(settings: Settings) -> None:
     account, query = seed(settings)
     yesterday = datetime.now(UTC) - timedelta(days=1)
@@ -191,6 +298,63 @@ def test_first_pages_of_all_regions_precede_deeper_pages(settings: Settings) -> 
         )
     assert browser.pages == [("Python", "1", 0), ("Python", "2", 0), ("Python", "1", 1)]
     assert progress is not None and progress["fresh_search_at"]
+
+
+def test_new_day_reads_all_fresh_regions_before_resuming_saved_depth(settings: Settings) -> None:
+    account, query = seed(
+        settings,
+        regions=(SearchRegion("1", "Москва"), SearchRegion("2", "Санкт-Петербург")),
+    )
+    browser = Browser()
+    cycle = IncrementalSearchCycle(settings, page_limit=3, detail_limit=1)
+    progress = None
+    for _ in range(6):
+        progress = cycle.run(
+            account_id=account, search_query_id=query, browser=browser, progress=progress
+        )
+    assert progress is not None
+    progress.update(
+        fresh_search_at=(datetime.now(UTC) - timedelta(days=2)).isoformat(),
+        fresh_sweep_started_at=None,
+        page_index=2,
+        variant_index=1,
+        next_step="details",
+        cursor_details_before=500,
+        continuation=True,
+    )
+    previous = deepcopy(progress)
+    browser.pages.clear()
+    browser.details.clear()
+    first = cycle.run(account_id=account, search_query_id=query, browser=browser, progress=progress)
+    assert browser.pages == [("Python", "1", 0)]
+    assert first["fresh_search_at"] == previous["fresh_search_at"]
+    assert not browser.details and progress == previous
+    second = IncrementalSearchCycle(settings, page_limit=3, detail_limit=1).run(
+        account_id=account, search_query_id=query, browser=browser, progress=first
+    )
+    assert browser.pages[-1] == ("Python", "2", 0)
+    assert second["page_index"] == 2 and second["variant_index"] == 1
+    assert second["cursor_details_before"] == 500
+    assert second["fresh_search_at"] != previous["fresh_search_at"]
+    third = cycle.run(account_id=account, search_query_id=query, browser=browser, progress=second)
+    assert third["details_loaded"] == 1
+    cycle.run(account_id=account, search_query_id=query, browser=browser, progress=third)
+    assert browser.pages[-1] == ("Python", "2", 2)
+
+
+def test_interrupted_fresh_sweep_restarts_all_regions_on_next_day(settings: Settings) -> None:
+    account, query = seed(
+        settings,
+        regions=(SearchRegion("1", "Москва"), SearchRegion("2", "Санкт-Петербург")),
+    )
+    browser = Browser()
+    cycle = IncrementalSearchCycle(settings)
+    first = cycle.run(account_id=account, search_query_id=query, browser=browser)
+    first["fresh_sweep_started_at"] = (datetime.now(UTC) - timedelta(days=2)).isoformat()
+    first["fresh_search_at"] = None
+    second = cycle.run(account_id=account, search_query_id=query, browser=browser, progress=first)
+    assert browser.pages == [("Python", "1", 0), ("Python", "1", 0)]
+    assert second.get("fresh_search_at") is None
 
 
 def test_fresh_page_sweep_unlocks_selection_gate_without_deep_pages(settings: Settings) -> None:

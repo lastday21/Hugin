@@ -9,6 +9,7 @@ from sqlalchemy import case, func, select
 from sqlalchemy.orm import Session
 
 from hugin.database.models import (
+    ApplicationSettingsModel,
     AutomationJobModel,
     CareerDirectionModel,
     DirectionSearchQueryModel,
@@ -23,6 +24,7 @@ from hugin.domain.automation import (
     automation_job_key,
 )
 from hugin.domain.directions import DirectionScope
+from hugin.domain.search_progress import fresh_search_today
 from hugin.domain.time import as_utc
 
 CLAIMABLE_STATES = (AutomationJobState.WAITING, AutomationJobState.FAILED)
@@ -134,9 +136,10 @@ class AutomationJobRepository:
         kind: AutomationJobKind,
         account_id: int,
         run_at: datetime,
+        search_query_id: int | None = None,
     ) -> AutomationJobRecord | None:
         scheduled_at = as_utc(run_at)
-        job_key = automation_job_key(kind, account_id)
+        job_key = automation_job_key(kind, account_id, search_query_id)
         model = self._session.get(AutomationJobModel, job_key)
         if model is None or model.state not in CLAIMABLE_STATES:
             return None
@@ -192,6 +195,28 @@ class AutomationJobRepository:
             .with_for_update(of=AutomationJobModel, skip_locked=True)
             .limit(1)
         )
+        if allowed_kinds == (AutomationJobKind.SEARCH,):
+            settings = self._session.get(ApplicationSettingsModel, 1)
+            timezone_name = settings.timezone_name if settings is not None else "UTC"
+            fresh_keys = []
+            rows = select(AutomationJobModel, DirectionSearchQueryModel).join(
+                DirectionSearchQueryModel,
+                DirectionSearchQueryModel.id == AutomationJobModel.search_query_id,
+            )
+            if account_id is not None:
+                rows = rows.where(AutomationJobModel.account_id == account_id)
+            for job, query in self._session.execute(rows):
+                if not fresh_search_today(job.last_result, selected_at, timezone_name) or (
+                    job.last_result.get("fresh_search_configuration")
+                    != search_configuration_key(query)
+                ):
+                    fresh_keys.append(job.key)
+            statement = statement.order_by(None).order_by(
+                case((AutomationJobModel.key.in_(fresh_keys), 0), else_=1),
+                AutomationJobModel.next_run_at,
+                search_direction_priority,
+                AutomationJobModel.key,
+            )
         if not search_enabled:
             statement = statement.where(AutomationJobModel.kind != AutomationJobKind.SEARCH)
         if allowed_kinds is not None:
