@@ -143,6 +143,14 @@ class BackgroundProcessService:
             runtime.cancel_generation += 1
         self._session.flush()
 
+    def start_all(self) -> None:
+        self._settings(lock=True)
+        if reason := self._blocked():
+            raise ValueError(reason)
+        for key in PROCESS_KEYS:
+            if not self._configured(key):
+                self.set_enabled(key, True)
+
     def stop_all(self) -> None:
         self._settings(lock=True)
         state = self._session.get(SystemStateModel, 1)

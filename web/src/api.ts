@@ -116,6 +116,10 @@ export function stopAllProcesses(): Promise<BackgroundProcesses> {
   return changeProcesses("/stop-all", "POST");
 }
 
+export function startAllProcesses(): Promise<BackgroundProcesses> {
+  return changeProcesses("/start-all", "POST");
+}
+
 export function checkMessagesNow(): Promise<BackgroundProcesses> {
   return changeProcesses("/synchronization/check-now", "POST");
 }

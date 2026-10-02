@@ -48,9 +48,66 @@ def test_independent_switches_and_combined_replies(service: BackgroundProcessSer
     assert policy.auto_prepare_replies and policy.auto_send_approved_replies
 
 
+def test_start_all_is_persistent_idempotent_and_preserves_limits(
+    service: BackgroundProcessService,
+) -> None:
+    service.stop_all()
+    session = service._session
+    settings = session.get(ApplicationSettingsModel, 1)
+    state = session.get(SystemStateModel, 1)
+    assert settings is not None and state is not None
+    state.next_apply_at = datetime.now(UTC) + timedelta(minutes=2)
+    session.flush()
+    next_apply_at = state.next_apply_at
+    limits = (
+        settings.hh_apply_daily_limit,
+        settings.hh_apply_delay_min_seconds,
+        settings.hh_apply_delay_max_seconds,
+    )
+    policy_before = AutonomyPolicyService(session).get().as_payload()
+
+    service.start_all()
+    session.expire_all()
+    assert all(service.enabled(key) for key in PROCESS_KEYS)
+    policy = AutonomyPolicyService(session).get()
+    expected = {**policy_before, "auto_prepare_replies": True, "auto_send_approved_replies": True}
+    assert policy.as_payload() == expected
+    revision = policy.revision
+    service.start_all()
+    assert AutonomyPolicyService(session).get().revision == revision
+    assert state.next_apply_at == next_apply_at
+    assert (
+        settings.hh_apply_daily_limit,
+        settings.hh_apply_delay_min_seconds,
+        settings.hh_apply_delay_max_seconds,
+    ) == limits
+
+
+@pytest.mark.parametrize("protection", [SystemState.CAPTCHA_REQUIRED, SystemState.AUTH_REQUIRED])
+def test_start_all_preserves_stopped_state_when_blocked(
+    service: BackgroundProcessService,
+    protection: SystemState,
+) -> None:
+    service.stop_all()
+    state = service._session.get(SystemStateModel, 1)
+    assert state is not None
+    state.state = protection
+    service._session.flush()
+    policy_before = AutonomyPolicyService(service._session).get()
+    with pytest.raises(ValueError, match="Требуется действие пользователя"):
+        service.start_all()
+    assert state.state == protection
+    assert not any(service._configured(key) for key in PROCESS_KEYS)
+    assert AutonomyPolicyService(service._session).get() == policy_before
+
+
 def test_stop_all_revokes_lease_and_keeps_protection(service: BackgroundProcessService) -> None:
+    service.stop_all()
     repository = SystemStateRepository(service._session)
     repository.acquire_supervised_lease("test-token", ttl=timedelta(minutes=5))
+    with pytest.raises(ValueError, match="отдельный разрешённый отклик"):
+        service.start_all()
+    assert not any(service._configured(key) for key in PROCESS_KEYS)
     state = service._session.get(SystemStateModel, 1)
     assert state is not None
     state.state = SystemState.CAPTCHA_REQUIRED
@@ -59,6 +116,8 @@ def test_stop_all_revokes_lease_and_keeps_protection(service: BackgroundProcessS
     assert state.recovery_state == SystemState.PAUSED
     assert not repository.supervised_lease_active()
     assert not any(service.enabled(key) for key in PROCESS_KEYS)
+    with pytest.raises(ValueError):
+        service.start_all()
     with pytest.raises(ValueError):
         service.set_enabled("applications", True)
 
@@ -125,6 +184,7 @@ def test_empty_account_has_no_work_and_api_mutations_are_not_found(settings: Set
             assert client.get("/api/processes").status_code == 200
             headers = {"X-Hugin-Session": app.state.session_key}
             assert client.post("/api/processes/stop-all", headers=headers).status_code == 404
+            assert client.post("/api/processes/start-all", headers=headers).status_code == 404
     finally:
         database.close()
 
@@ -306,6 +366,7 @@ def test_process_api_guard_and_validation(settings: Settings) -> None:
         url = f"/api/processes?account_id={account.id}"
         assert client.get(url).status_code == 200
         assert client.post(f"/api/processes/stop-all?account_id={account.id}").status_code == 403
+        assert client.post(f"/api/processes/start-all?account_id={account.id}").status_code == 403
         headers = {"X-Hugin-Session": app.state.session_key}
         assert (
             client.post(
@@ -313,6 +374,30 @@ def test_process_api_guard_and_validation(settings: Settings) -> None:
             ).status_code
             == 200
         )
+        started = client.post(f"/api/processes/start-all?account_id={account.id}", headers=headers)
+        assert started.status_code == 200
+        assert all(item["enabled"] for item in started.json()["processes"])
+        assert all(item["enabled"] for item in client.get(url).json()["processes"])
+        database = create_database(settings)
+        try:
+            with database.sessions.begin() as session:
+                state = session.get(SystemStateModel, 1)
+                assert state is not None
+                state.state = SystemState.ACCOUNT_WARNING
+        finally:
+            database.close()
+        blocked = client.post(f"/api/processes/start-all?account_id={account.id}", headers=headers)
+        assert blocked.status_code == 409
+        client.post(f"/api/processes/stop-all?account_id={account.id}", headers=headers)
+        assert not any(item["enabled"] for item in client.get(url).json()["processes"])
+        database = create_database(settings)
+        try:
+            with database.sessions.begin() as session:
+                state = session.get(SystemStateModel, 1)
+                assert state is not None
+                state.state = SystemState.PAUSED
+        finally:
+            database.close()
         assert (
             client.put(
                 f"/api/processes/evaluation?account_id={account.id}",

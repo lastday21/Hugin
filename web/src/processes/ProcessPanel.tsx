@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { checkMessagesNow, saveProcessSchedule, setProcessEnabled, stopAllProcesses } from "../api";
+import { checkMessagesNow, saveProcessSchedule, setProcessEnabled, startAllProcesses, stopAllProcesses } from "../api";
 import type { BackgroundProcesses, ProcessKey } from "../types";
 
 const descriptions: Record<ProcessKey, string> = {
@@ -70,13 +70,20 @@ export function ProcessPanel({ data, loadError, onSaved, onRefresh }: {
           <h2 id="process-title">Управление процессами</h2>
           <p>Включённые процессы выполняются по очереди.</p>
         </div>
-        <button type="button" className="secondary-button" disabled={pending}
-          onClick={() => void change(stopAllProcesses, "Все процессы выключены. Текущий ход завершает остановку.")}>
-          Остановить всё
-        </button>
+        <div className="process-actions">
+          <button type="button" className="primary-button" disabled={pending || !data || Boolean(loadError)}
+            onClick={() => void change(startAllProcesses, "Все процессы включены. Выполнение начнётся по очереди.")}>
+            Запустить всё
+          </button>
+          <button type="button" className="secondary-button" disabled={pending}
+            onClick={() => void change(stopAllProcesses, "Все процессы выключены. Текущий ход завершает остановку.")}>
+            Остановить всё
+          </button>
+        </div>
       </div>
       {loadError && <p role="alert">Не удалось обновить состояние: {loadError}. Показаны последние полученные сведения.</p>}
       {error && <p role="alert">{error}</p>}
+      {pending && <p role="status">Выполняем действие…</p>}
       {notice && <p role="status">{notice}</p>}
       {!data ? <p>{loadError ? "Состояние процессов неизвестно." : "Загружаем состояние процессов…"}</p> : <>
         <div className="process-list">

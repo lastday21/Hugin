@@ -37,6 +37,18 @@ def processes(session: ReadSession, account_id: AccountId = 1) -> dict[str, obje
     return BackgroundProcessService(session, account_id).snapshot()
 
 
+@router.post("/start-all")
+def start_all(
+    session: WriteSession, _guard: SessionGuard, account_id: AccountId = 1
+) -> dict[str, object]:
+    service = _service(session, account_id)
+    try:
+        service.start_all()
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    return service.snapshot()
+
+
 @router.post("/stop-all")
 def stop_all(
     session: WriteSession, _guard: SessionGuard, account_id: AccountId = 1

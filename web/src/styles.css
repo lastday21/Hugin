@@ -3905,6 +3905,7 @@ ol {
 .process-panel [role="alert"] { color: #9b3329; }
 .process-panel [role="status"] { color: #285c3e; }
 .process-heading button { flex-shrink: 0; }
+.process-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .process-list { display: grid; margin-top: 12px; }
 .process-row { display: flex; align-items: start; justify-content: space-between; gap: 20px; padding: 18px 0; border-top: 1px solid #e5eae7; }
 .process-row h3 { font-size: 16px; margin: 0; }
