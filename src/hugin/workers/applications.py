@@ -573,6 +573,8 @@ class ApplicationWorker:
                 attempt_number=getattr(job.task, "attempts", None),
             ):
                 prepared = self._letter_preparer(job)
+            if not prepared:
+                raise RuntimeError("Подготовка письма не завершилась; повтор отложен")
         except (LookupError, RuntimeError, ValueError) as error:
             self._journal.record(
                 "applications",
@@ -650,9 +652,13 @@ class ApplicationWorker:
                     limit=1,
                     include_stretch=include_stretch,
                 )
-                return result.generated + result.reused + result.already_ready
         finally:
             database.close()
+        prepared = result.generated + result.reused + result.already_ready
+        if not prepared:
+            reasons = [item.reason for item in result.items if item.reason]
+            raise RuntimeError("; ".join(reasons) or "Подготовка письма не завершилась")
+        return prepared
 
     def _preparation_allowed(self) -> bool:
         if self._stop.is_set():

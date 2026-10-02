@@ -596,7 +596,9 @@ def test_rejected_letter_does_not_delay_next_vacancy(
     )
     now = datetime(2026, 7, 27, 10, 0, tzinfo=UTC)
 
-    assert not worker._prepare_exact_letter(fake_job(), now)
+    job = fake_job()
+    assert not worker._prepare_exact_letter(job, now)
+    assert FakeApplicationService.deferred_letters == [(job.task.id, now + timedelta(minutes=15))]
 
     next_job = fake_job("102")
     FakeApplicationService.preflight_job = next_job
@@ -1000,8 +1002,10 @@ def test_worker_maps_incomplete_login_without_applying(
     assert result.status is apply_status
 
 
+@pytest.mark.parametrize("failed", [False, True])
 def test_worker_prepares_one_letter_for_active_direction(
     monkeypatch: pytest.MonkeyPatch,
+    failed: bool,
 ) -> None:
     class LetterSession:
         def scalar(self, _statement: object) -> str:
@@ -1040,7 +1044,17 @@ def test_worker_prepares_one_letter_for_active_direction(
                 "limit": 1,
                 "include_stretch": True,
             }
-            return SimpleNamespace(generated=1, reused=0, already_ready=0)
+            return SimpleNamespace(
+                generated=0 if failed else 1,
+                reused=0,
+                already_ready=0,
+                failed=int(failed),
+                items=(
+                    SimpleNamespace(action="failed", reason="Исправление качества не завершилось"),
+                )
+                if failed
+                else (),
+            )
 
     class FakeAutomation:
         def __init__(self, _session: object) -> None:
@@ -1070,7 +1084,11 @@ def test_worker_prepares_one_letter_for_active_direction(
         letter_preparer=lambda _job: 0,
     )
 
-    assert worker._prepare_letter(fake_job()) == 1
+    if failed:
+        with pytest.raises(RuntimeError, match="Исправление качества не завершилось"):
+            worker._prepare_letter(fake_job())
+    else:
+        assert worker._prepare_letter(fake_job()) == 1
 
 
 def test_worker_checks_current_application_state_before_submit(
