@@ -23,6 +23,11 @@ CORE_DUTY: dict[str, Any] = {
     "reason": "Такая разработка подтверждена проектом",
 }
 ANSWER: dict[str, Any] = {
+    "profession_basis": {
+        "kind": "technical_it",
+        "source_line_ids": [1],
+        "reason": "Основной результат — программные сервисы на Python и SQL",
+    },
     "fit": "direct",
     "profession": "applied_python",
     "role": "Разработка внутренних сервисов",
@@ -117,7 +122,14 @@ def test_transferable_core_work_is_not_full_direct_correspondence() -> None:
 
 
 def test_unclear_profession_can_only_have_low_priority() -> None:
-    answer = RoleAssessment.model_validate({**ANSWER, "fit": "possible", "profession": "unclear"})
+    answer = RoleAssessment.model_validate(
+        {
+            **ANSWER,
+            "fit": "possible",
+            "profession": "unclear",
+            "profession_basis": {**ANSWER["profession_basis"], "kind": "unclear"},
+        }
+    )
     assert assess_role(LINES, FACTS, answer).fit_tier is FitTier.POSSIBLE
 
 
@@ -216,4 +228,25 @@ def test_matching_tools_cannot_allow_an_unconfirmed_professional_basis(fit: str)
 
 def test_an_assessment_without_daily_work_cannot_enter_the_current_queue() -> None:
     answer = RoleAssessment.model_validate({**ANSWER, "core_duties": []})
+    assert assess_role(LINES, FACTS, answer).status == "REVIEW"
+
+
+def test_transferred_skills_need_an_independent_profession_from_the_vacancy() -> None:
+    answer = RoleAssessment.model_validate(
+        {key: value for key, value in ANSWER.items() if key != "profession_basis"}
+    )
+    assert assess_role(LINES, FACTS, answer).status == "REVIEW"
+
+
+@pytest.mark.parametrize(
+    "basis",
+    [
+        {"kind": "non_it", "source_line_ids": [1], "reason": "Организационная работа"},
+        {"kind": "technical_it", "source_line_ids": [0], "reason": "Только название"},
+    ],
+)
+def test_profession_basis_cannot_contradict_an_allow_or_use_only_the_title(
+    basis: dict[str, Any],
+) -> None:
+    answer = RoleAssessment.model_validate({**ANSWER, "profession_basis": basis})
     assert assess_role(LINES, FACTS, answer).status == "REVIEW"

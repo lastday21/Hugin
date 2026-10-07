@@ -1,3 +1,5 @@
+import pytest
+
 from hugin.services.semantic_results import StoredSelection, stored_decision
 from hugin.services.semantic_role import ROLE_SELECTION_VERSION, RoleAssessment
 from hugin.services.semantic_selection import SEMANTIC_SELECTION_VERSION, Extraction, Matching
@@ -36,7 +38,8 @@ def test_saved_whole_role_v2_replays_without_becoming_a_current_assessment() -> 
     assert stored_decision(LINES, FACTS, stored, ROLE_SELECTION_VERSION).status == "REVIEW"
 
 
-def test_saved_whole_role_v3_preserves_its_supported_daily_work() -> None:
+@pytest.mark.parametrize("version", ["whole_role_v3", "whole_role_v11", "whole_role_v12"])
+def test_saved_whole_role_preserves_its_supported_daily_work(version: str) -> None:
     stored = StoredSelection(
         extraction=None,
         matching=None,
@@ -46,7 +49,33 @@ def test_saved_whole_role_v3_preserves_its_supported_daily_work() -> None:
         retryable=False,
         assessment=RoleAssessment.model_validate(ANSWER),
     )
-    assert stored_decision(LINES, FACTS, stored, "whole_role_v3").status == "ALLOW"
+    assert stored_decision(LINES, FACTS, stored, version).status == "ALLOW"
+
+
+@pytest.mark.parametrize(
+    ("version", "expected"),
+    [
+        ("whole_role_v4", "ALLOW"),
+        ("whole_role_v5", "REVIEW"),
+        ("whole_role_v12", "REVIEW"),
+        (ROLE_SELECTION_VERSION, "REVIEW"),
+    ],
+)
+def test_saved_profession_basis_is_required_only_by_its_original_contract(
+    version: str, expected: str
+) -> None:
+    stored = StoredSelection(
+        extraction=None,
+        matching=None,
+        errors=[],
+        stage_keys=["old-role"],
+        model_calls=1,
+        retryable=False,
+        assessment=RoleAssessment.model_validate(
+            {key: value for key, value in ANSWER.items() if key != "profession_basis"}
+        ),
+    )
+    assert stored_decision(LINES, FACTS, stored, version).status == expected
 
 
 def test_saved_v3_transferable_direct_priority_uses_its_historical_contract() -> None:
@@ -65,4 +94,5 @@ def test_saved_v3_transferable_direct_priority_uses_its_historical_contract() ->
         ),
     )
     assert stored_decision(LINES, FACTS, stored, "whole_role_v3").status == "ALLOW"
+    assert stored_decision(LINES, FACTS, stored, "whole_role_v12").status == "REVIEW"
     assert stored_decision(LINES, FACTS, stored, ROLE_SELECTION_VERSION).status == "REVIEW"

@@ -253,6 +253,11 @@ class Client:
         return json.dumps(
             {
                 "fit": "direct",
+                "profession_basis": {
+                    "kind": "technical_it",
+                    "source_line_ids": [1],
+                    "reason": "Основная работа — создание программного API",
+                },
                 "core_duties": [
                     {
                         "task": "Создание API на Python",
@@ -405,6 +410,7 @@ def test_uncertain_fit_creates_queue_task_and_replays_without_new_model_call(
             result["fit"] = "possible"
             if uncertainty == "profession":
                 result["profession"] = "unclear"
+                result["profession_basis"]["kind"] = "unclear"
             else:
                 result["gaps"] = ["Неясен требуемый уровень работы с API"]
             return json.dumps(result)
@@ -1276,7 +1282,7 @@ def test_invalid_model_response_does_not_keep_cursor_ahead_of_other_vacancies(
         worker = SemanticSelectionWorker(
             settings, account_id=account, processor=processor, max_calls_per_turn=1
         )
-        assert worker.run_once() and not worker.run_once()
+        assert worker.run_once() and worker.run_once() and not worker.run_once()
         with database.sessions.begin() as session:
             tracked = DirectionRepository(session).get_tracked_vacancy(direction, vacancy_id)
             semantic = tracked.rules_details["semantic_selection"]
@@ -1293,7 +1299,7 @@ def test_invalid_model_response_does_not_keep_cursor_ahead_of_other_vacancies(
             DirectionRepository(session).track_vacancy(direction, newcomer.id)
         with database.sessions.begin() as session:
             assert worker._next(session) == (direction, newcomer.id)
-        assert client.calls == 1
+        assert client.calls == 2
     finally:
         database.close()
 

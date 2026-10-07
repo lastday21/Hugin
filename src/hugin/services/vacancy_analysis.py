@@ -35,7 +35,15 @@ from hugin.services.vacancy_duties import TechnicalDuty, technical_duty_evidence
 from hugin.services.vacancy_fit import FitAssessment, assess_fit, unsupported_administration
 from hugin.services.vacancy_skills import skill_terms
 
-RULES_VERSION = "python_it_v72"
+RULES_VERSION = "python_it_v73"
+
+_REQUIRED_OFFICE_PATTERN = re.compile(
+    r"(?:"
+    r"\bформат работы\s*:\s*(?:только\s+)?(?:в\s+)?офис(?:е|ный)?\b|"
+    r"\b(?:только\s+)?работа\s+в\s+офисе\b|"
+    r"\bполн\w*\s+(?:рабоч\w*\s+)?день\s+в\s+офисе\b"
+    r")"
+)
 MAX_VACANCY_AGE = timedelta(days=30)
 NET_SALARY_FACTOR = 0.87
 
@@ -2489,14 +2497,7 @@ class PythonBackendRules:
                 )
             )
         )
-        description_requires_office = re.search(
-            r"(?:"
-            r"\bформат работы\s*:\s*(?:только\s+)?(?:в\s+)?офис(?:е|ный)?\b|"
-            r"\b(?:только\s+)?работа\s+в\s+офисе\b|"
-            r"\bполн\w*\s+(?:рабоч\w*\s+)?день\s+в\s+офисе\b"
-            r")",
-            vacancy_text,
-        )
+        description_requires_office = _REQUIRED_OFFICE_PATTERN.search(vacancy_text)
         if (
             "удал" in work_format or "remote" in work_format
         ) and description_requires_office is None:
@@ -2517,9 +2518,50 @@ class PythonBackendRules:
             return False
         vacancy_region = _normalize_rule_text(vacancy.region)
         selected_regions = tuple(_normalize_rule_text(region.name) for region in context.regions)
-        return not any(
-            region and (region in vacancy_region or vacancy_region in region)
-            for region in selected_regions
+        return (
+            not any(
+                region and (region in vacancy_region or vacancy_region in region)
+                for region in selected_regions
+            )
+            and PythonBackendRules._listed_candidate_region_index(vacancy, context) is None
+        )
+
+    @staticmethod
+    def _listed_candidate_region_index(vacancy: VacancyData, context: RuleContext) -> int | None:
+        body = "\n".join(
+            filter(
+                None,
+                (
+                    vacancy.description,
+                    vacancy.responsibilities,
+                    vacancy.required_qualifications,
+                ),
+            )
+        )
+        if _REQUIRED_OFFICE_PATTERN.search(_normalize_rule_text(body)):
+            return None
+        locations = tuple(
+            match.group(1)
+            for line in re.split(r"[.!?\n]", body)
+            if (
+                match := re.search(
+                    r"^(?:[-—•]\s*)?(?:мы\s+)?рассматриваем\s+кандидатов\s+из\s+"
+                    r"(?:локаций|городов|регионов)\s*:\s*([^.!?]+)",
+                    _normalize_rule_text(line),
+                )
+            )
+        )
+        return next(
+            (
+                index
+                for index, region in enumerate(context.regions)
+                if (selected_region := _normalize_rule_text(region.name))
+                and any(
+                    re.search(rf"(?<!\w){re.escape(selected_region)}(?!\w)", cities)
+                    for cities in locations
+                )
+            ),
+            None,
         )
 
     @staticmethod
@@ -2545,6 +2587,10 @@ class PythonBackendRules:
         for index, region in enumerate(context.regions):
             if _normalize_rule_text(region.name) in vacancy_region:
                 return 100 if index == 0 else 95
+        if (
+            listed_index := PythonBackendRules._listed_candidate_region_index(vacancy, context)
+        ) is not None:
+            return 100 if listed_index == 0 else 95
         return 20
 
     @staticmethod

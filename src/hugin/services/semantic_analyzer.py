@@ -83,12 +83,20 @@ class AnalysisResult:
 
 
 class StageAnalyzer:
-    def __init__(self, cache: StageCache, *, max_calls: int = 1, force: bool = False) -> None:
+    def __init__(
+        self,
+        cache: StageCache,
+        *,
+        max_calls: int = 1,
+        force: bool = False,
+        retry_invalid_responses: bool = True,
+    ) -> None:
         if not 1 <= max_calls <= 6:
             raise ValueError("Число обращений должно быть от 1 до 6")
         self._cache = cache
         self._max_calls = max_calls
         self._force = force
+        self._retry_invalid_responses = retry_invalid_responses
         self._calls = 0
         self._budget_exhausted = False
         self._stages: list[StageRecord] = []
@@ -115,7 +123,11 @@ class StageAnalyzer:
             record.cache_key != key
             or fingerprint(record.request) != key
             or fingerprint(record.response_text) != record.response_sha256
-            or (record.errors and datetime.now(UTC) - record.created_at >= FAILED_STAGE_RETRY_AFTER)
+            or (
+                record.errors
+                and (not record.response_text or self._retry_invalid_responses)
+                and datetime.now(UTC) - record.created_at >= FAILED_STAGE_RETRY_AFTER
+            )
         ):
             record = None
         if record is None:

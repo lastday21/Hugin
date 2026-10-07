@@ -70,6 +70,50 @@ def test_salary_and_experience_reduce_priority_without_rejecting() -> None:
     assert result.fit is not None and result.fit.tier == FitTier.POSSIBLE
 
 
+@pytest.mark.parametrize(
+    "description,accepted,region_score",
+    [
+        (
+            "Тестировать программы. Рассматриваем кандидатов из локаций: "
+            "Тверь, Ростов-на-Дону, Краснодар, Санкт-Петербург.",
+            True,
+            100,
+        ),
+        (
+            "Тестировать программы. Офисы компании: Тверь, Санкт-Петербург.",
+            False,
+            20,
+        ),
+        (
+            "Тестировать программы. Не рассматриваем кандидатов из локаций: Санкт-Петербург.",
+            False,
+            20,
+        ),
+        (
+            "Тестировать программы. Рассматриваем кандидатов из локаций: "
+            "Тверь, Санкт-Петербург. Полный рабочий день в офисе в Твери.",
+            False,
+            20,
+        ),
+    ],
+)
+def test_explicit_candidate_locations_can_differ_from_card_region(
+    description: str, accepted: bool, region_score: int
+) -> None:
+    result = semantic_evaluation(
+        replace(vacancy(), description=description, region="Тверь", work_format="Офис или гибрид"),
+        RuleContext(
+            regions=(SearchRegion("2", "Санкт-Петербург"),),
+            work_formats=(WorkFormat.ON_SITE, WorkFormat.HYBRID),
+        ),
+        DirectionScope.IT_ADJACENT,
+        SemanticDecision("ALLOW", FitTier.RELATED, ("Тестирование подтверждено",)),
+        DirectionScope.IT_ADJACENT,
+    )
+    assert result.accepted is accepted
+    assert next(item.score for item in result.components if item.name == "region") == region_score
+
+
 def test_pending_and_uncertain_results_do_not_allow_preparation() -> None:
     result = semantic_evaluation(
         vacancy(),

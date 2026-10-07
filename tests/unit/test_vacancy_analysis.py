@@ -17,8 +17,8 @@ from hugin.services.vacancy_analysis import (
 )
 
 
-def test_rules_version_is_python_it_v72() -> None:
-    assert RULES_VERSION == "python_it_v72"
+def test_rules_version_is_python_it_v73() -> None:
+    assert RULES_VERSION == "python_it_v73"
 
 
 @pytest.mark.parametrize(

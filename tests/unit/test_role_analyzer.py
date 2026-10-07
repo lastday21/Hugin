@@ -53,14 +53,35 @@ def test_same_input_is_free_and_changed_profile_requires_one_new_assessment() ->
 
 
 @pytest.mark.parametrize("answer", [{}, {**ANSWER, "source_line_ids": [99]}, RuntimeError("Сбой")])
-def test_invalid_answer_is_not_repaired_by_extra_calls(answer: dict[str, Any] | Exception) -> None:
-    client = Client(answer)
+def test_invalid_answer_has_at_most_one_cached_repair(answer: dict[str, Any] | Exception) -> None:
+    client = Client(answer, answer)
     analyzer = RoleAnalyzer(client, MemoryStageCache(), max_calls=6)
     result = analyzer.analyze(LINES, FACTS)
     assert result.decision.status == "REVIEW" and result.assessment is None
-    assert result.model_calls == 1 and not result.budget_exhausted
+    expected_calls = 1 if isinstance(answer, Exception) else 2
+    assert result.model_calls == expected_calls and not result.budget_exhausted
     assert analyzer.analyze(LINES, FACTS).model_calls == 0
-    assert len(client.calls) == 1
+    assert len(client.calls) == expected_calls
+
+
+def test_contradictory_fit_is_repaired_from_saved_source_within_turn_budget() -> None:
+    invalid = {
+        **ANSWER,
+        "fit": "direct",
+        "core_duties": [{**ANSWER["core_duties"][0], "support": "transferable"}],
+    }
+    client = Client(invalid, ANSWER)
+    analyzer = RoleAnalyzer(client, MemoryStageCache(), max_calls=1)
+    first = analyzer.analyze(LINES, FACTS)
+    assert first.budget_exhausted and first.model_calls == 1
+    repaired = analyzer.analyze(LINES, FACTS)
+    assert repaired.decision.status == "ALLOW" and repaired.model_calls == 1
+    assert [stage.stage for stage in repaired.stages] == ["assess", "assess_repair"]
+    payload = json.loads(client.calls[1][1])
+    assert payload["vacancy_lines"] == [line.model_dump() for line in LINES]
+    assert payload["profile"]["facts"] == [fact.model_dump() for fact in FACTS]
+    assert payload["validation_errors"]
+    assert analyzer.analyze(LINES, FACTS).model_calls == 0
 
 
 @pytest.mark.parametrize("tampered", ["request", "response", "key"])
@@ -122,10 +143,10 @@ def test_long_evidence_lists_are_preserved_and_schema_limits_known_references(re
             fit="reject",
             blocker={"source_line_ids": list(range(1, 16)), "reason": "Чужая основная работа"},
         )
-    client = Client(answer)
-    result = RoleAnalyzer(client, MemoryStageCache()).analyze(lines, FACTS)
+    client = Client(answer, answer)
+    result = RoleAnalyzer(client, MemoryStageCache(), max_calls=2).analyze(lines, FACTS)
     assert result.decision.status == ("REJECT" if reject else "ALLOW")
-    assert result.model_calls == 1
+    assert result.model_calls == (2 if reject else 1)
     assert result.assessment is not None
     assert result.assessment.source_line_ids == list(range(1, 16))
     schema = cast(dict[str, Any], client.calls[0][2])
@@ -143,6 +164,7 @@ def test_each_request_schema_uses_its_own_source_and_profile_numbers() -> None:
     next_answer = {
         **ANSWER,
         "source_line_ids": [11],
+        "profession_basis": {**ANSWER["profession_basis"], "source_line_ids": [11]},
         "profile_fact_ids": [17],
         "core_duties": [
             {
@@ -188,24 +210,32 @@ def test_supported_daily_work_is_allowed_with_its_own_evidence(support: str) -> 
     assert result.assessment is not None
 
 
-def test_transferred_work_cannot_receive_direct_priority_or_trigger_extra_calls() -> None:
+def test_transferred_work_cannot_receive_direct_priority_after_failed_repair() -> None:
     answer = {
         **ANSWER,
         "core_duties": [{**ANSWER["core_duties"][0], "support": "transferable"}],
     }
-    client = Client(answer)
-    analyzer = RoleAnalyzer(client, MemoryStageCache())
+    client = Client(answer, answer, ANSWER)
+    cache = MemoryStageCache()
+    analyzer = RoleAnalyzer(client, cache, max_calls=2)
     result = analyzer.analyze(LINES, FACTS)
     assert result.decision.status == "REVIEW"
-    assert result.model_calls == 1
+    assert result.model_calls == 2 and not result.budget_exhausted
     assert analyzer.analyze(LINES, FACTS).decision.status == "REVIEW"
-    assert len(client.calls) == 1
+    assert len(client.calls) == 2
+    for key, stage in cache.records.items():
+        cache.records[key] = replace(stage, created_at=datetime.now(UTC) - timedelta(hours=1))
+    delayed = analyzer.analyze(LINES, FACTS)
+    assert delayed.decision.status == "REVIEW" and delayed.model_calls == 0
+    assert len(client.calls) == 2
 
 
-def test_general_tools_do_not_replace_the_required_professional_work() -> None:
+@pytest.mark.parametrize("profession", ["applied_python", "other_it"])
+def test_general_tools_do_not_replace_the_required_professional_work(profession: str) -> None:
     answer = {
         **ANSWER,
         "fit": "reject",
+        "profession": profession,
         "core_duties": [
             {
                 "task": "Самостоятельно разрабатывать Ruby-сервисы",
@@ -217,6 +247,58 @@ def test_general_tools_do_not_replace_the_required_professional_work() -> None:
         ],
         "blocker": {"source_line_ids": [2], "reason": "Обязательна другая основная разработка"},
     }
-    result = RoleAnalyzer(Client(answer), MemoryStageCache()).analyze(LINES, FACTS)
+    result = RoleAnalyzer(Client(answer, answer), MemoryStageCache(), max_calls=2).analyze(
+        LINES, FACTS
+    )
     assert result.decision.status == "REJECT"
-    assert result.model_calls == 1
+    assert result.model_calls == (1 if profession == "other_it" else 2)
+
+
+def false_rejection() -> dict[str, Any]:
+    return {
+        **ANSWER,
+        "fit": "reject",
+        "core_duties": [
+            {
+                **ANSWER["core_duties"][0],
+                "support": "unsupported",
+                "profile_fact_ids": [],
+                "reason": "Готовый новый артефакт отсутствует",
+            }
+        ],
+        "blocker": {"source_line_ids": [1], "reason": "Нет уже готового артефакта"},
+    }
+
+
+def test_false_rejection_is_reviewed_once_across_turn_budget() -> None:
+    client = Client(false_rejection(), ANSWER)
+    analyzer = RoleAnalyzer(client, MemoryStageCache(), max_calls=1)
+    first = analyzer.analyze(LINES, FACTS)
+    assert first.budget_exhausted and first.model_calls == 1
+    reviewed = analyzer.analyze(LINES, FACTS)
+    assert reviewed.decision.status == "ALLOW" and reviewed.model_calls == 1
+    assert [stage.stage for stage in reviewed.stages] == ["assess", "assess_review"]
+    request = json.loads(client.calls[1][1])
+    assert request["proposed_assessment"]["fit"] == "reject"
+    assert request["vacancy_lines"] == [line.model_dump() for line in LINES]
+    assert request["profile"]["facts"] == [fact.model_dump() for fact in FACTS]
+    assert analyzer.analyze(LINES, FACTS).model_calls == 0
+    assert len(client.calls) == 2
+
+
+def test_invalid_assessment_and_review_have_only_one_repair_each() -> None:
+    cache = MemoryStageCache()
+    client = Client({}, false_rejection(), {}, {})
+    analyzer = RoleAnalyzer(client, cache, max_calls=6)
+    result = analyzer.analyze(LINES, FACTS)
+    assert result.decision.status == "REVIEW" and result.model_calls == 4
+    assert [stage.stage for stage in result.stages] == [
+        "assess",
+        "assess_repair",
+        "assess_review",
+        "assess_review_repair",
+    ]
+    for key, stage in cache.records.items():
+        cache.records[key] = replace(stage, created_at=datetime.now(UTC) - timedelta(hours=1))
+    assert analyzer.analyze(LINES, FACTS).model_calls == 0
+    assert len(client.calls) == 4

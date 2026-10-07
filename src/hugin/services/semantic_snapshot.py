@@ -14,7 +14,13 @@ from hugin.domain.directions import DirectionRecord
 from hugin.domain.vacancies import VacancyData, VacancyRecord
 from hugin.repositories.directions import DirectionRepository
 from hugin.services.decision_evidence import fingerprint
-from hugin.services.semantic_role import ROLE_INSTRUCTIONS, ROLE_SELECTION_VERSION, RoleAssessment
+from hugin.services.semantic_role import (
+    ROLE_INSTRUCTIONS,
+    ROLE_REPAIR_TASK,
+    ROLE_REVIEW_INSTRUCTIONS,
+    ROLE_SELECTION_VERSION,
+    RoleAssessment,
+)
 from hugin.services.semantic_selection import (
     ProfileFact,
     SourceLine,
@@ -218,6 +224,8 @@ def selection_snapshot(
             "timeout_seconds": config.timeout_seconds,
         },
         "instructions": fingerprint(ROLE_INSTRUCTIONS),
+        "review_instructions": fingerprint(ROLE_REVIEW_INSTRUCTIONS),
+        "repair_instructions": fingerprint(ROLE_REPAIR_TASK),
         "schemas": fingerprint(
             [
                 RoleAssessment.model_json_schema(),

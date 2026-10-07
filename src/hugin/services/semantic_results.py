@@ -51,8 +51,9 @@ def final_stage(snapshot: SelectionSnapshot, result: AnalysisResult) -> StageRec
     errors = list(result.decision.reasons) if result.decision.status == "REVIEW" else []
     retryable = any(stage.errors for stage in result.stages)
     if snapshot.request.get("version") == ROLE_SELECTION_VERSION:
+        retryable = any(stage.errors and not stage.response_text for stage in result.stages)
         if result.assessment is None:
-            retryable = True
+            retryable = retryable or not result.stages
             errors = errors or ["Нет общей оценки вакансии"]
         else:
             recomputed = assess_role(snapshot.lines, snapshot.facts, result.assessment)
@@ -137,7 +138,20 @@ def stored_decision(
 ) -> SemanticDecision:
     if stored.errors:
         return SemanticDecision("REVIEW", None, tuple(stored.errors))
-    if version in {"whole_role_v2", "whole_role_v3", ROLE_SELECTION_VERSION}:
+    if version in {
+        "whole_role_v2",
+        "whole_role_v3",
+        "whole_role_v4",
+        "whole_role_v5",
+        "whole_role_v6",
+        "whole_role_v7",
+        "whole_role_v8",
+        "whole_role_v9",
+        "whole_role_v10",
+        "whole_role_v11",
+        "whole_role_v12",
+        ROLE_SELECTION_VERSION,
+    }:
         if stored.assessment is None:
             return SemanticDecision("REVIEW", None, ("Нет общей оценки вакансии",))
         return assess_role(
@@ -145,7 +159,31 @@ def stored_decision(
             facts,
             stored.assessment,
             require_core_duties=version != "whole_role_v2",
-            require_confirmed_direct=version == ROLE_SELECTION_VERSION,
+            require_confirmed_direct=version
+            in {
+                "whole_role_v4",
+                "whole_role_v5",
+                "whole_role_v6",
+                "whole_role_v7",
+                "whole_role_v8",
+                "whole_role_v9",
+                "whole_role_v10",
+                "whole_role_v11",
+                "whole_role_v12",
+                ROLE_SELECTION_VERSION,
+            },
+            require_profession_basis=version
+            in {
+                "whole_role_v5",
+                "whole_role_v6",
+                "whole_role_v7",
+                "whole_role_v8",
+                "whole_role_v9",
+                "whole_role_v10",
+                "whole_role_v11",
+                "whole_role_v12",
+                ROLE_SELECTION_VERSION,
+            },
         )
     if version != SEMANTIC_SELECTION_VERSION:
         return SemanticDecision("REVIEW", None, ("Неизвестная версия профессиональной оценки",))

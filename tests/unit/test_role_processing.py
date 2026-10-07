@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -35,6 +36,11 @@ class RoleClient:
         if self.callback is not None:
             self.callback()
         answer: dict[str, Any] = {
+            "profession_basis": {
+                "kind": "technical_it",
+                "source_line_ids": [1],
+                "reason": "Основная работа — создание программного API",
+            },
             "core_duties": [
                 {
                     "task": "Создание API на Python",
@@ -88,14 +94,94 @@ def test_processor_uses_only_whole_role_client_and_saved_result_replays(settings
         database.close()
 
 
-def test_invalid_whole_role_result_is_reviewed_without_an_extra_call(settings: Settings) -> None:
+@pytest.mark.parametrize("instruction", ["ROLE_REVIEW_INSTRUCTIONS", "ROLE_REPAIR_TASK"])
+def test_changed_review_instructions_invalidate_the_saved_selection(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch, instruction: str
+) -> None:
+    from hugin.services import semantic_role, semantic_snapshot
+
+    account, direction, vacancy, _resume, _fact = seed(settings)
+    client = RoleClient()
+    processor = SemanticSelectionProcessor(settings, client_factory=lambda *_: client)
+    first = processor.process(account, direction, vacancy)
+    assert first.applied
+    monkeypatch.setattr(
+        semantic_snapshot,
+        instruction,
+        getattr(semantic_role, instruction) + " Обновление.",
+        raising=False,
+    )
+    repeated = processor.process(account, direction, vacancy)
+    assert repeated.applied and repeated.key != first.key
+    assert repeated.model_calls == 0 and client.calls == 1
+
+
+def test_invalid_whole_role_result_resumes_one_repair_then_keeps_review(settings: Settings) -> None:
     account, direction, vacancy, _resume, _fact = seed(settings)
     client = RoleClient(invalid=True)
     processor = SemanticSelectionProcessor(settings, client_factory=lambda *_: client)
     result = processor.process(account, direction, vacancy)
+    assert result.status == "IN_PROGRESS" and not result.applied and result.model_calls == 1
+    result = processor.process(account, direction, vacancy)
     assert result.status == "REVIEW" and result.model_calls == 1
     assert processor.process(account, direction, vacancy).model_calls == 0
-    assert client.calls == 1
+    assert client.calls == 2
+    with create_database(settings).sessions.begin() as session:
+        for stage in session.scalars(select(SemanticStageModel)):
+            stage.created_at = datetime.now(UTC) - timedelta(hours=1)
+    assert processor.process(account, direction, vacancy).model_calls == 0
+    assert client.calls == 2
+
+
+def test_repaired_whole_role_result_does_not_expire_with_initial_validation_error(
+    settings: Settings,
+) -> None:
+    account, direction, vacancy, _resume, _fact = seed(settings)
+    client = RoleClient(invalid=True)
+    processor = SemanticSelectionProcessor(settings, client_factory=lambda *_: client)
+    assert processor.process(account, direction, vacancy).status == "IN_PROGRESS"
+    client.invalid = False
+    repaired = processor.process(account, direction, vacancy)
+    assert repaired.status == "MATCH" and repaired.applied and repaired.model_calls == 1
+    with create_database(settings).sessions.begin() as session:
+        for stage in session.scalars(select(SemanticStageModel)):
+            stage.created_at = datetime.now(UTC) - timedelta(hours=1)
+    repeated = processor.process(account, direction, vacancy)
+    assert repeated.status == "MATCH" and repeated.model_calls == 0
+    assert client.calls == 2
+
+
+def test_rejection_review_resumes_without_reapplying_the_first_decision(settings: Settings) -> None:
+    account, direction, vacancy, _resume, _fact = seed(settings)
+
+    class ReviewClient(RoleClient):
+        def complete_json(self, system: str, user: str, schema: dict[str, object]) -> str:
+            answer = json.loads(super().complete_json(system, user, schema))
+            if "proposed_assessment" not in json.loads(user):
+                answer.update(
+                    fit="reject",
+                    blocker={
+                        "source_line_ids": [1],
+                        "reason": "Готовый новый артефакт отсутствует",
+                    },
+                )
+            return json.dumps(answer)
+
+    client = ReviewClient()
+    processor = SemanticSelectionProcessor(settings, client_factory=lambda *_: client)
+    first = processor.process(account, direction, vacancy)
+    assert first.status == "IN_PROGRESS" and not first.applied and first.model_calls == 1
+    reviewed = processor.process(account, direction, vacancy)
+    assert reviewed.status == "MATCH" and reviewed.applied and reviewed.model_calls == 1
+    with create_database(settings).sessions.begin() as session:
+        saved = list(session.scalars(select(SemanticStageModel)))
+        assert sorted(stage.stage for stage in saved) == ["assess", "assess_review", "selection"]
+        final = next(stage for stage in saved if stage.stage == "selection")
+        assert json.loads(final.response_text)["retryable"] is False
+        for stage in saved:
+            stage.created_at = datetime.now(UTC) - timedelta(hours=1)
+    assert processor.process(account, direction, vacancy).model_calls == 0
+    assert client.calls == 2
 
 
 def test_stop_after_whole_role_call_preserves_cached_answer_for_resume(settings: Settings) -> None:

@@ -13,7 +13,10 @@ from hugin.services.semantic_analyzer import (
 from hugin.services.semantic_role import (
     ROLE_BODY_FIELDS,
     ROLE_INSTRUCTIONS,
+    ROLE_REPAIR_TASK,
+    ROLE_REVIEW_INSTRUCTIONS,
     CoreDuty,
+    ProfessionBasis,
     RoleAssessment,
     assess_role,
     role_errors,
@@ -23,6 +26,7 @@ from hugin.services.semantic_selection import ProfileFact, SemanticDecision, Sou
 
 def assessment_type(lines: list[SourceLine], facts: list[ProfileFact]) -> type[RoleAssessment]:
     class CaseAssessment(RoleAssessment):
+        profession_basis: ProfessionBasis
         core_duties: list[CoreDuty] = Field(min_length=1, max_length=12)
 
         @classmethod
@@ -39,6 +43,9 @@ def assessment_type(lines: list[SourceLine], facts: list[ProfileFact]) -> type[R
                 line.id for line in lines if line.field in ROLE_BODY_FIELDS and line.text.strip()
             ]
             duties["profile_fact_ids"]["items"]["enum"] = [fact.id for fact in facts]
+            schema["$defs"]["ProfessionBasis"]["properties"]["source_line_ids"]["items"]["enum"] = [
+                line.id for line in lines if line.field in ROLE_BODY_FIELDS and line.text.strip()
+            ]
             return schema
 
     return CaseAssessment
@@ -53,7 +60,7 @@ class RoleAnalyzer(StageAnalyzer):
         max_calls: int = 1,
         force: bool = False,
     ) -> None:
-        super().__init__(cache, max_calls=max_calls, force=force)
+        super().__init__(cache, max_calls=max_calls, force=force, retry_invalid_responses=False)
         self._client = client
 
     def analyze(self, lines: list[SourceLine], facts: list[ProfileFact]) -> AnalysisResult:
@@ -67,14 +74,25 @@ class RoleAnalyzer(StageAnalyzer):
                 "vacancy_lines": [line.model_dump() for line in lines],
                 "profile": {"facts": [fact.model_dump() for fact in facts]},
             }
-            assessment, errors = self._stage(
+            assessment, errors = self._assess(
                 "assess",
-                self._client,
                 ROLE_INSTRUCTIONS,
                 payload,
-                assessment_type(lines, facts),
-                lambda answer: role_errors(lines, facts, answer),
+                lines,
+                facts,
             )
+            if (
+                assessment is not None
+                and assessment.fit == "reject"
+                and assessment.profession != "other_it"
+            ):
+                assessment, errors = self._assess(
+                    "assess_review",
+                    ROLE_REVIEW_INSTRUCTIONS,
+                    {**payload, "proposed_assessment": assessment.model_dump()},
+                    lines,
+                    facts,
+                )
         decision = (
             assess_role(lines, facts, assessment)
             if assessment is not None
@@ -89,3 +107,40 @@ class RoleAnalyzer(StageAnalyzer):
             self._budget_exhausted,
             assessment,
         )
+
+    def _assess(
+        self,
+        stage: str,
+        instructions: str,
+        payload: dict[str, object],
+        lines: list[SourceLine],
+        facts: list[ProfileFact],
+    ) -> tuple[RoleAssessment | None, tuple[str, ...]]:
+        record_type = assessment_type(lines, facts)
+
+        def validate(answer: RoleAssessment) -> tuple[str, ...]:
+            return role_errors(lines, facts, answer)
+
+        assessment, errors = self._stage(
+            stage, self._client, instructions, payload, record_type, validate
+        )
+        if (
+            assessment is None
+            and self._stages
+            and self._stages[-1].stage == stage
+            and self._stages[-1].response_text
+        ):
+            assessment, errors = self._stage(
+                f"{stage}_repair",
+                self._client,
+                instructions,
+                {
+                    **payload,
+                    "previous_response": self._stages[-1].response_text,
+                    "validation_errors": list(errors),
+                    "revision_task": ROLE_REPAIR_TASK,
+                },
+                record_type,
+                validate,
+            )
+        return assessment, errors
