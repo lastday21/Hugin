@@ -14,6 +14,7 @@ from hugin.database import postgresql_url, upgrade_database
 @pytest.fixture(autouse=True)
 def isolated_runtime_data(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     monkeypatch.setenv("HUGIN_DATA_DIR", str(tmp_path / "runtime"))
+    monkeypatch.setenv("HUGIN_DATABASE_NAME", f"hugin_test_unconfigured_{uuid4().hex}")
     get_settings.cache_clear()
     try:
         yield
