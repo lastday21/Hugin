@@ -12,6 +12,109 @@ from hugin.workers.processes import BackgroundProcessWorker
 pytestmark = pytest.mark.integration
 
 
+def test_parallel_search_does_not_hold_evaluation_or_applications(settings: Settings) -> None:
+    database = create_database(settings)
+    with database.sessions.begin() as session:
+        AccountRepository(session).create("Параллельные исполнители")
+        service = BackgroundProcessService(session)
+        service.stop_all()
+        for key in ("search", "evaluation", "applications"):
+            service.set_enabled(key, True)
+    searching = threading.Event()
+    release = threading.Event()
+    evaluated = threading.Event()
+    applied = threading.Event()
+
+    def search(_token: int | None) -> bool:
+        searching.set()
+        return release.wait(10)
+
+    def evaluation(_token: int | None) -> bool:
+        if searching.wait(5):
+            evaluated.set()
+        return True
+
+    def applications(_token: int | None) -> bool:
+        if searching.wait(5):
+            applied.set()
+        return True
+
+    worker = BackgroundProcessWorker(
+        settings,
+        steps={"search": search, "evaluation": evaluation, "applications": applications},
+        parallel=True,
+        poll_seconds=0.01,
+    )
+    other = BackgroundProcessWorker(settings, steps={"search": search})
+    try:
+        worker.start()
+        assert searching.wait(5)
+        assert evaluated.wait(5) and applied.wait(5)
+        assert not release.is_set()
+        assert not other.run_once()
+        worker.stop(timeout_seconds=0)
+        release.set()
+        worker.stop(timeout_seconds=5)
+        assert not worker.running
+    finally:
+        release.set()
+        worker.stop(timeout_seconds=5)
+        database.close()
+
+
+def test_parallel_owner_loss_revokes_execution_before_another_worker_can_continue(
+    settings: Settings,
+) -> None:
+    from sqlalchemy import text
+
+    database = create_database(settings)
+    with database.sessions.begin() as session:
+        AccountRepository(session).create("Разрыв соединения владельца")
+        service = BackgroundProcessService(session)
+        service.stop_all()
+        service.set_enabled("search", True)
+    entered = threading.Event()
+    release = threading.Event()
+    cancelled = threading.Event()
+    sent: list[bool] = []
+
+    def search(_token: int | None) -> bool:
+        entered.set()
+        if release.wait(10) and worker.has_ownership():
+            sent.append(True)
+        return True
+
+    worker = BackgroundProcessWorker(
+        settings,
+        steps={"search": search},
+        parallel=True,
+        cancel=cancelled.set,
+        poll_seconds=0.01,
+    )
+    try:
+        worker.start()
+        assert entered.wait(5) and worker.has_ownership()
+        with database.engine.connect() as connection:
+            pid = connection.scalar(
+                text(
+                    "SELECT l.pid FROM pg_locks l JOIN pg_stat_activity a ON a.pid=l.pid "
+                    "WHERE l.locktype='advisory' AND l.classid=684721 AND l.objid=1 "
+                    "AND l.granted AND a.datname=current_database()"
+                )
+            )
+            assert pid is not None
+            assert connection.scalar(text("SELECT pg_terminate_backend(:pid)"), {"pid": pid})
+        assert not worker.has_ownership()
+        assert cancelled.is_set()
+        release.set()
+        worker.stop(timeout_seconds=5)
+        assert not worker.running and not sent
+    finally:
+        release.set()
+        worker.stop(timeout_seconds=5)
+        database.close()
+
+
 @pytest.mark.parametrize(
     "state", ["new", "queued", "delay", "review", "limit", "fresh_due", "retry_wait"]
 )

@@ -1667,6 +1667,9 @@ class VisibleHhBrowser:
         browser_source_ip: str | None = None,
         profile_lock_timeout_seconds: float | None = None,
         journal: OperationJournal | None = None,
+        shared_endpoint: Callable[[], str] | None = None,
+        remote_debugging: bool = False,
+        message_send_allowed: Callable[[], bool] | None = None,
     ) -> None:
         self._profile_dir = profile_dir
         self._journal = journal
@@ -1676,6 +1679,9 @@ class VisibleHhBrowser:
         self._timeout_ms = timeout_ms
         self._start_minimized = start_minimized
         self._browser_source_ip = browser_source_ip
+        self._shared_endpoint = shared_endpoint
+        self._remote_debugging = remote_debugging
+        self._message_send_allowed = message_send_allowed
         self._network_proxy: _HhHttpProxy | None = None
         self._playwright: Playwright | None = None
         self._context: BrowserContext | None = None
@@ -1694,9 +1700,23 @@ class VisibleHhBrowser:
 
     def __enter__(self) -> VisibleHhBrowser:
         self._profile_dir.mkdir(parents=True, exist_ok=True)
-        self._profile_lock.acquire()
+        if self._shared_endpoint is None:
+            self._profile_lock.acquire()
         try:
             self._playwright = sync_playwright().start()
+            if self._shared_endpoint is not None:
+                connected = self._playwright.chromium.connect_over_cdp(
+                    self._shared_endpoint(), timeout=self._timeout_ms
+                )
+                self._context = connected.contexts[0]
+                self._page = self._context.new_page()
+                self._page.set_default_timeout(self._timeout_ms)
+                self._page.set_default_navigation_timeout(self._timeout_ms)
+                if not self._start_minimized:
+                    self._set_window_state("normal")
+                    with suppress(PlaywrightError, AttributeError):
+                        self._page.bring_to_front()
+                return self
             chromium_args = (
                 [
                     "--start-minimized",
@@ -1706,6 +1726,10 @@ class VisibleHhBrowser:
                 else ["--start-maximized"]
             )
             source_ip = usable_source_ipv4(self._browser_source_ip)
+            if self._remote_debugging:
+                chromium_args.extend(
+                    ["--remote-debugging-port=0", "--remote-debugging-address=127.0.0.1"]
+                )
             if source_ip:
                 self._network_proxy = _HhHttpProxy(source_ip)
                 self._network_proxy.start()
@@ -1721,6 +1745,9 @@ class VisibleHhBrowser:
             self._page.set_default_navigation_timeout(self._timeout_ms)
             self._minimize_window()
         except BaseException:
+            if self._shared_endpoint is not None and self._page is not None:
+                with suppress(Exception):
+                    self._page.close()
             if self._playwright is not None:
                 with suppress(Exception):
                     self._playwright.stop()
@@ -1734,8 +1761,21 @@ class VisibleHhBrowser:
             raise
         return self
 
+    def debugging_endpoint(self) -> str:
+        if not self._remote_debugging or self._context is None:
+            raise RuntimeError("Общий браузер ещё не запущен")
+        port = int((self._profile_dir / "DevToolsActivePort").read_text().splitlines()[0])
+        if not 0 < port < 65536:
+            raise RuntimeError("Браузер вернул недопустимый локальный порт")
+        return f"http://127.0.0.1:{port}"
+
     def _minimize_window(self) -> None:
         if not self._start_minimized or self._context is None or self._page is None:
+            return
+        self._set_window_state("minimized")
+
+    def _set_window_state(self, state: str) -> None:
+        if self._context is None or self._page is None:
             return
         with suppress(PlaywrightError, AttributeError, KeyError, TypeError):
             session = self._context.new_cdp_session(self._page)
@@ -1748,7 +1788,7 @@ class VisibleHhBrowser:
                     "Browser.setWindowBounds",
                     {
                         "windowId": window_id,
-                        "bounds": {"windowState": "minimized"},
+                        "bounds": {"windowState": state},
                     },
                 )
             finally:
@@ -1761,7 +1801,9 @@ class VisibleHhBrowser:
         traceback: TracebackType | None,
     ) -> None:
         try:
-            if self._context is not None:
+            if self._shared_endpoint is not None and self._page is not None:
+                _close_browser_resource(self._page.close)
+            elif self._context is not None:
                 _close_browser_resource(self._context.close)
         finally:
             try:
@@ -1828,6 +1870,12 @@ class VisibleHhBrowser:
         return self._page is None or self._page.is_closed()
 
     def is_open(self) -> bool:
+        if self._remote_debugging and self._context is not None:
+            try:
+                self._context.cookies()
+            except PlaywrightError:
+                return False
+            return True
         page = self._page
         if page is None or page.is_closed():
             return False
@@ -3342,6 +3390,11 @@ class VisibleHhBrowser:
                 failure_code=MessageSendFailureCode.SUBMIT_UNAVAILABLE,
             )
 
+        if self._message_send_allowed is not None and not self._message_send_allowed():
+            return MessageSendResult(
+                MessageSendOutcome.FAILED,
+                failure_code=MessageSendFailureCode.SUBMISSION_STOPPED,
+            )
         response: Response | None = None
         try:
             with page.expect_response(

@@ -3942,6 +3942,22 @@ def test_confirmed_recruiter_message_is_sent_once(tmp_path: Path) -> None:
     assert frame.locators['[data-qa="chatik-do-send-message"]'].no_wait_after == [True]
 
 
+def test_recruiter_message_is_not_clicked_after_execution_permission_is_lost(
+    tmp_path: Path,
+) -> None:
+    page = FakePage("https://hh.ru/applicant/resumes")
+    frame = FakeFrame(messages_payloads=[[]])
+    frame.locators['[data-qa="chatik-new-message-text"]'] = FakeLocator()
+    submit = FakeLocator()
+    frame.locators['[data-qa="chatik-do-send-message"]'] = submit
+    page.frames = [cast(Frame, frame)]
+    browser = make_browser(page, tmp_path)
+    browser._message_send_allowed = lambda: False
+    result = browser.send_recruiter_message("https://hh.ru/vacancy/101", "Буду на связи.")
+    assert result.outcome is MessageSendOutcome.FAILED
+    assert submit.clicked == 0
+
+
 def test_recruiter_message_waits_until_filled_text_enables_send(
     tmp_path: Path,
 ) -> None:
@@ -4605,6 +4621,88 @@ class FakeStarter:
 
     def start(self) -> FakePlaywright:
         return self.playwright
+
+
+@pytest.mark.parametrize("background", [True, False])
+def test_shared_tabs_keep_other_pages_and_profile_owner_alive(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, background: bool
+) -> None:
+    from types import SimpleNamespace
+
+    class Tab(FakePage):
+        foreground = False
+
+        def close(self) -> None:
+            self.closed = True
+
+        def bring_to_front(self) -> None:
+            self.foreground = True
+
+    class Context(FakeContext):
+        window_state = "minimized"
+
+        def new_page(self) -> Tab:
+            page = Tab()
+            self.pages.append(page)
+            return page
+
+        def new_cdp_session(self, _page: Tab) -> object:
+            def send(command: str, params: object = None) -> dict[str, int]:
+                if command == "Browser.setWindowBounds":
+                    assert isinstance(params, dict)
+                    bounds = params["bounds"]
+                    assert isinstance(bounds, dict)
+                    self.window_state = bounds["windowState"]
+                return {"windowId": 7}
+
+            return SimpleNamespace(send=send, detach=lambda: None)
+
+    context = Context(Tab())
+
+    class Chromium(FakeChromium):
+        def connect_over_cdp(self, endpoint: str, **_kwargs: object) -> object:
+            assert endpoint == "http://127.0.0.1:12345"
+            return SimpleNamespace(contexts=[context])
+
+    monkeypatch.setattr(
+        browser_module,
+        "sync_playwright",
+        lambda: FakeStarter(FakePlaywright(Chromium(context))),
+    )
+    owner = browser_module._BrowserProfileLock(
+        tmp_path / browser_module._PROFILE_LOCK_FILENAME, timeout_seconds=0
+    )
+    owner.acquire()
+    try:
+        with VisibleHhBrowser(
+            tmp_path,
+            "login",
+            "resumes",
+            "search",
+            4000,
+            start_minimized=background,
+            shared_endpoint=lambda: "http://127.0.0.1:12345",
+        ) as first:
+            assert context.window_state == ("minimized" if background else "normal")
+            assert isinstance(first._page, Tab)
+            assert first._page.foreground is (not background)
+            with VisibleHhBrowser(
+                tmp_path,
+                "login",
+                "resumes",
+                "search",
+                4000,
+                shared_endpoint=lambda: "http://127.0.0.1:12345",
+            ) as second:
+                assert first._page is not second._page
+            assert first.is_open() and not context.closed
+            assert context.pages[0].is_closed() is False
+        assert context.pages[1].is_closed() and context.pages[2].is_closed()
+        assert not context.closed
+        with pytest.raises(RuntimeError, match="занят другой задачей"):
+            browser_module._BrowserProfileLock(owner._path, timeout_seconds=0).acquire()
+    finally:
+        owner.release()
 
 
 def test_profile_lock_waits_until_another_browser_releases_it(

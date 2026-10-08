@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import exists, func, select
@@ -37,12 +38,19 @@ class ReplyWorker:
         account_id: int = 1,
         browser_lock: threading.Lock | None = None,
         journal: OperationJournal | None = None,
+        shared_endpoint: Callable[[], str] | None = None,
+        execution_allowed: Callable[[], bool] | None = None,
     ) -> None:
         self._settings = settings
         self._account_id = account_id
         self._journal = journal or OperationJournal(settings.data_dir)
+        self._execution_allowed = execution_allowed
         self._sender = HhSyncJobHandler(
-            settings, AutomationJobKind.MESSAGES, account_id=account_id, browser_lock=browser_lock
+            settings,
+            AutomationJobKind.MESSAGES,
+            account_id=account_id,
+            browser_lock=browser_lock,
+            shared_endpoint=shared_endpoint,
         )
         self._stop = threading.Event()
 
@@ -50,7 +58,9 @@ class ReplyWorker:
         self._stop.set()
 
     def _allowed(self) -> bool:
-        if self._stop.is_set():
+        if self._stop.is_set() or (
+            self._execution_allowed is not None and not self._execution_allowed()
+        ):
             return False
         database = create_database(self._settings)
         try:

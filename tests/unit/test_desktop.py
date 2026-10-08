@@ -4,7 +4,7 @@ import socket
 import subprocess
 import time
 import webbrowser
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -113,10 +113,12 @@ class FakeBrowser:
         self,
         *_args: object,
         browser_source_ip: str | None = None,
+        shared_endpoint: Callable[[], str] | None = None,
     ) -> None:
         self.closed = False
         self.opened_login = False
         self.browser_source_ip = browser_source_ip
+        self.shared_endpoint = shared_endpoint
         self.instances.append(self)
 
     def __enter__(self) -> FakeBrowser:

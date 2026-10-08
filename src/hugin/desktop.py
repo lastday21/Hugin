@@ -33,6 +33,7 @@ from hugin.adapters.notification_gateway import (
     NotificationGatewayTimeout,
 )
 from hugin.adapters.postgres_backup import DockerPostgresBackupAdapter
+from hugin.adapters.shared_hh_browser import SharedHhBrowser
 from hugin.core.settings import Settings, get_settings
 from hugin.database import create_database, upgrade_database
 from hugin.database.models import ApplicationModel, VacancyModel
@@ -153,12 +154,14 @@ class DesktopBridge:
         *,
         browser_lock: threading.Lock | None = None,
         journal: OperationJournal | None = None,
+        shared_endpoint: Callable[[], str] | None = None,
     ) -> None:
         self._settings = settings
         self._account_id = account_id
         self._lock = browser_lock or threading.Lock()
         self._telegram_lock = threading.Lock()
         self._journal = journal or OperationJournal(settings.data_dir)
+        self._shared_endpoint = shared_endpoint
         self._form_review_guard = threading.Lock()
         self._form_review_thread: threading.Thread | None = None
         self._form_review_commands: Queue[_FormReviewCommand | None] | None = None
@@ -186,6 +189,7 @@ class DesktopBridge:
                 self._settings.hh_search_url,
                 self._settings.hh_browser_timeout_ms,
                 start_minimized=False,
+                shared_endpoint=self._shared_endpoint,
                 browser_source_ip=(
                     str(self._settings.hh_browser_source_ip)
                     if self._settings.hh_browser_source_ip is not None
@@ -369,6 +373,7 @@ class DesktopBridge:
                 self._settings.hh_resumes_url,
                 self._settings.hh_search_url,
                 self._settings.hh_browser_timeout_ms,
+                shared_endpoint=self._shared_endpoint,
                 browser_source_ip=(
                     str(self._settings.hh_browser_source_ip)
                     if self._settings.hh_browser_source_ip is not None
@@ -660,6 +665,7 @@ class DesktopBridge:
                     self._settings.hh_resumes_url,
                     self._settings.hh_search_url,
                     self._settings.hh_browser_timeout_ms,
+                    shared_endpoint=self._shared_endpoint,
                     browser_source_ip=(
                         str(self._settings.hh_browser_source_ip)
                         if self._settings.hh_browser_source_ip is not None
@@ -974,28 +980,38 @@ def main() -> None:
     finally:
         startup_status.close()
     browser_lock = threading.Lock()
+    search_browser_lock = threading.Lock()
+    shared_browser = SharedHhBrowser(settings, journal=journal)
     application_worker = ApplicationWorker(
         settings,
         browser_lock=browser_lock,
         journal=journal,
         release_browser_after_turn=True,
+        shared_endpoint=shared_browser.endpoint,
+        execution_allowed=lambda: process_worker.has_ownership(),
     )
     search_handler = HhSearchJobHandler(
         settings,
-        browser_lock=browser_lock,
+        browser_lock=search_browser_lock,
         incremental=True,
+        shared_endpoint=shared_browser.endpoint,
+        execution_allowed=lambda: process_worker.has_ownership(),
     )
     messages_handler = HhSyncJobHandler(
         settings,
         AutomationJobKind.MESSAGES,
-        browser_lock=browser_lock,
+        browser_lock=search_browser_lock,
         incremental=True,
+        shared_endpoint=shared_browser.endpoint,
+        execution_allowed=lambda: process_worker.has_ownership(),
     )
     statuses_handler = HhSyncJobHandler(
         settings,
         AutomationJobKind.STATUSES,
-        browser_lock=browser_lock,
+        browser_lock=search_browser_lock,
         incremental=True,
+        shared_endpoint=shared_browser.endpoint,
+        execution_allowed=lambda: process_worker.has_ownership(),
     )
     worker = AutomationWorker(
         settings,
@@ -1010,7 +1026,13 @@ def main() -> None:
     notification_worker = NotificationWorker(settings, journal=journal)
     backup_worker = BackupWorker(settings, journal=journal)
     semantic_worker = SemanticSelectionWorker(settings, journal=journal, max_calls_per_turn=1)
-    reply_worker = ReplyWorker(settings, browser_lock=browser_lock, journal=journal)
+    reply_worker = ReplyWorker(
+        settings,
+        browser_lock=browser_lock,
+        journal=journal,
+        shared_endpoint=shared_browser.endpoint,
+        execution_allowed=lambda: process_worker.has_ownership(),
+    )
 
     def synchronize(token: int | None) -> bool:
         messages_handler.one_shot_token = statuses_handler.one_shot_token = token
@@ -1052,11 +1074,13 @@ def main() -> None:
             "replies": lambda _token: reply_worker.run_once(),
         },
         cancel=cancel_processes,
+        parallel=True,
     )
     bridge = DesktopBridge(
         settings,
         browser_lock=browser_lock,
         journal=journal,
+        shared_endpoint=shared_browser.endpoint,
     )
     workers: tuple[BackgroundWorker, ...] = (
         process_worker,
@@ -1085,6 +1109,7 @@ def main() -> None:
         bridge.close()
         for background_worker in reversed(started_workers):
             background_worker.stop()
+        shared_browser.stop()
         raise
     starting.succeed(workers=len(started_workers))
     session = journal.start("desktop", "application.session")
@@ -1101,6 +1126,7 @@ def main() -> None:
         bridge.close()
         for background_worker in reversed(started_workers):
             background_worker.stop()
+        shared_browser.stop()
 
 
 def launch() -> None:

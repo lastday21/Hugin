@@ -343,10 +343,6 @@ class BackgroundProcessService:
         if key in {"search", "synchronization"}:
             return self._job_waiting_reason(key, settings, now)
         if key == "evaluation":
-            if ApplicationSelectionGate(self._session).fresh_search_pending(
-                self._account_id, now, due_only=True
-            ):
-                return "Сначала просмотр свежих страниц; затем оценка сохранённых вакансий"
             stages = funnel.get("stages")
             pending = (
                 next(
@@ -369,7 +365,9 @@ class BackgroundProcessService:
             )
             if sent >= settings.hh_apply_daily_limit:
                 return f"Достигнут дневной предел откликов ({settings.hh_apply_daily_limit})"
-            waiting = ApplicationSelectionGate(self._session).blocking_reason(self._account_id, now)
+            waiting = ApplicationSelectionGate(self._session).blocking_reason(
+                self._account_id, now, progressive=True
+            )
             if waiting is not None:
                 return waiting
             next_apply = self._session.scalar(

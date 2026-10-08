@@ -242,6 +242,7 @@ def test_search_handler_runs_cycle_after_successful_login(
             else None
         ),
         "profile_lock_timeout_seconds": 2.0,
+        "shared_endpoint": None,
     }
 
 

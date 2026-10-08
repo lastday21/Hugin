@@ -193,7 +193,12 @@ class QueueTaskRepository:
             statement = statement.where(DirectionVacancyModel.state == VacancyState.QUEUED)
         if vacancy_rules_version is not None:
             statement = statement.where(
-                DirectionVacancyModel.rules_version == vacancy_rules_version
+                DirectionVacancyModel.rules_version == vacancy_rules_version,
+                VacancyModel.details_fetched_at.is_not(None),
+                or_(
+                    VacancyModel.published_at.is_(None),
+                    VacancyModel.published_at <= VacancyModel.details_fetched_at,
+                ),
             )
         if vacancy_rule_categories is not None:
             statement = statement.where(

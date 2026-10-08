@@ -37,12 +37,16 @@ class HhSearchJobHandler:
         browser_lock: threading.Lock | None = None,
         application_work_pending: ApplicationWorkPending | None = None,
         incremental: bool = False,
+        shared_endpoint: Callable[[], str] | None = None,
+        execution_allowed: Callable[[], bool] | None = None,
     ) -> None:
         self._settings = settings
         self._account_id = account_id
         self._browser_lock = browser_lock or threading.Lock()
         self._application_work_pending = application_work_pending
         self._incremental = incremental
+        self._shared_endpoint = shared_endpoint
+        self._execution_allowed = execution_allowed
         cycle = PeriodSearchCycle if incremental else BackgroundSearchCycle
         self._cycle = cycle(
             settings,
@@ -89,6 +93,7 @@ class HhSearchJobHandler:
                         else None
                     ),
                     profile_lock_timeout_seconds=_BACKGROUND_PROFILE_LOCK_TIMEOUT_SECONDS,
+                    shared_endpoint=self._shared_endpoint,
                 ) as browser,
             ):
                 login = HhLoginService(WindowsCredentialStore()).authenticate(
@@ -134,6 +139,8 @@ class HhSearchJobHandler:
             ) from error
 
     def _allowed(self) -> bool:
+        if self._execution_allowed is not None and not self._execution_allowed():
+            return False
         database = create_database(self._settings)
         try:
             with database.sessions() as session:

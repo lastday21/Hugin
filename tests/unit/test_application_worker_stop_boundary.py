@@ -68,16 +68,21 @@ def test_stop_during_preparation_keeps_the_checked_task_without_sending(
     assert FakeApplicationService.recorded == []
 
 
+@pytest.mark.parametrize("loss", ["stop", "owner"])
 def test_stop_revokes_the_submit_guard_even_when_global_queue_remains_enabled(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, loss: str
 ) -> None:
-    worker = prepare_worker(monkeypatch, tmp_path)
+    owned = True
+    worker = prepare_worker(monkeypatch, tmp_path, execution_allowed=lambda: owned)
     job = fake_job()
     values = cast(SimpleNamespace, job)
     values.cover_letter_id = 15
     values.cover_letter_sha256 = "a" * 64
     assert worker._background_submission_is_allowed(job)
-    worker.stop()
+    if loss == "owner":
+        owned = False
+    else:
+        worker.stop()
     assert FakeApplicationService.enabled
     assert not worker._background_submission_is_allowed(job)
 

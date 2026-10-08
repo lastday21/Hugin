@@ -20,7 +20,37 @@ from tests.unit.test_automation_scheduler import seed_search_query
 from tests.unit.test_semantic_processing import Client, edit_fact, seed
 
 
-def test_later_stronger_vacancy_is_evaluated_before_spending_ready_slot(settings: Settings) -> None:
+def test_ready_candidate_does_not_wait_for_unfinished_search_or_other_details(
+    settings: Settings,
+) -> None:
+    database = create_database(settings)
+    try:
+        with database.sessions.begin() as session:
+            ready = queued_jobs(session, count=1)[0]
+            directions = DirectionRepository(session)
+            direction_id = ready.application.direction_id
+            assert direction_id is not None
+            directions.add_query(direction_id, "Python backend")
+            options = session.get(ApplicationSettingsModel, 1)
+            assert options is not None
+            options.search_enabled = True
+            other = VacancyRepository(session).upsert(
+                VacancyData("still-loading", "Python", "https://hh.ru/vacancy/still-loading")
+            )
+            directions.track_vacancy(direction_id, other.id)
+            gate = ApplicationSelectionGate(session)
+            assert gate.fresh_search_pending(ready.application.account_id)
+            chosen = ApplicationAutomationService(session).claim_next(
+                account_id=ready.application.account_id
+            )
+            assert chosen is not None and chosen.vacancy.id == ready.vacancy.id
+    finally:
+        database.close()
+
+
+def test_stronger_ready_vacancy_has_priority_without_waiting_for_other_details(
+    settings: Settings,
+) -> None:
     database = create_database(settings)
     try:
         with database.sessions.begin() as session:
@@ -34,13 +64,19 @@ def test_later_stronger_vacancy_is_evaluated_before_spending_ready_slot(settings
             )
             directions.track_vacancy(direction_id, late.id)
             service = ApplicationAutomationService(session)
-            assert service.claim_next(account_id=account_id) is None
+            assert (
+                ApplicationSelectionGate(session).blocking_reason(account_id, progressive=True)
+                is None
+            )
             assert QueueTaskRepository(session).get(old.task.id).attempts == 0
             row = session.get(VacancyModel, late.id)
             assert row is not None
             row.details_fetched_at = datetime.now(UTC)
             session.flush()
-            assert service.claim_next(account_id=account_id) is None
+            assert (
+                ApplicationSelectionGate(session).blocking_reason(account_id, progressive=True)
+                is None
+            )
             directions.apply_rules(
                 direction_id,
                 late.id,

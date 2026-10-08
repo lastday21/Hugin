@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from sqlalchemy import or_, select
+from sqlalchemy import literal, or_, select
 from sqlalchemy.orm import Session
 
 from hugin.database.models import (
@@ -27,18 +27,29 @@ class ApplicationSelectionGate:
     def __init__(self, session: Session) -> None:
         self._session = session
 
-    def blocking_reason(self, account_id: int, now: datetime | None = None) -> str | None:
+    def blocking_reason(
+        self, account_id: int, now: datetime | None = None, *, progressive: bool = False
+    ) -> str | None:
         now = as_utc(now or datetime.now(UTC))
-        if self.fresh_search_pending(account_id, now):
+        if not progressive and self.fresh_search_pending(account_id, now):
             return "Ожидает просмотра свежих страниц всех активных запросов"
 
-        rows = self._current_rows(account_id, now)
+        rows = self._current_rows(account_id, now, current_only=not progressive)
+        statuses = semantic_statuses(self._session, account_id, rows)
+        if progressive and any(
+            not self._needs_details(vacancy)
+            and tracked.rules_version == RULES_VERSION
+            and tracked.rules_details.get("category") in {"MATCH", "STRETCH"}
+            and statuses.get((direction.id, vacancy.id), "ALLOW") == "ALLOW"
+            for tracked, vacancy, direction in rows
+        ):
+            return None
         for tracked, vacancy, _ in rows:
             if self._needs_details(vacancy):
                 return "Ожидает загрузки найденных вакансий перед выбором откликов"
             if tracked.rules_version != RULES_VERSION:
                 return "Ожидает оценки найденных вакансий перед выбором откликов"
-        if "PENDING" in semantic_statuses(self._session, account_id, rows).values():
+        if "PENDING" in statuses.values():
             return "Ожидает оценки найденных вакансий перед выбором откликов"
         return None
 
@@ -57,7 +68,9 @@ class ApplicationSelectionGate:
             and as_utc(vacancy.published_at) > as_utc(vacancy.details_fetched_at)
         )
 
-    def _current_rows(self, account_id: int, now: datetime) -> SelectionRows:
+    def _current_rows(
+        self, account_id: int, now: datetime, *, current_only: bool = True
+    ) -> SelectionRows:
         settings = self._session.get(ApplicationSettingsModel, 1)
         day_start = day_start_utc(settings.timezone_name if settings else "UTC", now)
         return self._session.execute(
@@ -89,6 +102,7 @@ class ApplicationSelectionGate:
                     VacancyModel.published_at >= now - MAX_VACANCY_AGE,
                 ),
                 or_(
+                    literal(not current_only),
                     VacancyModel.created_at >= day_start,
                     VacancyModel.published_at >= day_start,
                 ),

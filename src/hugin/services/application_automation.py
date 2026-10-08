@@ -61,7 +61,6 @@ from hugin.repositories.tasks import (
 from hugin.repositories.vacancies import VacancyRepository
 from hugin.services.ai_prompts import AiPromptSettingsService
 from hugin.services.application_exposure import application_profile_snapshot
-from hugin.services.application_selection_gate import ApplicationSelectionGate
 from hugin.services.autonomy import AutonomyPolicyService
 from hugin.services.cover_letter import CoverLetterService
 from hugin.services.cover_letter_quality import QUALITY_RUBRIC_VERSION
@@ -616,10 +615,6 @@ class ApplicationAutomationService:
         if row is None:
             return False
         letter, resume, application = row
-        if ApplicationSelectionGate(self._session).blocking_reason(
-            application.account_id, selected_at
-        ):
-            return False
         if not self._application_selection_current(application):
             return False
         if self._vacancies.vacancy_has_sent_or_live_application(
@@ -1131,8 +1126,6 @@ class ApplicationAutomationService:
         now: datetime | None = None,
     ) -> ApplyJob | None:
         selected_at = as_utc(now or datetime.now(UTC))
-        if ApplicationSelectionGate(self._session).blocking_reason(account_id, selected_at):
-            return None
         system = self._system.lock()
         if (
             system.state is not SystemState.RUNNING
@@ -1826,12 +1819,16 @@ class ApplicationAutomationService:
     ) -> bool:
         if application.direction_id is None:
             return False
+        vacancy = self._vacancies.get(application.vacancy_id)
+        if vacancy.details_fetched_at is None or (
+            vacancy.published_at is not None
+            and as_utc(vacancy.published_at) > as_utc(vacancy.details_fetched_at)
+        ):
+            return False
         direction = self._directions.get_for_account(
             application.account_id, application.direction_id
         )
-        return self._semantic_selection_current(
-            direction, self._vacancies.get(application.vacancy_id), application.resume_id
-        )
+        return self._semantic_selection_current(direction, vacancy, application.resume_id)
 
     def _semantic_selection_current(
         self,

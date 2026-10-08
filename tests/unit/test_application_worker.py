@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+from collections.abc import Callable
 from contextlib import nullcontext
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -164,6 +165,7 @@ def prepare_worker(
     job_handler: applications.ApplicationJobHandler | None = None,
     form_preflight_handler: applications.FormPreflightHandler | None = None,
     letter_preparer: applications.LetterQueuePreparer | None = None,
+    execution_allowed: Callable[[], bool] | None = None,
 ) -> applications.ApplicationWorker:
     monkeypatch.setattr(applications, "create_database", lambda _settings: FakeDatabase())
     monkeypatch.setattr(
@@ -177,6 +179,7 @@ def prepare_worker(
         letter_preparer=letter_preparer or (lambda _job: 0),
         job_handler=job_handler,
         form_preflight_handler=form_preflight_handler,
+        execution_allowed=execution_allowed,
     )
 
 

@@ -311,6 +311,7 @@ def test_queue_uses_three_fit_tiers_across_directions(
                         "Python developer",
                         f"https://hh.ru/vacancy/{hh_id}",
                         published_at=published_at,
+                        details_fetched_at=max(now, published_at),
                     )
                 )
                 directions.track_vacancy(direction_id, vacancy.id)
@@ -441,6 +442,7 @@ def test_queue_prioritizes_location_then_experience_within_backend(
                         "Python developer",
                         f"https://hh.ru/vacancy/{hh_id}",
                         published_at=published_at,
+                        details_fetched_at=max(now, published_at),
                     )
                 )
                 directions.track_vacancy(backend.id, vacancy.id)

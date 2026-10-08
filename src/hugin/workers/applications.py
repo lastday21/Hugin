@@ -54,6 +54,8 @@ class ApplicationWorker:
         letter_preparer: LetterQueuePreparer | None = None,
         journal: OperationJournal | None = None,
         release_browser_after_turn: bool = False,
+        shared_endpoint: Callable[[], str] | None = None,
+        execution_allowed: Callable[[], bool] | None = None,
     ) -> None:
         if account_id < 1:
             raise ValueError("Идентификатор аккаунта должен быть положительным")
@@ -73,6 +75,8 @@ class ApplicationWorker:
         self._browser_owner: int | None = None
         self._browser_wait: JournalRun | None = None
         self._release_browser_after_turn = release_browser_after_turn
+        self._shared_endpoint = shared_endpoint
+        self._execution_allowed = execution_allowed
 
     def request_stop(self) -> None:
         self._stop.set()
@@ -661,7 +665,9 @@ class ApplicationWorker:
         return prepared
 
     def _preparation_allowed(self) -> bool:
-        if self._stop.is_set():
+        if self._stop.is_set() or (
+            self._execution_allowed is not None and not self._execution_allowed()
+        ):
             return False
         database = create_database(self._settings)
         try:
@@ -765,6 +771,7 @@ class ApplicationWorker:
             self._settings.hh_search_url,
             self._settings.hh_browser_timeout_ms,
             start_minimized=True,
+            shared_endpoint=self._shared_endpoint,
             browser_source_ip=(
                 str(self._settings.hh_browser_source_ip)
                 if self._settings.hh_browser_source_ip is not None
@@ -829,7 +836,12 @@ class ApplicationWorker:
         job: ApplyJob,
         submission: StoredScreeningSubmission | None = None,
     ) -> bool:
-        if self._stop.is_set() or job.cover_letter_id is None or job.cover_letter_sha256 is None:
+        if (
+            self._stop.is_set()
+            or job.cover_letter_id is None
+            or job.cover_letter_sha256 is None
+            or (self._execution_allowed is not None and not self._execution_allowed())
+        ):
             return False
         database = create_database(self._settings)
         try:

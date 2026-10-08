@@ -75,6 +75,8 @@ class HhSyncJobHandler:
         browser_lock: threading.Lock | None = None,
         application_work_pending: ApplicationWorkPending | None = None,
         incremental: bool = False,
+        shared_endpoint: Callable[[], str] | None = None,
+        execution_allowed: Callable[[], bool] | None = None,
     ) -> None:
         if kind not in {AutomationJobKind.MESSAGES, AutomationJobKind.STATUSES}:
             raise ValueError("Обработчик поддерживает только сообщения и статусы hh.ru")
@@ -84,9 +86,13 @@ class HhSyncJobHandler:
         self._browser_lock = browser_lock or threading.Lock()
         self._application_work_pending = application_work_pending
         self._incremental = incremental
+        self._shared_endpoint = shared_endpoint
+        self._execution_allowed = execution_allowed
         self.one_shot_token: int | None = None
 
     def _allowed(self) -> bool:
+        if self._execution_allowed is not None and not self._execution_allowed():
+            return False
         database = create_database(self._settings)
         try:
             with database.sessions() as session:
@@ -137,6 +143,7 @@ class HhSyncJobHandler:
                         else None
                     ),
                     profile_lock_timeout_seconds=_BACKGROUND_PROFILE_LOCK_TIMEOUT_SECONDS,
+                    shared_endpoint=self._shared_endpoint,
                 ) as browser,
             ):
                 login = HhLoginService(WindowsCredentialStore()).authenticate(
@@ -233,6 +240,8 @@ class HhSyncJobHandler:
             )
 
     def recover_authentication(self) -> bool:
+        if self._execution_allowed is not None and not self._execution_allowed():
+            return False
         if not self._browser_lock.acquire(blocking=False):
             return False
         try:
@@ -246,6 +255,7 @@ class HhSyncJobHandler:
                 self._settings.hh_search_url,
                 self._settings.hh_browser_timeout_ms,
                 start_minimized=False,
+                shared_endpoint=self._shared_endpoint,
                 browser_source_ip=(
                     str(self._settings.hh_browser_source_ip)
                     if self._settings.hh_browser_source_ip is not None
@@ -386,6 +396,8 @@ class HhSyncJobHandler:
                     else None
                 ),
                 profile_lock_timeout_seconds=_BACKGROUND_PROFILE_LOCK_TIMEOUT_SECONDS,
+                shared_endpoint=self._shared_endpoint,
+                message_send_allowed=can_continue,
             ) as browser,
         ):
             login = HhLoginService(WindowsCredentialStore()).authenticate(

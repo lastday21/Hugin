@@ -22,6 +22,7 @@ from hugin.database.models import (
     DirectionVacancyModel,
     IncidentModel,
     ResumeModel,
+    VacancyModel,
     VerifiedFactModel,
 )
 from hugin.domain import (
@@ -1882,6 +1883,17 @@ def test_background_claim_and_submit_guard_require_the_same_current_letter(
                     )
                 )
                 directions.track_vacancy(direction.id, arriving.id)
+                assert service.background_submission_is_allowed(
+                    task.id,
+                    letter_id=letter.id,
+                    letter_sha256=job.cover_letter_sha256,
+                    resume_hh_id=resume.hh_id,
+                    resume_title=resume.title,
+                )
+                selected_vacancy = session.get(VacancyModel, vacancy.id)
+                assert selected_vacancy is not None
+                selected_vacancy.details_fetched_at = None
+                session.flush()
                 assert not service.background_submission_is_allowed(
                     task.id,
                     letter_id=letter.id,

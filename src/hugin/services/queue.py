@@ -69,7 +69,7 @@ class QueueService:
         blocked = frozenset(
             identity
             for identity in self._session.scalars(accounts)
-            if gate.blocking_reason(identity, selected_at) is not None
+            if gate.blocking_reason(identity, selected_at, progressive=True) is not None
         )
         return self._tasks.claim_next(
             selected_at,
