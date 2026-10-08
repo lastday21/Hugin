@@ -59,6 +59,8 @@ AREAS = {
         "test_background_processes",
         "test_process_worker",
         "test_incremental_search",
+        "test_period_search",
+        "test_hh_search_worker",
         "test_model_turn",
         "test_reply_worker",
         "test_automation_scheduler",

@@ -147,8 +147,15 @@ export function ProcessPanel({ data, loadError, onSaved, onRefresh }: {
               <div><dt>Регион</dt><dd>{data.last_search.region ?? "Не записан"}</dd></div>
               <div><dt>Страница</dt><dd>{data.last_search.page ?? "Не записана"}</dd></div>
               <div><dt>Найдено hh.ru по этому запросу</dt><dd>{data.last_search.found?.toLocaleString("ru-RU") ?? "Неизвестно"}</dd></div>
-              <div><dt>Предел страниц обхода</dt><dd>{data.last_search.coverage_page_limit ?? "Не записан"}</dd></div>
-              <div><dt>Охват</dt><dd>{data.last_search.coverage_exhausted === true ? "Достигнут конец выдачи этого запроса" : data.last_search.coverage_exhausted === false ? "Конец выдачи не подтверждён" : "Неизвестен"}</dd></div>
+              {data.last_search.coverage_from_at ? <>
+                <div><dt>Публикации с</dt><dd>{dateText(data.last_search.coverage_from_at)}</dd></div>
+                <div><dt>Последний просмотр</dt><dd>{data.last_search.search_kind === "fresh" ? "Свежие публикации" : "Продолжение обхода"}</dd></div>
+                <div><dt>Обход периода по запросу</dt><dd>{data.last_search.coverage_complete ? `Завершён ${dateText(data.last_search.coverage_completed_at)}` : "Продолжается"}</dd></div>
+                <div><dt>Продолжение этого региона</dt><dd>{data.last_search.coverage_next_page ? `Сохранено: страница ${data.last_search.coverage_next_page}` : "Период просмотрен"}</dd></div>
+              </> : <>
+                <div><dt>Предел страниц обхода</dt><dd>{data.last_search.coverage_page_limit ?? "Не записан"}</dd></div>
+                <div><dt>Охват</dt><dd>{data.last_search.coverage_exhausted === true ? "Достигнут конец выдачи этого запроса" : data.last_search.coverage_exhausted === false ? "Конец выдачи не подтверждён" : "Неизвестен"}</dd></div>
+              </>}
             </dl>
             <p>Это наблюдение одного запроса в указанное время. Числа разных запросов могут пересекаться; они не входят в местный остаток.</p>
           </> : <p>Чтение выдачи ещё не подтверждено. Общий объём доступных на hh.ru вакансий неизвестен.</p>}

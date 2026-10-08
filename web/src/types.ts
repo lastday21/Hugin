@@ -621,6 +621,11 @@ export interface BackgroundProcesses {
     found: number | null;
     coverage_exhausted: boolean | null;
     coverage_page_limit: number | null;
+    coverage_complete: boolean | null;
+    coverage_from_at: string | null;
+    coverage_completed_at: string | null;
+    coverage_next_page: number | null;
+    search_kind: string | null;
     job_key: string;
   } | null;
 }

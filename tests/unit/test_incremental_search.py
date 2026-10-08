@@ -96,6 +96,7 @@ def seed(settings: Settings, *, regions: tuple[SearchRegion, ...] | None = None)
             d.id,
             "Python",
             regions=regions or (SearchRegion("1", "Москва"),),
+            filters={"order_by": "publication_time"},
             schedule_minutes=120,
         )
         return a.id, q.id

@@ -616,6 +616,10 @@ def test_search_observation_keeps_time_and_ignores_unobserved_deferred_counts(
                         "observed_found": 125,
                         "pages_loaded": 0,
                         "details_loaded": 3,
+                        "coverage_from_at": "2026-08-10T05:00:00+00:00",
+                        "coverage_complete": False,
+                        "coverage_next_page": 4,
+                        "observed_search_kind": "depth",
                     }
                     if index == 0
                     else {"found": 999, "deferred": "APPLICATIONS_PENDING"}
@@ -627,6 +631,9 @@ def test_search_observation_keeps_time_and_ignores_unobserved_deferred_counts(
     assert result["observed_at"] == "2026-09-09T05:00:00+00:00"
     assert result["found"] == 125 and result["page"] == 2
     assert result["coverage_exhausted"] is None
+    assert result["coverage_from_at"] == "2026-08-10T05:00:00+00:00"
+    assert result["coverage_next_page"] == 4 and result["coverage_complete"] is False
+    assert result["search_kind"] == "depth"
 
 
 def test_sync_schedule_once_and_protection_api(settings: Settings) -> None:

@@ -102,10 +102,12 @@ class HhLoginService:
         self,
         account_id: int,
         browser: HhLoginBrowser,
+        *,
+        open_login: bool = True,
     ) -> LoginResult:
         self._validate_account_id(account_id)
         status = self._current_status(browser)
-        if status not in {
+        if open_login and status not in {
             LoginStatus.CONFIRMATION_REQUIRED,
             LoginStatus.CAPTCHA_REQUIRED,
             LoginStatus.ACCOUNT_WARNING,

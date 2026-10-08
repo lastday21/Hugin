@@ -241,6 +241,15 @@ def test_notification_collection_delivery_and_retry_are_idempotent(
                 )
                 == 2
             )
+            captcha_notifications = tuple(
+                session.scalars(
+                    select(NotificationModel).where(NotificationModel.event_type == "AUTH_REQUIRED")
+                )
+            )
+            assert all(
+                notification.payload["title"] == "Нужно пройти CAPTCHA на hh.ru"
+                for notification in captcha_notifications
+            )
             summary = session.scalar(
                 select(NotificationModel).where(NotificationModel.event_type == "DAILY_SUMMARY")
             )

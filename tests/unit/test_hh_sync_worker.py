@@ -106,7 +106,9 @@ class FakeLoginService:
             status=self.status,
         )
 
-    def observe_authentication(self, account_id: int, browser: object) -> SimpleNamespace:
+    def observe_authentication(
+        self, account_id: int, browser: object, *, open_login: bool = True
+    ) -> SimpleNamespace:
         assert account_id == 1
         assert isinstance(browser, FakeBrowser)
         type(self).observation_calls.append(account_id)
@@ -134,6 +136,9 @@ def prepare_handler(
         browser_lock=browser_lock,
     )
     monkeypatch.setattr(handler, "_tracked_vacancy_ids", lambda: ("101",))
+    if settings is None:
+        monkeypatch.setattr(handler, "_captcha_verification_urls", lambda: ())
+        monkeypatch.setattr(handler, "_protect_system", lambda _state: None)
     return handler
 
 
@@ -625,12 +630,93 @@ def test_captcha_recovery_only_observes_visible_browser(
         lambda: SystemState.CAPTCHA_REQUIRED,
     )
     monkeypatch.setattr(FakeLoginService, "status", LoginStatus.AUTHENTICATED)
+    monkeypatch.setattr(handler, "_captcha_verification_urls", lambda: (), raising=False)
     monkeypatch.setattr(handler, "_restore_after_authentication", lambda: True)
 
     assert handler.recover_authentication()
     assert FakeLoginService.authentication_calls == []
     assert FakeLoginService.observation_calls == [1]
     assert FakeBrowser.initialization_options[-1]["start_minimized"] is False
+
+
+@pytest.mark.parametrize("source_blocked", [True, False])
+@pytest.mark.parametrize("state", [SystemState.CAPTCHA_REQUIRED, SystemState.AUTH_REQUIRED])
+def test_captcha_recovery_checks_every_blocked_source_before_restoring(
+    monkeypatch: pytest.MonkeyPatch, source_blocked: bool, state: SystemState
+) -> None:
+    handler = prepare_handler(monkeypatch, AutomationJobKind.MESSAGES)
+    urls = ("https://hh.ru/search/vacancy?text=Python", "https://uchaly.hh.ru/vacancy/123")
+    opened: list[str] = []
+    restored: list[bool] = []
+    protected: list[SystemState] = []
+    monkeypatch.setattr(handler, "_protect_system", protected.append)
+    monkeypatch.setattr(handler, "_authentication_system_state", lambda: state)
+    monkeypatch.setattr(handler, "_captcha_verification_urls", lambda: urls, raising=False)
+    monkeypatch.setattr(
+        FakeBrowser, "open_verification", lambda _self, url: opened.append(url), raising=False
+    )
+    monkeypatch.setattr(
+        FakeBrowser, "authentication_status", lambda _self: LoginStatus.AUTHENTICATED, raising=False
+    )
+
+    def observe(
+        _self: object, account_id: int, browser: object, *, open_login: bool
+    ) -> SimpleNamespace:
+        assert account_id == 1 and isinstance(browser, FakeBrowser)
+        assert not open_login
+        blocked = source_blocked and opened[-1] == urls[-1]
+        return SimpleNamespace(
+            authenticated=not blocked,
+            status=LoginStatus.CAPTCHA_REQUIRED if blocked else LoginStatus.AUTHENTICATED,
+        )
+
+    monkeypatch.setattr(FakeLoginService, "observe_authentication", observe)
+
+    def restore() -> bool:
+        restored.append(True)
+        return True
+
+    monkeypatch.setattr(handler, "_restore_after_authentication", restore)
+    assert handler.recover_authentication() is not source_blocked
+    assert opened == [urls[0], urls[0], urls[1]] + ([] if source_blocked else [urls[1]])
+    assert restored == ([] if source_blocked else [True])
+    assert FakeLoginService.authentication_calls == (
+        [1] if state is SystemState.AUTH_REQUIRED else []
+    )
+    assert protected == (
+        [SystemState.CAPTCHA_REQUIRED]
+        if source_blocked and state is SystemState.AUTH_REQUIRED
+        else []
+    )
+
+
+def test_captcha_recovery_rechecks_source_after_authenticated_observation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    handler = prepare_handler(monkeypatch, AutomationJobKind.MESSAGES)
+    urls = ("https://hh.ru/vacancy/123", "https://hh.ru/vacancy/456")
+    opened: list[str] = []
+    monkeypatch.setattr(
+        handler, "_authentication_system_state", lambda: SystemState.CAPTCHA_REQUIRED
+    )
+    monkeypatch.setattr(handler, "_captcha_verification_urls", lambda: urls)
+    monkeypatch.setattr(
+        FakeBrowser, "open_verification", lambda _self, url: opened.append(url), raising=False
+    )
+    monkeypatch.setattr(
+        FakeBrowser,
+        "authentication_status",
+        lambda _self: LoginStatus.CAPTCHA_REQUIRED,
+        raising=False,
+    )
+    monkeypatch.setattr(FakeLoginService, "status", LoginStatus.AUTHENTICATED)
+    monkeypatch.setattr(
+        handler,
+        "_restore_after_authentication",
+        lambda: pytest.fail("Исходная страница остаётся заблокированной"),
+    )
+    assert not handler.recover_authentication()
+    assert opened == [urls[0], urls[0]]
 
 
 def test_recovery_promotes_real_account_warning_and_does_not_restore(

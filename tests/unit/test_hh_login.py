@@ -197,6 +197,17 @@ def test_observation_never_loads_or_submits_credentials() -> None:
     assert store.loaded_account_id is None
 
 
+@pytest.mark.parametrize("authenticated", [True, False])
+def test_source_observation_stays_on_current_page(authenticated: bool) -> None:
+    store = FakeStore(HhCredentials("person@example.com", "secret"))
+    browser = FakeBrowser(authenticated=authenticated)
+    result = HhLoginService(store).observe_authentication(3, browser, open_login=False)
+    assert result.authenticated is authenticated
+    assert not browser.opened
+    assert browser.submitted is None
+    assert store.loaded_account_id is None
+
+
 def test_account_warning_stops_authentication_without_credentials() -> None:
     store = FakeStore(HhCredentials("person@example.com", "secret"))
     browser = FakeBrowser(current_status=LoginStatus.ACCOUNT_WARNING)

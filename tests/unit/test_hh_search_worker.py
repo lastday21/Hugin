@@ -14,8 +14,9 @@ from hugin.domain import (
     AutomationJobResult,
     AutomationJobState,
 )
+from hugin.domain.hh_sync import HhSyncBlockedError, HhSyncRetryableError
 from hugin.services.hh_login import LoginResult, LoginStatus
-from hugin.workers.automation import AutomationJobBlocked, AutomationJobDeferred
+from hugin.workers.automation import AutomationJobBlocked, AutomationJobDeferred, AutomationJobRetry
 from hugin.workers.hh_search import HhSearchJobHandler
 
 
@@ -242,6 +243,39 @@ def test_search_handler_runs_cycle_after_successful_login(
         ),
         "profile_lock_timeout_seconds": 2.0,
     }
+
+
+def test_search_preserves_captcha_source_from_cycle(monkeypatch: pytest.MonkeyPatch) -> None:
+    handler, cycle, browsers, _ = prepare_handler(monkeypatch, LoginStatus.AUTHENTICATED)
+    url = "https://hh.ru/search/vacancy?text=Python&page=3"
+
+    def blocked(**_kwargs: object) -> AutomationJobResult:
+        raise HhSyncBlockedError("CAPTCHA_REQUIRED", "Проверка", verification_url=url)
+
+    monkeypatch.setattr(cycle, "run", blocked)
+    with pytest.raises(AutomationJobBlocked) as error:
+        handler(make_job())
+    assert error.value.code == "CAPTCHA_REQUIRED"
+    assert error.value.verification_url == url
+    assert browsers[0].exited
+
+
+def test_search_preserves_retry_reason_and_delay_after_login_browser_closes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    handler, cycle, browsers, _ = prepare_handler(monkeypatch, LoginStatus.AUTHENTICATED)
+
+    def authenticate(_self: FakeLoginService, _account: int, _browser: object) -> LoginResult:
+        raise HhSyncRetryableError("HH_BROWSER_CLOSED", "Браузер закрыт", retry_after_seconds=60)
+
+    monkeypatch.setattr(FakeLoginService, "authenticate", authenticate)
+    with pytest.raises(AutomationJobRetry) as raised:
+        handler(make_job(last_result={"page_index": 4, "next_step": "details"}))
+
+    assert raised.value.code == "HH_BROWSER_CLOSED"
+    assert raised.value.retry_after_seconds == 60
+    assert browsers[0].exited
+    assert not cycle.calls
 
 
 def test_search_forces_fresh_results_after_backlog_pass(

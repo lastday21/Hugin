@@ -77,6 +77,7 @@ class FakeScheduler:
         self.heartbeats: list[tuple[str, datetime | None]] = []
         self.heartbeat_seen = threading.Event()
         self.blocked: list[tuple[str, str, str, datetime | None]] = []
+        self.verification_urls: list[str | None] = []
         self.failed: list[tuple[str, str, str, datetime | None]] = []
         self.retry_delays: list[int | None] = []
         self.completed: list[tuple[str, AutomationJobResult, datetime | None]] = []
@@ -123,9 +124,11 @@ class FakeScheduler:
         *,
         error_code: str,
         error_message: str,
+        verification_url: str | None = None,
         now: datetime | None = None,
     ) -> None:
         self.blocked.append((job_key, error_code, error_message, now))
+        self.verification_urls.append(verification_url)
 
     def fail(
         self,
@@ -429,7 +432,11 @@ def test_worker_blocks_job_when_handler_reports_required_action(
     database = patch_worker_storage(monkeypatch, scheduler)
 
     def blocked(_job: AutomationJobRecord) -> AutomationJobResult:
-        raise AutomationJobBlocked("  CAPTCHA_REQUIRED  ", "Пройдите проверку")
+        raise AutomationJobBlocked(
+            "  CAPTCHA_REQUIRED  ",
+            "Пройдите проверку",
+            verification_url="https://hh.ru/vacancy/123",
+        )
 
     worker = AutomationWorker(
         Settings(environment="test", data_dir=tmp_path),
@@ -438,6 +445,7 @@ def test_worker_blocks_job_when_handler_reports_required_action(
 
     assert worker.run_once(now)
     assert scheduler.blocked == [(job.key, "CAPTCHA_REQUIRED", "Пройдите проверку", now)]
+    assert scheduler.verification_urls == ["https://hh.ru/vacancy/123"]
     assert not scheduler.failed
     assert not scheduler.completed
     assert database.closed
@@ -547,6 +555,11 @@ def test_worker_defers_search_without_recording_failure(
             "continuation": False,
             "cursor_details_before": 3002,
             "round_complete": True,
+            "search_coverage": '{"variants":[{"depth":{"page":4}}]}',
+            "coverage_complete": False,
+            "coverage_from_at": "2026-06-26T08:00:00+00:00",
+            "coverage_completed_at": None,
+            "coverage_next_page": 4,
         },
     ],
 )

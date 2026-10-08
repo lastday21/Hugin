@@ -237,6 +237,8 @@ class NotificationService:
                 title=(
                     "Предупреждение аккаунта hh.ru"
                     if job_event_type == "ACCOUNT_WARNING"
+                    else "Нужно пройти CAPTCHA на hh.ru"
+                    if error_code == "CAPTCHA_REQUIRED"
                     else "Нужно восстановить вход в hh.ru"
                 ),
                 body=(representative.last_error_message or "Откройте Hugin и завершите проверку."),

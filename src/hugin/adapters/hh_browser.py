@@ -163,6 +163,20 @@ def _is_temporary_navigation_error(error: PlaywrightError) -> bool:
     )
 
 
+def _close_browser_resource(close: Callable[[], None]) -> None:
+    try:
+        close()
+    except PlaywrightError as error:
+        if not any(
+            marker in str(error)
+            for marker in (
+                "Target page, context or browser has been closed",
+                "Connection closed while reading from the driver",
+            )
+        ):
+            raise
+
+
 _FORM_ATTACHMENT_WARNING = "Форма содержит загрузку файла"
 _FORM_EXTERNAL_LINK_WARNING = "Форма содержит внешнюю ссылку"
 _FORM_TEST_ASSIGNMENT_WARNING = "Форма содержит тестовое или испытательное задание"
@@ -210,6 +224,36 @@ PROFILE_SNAPSHOT_SCRIPT = """
         lastName: fieldValue('lastName'),
         resumes,
     };
+}
+"""
+
+VACANCY_SEARCH_READY_SCRIPT = """
+() => {
+    const results = document.querySelector('[data-qa="vacancy-serp__results"]');
+    if (!results) return false;
+    const fiberKey = Object.keys(results).find((key) => key.startsWith('__reactFiber$'));
+    let fiber = fiberKey ? results[fiberKey] : null;
+    for (let level = 0; fiber && level < 40; level += 1, fiber = fiber.return) {
+        const vacancies = fiber.memoizedProps?.vacancySearchResult?.vacancies;
+        if (!Array.isArray(vacancies)) continue;
+        const renderedIds = new Set(Array.from(
+            results.querySelectorAll('[data-qa="serp-item__title"]')
+        ).map((link) => {
+            try {
+                return new URL(link.href, window.location.href).pathname
+                    .match(/\\/vacancy\\/(\\d+)/)?.[1] || '';
+            } catch {
+                return '';
+            }
+        }));
+        if (!vacancies.length) return renderedIds.size === 0;
+        return vacancies.every((vacancy) => {
+            if (!vacancy || typeof vacancy !== 'object') return false;
+            const id = String(vacancy.vacancyId || '');
+            return id && renderedIds.has(id);
+        });
+    }
+    return false;
 }
 """
 
@@ -1718,11 +1762,11 @@ class VisibleHhBrowser:
     ) -> None:
         try:
             if self._context is not None:
-                self._context.close()
+                _close_browser_resource(self._context.close)
         finally:
             try:
                 if self._playwright is not None:
-                    self._playwright.stop()
+                    _close_browser_resource(self._playwright.stop)
             finally:
                 self._context = None
                 self._page = None
@@ -1764,6 +1808,13 @@ class VisibleHhBrowser:
                 except PlaywrightError as followup_error:
                     error = followup_error
                     message = str(followup_error)
+            if "Target page, context or browser has been closed" in message:
+                raise HhSyncRetryableError(
+                    "HH_BROWSER_CLOSED",
+                    "Браузер hh.ru закрыт до завершения входа; "
+                    "фоновая проверка будет повторена автоматически",
+                    retry_after_seconds=_NETWORK_RETRY_SECONDS,
+                ) from error
             if _is_temporary_navigation_error(error):
                 raise HhSyncRetryableError(
                     "HH_NETWORK_TIMEOUT",
@@ -1844,11 +1895,20 @@ class VisibleHhBrowser:
         url = f"{self._search_url}{separator}{urlencode(parameters)}"
 
         page = self._require_page()
-        page.goto(url, wait_until="domcontentloaded")
-        page.locator('[data-qa="vacancies-search-header"]').first.wait_for(
-            state="visible",
-            timeout=self._timeout_ms,
-        )
+        try:
+            page.goto(url, wait_until="domcontentloaded")
+            self._raise_for_captcha(page, verification_url=url)
+            page.locator('[data-qa="vacancies-search-header"]').first.wait_for(
+                state="visible",
+                timeout=self._timeout_ms,
+            )
+            page.wait_for_function(
+                VACANCY_SEARCH_READY_SCRIPT, timeout=self._timeout_ms, polling=100
+            )
+            self._raise_for_captcha(page, verification_url=url)
+        except PlaywrightTimeoutError:
+            self._raise_for_captcha(page, verification_url=url)
+            raise
         payload = page.evaluate(VACANCY_SEARCH_SCRIPT)
         if not isinstance(payload, dict):
             raise RuntimeError("hh.ru вернул некорректные результаты поиска")
@@ -1892,6 +1952,7 @@ class VisibleHhBrowser:
         page = self._require_page()
         try:
             response = page.goto(normalized_url, wait_until="domcontentloaded")
+            self._raise_for_captcha(page, verification_url=normalized_url)
             payload = page.evaluate(VACANCY_DETAILS_SCRIPT)
             availability = self._vacancy_availability(response, payload)
             if availability is VacancyAvailability.ACTIVE and self._vacancy_is_closed(
@@ -1905,6 +1966,7 @@ class VisibleHhBrowser:
                 state="visible",
                 timeout=self._timeout_ms,
             )
+            self._raise_for_captcha(page, verification_url=normalized_url)
             payload = page.evaluate(VACANCY_DETAILS_SCRIPT)
             availability = self._vacancy_availability(response, payload)
             if availability is VacancyAvailability.ACTIVE and self._vacancy_is_closed(
@@ -1915,6 +1977,7 @@ class VisibleHhBrowser:
             if availability is not VacancyAvailability.ACTIVE:
                 raise VacancyUnavailableError(vacancy_id, normalized_url, availability)
         except PlaywrightTimeoutError as error:
+            self._raise_for_captcha(page, verification_url=normalized_url)
             raise RuntimeError(f"Страница вакансии {vacancy_id} не загрузилась") from error
         if not isinstance(payload, dict):
             raise RuntimeError("hh.ru вернул некорректные подробности вакансии")
@@ -1962,6 +2025,38 @@ class VisibleHhBrowser:
             availability=availability,
             published_at=self._date_time(self._optional_string(payload, "publishedAt")),
         )
+
+    def _has_captcha(self, page: Page) -> bool:
+        return urlparse(page.url).path.rstrip("/") == "/account/captcha" or self._any_present(
+            page, _CAPTCHA_SELECTOR
+        )
+
+    def _raise_for_captcha(self, page: Page, *, verification_url: str) -> None:
+        if self._has_captcha(page):
+            raise HhSyncBlockedError(
+                "CAPTCHA_REQUIRED",
+                "hh.ru запросил проверку; пройдите CAPTCHA в браузере Hugin",
+                verification_url=verification_url,
+            )
+
+    def open_verification(self, url: str) -> None:
+        self._validate_verification_url(url)
+        page = self._require_page()
+        page.goto(url, wait_until="domcontentloaded")
+        self._validate_verification_url(page.url)
+
+    @staticmethod
+    def _validate_verification_url(url: str) -> None:
+        parsed = urlparse(url)
+        hostname = parsed.hostname or ""
+        if (
+            parsed.scheme != "https"
+            or not (hostname == "hh.ru" or hostname.endswith(".hh.ru"))
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.port not in (None, 443)
+        ):
+            raise ValueError("Адрес проверки должен принадлежать hh.ru и использовать HTTPS")
 
     def read_resume_details(self, resume_id: str) -> HhResumeDetails:
         if not resume_id or len(resume_id) > 64 or re.fullmatch(r"[A-Za-z0-9]+", resume_id) is None:
@@ -3812,7 +3907,7 @@ class VisibleHhBrowser:
         is_hh = hostname == "hh.ru" or hostname.endswith(".hh.ru")
         if not is_hh or "/account/login" in parsed_url.path:
             return False
-        if self._any_present(page, _CAPTCHA_SELECTOR):
+        if self._has_captcha(page):
             return False
         if self._any_present(page, _CONFIRMATION_CODE_SELECTOR):
             return False
@@ -3944,7 +4039,7 @@ class VisibleHhBrowser:
     def _classify(self, page: Page) -> LoginStatus:
         if self.has_account_warning():
             return LoginStatus.ACCOUNT_WARNING
-        if self._any_present(page, _CAPTCHA_SELECTOR):
+        if self._has_captcha(page):
             return LoginStatus.CAPTCHA_REQUIRED
         if self._any_present(page, _CONFIRMATION_CODE_SELECTOR):
             return LoginStatus.CONFIRMATION_REQUIRED

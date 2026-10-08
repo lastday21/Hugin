@@ -47,6 +47,7 @@ from hugin.domain.automation import AutomationJobKind, AutomationJobState
 from hugin.domain.communications import CommunicationNotFoundError, CommunicationStateError
 from hugin.domain.content import RecruiterMessageState
 from hugin.domain.hh import HhFormReviewStatus
+from hugin.domain.hh_sync import HhSyncRetryableError
 from hugin.domain.vacancies import VacancyAvailability
 from hugin.services.application_automation import ApplicationAutomationService
 from hugin.services.automation import AutomationSchedulerService
@@ -193,22 +194,45 @@ class DesktopBridge:
             ) as browser,
         ):
             try:
-                browser.open_login()
+                urls = self._captcha_verification_urls()
+                if urls:
+                    browser.open_verification(urls[0])
+                else:
+                    browser.open_login()
                 while browser.is_open():
                     status = browser.authentication_status()
                     if status is LoginStatus.AUTHENTICATED:
-                        self._resume_after_hh_login()
-                        return self._result("READY", "Вход в hh.ru выполнен")
+                        for url in urls:
+                            browser.open_verification(url)
+                            status = browser.authentication_status()
+                            if status is not LoginStatus.AUTHENTICATED:
+                                break
+                        if status is LoginStatus.AUTHENTICATED:
+                            self._resume_after_hh_login()
+                            return self._result("READY", "Вход в hh.ru выполнен")
                     if status is LoginStatus.ACCOUNT_WARNING:
                         return self._result(
                             "ACCOUNT_WARNING",
                             "hh.ru показал предупреждение безопасности аккаунта",
                         )
                     browser.wait_for_authentication()
+            except HhSyncRetryableError as error:
+                if error.code != "HH_BROWSER_CLOSED":
+                    raise
             except PlaywrightError:
                 if not browser.is_closed():
                     raise
         return self._result("CANCELLED", "Окно hh.ru закрыто до завершения входа")
+
+    def _captcha_verification_urls(self) -> tuple[str, ...]:
+        database = create_database(self._settings)
+        try:
+            with database.sessions.begin() as session:
+                return AutomationSchedulerService(session).captcha_verification_urls(
+                    self._account_id
+                )
+        finally:
+            database.close()
 
     def _resume_after_hh_login(self) -> None:
         upgrade_database(self._settings)

@@ -8,13 +8,15 @@ from hugin.adapters.hh_browser import VisibleHhBrowser
 from hugin.core.settings import Settings
 from hugin.database import create_database
 from hugin.domain.automation import AutomationJobKind, AutomationJobRecord, AutomationJobResult
+from hugin.domain.hh_sync import HhSyncBlockedError, HhSyncRetryableError
 from hugin.services.background_processes import BackgroundProcessService
 from hugin.services.hh_login import HhLoginService, LoginStatus
-from hugin.services.incremental_search import IncrementalSearchCycle
+from hugin.services.period_search import PeriodSearchCycle
 from hugin.services.search_cycle import BackgroundSearchCycle
 from hugin.workers.automation import (
     AutomationJobBlocked,
     AutomationJobDeferred,
+    AutomationJobRetry,
     background_browser_access,
 )
 
@@ -41,7 +43,7 @@ class HhSearchJobHandler:
         self._browser_lock = browser_lock or threading.Lock()
         self._application_work_pending = application_work_pending
         self._incremental = incremental
-        cycle = IncrementalSearchCycle if incremental else BackgroundSearchCycle
+        cycle = PeriodSearchCycle if incremental else BackgroundSearchCycle
         self._cycle = cycle(
             settings,
             page_limit=settings.hh_background_search_pages,
@@ -98,7 +100,7 @@ class HhSearchJobHandler:
                         login.status.value.upper(),
                         self._login_message(login.status),
                     )
-                if isinstance(self._cycle, IncrementalSearchCycle):
+                if isinstance(self._cycle, PeriodSearchCycle):
                     return self._cycle.run(
                         account_id=self._account_id,
                         search_query_id=job.search_query_id,
@@ -112,6 +114,16 @@ class HhSearchJobHandler:
                     browser=browser,
                     prefer_fresh_search=job.last_result.get("backlog_processed") is True,
                 )
+        except HhSyncBlockedError as error:
+            raise AutomationJobBlocked(
+                error.code, str(error), verification_url=error.verification_url
+            ) from error
+        except HhSyncRetryableError as error:
+            raise AutomationJobRetry(
+                error.code,
+                str(error),
+                retry_after_seconds=error.retry_after_seconds,
+            ) from error
         except RuntimeError as error:
             if "Профиль hh.ru занят другой задачей" not in str(error):
                 raise

@@ -186,6 +186,18 @@ def main() -> None:
         assert state["synchronization"]["status_interval_minutes"] == 120
         page.get_by_text("Последнее чтение выдачи hh.ru", exact=True).click()
         expect(page.locator(".process-search dd").filter(has_text="Неизвестно")).to_have_count(1)
+        state["last_search"].update(
+            coverage_from_at="2026-08-10T05:00:00Z",
+            coverage_complete=False,
+            coverage_completed_at=None,
+            coverage_next_page=4,
+            search_kind="depth",
+        )
+        page.reload()
+        page.get_by_text("Расписание проверок и общий остаток вакансий", exact=True).click()
+        page.get_by_text("Последнее чтение выдачи hh.ru", exact=True).click()
+        expect(page.get_by_text("Сохранено: страница 4", exact=True)).to_be_visible()
+        expect(page.get_by_text("Продолжение обхода", exact=True)).to_be_visible()
         reject_next = True
         page.get_by_role("switch", name="Отклики", exact=True).click()
         expect(page.get_by_role("alert")).to_contain_text("требует действия пользователя")

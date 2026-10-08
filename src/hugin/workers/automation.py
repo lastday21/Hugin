@@ -34,9 +34,10 @@ AUTHENTICATION_RECOVERY_STATES = frozenset(
 
 
 class AutomationJobBlocked(RuntimeError):
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(self, code: str, message: str, *, verification_url: str | None = None) -> None:
         super().__init__(message)
         self.code = code.strip()[:64] or "AUTOMATION_BLOCKED"
+        self.verification_url = verification_url
 
 
 class AutomationJobRetry(RuntimeError):
@@ -277,10 +278,16 @@ class AutomationWorker:
                             "message_baseline_initialized",
                             "coverage_exhausted",
                             "coverage_page_limit",
+                            "coverage_complete",
+                            "coverage_from_at",
+                            "coverage_completed_at",
+                            "coverage_next_page",
                             "exhausted_mask",
                             "cursor_backlog_before",
                             "fresh_search_at",
                             "fresh_search_configuration",
+                            "search_coverage",
+                            "fresh_sweep_started_at",
                         }
                     },
                     "deferred": True,
@@ -300,6 +307,7 @@ class AutomationWorker:
                         job.key,
                         error_code=error.code,
                         error_message=str(error),
+                        verification_url=error.verification_url,
                         now=now,
                     )
                 run.block(error_code=error.code, error_message=str(error))

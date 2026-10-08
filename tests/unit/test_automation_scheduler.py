@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -31,6 +33,7 @@ from hugin.repositories import (
 )
 from hugin.repositories.automation import search_configuration_key
 from hugin.services.application_automation import ApplicationAutomationService
+from hugin.services.application_selection_gate import ApplicationSelectionGate
 from hugin.services.automation import AutomationSchedulerService
 
 pytestmark = pytest.mark.integration
@@ -200,7 +203,7 @@ def test_scheduler_processes_the_oldest_due_search_without_direction_starvation(
         database.close()
 
 
-@pytest.mark.parametrize("reason", ["new_day", "changed_query"])
+@pytest.mark.parametrize("reason", ["new_day", "changed_query", "page_contract"])
 def test_today_fresh_search_is_due_before_older_depth_continuation(
     settings: Settings, reason: str
 ) -> None:
@@ -233,6 +236,18 @@ def test_today_fresh_search_is_due_before_older_depth_continuation(
             }
             if reason == "changed_query":
                 fresh_model.query = "Другой запрос"
+            elif reason == "page_contract":
+                old_payload = {
+                    name: getattr(fresh_model, name)
+                    for name in ("query", "area", "filters", "regions", "work_formats")
+                }
+                old_payload["page_contract"] = "complete_cards_v2"
+                fresh_job.last_result = {
+                    **fresh_job.last_result,
+                    "fresh_search_configuration": hashlib.sha256(
+                        json.dumps(old_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+                    ).hexdigest(),
+                }
             fresh_job.next_run_at = now + timedelta(hours=2)
             deeper_job.last_result = {
                 "continuation": True,
@@ -241,11 +256,33 @@ def test_today_fresh_search_is_due_before_older_depth_continuation(
             }
             deeper_job.next_run_at = yesterday
             session.flush()
+            assert ApplicationSelectionGate(session).fresh_search_pending(account_id, now)
             jobs = scheduler.ensure_configured_jobs(account_id, now)
             refreshed = next(job for job in jobs if job.key == fresh_job.key)
             assert refreshed.next_run_at == now
             claimed = scheduler.claim_due(now, allowed_kinds=(AutomationJobKind.SEARCH,))
             assert claimed is not None and claimed.key == fresh_job.key
+            previous_fresh = fresh_job.last_result["fresh_search_at"]
+            previous_configuration = fresh_job.last_result["fresh_search_configuration"]
+            partial = scheduler.complete(claimed.key, {"continuation": True}, now)
+            assert partial.last_result["fresh_search_at"] == previous_fresh
+            assert partial.last_result["fresh_search_configuration"] == previous_configuration
+            assert ApplicationSelectionGate(session).fresh_search_pending(account_id, now)
+
+            refreshed_at = now + timedelta(seconds=16)
+            claimed = scheduler.claim_due(refreshed_at, allowed_kinds=(AutomationJobKind.SEARCH,))
+            assert claimed is not None and claimed.key == fresh_job.key
+            finished = scheduler.complete(
+                claimed.key,
+                {"continuation": True, "fresh_search_at": refreshed_at.isoformat()},
+                refreshed_at,
+            )
+            assert finished.last_result["fresh_search_configuration"] == search_configuration_key(
+                fresh_model
+            )
+            assert not ApplicationSelectionGate(session).fresh_search_pending(
+                account_id, refreshed_at
+            )
     finally:
         database.close()
 
@@ -410,6 +447,63 @@ def test_due_job_is_claimed_by_only_one_transaction(settings: Settings) -> None:
     finally:
         first_session.close()
         second_session.close()
+        database.close()
+
+
+def test_captcha_source_preserves_progress_and_is_scoped_to_account(settings: Settings) -> None:
+    from hugin.workers.hh_sync import HhSyncJobHandler
+
+    account_id, _ = seed_search_query(settings)
+    database = create_database(settings)
+    now = datetime(2026, 10, 4, tzinfo=UTC)
+    url = "https://hh.ru/search/vacancy?text=Python&page=3"
+    progress = {"search_coverage": "saved-coverage", "page_index": 3}
+    try:
+        with database.sessions.begin() as session:
+            other = AccountRepository(session).create("Другой", "captcha-other")
+            scheduler = AutomationSchedulerService(session)
+            own, duplicate = scheduler.ensure_account_jobs(account_id, now)
+            foreign, _ = scheduler.ensure_account_jobs(other.id, now)
+            model = session.get(AutomationJobModel, own.key)
+            assert model is not None
+            model.last_result = dict(progress)
+            for job, source in (
+                (own, url),
+                (duplicate, url),
+                (foreign, "https://hh.ru/vacancy/456"),
+            ):
+                scheduler.block(
+                    job.key,
+                    error_code="CAPTCHA_REQUIRED",
+                    error_message="Проверка",
+                    verification_url=source,
+                    now=now,
+                )
+            scheduler.disable(duplicate.key, now)
+        handler = HhSyncJobHandler(settings, AutomationJobKind.MESSAGES, account_id=account_id)
+        assert handler._captcha_verification_urls() == (url,)
+        with database.sessions.begin() as session:
+            scheduler = AutomationSchedulerService(session)
+            own = next(j for j in scheduler.list_for_account(account_id) if j.key == own.key)
+            assert own.last_result == {**progress, "verification_url": url}
+            SystemStateRepository(session).transition(SystemState.PAUSED)
+            restored = scheduler.unblock(own.key, now)
+            assert restored.last_result == progress
+        assert handler._captcha_verification_urls() == (url,)
+        with database.sessions.begin() as session:
+            scheduler = AutomationSchedulerService(session)
+            scheduler.enable(duplicate.key, now)
+            scheduler.block(
+                duplicate.key, error_code="AUTH_REQUIRED", error_message="Вход", now=now
+            )
+            assert (
+                "verification_url"
+                not in next(
+                    j for j in scheduler.list_for_account(account_id) if j.key == duplicate.key
+                ).last_result
+            )
+        assert handler._captcha_verification_urls() == ()
+    finally:
         database.close()
 
 

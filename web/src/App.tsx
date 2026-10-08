@@ -656,6 +656,18 @@ export default function App() {
         </header>
 
         <main className="main-content">
+          {workspace?.dashboard?.system_state === "CAPTCHA_REQUIRED" && view !== "dashboard" && (
+            <div className="data-warning" role="alert">
+              <AlertTriangle size={20} aria-hidden="true" />
+              <div>
+                <strong>Нужно пройти CAPTCHA на hh.ru</strong>
+                <span>Откройте главную и завершите проверку в браузере Hugin.</span>
+              </div>
+              <button type="button" className="text-button" onClick={() => setView("dashboard")}>
+                Открыть проверку
+              </button>
+            </div>
+          )}
           {error && (
             <div className="data-warning" role="alert">
               <AlertTriangle size={20} aria-hidden="true" />
@@ -959,7 +971,7 @@ function DashboardView({
               {signingInToHh
                 ? "Ожидаем вход…"
                 : dashboard.system_state === "CAPTCHA_REQUIRED"
-                  ? "Продолжить на hh.ru"
+                  ? "Пройти CAPTCHA на hh.ru"
                   : "Войти на hh.ru"}
             </button>
           )}
@@ -1201,8 +1213,8 @@ function systemPresentation(dashboard: Dashboard, processes: BackgroundProcesses
       };
     case "CAPTCHA_REQUIRED":
       return {
-        title: "Нужно подтверждение на hh.ru",
-        description: "Откройте hh.ru и пройдите проверку — Hugin продолжит работу сам",
+        title: "Нужно пройти CAPTCHA на hh.ru",
+        description: "Нажмите «Пройти CAPTCHA на hh.ru» и завершите проверку в браузере Hugin. После проверки Hugin восстановит прежний режим работы.",
         tone: "warning",
         icon: AlertTriangle,
       };

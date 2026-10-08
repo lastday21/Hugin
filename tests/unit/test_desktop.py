@@ -231,6 +231,10 @@ def test_bridge_opens_manual_hh_login_and_restores_work(
             assert account_id == 1
             return [blocked_job]
 
+        def captcha_verification_urls(self, account_id: int) -> tuple[str, ...]:
+            assert account_id == 1
+            return ()
+
         def unblock(self, key: str) -> None:
             events.append(("unblocked", key))
 
@@ -255,12 +259,81 @@ def test_bridge_opens_manual_hh_login_and_restores_work(
     ]
 
 
+@pytest.mark.parametrize("resolve", [False, True])
+def test_manual_login_checks_every_captcha_source_before_restoring_work(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    resolve: bool,
+) -> None:
+    urls = ("https://hh.ru/search/vacancy?text=Python", "https://hh.ru/vacancy/101")
+    events: list[object] = []
+
+    class LoginBrowser:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            self.open = True
+            self.url = ""
+            self.resolved = False
+
+        def __enter__(self) -> LoginBrowser:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            self.open = False
+
+        def open_login(self) -> None:
+            events.append("login")
+            self.url = "login"
+
+        def open_verification(self, url: str) -> None:
+            events.append(url)
+            self.url = url
+
+        def is_open(self) -> bool:
+            return self.open
+
+        def is_closed(self) -> bool:
+            return not self.open
+
+        def authentication_status(self) -> LoginStatus:
+            return (
+                LoginStatus.CAPTCHA_REQUIRED
+                if self.url == urls[1] and not self.resolved
+                else LoginStatus.AUTHENTICATED
+            )
+
+        def wait_for_authentication(self) -> bool:
+            events.append("wait")
+            if resolve:
+                self.resolved = True
+            else:
+                self.open = False
+            return resolve
+
+    monkeypatch.setattr(desktop, "VisibleHhBrowser", LoginBrowser)
+    monkeypatch.setattr(
+        desktop.DesktopBridge, "_captcha_verification_urls", lambda _self: urls, raising=False
+    )
+    monkeypatch.setattr(
+        desktop.DesktopBridge, "_resume_after_hh_login", lambda _self: events.append("resumed")
+    )
+    bridge = desktop.DesktopBridge(Settings(environment="test", data_dir=tmp_path))
+    result = bridge.login_hh()
+    assert "login" not in events
+    assert "wait" in events
+    assert result["status"] == ("READY" if resolve else "CANCELLED")
+    assert ("resumed" in events) is resolve
+    if resolve:
+        assert events[-3:] == [urls[0], urls[1], "resumed"]
+
+
 @pytest.mark.parametrize("warning", [False, True])
 def test_manual_login_cancel_or_account_warning_never_resumes_work(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     warning: bool,
 ) -> None:
+    monkeypatch.setattr(desktop.DesktopBridge, "_captcha_verification_urls", lambda _self: ())
+
     class LoginBrowser:
         def __init__(self, *_args: object, **_kwargs: object) -> None:
             self.open = True
@@ -308,6 +381,7 @@ def test_manual_login_handles_browser_closing_during_operation(
     stage: str,
     closed: bool,
 ) -> None:
+    monkeypatch.setattr(desktop.DesktopBridge, "_captcha_verification_urls", lambda _self: ())
     failure = PlaywrightError("Target page, context or browser has been closed")
 
     class LoginBrowser:

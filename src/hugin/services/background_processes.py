@@ -613,6 +613,11 @@ class BackgroundProcessService:
                     "found": result.get("observed_found"),
                     "coverage_exhausted": result.get("coverage_exhausted"),
                     "coverage_page_limit": result.get("coverage_page_limit"),
+                    "coverage_complete": result.get("coverage_complete"),
+                    "coverage_from_at": result.get("coverage_from_at"),
+                    "coverage_completed_at": result.get("coverage_completed_at"),
+                    "coverage_next_page": result.get("coverage_next_page"),
+                    "search_kind": result.get("observed_search_kind"),
                     "job_key": job.key,
                 }
             )

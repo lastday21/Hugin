@@ -33,7 +33,7 @@ from hugin.services.autonomous_replies import (
 )
 from hugin.services.background_processes import BackgroundProcessService
 from hugin.services.communications import CommunicationService
-from hugin.services.hh_login import HhLoginService, LoginStatus
+from hugin.services.hh_login import HhLoginService, LoginResult, LoginStatus
 from hugin.services.hh_sync import HhSynchronizationService
 from hugin.workers.automation import (
     AutomationJobBlocked,
@@ -192,7 +192,9 @@ class HhSyncJobHandler:
             return self._synchronize_statuses(statuses)
         except HhSyncBlockedError as error:
             self._protect_system(self._system_state_from_code(error.code))
-            raise AutomationJobBlocked(error.code, str(error)) from error
+            raise AutomationJobBlocked(
+                error.code, str(error), verification_url=error.verification_url
+            ) from error
         except HhSyncRetryableError as error:
             raise AutomationJobRetry(
                 error.code,
@@ -251,11 +253,17 @@ class HhSyncJobHandler:
                 ),
             ) as browser:
                 login_service = HhLoginService(WindowsCredentialStore())
-                login = (
-                    login_service.observe_authentication(self._account_id, browser)
-                    if system_state is SystemState.CAPTCHA_REQUIRED
-                    else login_service.authenticate(self._account_id, browser)
-                )
+                urls = self._captcha_verification_urls()
+                if system_state is SystemState.CAPTCHA_REQUIRED and urls:
+                    login = self._observe_captcha_sources(login_service, browser, urls)
+                else:
+                    login = (
+                        login_service.observe_authentication(self._account_id, browser)
+                        if system_state is SystemState.CAPTCHA_REQUIRED
+                        else login_service.authenticate(self._account_id, browser)
+                    )
+                    if login.authenticated and urls:
+                        login = self._observe_captcha_sources(login_service, browser, urls)
                 if login.status is LoginStatus.ACCOUNT_WARNING:
                     self._protect_system(SystemState.ACCOUNT_WARNING)
                     return False
@@ -267,6 +275,30 @@ class HhSyncJobHandler:
             return self._restore_after_authentication()
         finally:
             self._browser_lock.release()
+
+    def _observe_captcha_sources(
+        self, service: HhLoginService, browser: VisibleHhBrowser, urls: tuple[str, ...]
+    ) -> LoginResult:
+        for url in urls:
+            browser.open_verification(url)
+            login = service.observe_authentication(self._account_id, browser, open_login=False)
+            if not login.authenticated:
+                return login
+            browser.open_verification(url)
+            login = LoginResult(browser.authentication_status())
+            if not login.authenticated:
+                return login
+        return login
+
+    def _captcha_verification_urls(self) -> tuple[str, ...]:
+        database = create_database(self._settings)
+        try:
+            with database.sessions() as session:
+                return AutomationSchedulerService(session).captcha_verification_urls(
+                    self._account_id
+                )
+        finally:
+            database.close()
 
     def _authentication_system_state(self) -> SystemState:
         database = create_database(self._settings)

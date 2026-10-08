@@ -35,6 +35,8 @@ def search_configuration_key(query: DirectionSearchQueryModel) -> str:
         name: getattr(query, name)
         for name in ("query", "area", "filters", "regions", "work_formats")
     }
+    payload["page_contract"] = "complete_cards_v2"
+    payload["fresh_contract"] = "all_variants_v1"
     return hashlib.sha256(
         json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
     ).hexdigest()
@@ -273,6 +275,7 @@ class AutomationJobRepository:
         model.last_error_message = None
         previous_result = model.last_result
         model.last_result = dict(result or {})
+        model.last_result.pop("verification_url", None)
         if model.kind is AutomationJobKind.SEARCH:
             for key in (
                 "completed_search_at",
@@ -286,6 +289,7 @@ class AutomationJobRepository:
             if (
                 query is not None
                 and result
+                and result.get("fresh_search_at") is not None
                 and result.get("fresh_search_at") != previous_result.get("fresh_search_at")
                 and previous_result.get("running_search_configuration")
                 == search_configuration_key(query)
@@ -355,6 +359,7 @@ class AutomationJobRepository:
         *,
         error_code: str,
         error_message: str,
+        verification_url: str | None = None,
         now: datetime | None = None,
     ) -> AutomationJobRecord:
         blocked_at = as_utc(now or datetime.now(UTC))
@@ -372,6 +377,11 @@ class AutomationJobRepository:
         model.heartbeat_at = blocked_at
         model.last_error_code = self._error_code(error_code)
         model.last_error_message = self._error_message(error_message)
+        result = dict(model.last_result)
+        result.pop("verification_url", None)
+        if verification_url is not None:
+            result["verification_url"] = verification_url
+        model.last_result = result
         model.updated_at = blocked_at
         self._session.flush()
         return _job_record(model)
@@ -390,6 +400,9 @@ class AutomationJobRepository:
         model.consecutive_failures = 0
         model.last_error_code = None
         model.last_error_message = None
+        result = dict(model.last_result)
+        result.pop("verification_url", None)
+        model.last_result = result
         model.updated_at = unblocked_at
         self._session.flush()
         return _job_record(model)

@@ -196,6 +196,20 @@ class AutomationSchedulerService:
     def list_for_account(self, account_id: int) -> tuple[AutomationJobRecord, ...]:
         return self._jobs.list_for_account(account_id)
 
+    def captcha_verification_urls(self, account_id: int) -> tuple[str, ...]:
+        urls: dict[str, None] = {}
+        for job in self.list_for_account(account_id):
+            if (
+                job.state in {AutomationJobState.BLOCKED, AutomationJobState.DISABLED}
+                and (job.last_error_code or "").strip().upper() == "CAPTCHA_REQUIRED"
+            ):
+                url = job.last_result.get("verification_url")
+                if url is not None:
+                    if not isinstance(url, str) or not url.strip():
+                        raise ValueError("Некорректный адрес проверки hh.ru")
+                    urls[url] = None
+        return tuple(urls)
+
     def claim_due(
         self,
         now: datetime | None = None,
@@ -330,12 +344,14 @@ class AutomationSchedulerService:
         *,
         error_code: str,
         error_message: str,
+        verification_url: str | None = None,
         now: datetime | None = None,
     ) -> AutomationJobRecord:
         blocked = self._jobs.block(
             job_key,
             error_code=error_code,
             error_message=error_message,
+            verification_url=verification_url,
             now=self._now(now),
         )
         self._protect_system(error_code)

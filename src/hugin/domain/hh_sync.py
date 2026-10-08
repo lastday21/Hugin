@@ -7,9 +7,10 @@ from hugin.domain.content import MessageDirection
 
 
 class HhSyncBlockedError(RuntimeError):
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(self, code: str, message: str, *, verification_url: str | None = None) -> None:
         super().__init__(message)
         self.code = code
+        self.verification_url = verification_url
 
 
 class HhSyncRetryableError(RuntimeError):

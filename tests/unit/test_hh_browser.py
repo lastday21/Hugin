@@ -205,6 +205,9 @@ class FakePage:
         self.load_state_error: Error | None = None
         self.load_state_callback: Callable[[], None] | None = None
         self.load_state_calls: list[tuple[str, int]] = []
+        self.function_waits: list[tuple[str, int, int]] = []
+        self.function_wait_callback: Callable[[], None] | None = None
+        self.function_wait_error: Error | None = None
         self.window_probe_error: Error | None = None
         self.closed = False
         self.route_handler: Callable[[object, object], None] | None = None
@@ -244,6 +247,13 @@ class FakePage:
 
     def set_default_timeout(self, timeout: int) -> None:
         self.timeout = timeout
+
+    def wait_for_function(self, expression: str, *, timeout: int, polling: int) -> None:
+        self.function_waits.append((expression, timeout, polling))
+        if self.function_wait_error is not None:
+            raise self.function_wait_error
+        if self.function_wait_callback is not None:
+            self.function_wait_callback()
 
     def set_default_navigation_timeout(self, timeout: int) -> None:
         self.navigation_timeout = timeout
@@ -565,7 +575,7 @@ def test_closed_page_during_aborted_login_redirect_is_retried(tmp_path: Path) ->
     with pytest.raises(HhSyncRetryableError) as error:
         make_browser(page, tmp_path).open_login()
 
-    assert error.value.code == "HH_NETWORK_TIMEOUT"
+    assert error.value.code == "HH_BROWSER_CLOSED"
     assert error.value.retry_after_seconds == browser_module._NETWORK_RETRY_SECONDS
 
 
@@ -592,7 +602,7 @@ def test_closed_page_during_aborted_login_authentication_check_is_retried(
     with pytest.raises(HhSyncRetryableError) as error:
         make_browser(page, tmp_path).open_login()
 
-    assert error.value.code == "HH_NETWORK_TIMEOUT"
+    assert error.value.code == "HH_BROWSER_CLOSED"
     assert error.value.retry_after_seconds == browser_module._NETWORK_RETRY_SECONDS
 
 
@@ -772,6 +782,9 @@ def test_vacancies_are_read_from_search_page(tmp_path: Path) -> None:
             },
         ],
     }
+    full_payload = page.search_payload
+    page.search_payload = {"header": "Найдено 1 234 вакансии «Python backend»", "vacancies": []}
+    page.function_wait_callback = lambda: setattr(page, "search_payload", full_payload)
     browser = make_browser(page, tmp_path)
 
     result = browser.search_vacancies(
@@ -782,6 +795,7 @@ def test_vacancies_are_read_from_search_page(tmp_path: Path) -> None:
     )
 
     assert result.found == 1234
+    assert page.function_waits == [(browser_module.VACANCY_SEARCH_READY_SCRIPT, 5_000, 100)]
     assert [vacancy.hh_id for vacancy in result.vacancies] == ["123", "456"]
     assert result.vacancies[0].source_url == "https://ufa.hh.ru/vacancy/123"
     assert result.vacancies[0].employer_name == "Компания"
@@ -815,12 +829,147 @@ def test_search_reads_publication_time_from_current_hh_card_data() -> None:
     assert "candidate.creationTime" not in browser_module.VACANCY_SEARCH_SCRIPT
 
 
+def test_search_waits_for_all_current_page_cards_including_empty_page() -> None:
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch()
+        try:
+            page = browser.new_page()
+            page.set_content('<section data-qa="vacancy-serp__results"></section>')
+            page.evaluate("""() => {
+                const list = document.querySelector('section');
+                list.__reactFiber$test = {memoizedProps: {vacancySearchResult: {
+                    vacancies: Array.from({length: 50}, (_, i) => ({vacancyId: String(i + 1)})),
+                }}};
+                window.renderCards = (ids) => {
+                    list.innerHTML = ids.map(id => `<article data-qa="vacancy-serp__vacancy">
+                        <a data-qa="serp-item__title" href="https://hh.ru/vacancy/${id}">Python</a>
+                        </article>`).join('');
+                };
+                window.renderCards(Array.from({length: 20}, (_, i) => i + 1));
+            }""")
+            assert page.evaluate(browser_module.VACANCY_SEARCH_READY_SCRIPT) is False
+            page.evaluate("window.renderCards(Array.from({length: 50}, (_, i) => i + 101))")
+            assert page.evaluate(browser_module.VACANCY_SEARCH_READY_SCRIPT) is False
+            page.evaluate("window.renderCards(Array.from({length: 50}, (_, i) => i + 1))")
+            assert page.evaluate(browser_module.VACANCY_SEARCH_READY_SCRIPT) is True
+            page.evaluate("""() => {
+                document.querySelector('section').__reactFiber$test.memoizedProps
+                    .vacancySearchResult.vacancies = [];
+                window.renderCards([]);
+            }""")
+            assert page.evaluate(browser_module.VACANCY_SEARCH_READY_SCRIPT) is True
+            page.evaluate("delete document.querySelector('section').__reactFiber$test")
+            assert page.evaluate(browser_module.VACANCY_SEARCH_READY_SCRIPT) is False
+        finally:
+            browser.close()
+
+
+def test_search_does_not_accept_partial_cards_after_readiness_timeout(tmp_path: Path) -> None:
+    page = FakePage()
+    page.function_wait_error = TimeoutError("Карточки выдачи загрузились не полностью")
+    with pytest.raises(TimeoutError, match="не полностью"):
+        make_browser(page, tmp_path).search_vacancies("Python")
+
+
 def test_search_rejects_unknown_filter(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="не поддерживается"):
         make_browser(FakePage(), tmp_path).search_vacancies(
             "Python",
             filters={"unexpected": "value"},
         )
+
+
+@pytest.mark.parametrize("operation", ["search", "details"])
+@pytest.mark.parametrize("surface", ["redirect", "widget"])
+def test_vacancy_reading_reports_captcha_before_waiting_for_content(
+    tmp_path: Path, operation: str, surface: str
+) -> None:
+    page = FakePage()
+    if surface == "redirect":
+        page.goto_final_url = "https://uchaly.hh.ru/account/captcha"
+    else:
+        page.locators[browser_module._CAPTCHA_SELECTOR] = FakeLocator()
+    content = (
+        '[data-qa="vacancies-search-header"]'
+        if operation == "search"
+        else '[data-qa="vacancy-title"]'
+    )
+    page.locators[content] = FakeLocator(wait_error=True)
+    browser = make_browser(page, tmp_path)
+
+    with pytest.raises(HhSyncBlockedError) as error:
+        if operation == "search":
+            browser.search_vacancies("Python")
+        else:
+            browser.read_vacancy_details("https://uchaly.hh.ru/vacancy/137870570")
+
+    assert error.value.code == "CAPTCHA_REQUIRED"
+    assert error.value.verification_url == page.goto_calls[0][0]
+    assert page.function_waits == []
+
+
+@pytest.mark.parametrize("operation", ["search", "details"])
+def test_vacancy_reading_reports_captcha_appearing_during_content_wait(
+    tmp_path: Path, operation: str
+) -> None:
+    page = FakePage()
+
+    class RedirectingLocator(FakeLocator):
+        def wait_for(self, *, state: str, timeout: int) -> None:
+            page.url = "https://uchaly.hh.ru/account/captcha"
+            raise TimeoutError("captcha redirect while waiting for content")
+
+    content = (
+        '[data-qa="vacancies-search-header"]'
+        if operation == "search"
+        else '[data-qa="vacancy-title"]'
+    )
+    page.locators[content] = RedirectingLocator()
+    browser = make_browser(page, tmp_path)
+
+    with pytest.raises(HhSyncBlockedError) as error:
+        if operation == "search":
+            browser.search_vacancies("Python")
+        else:
+            browser.read_vacancy_details("https://uchaly.hh.ru/vacancy/137870570")
+
+    assert error.value.code == "CAPTCHA_REQUIRED"
+    assert error.value.verification_url == page.goto_calls[0][0]
+
+
+def test_verification_opens_source_and_recognizes_captcha_without_widget(tmp_path: Path) -> None:
+    page = FakePage()
+    page.goto_final_url = "https://uchaly.hh.ru/account/captcha/"
+    page.locators[browser_module._AUTHENTICATED_APPLICANT_SELECTOR] = FakeLocator()
+    browser = make_browser(page, tmp_path)
+    url = "https://uchaly.hh.ru/search/vacancy?text=Python&page=3"
+    browser.open_verification(url)
+    assert page.goto_calls == [(url, "domcontentloaded")]
+    assert browser.authentication_status() is LoginStatus.CAPTCHA_REQUIRED
+    assert not browser.is_authenticated()
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://hh.ru.example.org/search/vacancy",
+        "http://hh.ru/search/vacancy",
+        "https://user:password@hh.ru/search/vacancy",
+        "https://hh.ru:8000/search/vacancy",
+    ],
+)
+def test_verification_rejects_unsafe_source_before_navigation(tmp_path: Path, url: str) -> None:
+    page = FakePage()
+    with pytest.raises(ValueError, match="Адрес проверки"):
+        make_browser(page, tmp_path).open_verification(url)
+    assert not page.goto_calls
+
+
+def test_verification_rejects_external_redirect(tmp_path: Path) -> None:
+    page = FakePage()
+    page.goto_final_url = "https://example.org/login"
+    with pytest.raises(ValueError, match="Адрес проверки"):
+        make_browser(page, tmp_path).open_verification("https://hh.ru/vacancy/123")
 
 
 def test_vacancy_details_are_read_from_page(tmp_path: Path) -> None:
@@ -4490,6 +4639,34 @@ def test_profile_lock_wait_is_bounded(tmp_path: Path) -> None:
             contender.acquire()
     finally:
         owner.release()
+
+
+@pytest.mark.parametrize("original_failure", [True, False])
+def test_closed_driver_cleanup_releases_profile_and_preserves_original_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, original_failure: bool
+) -> None:
+    class ClosedContext(FakeContext):
+        def close(self) -> None:
+            raise Error("BrowserContext.close: Connection closed while reading from the driver")
+
+    context = ClosedContext(FakePage())
+    playwright = FakePlaywright(FakeChromium(context))
+    monkeypatch.setattr(browser_module, "sync_playwright", lambda: FakeStarter(playwright))
+    browser = VisibleHhBrowser(tmp_path, "login", "resumes", "search", 4000)
+    failure = HhSyncRetryableError("HH_BROWSER_CLOSED", "Браузер закрыт", retry_after_seconds=60)
+    if original_failure:
+        with pytest.raises(HhSyncRetryableError) as raised, browser:
+            raise failure
+        assert raised.value is failure
+    else:
+        with browser:
+            pass
+    assert playwright.stopped
+    contender = browser_module._BrowserProfileLock(
+        tmp_path / browser_module._PROFILE_LOCK_FILENAME, timeout_seconds=0
+    )
+    contender.acquire()
+    contender.release()
 
 
 def test_context_starts_visible_persistent_browser(
