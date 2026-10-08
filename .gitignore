@@ -217,6 +217,21 @@ cython_debug/
 *.sqlite3
 !.env.example
 
+# Local working materials and assistant instructions
+/.project-notes/
+/.codex-remote-attachments/
+/.superpowers/
+/служебное/
+/AGENTS.md
+/CLAUDE.md
+/GEMINI.md
+/CODING_STANDARDS.md
+/docs/diagnostics.md
+/Анализ_*.md
+/Оценка_кода_*.md
+/Карта_навыков_*.md
+/Резюме_правки_*.txt
+
 # Marimo
 marimo/_static/
 marimo/_lsp/
