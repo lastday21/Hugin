@@ -8,7 +8,8 @@ from hugin.core.settings import Settings, default_data_dir, get_settings
 from hugin.domain.time import local_day_start_utc, local_timezone_name, timezone_by_name
 
 
-def test_default_api_is_local_only() -> None:
+def test_default_api_is_local_only(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.chdir(tmp_path)
     settings = Settings()
 
     assert settings.api_host == "127.0.0.1"
@@ -23,8 +24,8 @@ def test_default_api_is_local_only() -> None:
     assert settings.notification_gateway_connection_timeout_seconds == 120
     assert settings.yandex_ai_model == "aliceai-llm/latest"
     assert settings.codex_cli_path is None
-    assert settings.codex_letter_model == "gpt-5.6-terra"
-    assert settings.codex_letter_reasoning_effort == "low"
+    assert settings.codex_letter_model == "gpt-6.1-sol"
+    assert settings.codex_letter_reasoning_effort == "medium"
     assert settings.codex_letter_timeout_seconds == 180
     assert settings.codex_reply_requirement_model == "gpt-5.6-luna"
     assert settings.codex_reply_requirement_timeout_seconds == 60
@@ -77,7 +78,10 @@ def test_non_hh_account_urls_are_not_rewritten() -> None:
     assert settings.hh_resumes_url == "http://localhost:9000/applicant/resumes"
 
 
-def test_explicit_data_directory_is_preserved(tmp_path: Path) -> None:
+def test_explicit_data_directory_is_preserved(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
     settings = Settings(data_dir=tmp_path)
 
     assert settings.data_dir == tmp_path

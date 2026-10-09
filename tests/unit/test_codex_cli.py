@@ -7,7 +7,13 @@ from types import SimpleNamespace
 
 import pytest
 
-from hugin.adapters.codex_cli import CodexCliClient, CodexCliError, find_codex_cli
+from hugin.adapters.codex_cli import (
+    CodexCliClient,
+    CodexCliError,
+    configured_codex_cli_client,
+    find_codex_cli,
+)
+from hugin.core.settings import Settings
 
 
 class RecordingRun:
@@ -100,9 +106,13 @@ def test_structured_analysis_rejects_tool_use_and_cleans_schema(
     assert not paths[0].exists()
 
 
+@pytest.mark.parametrize(
+    "configured_operation", [None, "cover_letter", "cover_letter_quality_check"]
+)
 def test_client_uses_subscription_login_without_api_key(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    configured_operation: str | None,
 ) -> None:
     calls: list[tuple[list[str], dict[str, object]]] = []
     monkeypatch.setenv("OPENAI_API_KEY", "must-not-be-used")
@@ -113,15 +123,32 @@ def test_client_uses_subscription_login_without_api_key(
 
     monkeypatch.setattr("hugin.adapters.codex_cli.run_cli", run)
 
-    result = make_client(tmp_path).complete("Правила", "Данные вакансии")
+    if configured_operation is None:
+        client = make_client(tmp_path)
+    else:
+        executable = tmp_path / "codex.cmd"
+        executable.touch()
+        settings = Settings.model_construct(
+            codex_cli_path=executable, data_dir=tmp_path / "runtime"
+        )
+        client = configured_codex_cli_client(settings, operation=configured_operation)
+
+    result = client.complete("Правила", "Данные вакансии")
 
     assert result == "Здравствуйте!\n\nГотовое письмо."
     command, values = calls[0]
     assert command[1:4] == ["exec", "--ephemeral", "--ignore-user-config"]
     assert "--ignore-rules" in command
     assert "--json" in command
+    assert command[command.index("-m") + 1] == "gpt-6.1-sol"
+    assert 'model_reasoning_effort="medium"' in command
     assert command[command.index("--sandbox") + 1] == "read-only"
     assert values["env"] is not None
+    disabled = {
+        command[index + 1] for index, value in enumerate(command[:-1]) if value == "--disable"
+    }
+    assert disabled == {"apps", "plugins", "remote_plugin", "skill_search", "shell_tool"}
+    assert "skip_host_skill_discovery" not in command
     assert "OPENAI_API_KEY" not in values["env"]  # type: ignore[operator]
     assert "Правила" in str(values["input"])
     assert "Данные вакансии" in str(values["input"])
@@ -174,6 +201,12 @@ def test_client_reads_text_and_token_usage_from_json_events(
     ("return_code", "stdout", "stderr", "message"),
     [
         (1, "", "подписка временно недоступна", "подписка временно недоступна"),
+        (
+            1,
+            '{"type":"turn.failed","error":{"message":"workspace routing discovery failed"}}',
+            "WARN analytics unavailable",
+            "workspace routing discovery failed",
+        ),
         (0, "", "", "пустой ответ"),
     ],
 )

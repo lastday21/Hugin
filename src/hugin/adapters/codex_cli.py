@@ -232,8 +232,8 @@ class CodexCliClient:
         executable: Path,
         runtime_dir: Path,
         *,
-        model: str = "gpt-5.6-terra",
-        reasoning_effort: str = "low",
+        model: str = "gpt-6.1-sol",
+        reasoning_effort: str = "medium",
         timeout_seconds: int = 180,
         journal: OperationJournal | None = None,
         operation: str = "cover_letter",
@@ -323,6 +323,16 @@ class CodexCliClient:
             self._model,
             "-c",
             f'model_reasoning_effort="{self._reasoning_effort}"',
+            "--disable",
+            "apps",
+            "--disable",
+            "plugins",
+            "--disable",
+            "remote_plugin",
+            "--disable",
+            "skill_search",
+            "--disable",
+            "shell_tool",
             "-",
         ]
         if schema_path is not None:
@@ -388,7 +398,7 @@ class CodexCliClient:
 
         text, usage = self._parse_output(result.stdout)
         if result.returncode != 0:
-            detail = self._safe_error(result.stderr or result.stdout)
+            detail = self._failure_message(result.stdout, result.stderr)
             failure = CodexCliError(
                 "Создание сопроводительного письма завершилось ошибкой"
                 + (f": {detail}" if detail else "")
@@ -542,6 +552,21 @@ class CodexCliClient:
     def _safe_error(value: str) -> str:
         lines = [line.strip() for line in value.splitlines() if line.strip()]
         return (lines[-1] if lines else "")[:500]
+
+    @classmethod
+    def _failure_message(cls, stdout: str, stderr: str) -> str:
+        for line in reversed(stdout.splitlines()):
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(event, dict) or event.get("type") != "turn.failed":
+                continue
+            error = event.get("error")
+            message = error.get("message") if isinstance(error, dict) else None
+            if isinstance(message, str) and message.strip():
+                return cls._safe_error(message)
+        return cls._safe_error(stderr or stdout)
 
 
 def configured_codex_cli_client(
