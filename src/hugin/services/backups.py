@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 import shutil
+import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -176,11 +177,11 @@ class BackupService:
         if previous_names is not None and previous_names != sorted(expected_tables):
             raise RuntimeError("Состав таблиц дампа не соответствует описанию резервной копии")
         temporary_database = f"hugin_restore_check_{uuid4().hex[:16]}"
-        self._adapter.create_database(
-            temporary_database,
-            self._settings.database_user,
-        )
         try:
+            self._adapter.create_database(
+                temporary_database,
+                self._settings.database_user,
+            )
             self._adapter.restore(
                 temporary_database,
                 self._settings.database_user,
@@ -188,10 +189,16 @@ class BackupService:
             )
             self._check_restored_tables(temporary_database, expected_tables)
         finally:
-            self._adapter.drop_database(
-                temporary_database,
-                self._settings.database_user,
-            )
+            original_error = sys.exception()
+            try:
+                self._adapter.drop_database(
+                    temporary_database,
+                    self._settings.database_user,
+                )
+            except Exception as cleanup_error:
+                if original_error is None:
+                    raise
+                original_error.add_note(f"Не удалось удалить проверочную базу: {cleanup_error}")
         timestamp = verified_at or self._selected_now()
         manifest["verified_at"] = timestamp.isoformat()
         manifest["public_tables"] = len(expected_tables)

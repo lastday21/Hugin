@@ -226,6 +226,40 @@ def test_verification_rejects_bad_manifest_and_negative_table_result(
     assert adapter.calls[-1][0] == "drop_database"
 
 
+@pytest.mark.parametrize("failure", ["create", "restore"])
+def test_verification_cleans_temporary_database_and_preserves_original_error(
+    tmp_path: Path,
+    failure: str,
+) -> None:
+    class FailingAdapter(FakeBackupAdapter):
+        def create_database(self, database_name: str, database_user: str) -> None:
+            super().create_database(database_name, database_user)
+            if failure == "create":
+                raise RuntimeError("create timed out after database creation")
+
+        def restore(self, database_name: str, database_user: str, source: Path) -> None:
+            super().restore(database_name, database_user, source)
+            raise RuntimeError("restore timed out")
+
+        def drop_database(self, database_name: str, database_user: str) -> None:
+            super().drop_database(database_name, database_user)
+            raise RuntimeError("cleanup failed")
+
+    adapter = FailingAdapter()
+    service = BackupService(backup_settings(tmp_path), adapter=adapter)
+    record = service.create("manual", verify=False)
+
+    with pytest.raises(RuntimeError, match=f"{failure} timed out") as raised:
+        service.verify(record.path)
+
+    assert adapter.calls[-1][0] == "drop_database"
+    temporary_database = adapter.calls[-1][1]
+    assert isinstance(temporary_database, str)
+    assert temporary_database.startswith("hugin_restore_check_")
+    assert service.list()[0].verified_at is None
+    assert any("cleanup failed" in note for note in raised.value.__notes__)
+
+
 @pytest.mark.parametrize("result", ["empty", "missing", "replaced"])
 def test_verification_rejects_incomplete_restored_tables(
     tmp_path: Path,
