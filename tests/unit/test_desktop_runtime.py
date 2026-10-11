@@ -216,29 +216,34 @@ def test_docker_desktop_is_started_and_waited_for(
     executable = tmp_path / "Docker Desktop.exe"
     executable.write_bytes(b"")
     readiness = iter((False, False, True))
-    launched: list[tuple[object, ...]] = []
+    launched: list[tuple[list[str], dict[str, object]]] = []
     messages: list[str] = []
 
     monkeypatch.setattr(desktop_runtime, "docker_engine_is_ready", lambda: next(readiness))
     monkeypatch.setattr("hugin.desktop_runtime.shutil.which", lambda _name: "docker.exe")
     monkeypatch.setattr(desktop_runtime, "docker_desktop_executable", lambda: executable)
-    monkeypatch.setattr(
-        "hugin.desktop_runtime.subprocess.Popen",
-        lambda *args, **kwargs: launched.append((args, kwargs)),
-    )
+
+    def run(command: list[str], **kwargs: object) -> SimpleNamespace:
+        launched.append((command, kwargs))
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr("hugin.desktop_runtime.subprocess.run", run)
     monkeypatch.setattr("hugin.desktop_runtime.time.sleep", lambda _seconds: None)
 
     started = desktop_runtime.ensure_docker_desktop_running(status=messages.append)
 
     assert started
-    assert launched[0][0] == ([str(executable)],)
+    command = launched[0][0]
+    assert command[-1] == str(desktop_runtime.DOCKER_EXPLORER_LAUNCHER)
+    assert "-File" in command and str(executable) not in command
+    assert launched[0][1]["creationflags"] == int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
     assert messages == ["Погодите, запускается Docker Desktop…"]
 
 
 def test_ready_docker_is_not_started(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(desktop_runtime, "docker_engine_is_ready", lambda: True)
     monkeypatch.setattr(
-        "hugin.desktop_runtime.subprocess.Popen",
+        "hugin.desktop_runtime.subprocess.run",
         lambda *_args, **_kwargs: pytest.fail("Docker Desktop не должен запускаться"),
     )
 
@@ -256,8 +261,8 @@ def test_docker_start_timeout_has_clear_message(
     monkeypatch.setattr("hugin.desktop_runtime.shutil.which", lambda _name: "docker.exe")
     monkeypatch.setattr(desktop_runtime, "docker_desktop_executable", lambda: executable)
     monkeypatch.setattr(
-        "hugin.desktop_runtime.subprocess.Popen",
-        lambda *_args, **_kwargs: object(),
+        "hugin.desktop_runtime.subprocess.run",
+        lambda *_args, **_kwargs: SimpleNamespace(returncode=0),
     )
     monkeypatch.setattr("hugin.desktop_runtime.time.monotonic", lambda: next(clock))
 

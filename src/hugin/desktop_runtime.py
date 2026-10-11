@@ -16,6 +16,7 @@ from hugin.startup_status import CLOSE_COMMAND
 
 DOCKER_START_TIMEOUT_SECONDS = 180
 DOCKER_POLL_SECONDS = 2.0
+DOCKER_EXPLORER_LAUNCHER = Path(__file__).with_name("assets") / "start_docker_desktop.ps1"
 
 
 class WindowEvent(Protocol):
@@ -208,17 +209,24 @@ def ensure_docker_desktop_running(
     if status is not None:
         status("Погодите, запускается Docker Desktop…")
     try:
-        subprocess.Popen(
-            [str(executable)],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=int(
-                getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-                | getattr(subprocess, "DETACHED_PROCESS", 0)
-            ),
+        completed = subprocess.run(
+            [
+                shutil.which("pwsh") or "powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-File",
+                str(DOCKER_EXPLORER_LAUNCHER),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+            creationflags=int(getattr(subprocess, "CREATE_NO_WINDOW", 0)),
         )
-    except OSError as error:
-        raise RuntimeError("Не удалось запустить Docker Desktop") from error
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise RuntimeError("Не удалось запустить Docker Desktop через Проводник") from error
+    if completed.returncode != 0:
+        raise RuntimeError("Не удалось запустить Docker Desktop через Проводник")
 
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
