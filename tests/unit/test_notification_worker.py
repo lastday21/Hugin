@@ -9,6 +9,10 @@ import pytest
 from sqlalchemy import select
 
 import hugin.workers.notifications as worker_module
+from hugin.adapters.notification_gateway import (
+    NotificationGatewayConnectionError,
+    NotificationGatewayDeliveryError,
+)
 from hugin.adapters.notifications import NotificationContent
 from hugin.core.settings import Settings
 from hugin.database import create_database, upgrade_database
@@ -16,6 +20,7 @@ from hugin.database.models import IncidentModel, NotificationModel
 from hugin.diagnostics import OperationJournal
 from hugin.domain.communications import NotificationRecord
 from hugin.domain.content import DeliveryState, IncidentState, NotificationChannel
+from hugin.notification_runtime import NotificationGatewayRecovery
 from hugin.repositories.communications import CommunicationRepository
 
 
@@ -106,6 +111,40 @@ def test_worker_routes_each_channel(
         "hugin:" + sha256(telegram.deduplication_key.encode("utf-8")).hexdigest()
     )
     assert telegram.deduplication_key not in str(gateway_calls[0]["event_id"])
+
+
+@pytest.mark.parametrize(
+    ("error_type", "recoveries"),
+    [(NotificationGatewayConnectionError, 1), (NotificationGatewayDeliveryError, 0)],
+)
+def test_worker_recovers_only_connection_failure_without_resending(
+    monkeypatch: pytest.MonkeyPatch, error_type: type[Exception], recoveries: int
+) -> None:
+    recovered: list[bool] = []
+    sent: list[dict[str, object]] = []
+
+    class GatewaySender:
+        def __init__(self, *_args: object, **_options: object) -> None:
+            pass
+
+        def send(self, **values: object) -> None:
+            sent.append(values)
+            raise error_type("unavailable")
+
+    monkeypatch.setattr(worker_module, "NotificationGatewaySender", GatewaySender)
+    monkeypatch.setattr(
+        worker_module, "load_notification_gateway_credentials", lambda _path: object()
+    )
+    monkeypatch.setattr(
+        NotificationGatewayRecovery,
+        "ensure_running",
+        lambda _self: recovered.append(True),
+    )
+    worker = worker_module.NotificationWorker(Settings(environment="test"))
+    with pytest.raises(error_type):
+        worker._send(notification(NotificationChannel.TELEGRAM))
+    assert len(sent) == 1
+    assert len(recovered) == recoveries
 
 
 @pytest.mark.parametrize(

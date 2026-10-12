@@ -34,6 +34,10 @@ class NotificationGatewayError(RuntimeError):
     pass
 
 
+class NotificationGatewayConnectionError(NotificationGatewayError):
+    pass
+
+
 class NotificationGatewayAuthorizationError(NotificationGatewayError):
     pass
 
@@ -298,7 +302,9 @@ class NotificationGatewayClient:
                 return self._error_payload(error)
             self._raise_http_error(error.code)
         except (URLError, TimeoutError, OSError):
-            raise NotificationGatewayError("Служба уведомлений сейчас недоступна") from None
+            raise NotificationGatewayConnectionError(
+                "Служба уведомлений сейчас недоступна"
+            ) from None
         return self._json_object(response_body)
 
     @classmethod

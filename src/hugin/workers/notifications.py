@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 
 from hugin.adapters.notification_credentials import load_notification_gateway_credentials
+from hugin.adapters.notification_gateway import NotificationGatewayConnectionError
 from hugin.adapters.notifications import (
     NotificationContent,
     NotificationGatewaySender,
@@ -17,6 +18,7 @@ from hugin.database import create_database, upgrade_database
 from hugin.diagnostics import OperationJournal, error_details
 from hugin.domain.communications import NotificationRecord
 from hugin.domain.content import IncidentSeverity, NotificationChannel
+from hugin.notification_runtime import NotificationGatewayRecovery
 from hugin.repositories.communications import CommunicationRepository
 from hugin.services.incidents import IncidentService
 from hugin.services.notifications import NotificationService
@@ -53,6 +55,7 @@ class NotificationWorker:
         self._account_id = account_id
         self._poll_seconds = poll_seconds
         self._journal = journal or OperationJournal(settings.data_dir)
+        self._gateway_recovery = NotificationGatewayRecovery(settings, journal=self._journal)
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._last_collection_at: datetime | None = None
@@ -201,17 +204,21 @@ class NotificationWorker:
         if action_url is not None and not isinstance(action_url, str):
             raise ValueError("Некорректная ссылка в уведомлении")
         selected_action_url = action_url.strip() if isinstance(action_url, str) else None
-        NotificationGatewaySender(
-            self._settings.notification_gateway_url,
-            credentials,
-            timeout_seconds=self._settings.notification_gateway_timeout_seconds,
-        ).send(
-            event_id=_gateway_event_id(notification.deduplication_key),
-            channel=notification.channel.value,
-            event_type=notification.event_type,
-            content=content,
-            action_url=selected_action_url or None,
-        )
+        try:
+            NotificationGatewaySender(
+                self._settings.notification_gateway_url,
+                credentials,
+                timeout_seconds=self._settings.notification_gateway_timeout_seconds,
+            ).send(
+                event_id=_gateway_event_id(notification.deduplication_key),
+                channel=notification.channel.value,
+                event_type=notification.event_type,
+                content=content,
+                action_url=selected_action_url or None,
+            )
+        except NotificationGatewayConnectionError:
+            self._gateway_recovery.ensure_running()
+            raise
 
     def _record_success(
         self,

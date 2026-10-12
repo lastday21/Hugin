@@ -20,6 +20,7 @@ from hugin.adapters.notification_gateway import (
     GatewayTransport,
     NotificationGatewayAuthorizationError,
     NotificationGatewayClient,
+    NotificationGatewayConnectionError,
     NotificationGatewayDeliveryError,
     NotificationGatewayError,
     NotificationGatewayNotReadyError,
@@ -373,7 +374,7 @@ def test_gateway_reports_timeout_network_error_and_malformed_json() -> None:
         assert timeout == 15
         raise URLError("offline")
 
-    with pytest.raises(NotificationGatewayError, match="недоступна"):
+    with pytest.raises(NotificationGatewayConnectionError, match="недоступна"):
         client(cast(GatewayTransport, unavailable)).status()
 
     class RawResponse(Response):

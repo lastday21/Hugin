@@ -1188,6 +1188,17 @@ def test_ensure_services_starts_docker_and_reports_failures(
     readiness = iter((False, True))
     monkeypatch.setattr(desktop, "api_is_ready", lambda _url: next(readiness))
     calls: list[tuple[list[str], Path, bool, bool, int]] = []
+    gateways: list[Settings] = []
+
+    def gateway(selected: Settings, **_kwargs: object) -> bool:
+        gateways.append(selected)
+        return False
+
+    monkeypatch.setattr(
+        desktop,
+        "ensure_notification_gateway_running",
+        gateway,
+    )
 
     def run(
         command: list[str],
@@ -1204,6 +1215,7 @@ def test_ensure_services_starts_docker_and_reports_failures(
 
     monkeypatch.setattr(subprocess, "run", run)
     desktop.ensure_services(settings)
+    assert gateways == [settings]
     assert calls == [
         (
             ["docker", "compose", "up", "--detach", "--wait", "db"],
@@ -1243,6 +1255,26 @@ def test_ensure_services_starts_docker_and_reports_failures(
     monkeypatch.setattr(time, "monotonic", lambda: next(clock))
     with pytest.raises(RuntimeError, match="не стал доступен"):
         desktop.ensure_services(settings, timeout_seconds=1)
+
+
+def test_ready_api_also_recovers_optional_notifications(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = Settings(environment="test", data_dir=tmp_path)
+    calls: list[Settings] = []
+
+    def gateway(selected: Settings, **_kwargs: object) -> bool:
+        calls.append(selected)
+        return False
+
+    monkeypatch.setattr(desktop, "api_is_ready", lambda _url: True)
+    monkeypatch.setattr(
+        desktop,
+        "ensure_notification_gateway_running",
+        gateway,
+    )
+    desktop.ensure_services(settings)
+    assert calls == [settings]
 
 
 def test_main_starts_window_and_always_closes_bridge(

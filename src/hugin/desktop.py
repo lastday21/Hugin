@@ -50,6 +50,7 @@ from hugin.domain.content import RecruiterMessageState
 from hugin.domain.hh import HhFormReviewStatus
 from hugin.domain.hh_sync import HhSyncRetryableError
 from hugin.domain.vacancies import VacancyAvailability
+from hugin.notification_runtime import ensure_notification_gateway_running
 from hugin.services.application_automation import ApplicationAutomationService
 from hugin.services.automation import AutomationSchedulerService
 from hugin.services.backups import BackupService
@@ -882,6 +883,7 @@ def ensure_services(
     status: Callable[[str], None] | None = None,
 ) -> None:
     if api_is_ready(settings.desktop_api_url):
+        ensure_notification_gateway_running(settings, project_directory=project_directory())
         return
     if status is not None:
         status("Погодите, проверяется Docker Desktop…")
@@ -920,6 +922,7 @@ def ensure_services(
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
         if api_is_ready(settings.desktop_api_url):
+            ensure_notification_gateway_running(settings, project_directory=root)
             return
         time.sleep(1)
     raise RuntimeError("Сервер Hugin не стал доступен вовремя")
