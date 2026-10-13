@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import ClassVar
+from typing import ClassVar, Literal
 from urllib.error import URLError
 
 import pytest
@@ -1277,13 +1277,18 @@ def test_ready_api_also_recovers_optional_notifications(
     assert calls == [settings]
 
 
+@pytest.mark.parametrize(("mode", "parallel"), [("normal", True), ("gaming", True)])
 def test_main_starts_window_and_always_closes_bridge(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    mode: Literal["normal", "gaming"],
+    parallel: bool,
 ) -> None:
-    settings = Settings(environment="development", data_dir=tmp_path)
+    settings = Settings(environment="development", data_dir=tmp_path, resource_mode=mode)
     events: list[object] = []
+    parallel_values: list[object] = []
     created: list[tuple[tuple[object, ...], dict[str, object]]] = []
+    executors: list[FakeWorker] = []
 
     class FakeWebview:
         def create_window(self, *args: object, **kwargs: object) -> object:
@@ -1303,6 +1308,12 @@ def test_main_starts_window_and_always_closes_bridge(
     class FakeWorker:
         def __init__(self, selected: Settings, **_kwargs: object) -> None:
             assert selected is settings
+            self.options = _kwargs
+            self.running = False
+            self.cancelled = False
+            executors.append(self)
+            if "parallel" in _kwargs:
+                parallel_values.append(_kwargs["parallel"])
 
         def start(self) -> None:
             events.append("worker-start")
@@ -1334,6 +1345,10 @@ def test_main_starts_window_and_always_closes_bridge(
             events.append("tray-stop")
 
     monkeypatch.setattr(desktop, "get_settings", lambda: settings)
+    monkeypatch.setattr(desktop, "configure_process", lambda selected: {"mode": selected})
+    monkeypatch.setattr(
+        desktop, "configure_containers", lambda *args: events.append(("resources", args[-1]))
+    )
     monkeypatch.setattr(
         desktop,
         "ensure_services",
@@ -1355,15 +1370,11 @@ def test_main_starts_window_and_always_closes_bridge(
 
     assert desktop.APP_ICON.is_file()
     assert events[0] == "services"
-    assert events[-7:] == [
-        "tray-start",
-        ("start", False, str(desktop.APP_ICON)),
-        "tray-stop",
-        "close",
-        "worker-stop",
-        "worker-stop",
-        "worker-stop",
-    ]
+    assert events[1] == ("resources", mode)
+    assert parallel_values == [parallel]
+    assert events.index("tray-start") < events.index(("start", False, str(desktop.APP_ICON)))
+    assert events.index("tray-stop") < events.index("close")
+    assert events[-4:] == ["close", "worker-stop", "worker-stop", "worker-stop"]
     assert created[0][0] == ("Hugin — поиск работы", settings.desktop_api_url)
 
 

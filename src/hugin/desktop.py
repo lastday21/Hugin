@@ -51,6 +51,7 @@ from hugin.domain.hh import HhFormReviewStatus
 from hugin.domain.hh_sync import HhSyncRetryableError
 from hugin.domain.vacancies import VacancyAvailability
 from hugin.notification_runtime import ensure_notification_gateway_running
+from hugin.runtime_resources import configure_containers, configure_process
 from hugin.services.application_automation import ApplicationAutomationService
 from hugin.services.automation import AutomationSchedulerService
 from hugin.services.backups import BackupService
@@ -963,6 +964,7 @@ def show_launch_error(message: str) -> None:
 
 def main() -> None:
     settings = get_settings()
+    resources = configure_process(settings.resource_mode)
     journal = OperationJournal(settings.data_dir)
     starting = journal.start(
         "desktop",
@@ -972,6 +974,12 @@ def main() -> None:
     startup_status = StartupStatusWindow()
     try:
         ensure_services(settings, status=startup_status.update)
+        configure_containers(
+            project_directory(),
+            settings.data_dir / "runtime-resource-limits.json",
+            settings.resource_mode,
+        )
+        journal.record("desktop", "resource_limits", status="completed", resource_limits=resources)
         webview = cast(WebviewModule, import_module("webview"))
     except ImportError as error:
         failure = RuntimeError("Установите оконную часть: uv sync --extra desktop --extra browser")
