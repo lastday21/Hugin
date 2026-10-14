@@ -32,6 +32,7 @@ _URL_SECRET = re.compile(
 )
 _URL_CREDENTIALS = re.compile(r"(?i)(\b[a-z][a-z0-9+.-]*://)[^/\s:@]*:[^/\s]+@")
 _MAX_TEXT = 8_000
+_EVIDENCE_GROUPS = ("models", "applications")
 _MAX_ITEMS = 100
 _TOKEN_COUNTS = frozenset(
     {"input_tokens", "cached_input_tokens", "output_tokens", "reasoning_tokens", "total_tokens"}
@@ -60,6 +61,9 @@ _SOURCE_TEXT_KEYS = frozenset(
     }
 )
 _WRITE_LOCK = threading.RLock()
+_PRUNE_LOCK = threading.Lock()
+_PRUNED_ON: dict[tuple[Path, int], date] = {}
+_PRUNING: set[tuple[Path, int]] = set()
 _OPERATION: ContextVar[dict[str, object] | None] = ContextVar("journal_operation", default=None)
 
 
@@ -180,7 +184,14 @@ class OperationJournal:
     def log_dir(self) -> Path:
         return self._log_dir
 
-    def save_evidence(self, run_id: str, stage: str, payload: Mapping[str, object]) -> bool:
+    def save_evidence(
+        self,
+        run_id: str,
+        stage: str,
+        payload: Mapping[str, object],
+        *,
+        group: str = "models",
+    ) -> bool:
         from hugin.services.decision_evidence import fingerprint, source_fingerprint
 
         if re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", run_id) is None or stage not in {
@@ -189,6 +200,8 @@ class OperationJournal:
             "failure",
         }:
             raise ValueError("Invalid evidence identifier")
+        if group not in _EVIDENCE_GROUPS:
+            raise ValueError("Invalid evidence group")
         record = {
             "schema_version": 1,
             "run_id": run_id,
@@ -198,7 +211,7 @@ class OperationJournal:
             "payload": dict(payload),
         }
         record["sha256"] = fingerprint(record)
-        directory = self._log_dir.parent / "evidence" / "models"
+        directory = self._log_dir.parent / "evidence" / group
         try:
             directory.mkdir(parents=True, exist_ok=True)
             descriptor = os.open(
@@ -382,9 +395,29 @@ class OperationJournal:
     def _prune_once(self, today: date) -> None:
         if self._last_pruned_on == today:
             return
-        self.prune(now=datetime.combine(today, datetime.min.time(), tzinfo=UTC))
-        directory = self._log_dir.parent / "evidence" / "models"
-        if directory.is_dir():
+        key = (self._log_dir.resolve(), self._retention_days)
+        with _PRUNE_LOCK:
+            if _PRUNED_ON.get(key) == today:
+                self._last_pruned_on = today
+                return
+            if key in _PRUNING:
+                return
+            _PRUNING.add(key)
+        try:
+            self.prune(now=datetime.combine(today, datetime.min.time(), tzinfo=UTC))
+            self._prune_evidence(today)
+            with _PRUNE_LOCK:
+                _PRUNED_ON[key] = today
+            self._last_pruned_on = today
+        finally:
+            with _PRUNE_LOCK:
+                _PRUNING.discard(key)
+
+    def _prune_evidence(self, today: date) -> None:
+        for group in _EVIDENCE_GROUPS:
+            directory = self._log_dir.parent / "evidence" / group
+            if not directory.is_dir():
+                continue
             threshold = datetime.combine(today, datetime.min.time(), tzinfo=UTC) - timedelta(
                 days=self._retention_days
             )
@@ -403,7 +436,6 @@ class OperationJournal:
                     and path.stat().st_mtime < threshold.timestamp()
                 ):
                     path.unlink()
-        self._last_pruned_on = today
 
 
 class JournalRun:
@@ -467,8 +499,8 @@ class JournalRun:
         else:
             child.succeed()
 
-    def save_evidence(self, stage: str, **payload: object) -> bool:
-        saved = self._journal.save_evidence(self._run_id, stage, payload)
+    def save_evidence(self, stage: str, group: str = "models", /, **payload: object) -> bool:
+        saved = self._journal.save_evidence(self._run_id, stage, payload, group=group)
         self._details[f"{stage}_evidence_saved"] = saved
         return saved
 

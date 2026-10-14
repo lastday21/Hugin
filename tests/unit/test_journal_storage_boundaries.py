@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from threading import Event
 from typing import Any
 
 import pytest
@@ -66,14 +68,25 @@ def test_storage_failure_is_reported_without_stopping_the_caller(
         journal.record(" ", "write", status="completed")
 
 
+@pytest.mark.parametrize("group", ["models", "applications"])
 def test_retention_removes_only_old_owned_evidence_and_preserves_fresh_sources(
-    tmp_path: Path,
+    tmp_path: Path, group: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     now = datetime.now(UTC)
+    prune = OperationJournal.prune
+    calls = []
+
+    def counted(
+        journal: OperationJournal, retention_days: int | None = None, *, now: datetime | None = None
+    ) -> int:
+        calls.append(journal.log_dir)
+        return prune(journal, retention_days, now=now)
+
+    monkeypatch.setattr(OperationJournal, "prune", counted)
     journal = OperationJournal(tmp_path, retention_days=3, clock=lambda: now)
-    assert journal.save_evidence("old", "request", {"source": "old"})
-    assert journal.save_evidence("new", "request", {"source": "new"})
-    directory = tmp_path / "evidence/models"
+    assert journal.save_evidence("old", "request", {"source": "old"}, group=group)
+    assert journal.save_evidence("new", "request", {"source": "new"}, group=group)
+    directory = tmp_path / "evidence" / group
     old = directory / "old-request.json"
     stale = (now - timedelta(days=10)).timestamp()
     os.utime(old, (stale, stale))
@@ -84,6 +97,60 @@ def test_retention_removes_only_old_owned_evidence_and_preserves_fresh_sources(
     assert not old.exists()
     assert (directory / "new-request.json").exists() and unrelated.exists()
     assert journal.record("worker", "second", status="completed")
+    assert OperationJournal(tmp_path, retention_days=3, clock=lambda: now).record(
+        "worker", "another_step", status="completed"
+    )
+    assert len(calls) == 1
+    tomorrow = now + timedelta(days=1)
+    assert OperationJournal(tmp_path, retention_days=3, clock=lambda: tomorrow).record(
+        "worker", "next_day", status="completed"
+    )
+    assert len(calls) == 2
+    assert OperationJournal(tmp_path, retention_days=2, clock=lambda: tomorrow).record(
+        "worker", "changed_retention", status="completed"
+    )
+    assert OperationJournal(tmp_path / "other", retention_days=3, clock=lambda: tomorrow).record(
+        "worker", "another_directory", status="completed"
+    )
+    assert len(calls) == 4
+
+
+@pytest.mark.parametrize("first_fails", [False, True])
+def test_cleanup_does_not_block_other_writers_and_retries_after_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, first_fails: bool
+) -> None:
+    entered, release = Event(), Event()
+    calls = []
+
+    def slow_prune(
+        journal: OperationJournal, retention_days: int | None = None, *, now: datetime | None = None
+    ) -> int:
+        calls.append(journal.log_dir)
+        if len(calls) == 1:
+            entered.set()
+            assert release.wait(5)
+            if first_fails:
+                raise PermissionError("temporary cleanup failure")
+        return 0
+
+    monkeypatch.setattr(OperationJournal, "prune", slow_prune)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(
+            OperationJournal(tmp_path).record, "worker", "first", status="completed"
+        )
+        try:
+            assert entered.wait(2)
+            second = executor.submit(
+                OperationJournal(tmp_path).record, "worker", "second", status="completed"
+            )
+            assert second.result(timeout=2) is True
+            assert len(calls) == 1
+        finally:
+            release.set()
+        assert first.result(timeout=2) is (not first_fails)
+    assert OperationJournal(tmp_path).record("worker", "next", status="completed")
+    assert len(calls) == (2 if first_fails else 1)
+    assert len(list(OperationJournal(tmp_path).entries())) == 3
 
 
 def test_reader_survives_a_disappearing_file_and_invalid_times(

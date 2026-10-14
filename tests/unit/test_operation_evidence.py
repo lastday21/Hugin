@@ -434,6 +434,8 @@ def test_evidence_write_failure_does_not_destroy_existing_record(tmp_path: Path)
     assert next(journal.entries(status="failed"))["details"]["error_type"] == "FileExistsError"
     with pytest.raises(ValueError, match="identifier"):
         journal.save_evidence("../escape", "request", {})
+    with pytest.raises(ValueError, match="group"):
+        journal.save_evidence("test-run", "response", {}, group="../escape")
 
 
 def test_cli_reads_saved_report_and_refuses_overwrite(

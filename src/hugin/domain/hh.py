@@ -4,6 +4,7 @@ import hashlib
 import json
 from dataclasses import dataclass
 from enum import StrEnum
+from urllib.parse import urlencode, urlsplit
 
 
 @dataclass(frozen=True, slots=True)
@@ -184,3 +185,40 @@ class HhApplyResult:
     screening_form: HhScreeningForm | None = None
     screening_form_version_hash: str | None = None
     retry_blocks_queue: bool = False
+    submission_evidence: dict[str, object] | None = None
+    reconciliation_error_code: str | None = None
+
+    def captcha_verification_url(self) -> str | None:
+        if self.status is not HhApplyStatus.CAPTCHA_REQUIRED or self.submission_evidence is None:
+            return None
+        source = self.submission_evidence.get("page_url")
+        response_text = self.submission_evidence.get("response_text")
+        if not isinstance(source, str) or not isinstance(response_text, str):
+            return None
+        try:
+            page = urlsplit(source)
+            payload = json.loads(response_text)
+            if (
+                page.scheme != "https"
+                or not (page.hostname == "hh.ru" or (page.hostname or "").endswith(".hh.ru"))
+                or page.username is not None
+                or page.password is not None
+                or page.port not in {None, 443}
+            ):
+                return None
+        except ValueError:
+            return None
+        captcha = payload.get("hhcaptcha") if isinstance(payload, dict) else None
+        if not isinstance(captcha, dict) or captcha.get("isBot") is not True:
+            return None
+        state = captcha.get("captchaState")
+        if not isinstance(state, str) or not state.strip():
+            return None
+        # The challenge page accepts "state"; "captchaState" belongs to the response/POST.
+        # Keep the return URL on the original HH host and never carry over a solution.
+        backurl = page._replace(path="/", query="", fragment="").geturl()
+        return page._replace(
+            path="/account/captcha",
+            query=urlencode({"state": state, "backurl": backurl}),
+            fragment="",
+        ).geturl()
