@@ -1229,6 +1229,19 @@ def test_reply_action_completes_only_after_confirmed_sent_outgoing(
                 reason_code="MODEL_REPLY_REQUIRED",
                 reason="Неоднозначное сообщение требует ответа.",
             )
+            duplicate = communications.save_incoming(
+                application_id=application_id,
+                hh_id=f"duplicate-ui-reply-action-{outcome.value.lower()}",
+                body=incoming.body,
+            )
+            communications.record_reply_requirement(
+                account_id=account_id,
+                message_id=duplicate.id,
+                required=True,
+                source=RecruiterActionSource.MODEL,
+                reason_code="MODEL_REPLY_REQUIRED",
+                reason="Повтор того же вопроса до отправки ответа.",
+            )
             draft = communications.create_outgoing_draft(
                 application_id=application_id,
                 body="Понял, спасибо за сообщение.",
@@ -1249,12 +1262,39 @@ def test_reply_action_completes_only_after_confirmed_sent_outgoing(
             conversation = UiCommunicationService(session).get(account_id).conversations[0]
 
             assert action.state is expected_state
+            assert all(
+                row.state is expected_state for row in communications.message_actions(account_id)
+            )
             assert conversation.needs_reply is expected_needs_reply
             assert stored_incoming.read_at is None
             if outcome is MessageSendOutcome.SENT:
                 assert action.source is RecruiterActionSource.SYSTEM
                 assert action.reason_code == "REPLY_SENT"
                 assert action.resolved_at == sent_at
+                future = communications.save_incoming(
+                    application_id=application_id,
+                    hh_id="repeated-after-confirmed-answer",
+                    body=incoming.body,
+                )
+                communications.record_reply_requirement(
+                    account_id=account_id,
+                    message_id=future.id,
+                    required=True,
+                    source=RecruiterActionSource.MODEL,
+                    reason_code="MODEL_REPLY_REQUIRED",
+                    reason="Новый вопрос пришёл после предыдущего ответа.",
+                )
+                CommunicationRepository(session).complete_reply_action_for_sent_outgoing(
+                    account_id=account_id, message_id=draft.id, completed_at=sent_at
+                )
+                assert (
+                    next(
+                        row
+                        for row in communications.message_actions(account_id)
+                        if row.message_id == future.id
+                    ).state
+                    is RecruiterActionState.REQUIRED
+                )
             else:
                 assert action.source is RecruiterActionSource.MODEL
                 assert action.resolved_at is None

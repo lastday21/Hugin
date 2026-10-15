@@ -54,6 +54,7 @@ from hugin.repositories.communications import CommunicationRepository
 from hugin.services.autonomous_replies import AutonomousReplyService
 from hugin.services.autonomy import DEFAULT_AUTONOMY_POLICY, AutonomyPolicyService
 from hugin.services.communications import CommunicationService, RecordingMessageSender
+from hugin.services.ui_communications import UiCommunicationService
 
 pytestmark = pytest.mark.integration
 
@@ -1181,6 +1182,98 @@ def test_automatic_reply_filter_does_not_construct_model_for_skipped_messages(
                 assert actions[0].source is RecruiterActionSource.RULE
             else:
                 assert actions == ()
+    finally:
+        database.close()
+
+
+def test_generic_user_dismissal_survives_external_action_reclassification(
+    settings: Settings,
+) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+
+    def unexpected_model() -> Never:
+        raise AssertionError("Исключённый этап не требует модели")
+
+    try:
+        with database.sessions.begin() as session:
+            account_id, application_id = create_application(
+                session,
+                account_label="Исключённый внешний отбор",
+                vacancy_hh_id="dismissed-stage-reclassified-as-test",
+            )
+            communications = CommunicationService(session, RecordingMessageSender())
+            incoming = communications.save_incoming(
+                application_id=application_id,
+                hh_id="incoming-dismissed-stage",
+                body="Заполните анкету и выполните тестовое задание: https://example.test/form",
+            )
+            excluded = communications.dismiss_incoming_action(
+                account_id=account_id,
+                message_id=incoming.id,
+                kind=RecruiterActionKind.EXTERNAL_ACTION,
+                source=RecruiterActionSource.USER,
+                reason_code="USER_EXCLUDED_STAGE",
+                reason="Пользователь исключил этот отбор.",
+            )
+            for _ in range(2):
+                batch = AutonomousReplyService(session).prepare(
+                    account_id=account_id,
+                    model_factory=unexpected_model,
+                    requirement_model_factory=unexpected_model,
+                    incoming_message_ids=(incoming.id,),
+                )
+                assert batch.skipped_manual == 0
+                assert batch.approved == ()
+                assert batch.drafts_created == 0
+
+            actions = communications.message_actions(account_id)
+            assert len(actions) == 2
+            assert excluded in actions
+            test_action = next(a for a in actions if a.kind is RecruiterActionKind.TEST_ASSIGNMENT)
+            assert test_action.state is RecruiterActionState.DISMISSED
+            assert test_action.source is RecruiterActionSource.USER
+            assert test_action.reason_code == "USER_EXCLUDED_STAGE"
+            assert test_action.resolved_at == excluded.resolved_at
+            assert (
+                UiCommunicationService(session).get(account_id).conversations[0].needs_reply
+                is False
+            )
+
+            communications.record_reply_requirement(
+                account_id=account_id,
+                message_id=incoming.id,
+                required=True,
+                source=RecruiterActionSource.SYSTEM,
+                reason_code="REPLY_STILL_REQUIRED",
+                reason="Отдельный ответ не отменён.",
+            )
+            assert (
+                next(
+                    a
+                    for a in communications.message_actions(account_id)
+                    if a.kind is RecruiterActionKind.REPLY
+                ).state
+                is RecruiterActionState.REQUIRED
+            )
+            assert (
+                UiCommunicationService(session).get(account_id).conversations[0].needs_reply is True
+            )
+
+            later = communications.save_incoming(
+                application_id=application_id,
+                hh_id="incoming-new-independent-stage",
+                body="Пройдите тестовое задание: https://example.test/new",
+            )
+            later_action = communications.require_external_action(
+                account_id=account_id,
+                message_id=later.id,
+                kind=RecruiterActionKind.TEST_ASSIGNMENT,
+                source=RecruiterActionSource.RULE,
+                reason_code="NEW_TEST_REQUIRED",
+                reason="Новое приглашение работодателя.",
+            )
+            assert later_action.state is RecruiterActionState.REQUIRED
     finally:
         database.close()
 

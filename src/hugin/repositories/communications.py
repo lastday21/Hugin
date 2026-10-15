@@ -329,6 +329,29 @@ class CommunicationRepository:
             return _message_action_record(model)
 
         resolved_at = None if state is RecruiterActionState.REQUIRED else as_utc(changed_at)
+        if (
+            model is None
+            and preserve_resolved
+            and state is RecruiterActionState.REQUIRED
+            and source in {RecruiterActionSource.RULE, RecruiterActionSource.SYSTEM}
+            and kind in {RecruiterActionKind.EXTERNAL_FORM, RecruiterActionKind.TEST_ASSIGNMENT}
+        ):
+            general_action = self._session.get(
+                RecruiterMessageActionModel,
+                (message_id, RecruiterActionKind.EXTERNAL_ACTION),
+            )
+            if (
+                general_action is not None
+                and general_action.source is RecruiterActionSource.USER
+                and general_action.state is RecruiterActionState.DISMISSED
+            ):
+                # Сохраняем пользовательское решение при уточнении типа запроса.
+                state = general_action.state
+                source = general_action.source
+                reason_code = general_action.reason_code
+                reason = general_action.reason
+                due_at = general_action.due_at
+                resolved_at = general_action.resolved_at
         if model is None:
             model = RecruiterMessageActionModel(
                 message_id=message_id,
@@ -407,8 +430,8 @@ class CommunicationRepository:
             or outgoing.state is not RecruiterMessageState.SENT
         ):
             return None
-        incoming_id = self._session.scalar(
-            select(RecruiterMessageModel.id)
+        incoming = self._session.scalar(
+            select(RecruiterMessageModel)
             .where(
                 RecruiterMessageModel.application_id == outgoing.application_id,
                 RecruiterMessageModel.direction == MessageDirection.INCOMING,
@@ -417,24 +440,39 @@ class CommunicationRepository:
             .order_by(RecruiterMessageModel.id.desc())
             .limit(1)
         )
-        if incoming_id is None:
+        if incoming is None:
             return None
         action = self._session.get(
             RecruiterMessageActionModel,
-            (incoming_id, RecruiterActionKind.REPLY),
-            with_for_update=True,
+            (incoming.id, RecruiterActionKind.REPLY),
         )
-        if action is None or action.state is not RecruiterActionState.REQUIRED:
-            return _message_action_record(action) if action is not None else None
         selected_at = as_utc(completed_at)
-        action.state = RecruiterActionState.COMPLETED
-        action.source = RecruiterActionSource.SYSTEM
-        action.reason_code = "REPLY_SENT"
-        action.reason = "Ответ на входящее сообщение подтверждённо отправлен в hh.ru."
-        action.resolved_at = selected_at
-        action.updated_at = selected_at
+        duplicates = self._session.scalars(
+            select(RecruiterMessageActionModel)
+            .join(
+                RecruiterMessageModel,
+                RecruiterMessageModel.id == RecruiterMessageActionModel.message_id,
+            )
+            .where(
+                RecruiterMessageModel.application_id == outgoing.application_id,
+                RecruiterMessageModel.direction == MessageDirection.INCOMING,
+                RecruiterMessageModel.id <= incoming.id,
+                RecruiterMessageModel.body == incoming.body,
+                RecruiterMessageActionModel.kind == RecruiterActionKind.REPLY,
+                RecruiterMessageActionModel.state == RecruiterActionState.REQUIRED,
+            )
+            .order_by(RecruiterMessageActionModel.message_id)
+            .with_for_update(of=RecruiterMessageActionModel)
+        )
+        for duplicate in duplicates:
+            duplicate.state = RecruiterActionState.COMPLETED
+            duplicate.source = RecruiterActionSource.SYSTEM
+            duplicate.reason_code = "REPLY_SENT"
+            duplicate.reason = "Ответ на входящее сообщение подтверждённо отправлен в hh.ru."
+            duplicate.resolved_at = selected_at
+            duplicate.updated_at = selected_at
         self._session.flush()
-        return _message_action_record(action)
+        return _message_action_record(action) if action is not None else None
 
     def create_outgoing_draft(
         self,
