@@ -3,6 +3,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 from enum import IntEnum
 
+FIT_SCORE_VERSION = "fit_tiers_v1"
+
 
 class FitTier(IntEnum):
     DIRECT = 1

@@ -12,7 +12,7 @@ from hugin.domain.vacancies import VacancyAvailability, VacancyData
 from hugin.domain.vacancy_priority import FitTier
 from hugin.services.semantic_ranking import semantic_evaluation
 from hugin.services.semantic_selection import SemanticDecision
-from hugin.services.vacancy_analysis import RuleCategory, RuleContext
+from hugin.services.vacancy_analysis import PythonBackendRules, RuleCategory, RuleContext
 
 
 def vacancy() -> VacancyData:
@@ -25,9 +25,24 @@ def vacancy() -> VacancyData:
     )
 
 
-def test_semantic_profession_replaces_keyword_requirement() -> None:
+@pytest.mark.parametrize(
+    "title",
+    [
+        "Специалист",
+        "Junior Python под руководством Senior разработчика",
+        "Senior Python Backend Developer (MWS AI)",
+        "Team leader по внедрению ИИ на производство",
+    ],
+)
+def test_semantic_profession_replaces_keyword_requirement(title: str) -> None:
     result = semantic_evaluation(
-        vacancy(),
+        replace(
+            vacancy(),
+            title=title,
+            description=(
+                "Компания — лидер рынка. Разрабатываем ведущие решения. Создавать сервисы и отчёты"
+            ),
+        ),
         RuleContext(),
         DirectionScope.PYTHON_BACKEND,
         SemanticDecision("ALLOW", FitTier.DIRECT, ("Подтверждено",)),
@@ -43,6 +58,11 @@ def test_semantic_profession_replaces_keyword_requirement() -> None:
         {"availability": VacancyAvailability.CLOSED},
         {"published_at": datetime.now(UTC) - timedelta(days=31)},
         {"description": "Работа без оплаты"},
+        {"responsibilities": "Руководить командой разработки и отвечать за найм."},
+        {"required_qualifications": "Основной обязательный стек: Java и Spring."},
+        {"responsibilities": "Разрабатывать хранимые процедуры на Oracle PL/SQL."},
+        {"responsibilities": "Не рассматриваем Python-разработчиков."},
+        {"description": "Обязательный переезд во Владивосток."},
         {"work_format": "На месте работодателя", "region": "Томск"},
     ],
 )
@@ -55,19 +75,83 @@ def test_semantic_allow_cannot_cancel_independent_constraints(change: dict[str, 
         DirectionScope.PYTHON_BACKEND,
     )
     assert result.category is RuleCategory.REJECTED
+    assert result.score == 0
 
 
-def test_salary_and_experience_reduce_priority_without_rejecting() -> None:
+@pytest.mark.parametrize(
+    ("description", "requirements"),
+    [
+        ("Разрабатывать Python API. Компания также использует Java.", "Python, FastAPI."),
+        ("Компания также использует Java. Разрабатывать Python API.", None),
+        ("Разрабатывать Python API.", "Опыт с Python или Java."),
+        ("Разрабатывать Python API.", "Python. Желательно знание Java."),
+        ("Разрабатывать Python API.", "Python. Понимание чужого кода на Java."),
+        ("Работа под руководством Team Lead. Разрабатывать Python API.", "Python."),
+        ("Разрабатывать Python API. Без управления командой.", "Python."),
+        ("Разрабатывать Python API. Будет плюсом: опыт управления командой.", None),
+    ],
+)
+def test_shared_constraints_keep_secondary_context_and_negated_management(
+    description: str, requirements: str | None
+) -> None:
+    item = replace(
+        vacancy(),
+        title="Senior Python Backend Developer",
+        description=description,
+        required_qualifications=requirements,
+    )
+    context = RuleContext(skills=("Python, FastAPI, PostgreSQL",))
+    ordinary = PythonBackendRules().evaluate(item, context)
+    semantic = semantic_evaluation(
+        item,
+        context,
+        DirectionScope.PYTHON_BACKEND,
+        SemanticDecision("ALLOW", FitTier.DIRECT, ("Python подтверждён",)),
+        DirectionScope.PYTHON_BACKEND,
+    )
+
+    assert ordinary.accepted
+    assert semantic.accepted
+
+
+def test_semantic_primary_duty_uses_confirmed_specialist_skill() -> None:
+    result = semantic_evaluation(
+        replace(vacancy(), responsibilities="Разрабатывать хранимые процедуры на PL/SQL."),
+        RuleContext(skills=("Python, PostgreSQL, PL/SQL",)),
+        DirectionScope.IT_ADJACENT,
+        SemanticDecision("ALLOW", FitTier.RELATED, ("PL/SQL подтверждён",)),
+        DirectionScope.IT_ADJACENT,
+    )
+
+    assert result.accepted
+
+
+@pytest.mark.parametrize(
+    "tier,lower,upper",
+    [(FitTier.DIRECT, 70, 100), (FitTier.RELATED, 40, 69), (FitTier.POSSIBLE, 0, 39)],
+)
+def test_salary_and_experience_reduce_priority_without_rejecting(
+    tier: FitTier, lower: int, upper: int
+) -> None:
     result = semantic_evaluation(
         replace(vacancy(), salary_from=Decimal(60000), experience="От 3 до 6 лет"),
         RuleContext(desired_salary=120000),
         DirectionScope.PYTHON_BACKEND,
-        SemanticDecision("ALLOW", FitTier.POSSIBLE, ("Нужен больший опыт",)),
+        SemanticDecision("ALLOW", tier, ("Степень соответствия определена по задачам",)),
         DirectionScope.PYTHON_BACKEND,
     )
     assert result.accepted
     assert next(item.score for item in result.components if item.name == "salary") == 50
-    assert result.fit is not None and result.fit.tier == FitTier.POSSIBLE
+    assert result.fit is not None and result.fit.tier == tier
+    assert lower <= result.score <= upper
+    better_conditions = semantic_evaluation(
+        replace(vacancy(), salary_from=Decimal(180000), experience="Нет опыта"),
+        RuleContext(desired_salary=120000),
+        DirectionScope.PYTHON_BACKEND,
+        SemanticDecision("ALLOW", tier, ("Та же степень соответствия",)),
+        DirectionScope.PYTHON_BACKEND,
+    )
+    assert result.score < better_conditions.score <= upper
 
 
 @pytest.mark.parametrize(
@@ -124,6 +208,7 @@ def test_pending_and_uncertain_results_do_not_allow_preparation() -> None:
     )
     assert result.category is RuleCategory.REVIEW
     assert not result.accepted
+    assert result.score == 0
 
 
 @pytest.mark.parametrize(
@@ -148,14 +233,24 @@ def test_pending_and_uncertain_results_do_not_allow_preparation() -> None:
         ),
     ],
 )
+@pytest.mark.parametrize("semantic", [False, True])
 def test_unpaid_training_is_not_confused_with_free_training_at_paid_work(
-    description: str, accepted: bool
+    description: str, accepted: bool, semantic: bool
 ) -> None:
-    result = semantic_evaluation(
-        replace(vacancy(), title="Стажёр Python", description=description),
-        RuleContext(),
-        DirectionScope.PYTHON_BACKEND,
-        SemanticDecision("ALLOW", FitTier.DIRECT, ("Python подтверждён",)),
-        DirectionScope.PYTHON_BACKEND,
+    item = replace(
+        vacancy(),
+        title="Стажёр Python backend разработчик",
+        description="Разработка backend на Python. " + description,
+    )
+    result = (
+        semantic_evaluation(
+            item,
+            RuleContext(),
+            DirectionScope.PYTHON_BACKEND,
+            SemanticDecision("ALLOW", FitTier.DIRECT, ("Python подтверждён",)),
+            DirectionScope.PYTHON_BACKEND,
+        )
+        if semantic
+        else PythonBackendRules().evaluate(item)
     )
     assert result.accepted is accepted

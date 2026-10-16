@@ -371,6 +371,26 @@ def test_pending_then_allowed_and_cached_with_profile_change_guard(settings: Set
             assert ApplicationAutomationService(session)._semantic_selection_current(
                 direction, vacancy, resume_id
             )
+        from hugin.database.models import DirectionVacancyModel
+        from hugin.services.background_processes import BackgroundProcessService
+        from hugin.workers.semantic_selection import SemanticSelectionWorker
+
+        with database.sessions.begin() as session:
+            tracked_row = session.get(DirectionVacancyModel, (direction_id, vacancy_id))
+            assert tracked_row is not None
+            tracked_row.rules_details = {
+                key: value
+                for key, value in tracked_row.rules_details.items()
+                if key != "score_version"
+            }
+            BackgroundProcessService(session, account_id).set_enabled("evaluation", True)
+        worker = SemanticSelectionWorker(settings, account_id=account_id, processor=processor)
+        assert worker.run_once()
+        assert not worker.run_once()
+        assert client.calls == 1
+        with database.sessions() as session:
+            tracked = DirectionRepository(session).get_tracked_vacancy(direction_id, vacancy_id)
+            assert tracked.rules_details["score_version"] == "fit_tiers_v1"
         edit_fact(settings, fact_id)
         with database.sessions.begin() as session:
             assert not ApplicationAutomationService(session)._semantic_selection_current(
@@ -967,6 +987,64 @@ def test_worker_replaces_semantic_result_when_direction_switches_to_rules(
         database.close()
 
 
+@pytest.mark.parametrize("queued", [False, True])
+def test_evaluation_checks_primary_python_before_fresher_adjacent_role(
+    settings: Settings, queued: bool
+) -> None:
+    from datetime import timedelta
+
+    from hugin.database.models import DirectionVacancyModel, VacancyModel
+    from hugin.repositories import ApplicationRepository, QueueTaskRepository
+    from hugin.services.background_processes import BackgroundProcessService
+    from hugin.workers.semantic_selection import SemanticSelectionWorker
+
+    account, direction, adjacent_id, resume_id, _ = seed(settings)
+    now = datetime.now(UTC)
+    database = create_database(settings)
+    try:
+        with database.sessions.begin() as session:
+            adjacent = session.get(VacancyModel, adjacent_id)
+            assert adjacent is not None
+            adjacent.title = "Аналитик 1С"
+            adjacent.description = "Сопровождение 1С"
+            adjacent.published_at = now
+            adjacent.details_fetched_at = now
+            primary = VacancyRepository(session).upsert(
+                VacancyData(
+                    "primary-python",
+                    "Middle Backend Developer — Python",
+                    "https://hh.ru/vacancy/primary-python",
+                    description="Разработка API на Python",
+                    published_at=now - timedelta(hours=1),
+                    details_fetched_at=now,
+                )
+            )
+            DirectionRepository(session).track_vacancy(direction, primary.id)
+            BackgroundProcessService(session, account).set_enabled("evaluation", True)
+        worker = SemanticSelectionWorker(settings, account_id=account)
+        with database.sessions.begin() as session:
+            assert worker._next(session) == (direction, primary.id)
+            runtime = BackgroundProcessService(session, account)._runtime("evaluation")
+            runtime.cursor_vacancy_id = adjacent_id
+            session.flush()
+            assert worker._next(session) == (direction, adjacent_id)
+            runtime.cursor_vacancy_id = None
+            session.flush()
+            if queued:
+                app = ApplicationRepository(session).create_apply_intent(
+                    account, adjacent_id, resume_id, direction
+                )
+                QueueTaskRepository(session).enqueue(app.id, 70)
+            else:
+                tracked = session.get(DirectionVacancyModel, (direction, adjacent_id))
+                assert tracked is not None
+                tracked.rules_details = {"category": "MATCH"}
+            session.flush()
+            assert worker._next(session) == (direction, adjacent_id)
+    finally:
+        database.close()
+
+
 def test_worker_stop_during_model_call_does_not_prepare_application(settings: Settings) -> None:
     from sqlalchemy import func, select
 
@@ -1030,16 +1108,20 @@ def test_one_call_finishes_selection_and_repeat_reuses_saved_result(
     assert processor.process(account_id, direction_id, vacancy_id, max_calls=1).model_calls == 0
 
 
+@pytest.mark.parametrize("queued", [False, True])
 def test_evaluation_uses_new_publication_before_old_unfinished_description(
     settings: Settings,
+    queued: bool,
 ) -> None:
     from datetime import timedelta
 
-    from hugin.database.models import VacancyModel
+    from hugin.database.models import ApplicationModel, DirectionVacancyModel, VacancyModel
+    from hugin.domain.applications import ApplicationState
+    from hugin.repositories import ApplicationRepository, QueueTaskRepository
     from hugin.services.background_processes import BackgroundProcessService
     from hugin.workers.semantic_selection import SemanticSelectionWorker
 
-    account, direction, first_id, _, _ = seed(settings)
+    account, direction, first_id, resume_id, _ = seed(settings)
     now = datetime.now(UTC)
     database = create_database(settings)
     try:
@@ -1048,6 +1130,9 @@ def test_evaluation_uses_new_publication_before_old_unfinished_description(
             assert first is not None
             first.details_fetched_at = now - timedelta(minutes=10)
             first.published_at = now - timedelta(days=2)
+            old_evaluation = session.get(DirectionVacancyModel, (direction, first_id))
+            assert old_evaluation is not None
+            old_evaluation.rules_details = {"category": "REJECTED"}
             newer = VacancyRepository(session).upsert(
                 VacancyData(
                     "newer-publication",
@@ -1059,10 +1144,34 @@ def test_evaluation_uses_new_publication_before_old_unfinished_description(
                 )
             )
             DirectionRepository(session).track_vacancy(direction, newer.id)
+            confirmed = VacancyRepository(session).upsert(
+                VacancyData(
+                    "already-confirmed-publication",
+                    "Разработчик",
+                    "https://hh.ru/vacancy/already-confirmed-publication",
+                    description="Создавать API на Python",
+                    details_fetched_at=now,
+                    published_at=now,
+                )
+            )
+            DirectionRepository(session).track_vacancy(direction, confirmed.id)
+            sent = ApplicationRepository(session).create_apply_intent(
+                account, confirmed.id, resume_id, direction
+            )
+            stored = session.get(ApplicationModel, sent.id)
+            assert stored is not None
+            stored.state = ApplicationState.APPLIED
+            if queued:
+                application = ApplicationRepository(session).create_apply_intent(
+                    account, first_id, resume_id, direction
+                )
+                QueueTaskRepository(session).enqueue(application.id, 70)
             BackgroundProcessService(session, account).set_enabled("evaluation", True)
         worker = SemanticSelectionWorker(settings, account_id=account)
         with database.sessions.begin() as session:
-            assert worker._next(session) == (direction, newer.id)
+            old_evaluation = session.get(DirectionVacancyModel, (direction, first_id))
+            assert old_evaluation is not None
+            assert worker._next(session) == (direction, first_id if queued else newer.id)
             republished = session.get(VacancyModel, newer.id)
             assert republished is not None
             republished.details_fetched_at = now - timedelta(days=3)
@@ -1073,7 +1182,27 @@ def test_evaluation_uses_new_publication_before_old_unfinished_description(
                 "evaluation"
             ).cursor_vacancy_id = None
             session.flush()
-            assert worker._next(session) == (direction, newer.id)
+            assert worker._next(session) == (direction, first_id if queued else newer.id)
+            old_evaluation.rules_details = {"category": "MATCH"}
+            BackgroundProcessService(session, account)._runtime(
+                "evaluation"
+            ).cursor_vacancy_id = None
+            session.flush()
+            assert worker._next(session) == (direction, first_id)
+            old_evaluation.rules_details = {"category": "REJECTED"}
+            BackgroundProcessService(session, account)._runtime(
+                "evaluation"
+            ).cursor_vacancy_id = None
+            session.flush()
+            stored = session.get(ApplicationModel, sent.id)
+            assert stored is not None
+            stored.state = ApplicationState.APPLYING
+            QueueTaskRepository(session).enqueue(sent.id, 70)
+            BackgroundProcessService(session, account)._runtime(
+                "evaluation"
+            ).cursor_vacancy_id = None
+            session.flush()
+            assert worker._next(session) == (direction, confirmed.id)
     finally:
         database.close()
 

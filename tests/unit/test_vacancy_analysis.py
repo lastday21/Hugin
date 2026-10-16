@@ -17,8 +17,8 @@ from hugin.services.vacancy_analysis import (
 )
 
 
-def test_rules_version_is_python_it_v73() -> None:
-    assert RULES_VERSION == "python_it_v73"
+def test_rules_version_is_python_it_v76() -> None:
+    assert RULES_VERSION == "python_it_v76"
 
 
 @pytest.mark.parametrize(
@@ -1002,7 +1002,7 @@ def test_v52_rejects_senior_role_with_team_leadership_from_description() -> None
     )
 
     assert result.category is RuleCategory.REJECTED
-    assert any("Senior/Lead" in reason for reason in result.reasons)
+    assert any("управленческими обязанностями" in reason for reason in result.reasons)
 
 
 def test_v52_keeps_remote_role_with_country_location_restriction() -> None:
@@ -1509,7 +1509,7 @@ def test_technical_lead_title_without_management_duties_is_not_rejected(title: s
         "Архитектор-разработчик Python",
     ],
 )
-def test_managerial_or_architect_titles_are_rejected(title: str) -> None:
+def test_managerial_or_architect_titles_alone_do_not_reject(title: str) -> None:
     result = PythonBackendRules().evaluate(
         VacancyData(
             f"managerial-level-{title}",
@@ -1520,8 +1520,8 @@ def test_managerial_or_architect_titles_are_rejected(title: str) -> None:
         )
     )
 
-    assert result.category is RuleCategory.REJECTED
-    assert any("руководящая или архитектурная" in reason for reason in result.reasons)
+    assert result.accepted
+    assert any("сам по себе не блокирует" in reason for reason in result.reasons)
 
 
 def test_senior_with_excessive_responsibility_is_rejected() -> None:

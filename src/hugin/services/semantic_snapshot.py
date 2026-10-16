@@ -56,7 +56,7 @@ class SelectionConfig(StrictRecord):
 
     @property
     def model(self) -> str:
-        return self.assessment_model or "gpt-5.6-terra"
+        return self.assessment_model or "gpt-6.1-sol"
 
 
 def selection_config(direction: DirectionRecord) -> SelectionConfig | None:

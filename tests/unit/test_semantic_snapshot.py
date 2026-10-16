@@ -22,7 +22,8 @@ def test_selection_is_opt_in_and_invalid_configuration_cannot_fall_back() -> Non
     assert config is not None
     assert config.extraction_model == "gpt-5.6-luna"
     assert config.matching_model == "gpt-5.6-sol"
-    assert config.model == "gpt-5.6-terra"
+    assert config.model == "gpt-6.1-sol"
+    assert config.reasoning_effort == "medium"
     assert config.timeout_seconds == 300
     with pytest.raises(ValueError):
         selection_config(direction({"semantic_selection": "yes"}))
@@ -87,7 +88,7 @@ def test_assessment_model_overrides_legacy_matching_configuration() -> None:
             }
         )
     )
-    assert legacy is not None and legacy.model == "gpt-5.6-terra"
+    assert legacy is not None and legacy.model == "gpt-6.1-sol"
 
 
 def test_description_keeps_context_and_repeated_derived_lines_are_not_sent_again() -> None:

@@ -3,13 +3,15 @@ from __future__ import annotations
 import threading
 from datetime import UTC, datetime
 
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from hugin.core.settings import Settings
 from hugin.database import create_database, upgrade_database
 from hugin.database.models import (
+    ApplicationModel,
     ApplicationSettingsModel,
+    ApplicationTaskModel,
     CareerDirectionModel,
     DirectionVacancyModel,
     HhAccountModel,
@@ -17,7 +19,10 @@ from hugin.database.models import (
     VacancyModel,
 )
 from hugin.diagnostics import OperationJournal, operation_context
+from hugin.domain.applications import ApplicationState
+from hugin.domain.tasks import TaskState
 from hugin.domain.vacancies import VacancyAvailability
+from hugin.domain.vacancy_priority import FIT_SCORE_VERSION
 from hugin.repositories.directions import DirectionRepository
 from hugin.repositories.vacancies import VacancyRepository
 from hugin.services.automation import PROTECTIVE_SYSTEM_STATES
@@ -90,6 +95,28 @@ class SemanticSelectionWorker:
         ):
             return None
         runtime = BackgroundProcessService(session, self._account_id)._runtime("evaluation")
+        pending_application = (
+            select(ApplicationTaskModel.id)
+            .join(ApplicationModel)
+            .where(
+                ApplicationModel.account_id == self._account_id,
+                ApplicationModel.direction_id == DirectionVacancyModel.direction_id,
+                ApplicationModel.vacancy_id == VacancyModel.id,
+                ApplicationModel.state == ApplicationState.APPLYING,
+                ApplicationTaskModel.state.in_((TaskState.PENDING, TaskState.RETRY_SCHEDULED)),
+                ApplicationTaskModel.scheduled_at <= datetime.now(UTC),
+            )
+            .exists()
+        )
+        completed_application = (
+            select(ApplicationModel.id)
+            .where(
+                ApplicationModel.account_id == self._account_id,
+                ApplicationModel.vacancy_id == VacancyModel.id,
+                ApplicationModel.state != ApplicationState.APPLYING,
+            )
+            .exists()
+        )
         rows = session.execute(
             select(DirectionVacancyModel.direction_id, VacancyModel.id)
             .join(VacancyModel, VacancyModel.id == DirectionVacancyModel.vacancy_id)
@@ -101,6 +128,7 @@ class SemanticSelectionWorker:
                 CareerDirectionModel.account_id == self._account_id,
                 CareerDirectionModel.is_active.is_(True),
                 HhAccountModel.is_active.is_(True),
+                or_(pending_application, ~completed_application),
                 VacancyModel.availability == VacancyAvailability.ACTIVE,
                 VacancyModel.details_fetched_at.is_not(None),
                 or_(
@@ -114,6 +142,12 @@ class SemanticSelectionWorker:
             )
             .order_by(
                 (VacancyModel.id == runtime.cursor_vacancy_id).desc(),
+                pending_application.desc(),
+                func.coalesce(
+                    DirectionVacancyModel.rules_details["category"].as_string() == "MATCH",
+                    False,
+                ).desc(),
+                VacancyModel.title.ilike("%python%").desc(),
                 VacancyModel.published_at.desc().nullslast(),
                 VacancyModel.created_at.desc(),
                 VacancyModel.details_fetched_at.desc(),
@@ -144,6 +178,7 @@ class SemanticSelectionWorker:
             if (
                 result.due
                 or tracked.rules_version != RULES_VERSION
+                or tracked.rules_details.get("score_version") != FIT_SCORE_VERSION
                 or not isinstance(evidence, dict)
                 or evidence.get("key") != snapshot.key
             ):

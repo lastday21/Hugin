@@ -23,7 +23,7 @@ from hugin.domain.directions import (
 )
 from hugin.domain.time import as_utc
 from hugin.domain.vacancies import VacancyAvailability, VacancyData, VacancyRecord
-from hugin.domain.vacancy_priority import FIT_TIER_LABELS, FitTier
+from hugin.domain.vacancy_priority import FIT_SCORE_VERSION, FIT_TIER_LABELS, FitTier
 from hugin.repositories.directions import AccountRepository, DirectionRepository
 from hugin.repositories.vacancies import VacancyRepository
 from hugin.services.candidate_skills import confirmed_skill_texts
@@ -35,7 +35,7 @@ from hugin.services.vacancy_duties import TechnicalDuty, technical_duty_evidence
 from hugin.services.vacancy_fit import FitAssessment, assess_fit, unsupported_administration
 from hugin.services.vacancy_skills import skill_terms
 
-RULES_VERSION = "python_it_v73"
+RULES_VERSION = "python_it_v76"
 
 _REQUIRED_OFFICE_PATTERN = re.compile(
     r"(?:"
@@ -847,6 +847,135 @@ class PythonBackendRules:
         r")"
     )
 
+    def independent_constraints(
+        self, vacancy: VacancyData, context: RuleContext
+    ) -> tuple[str, ...]:
+        return (
+            *self._general_constraints(vacancy, context),
+            *self._primary_duty_constraints(vacancy, context),
+        )
+
+    def _general_constraints(self, vacancy: VacancyData, context: RuleContext) -> tuple[str, ...]:
+        body = " ".join(
+            filter(
+                None,
+                (
+                    vacancy.description,
+                    vacancy.responsibilities,
+                    vacancy.required_qualifications,
+                    vacancy.preferred_qualifications,
+                ),
+            )
+        )
+        title = _normalize_rule_text(vacancy.title)
+        text = _normalize_rule_text(" ".join((vacancy.title, body, *vacancy.key_skills)))
+        rejected: list[str] = []
+        if not body.strip():
+            rejected.append("описание вакансии отсутствует")
+        if vacancy.availability is not VacancyAvailability.ACTIVE:
+            rejected.append(f"вакансия недоступна: {vacancy.availability.value}")
+        if self._is_too_old(vacancy.published_at):
+            rejected.append("вакансия опубликована более 30 дней назад")
+        scam = next((marker for marker in self._scam_markers if marker in text), None)
+        if scam is not None:
+            rejected.append(f"подозрительное требование: {scam}")
+        unpaid_training = (
+            self._internship_title_pattern.search(title)
+            and re.search(
+                r"\bобучени\w*\s+не\s*оплачиваем(?:ое|о)\b|"
+                r"\bне\s*оплачиваемое\s+обучени\w*\b",
+                text,
+            )
+            and re.search(
+                r"\b(?:зарплат\w*|оплат\w*)[^.!?]{0,80}\bпосле\s+трудоустройств\w*\b|"
+                r"\b(?:после|по итогам|по окончании)\s+обучени\w*[^.!?]{0,150}"
+                r"\b(?:трудоустройств\w*|при[её]м\w*\s+в\s+штат|приглаш\w*)\b|"
+                r"\bпоследующ\w*\s+трудоустройств\w*\b",
+                text,
+            )
+        )
+        if (
+            self._unpaid_compensation_pattern.search(text)
+            or re.search(r"\bработ\w*\s+без\s+(?:денежной\s+)?оплат\w*", text)
+            or unpaid_training
+        ):
+            rejected.append("работа явно не предусматривает денежную оплату")
+        if self._negative_candidate_exclusion_pattern.search(_normalize_rule_text(body)):
+            rejected.append("работодатель прямо исключил кандидатов с текущим профилем разработки")
+        if self._relocation_conflicts(text, context):
+            rejected.append("обязательный переезд противоречит подтверждённым настройкам")
+        if self._location_conflicts(vacancy, context):
+            rejected.append("офис или гибрид находится вне выбранных регионов")
+        if self._work_format_score(vacancy, context) == 0:
+            rejected.append("обязательный формат работы противоречит настройкам")
+        return tuple(rejected)
+
+    def _primary_duty_constraints(
+        self, vacancy: VacancyData, context: RuleContext
+    ) -> tuple[str, ...]:
+        title = _normalize_rule_text(vacancy.title)
+        requirements = self._mandatory_requirements(vacancy)
+        if not requirements:
+            requirements = self._without_optional_requirements(
+                " ".join((vacancy.required_qualifications or "", vacancy.description or ""))
+            )
+        duties = self._without_optional_requirements(
+            primary_duties(vacancy.description, vacancy.responsibilities)
+        )
+        profile_tokens = self._profile_skill_tokens(context.skills)
+        rejected: list[str] = []
+        _, level_rejection = self._senior_level_outcome(title, requirements, duties, "")
+        if level_rejection is not None:
+            rejected.append(level_rejection)
+
+        mandatory_other_stack = self._mandatory_other_stack(requirements)
+        if mandatory_other_stack is not None:
+            rejected.append(f"другой обязательный основной стек: {mandatory_other_stack}")
+        primary_other_stack = self._primary_duty_other_stack(duties, profile_tokens)
+        if primary_other_stack is not None:
+            rejected.append(f"основные обязанности требуют другой стек: {primary_other_stack}")
+        described_other_stack = self._described_other_stack(
+            self._without_optional_requirements(vacancy.description or "")
+        )
+        if described_other_stack is not None:
+            rejected.append(f"основной стек вакансии — {described_other_stack}")
+        administration_gaps = unsupported_administration(vacancy, requirements, context.skills)
+        if administration_gaps:
+            rejected.append(
+                "основная работа требует неподтверждённой специализации администрирования: "
+                + "; ".join(administration_gaps)
+            )
+        if self._mandatory_fullstack_client_stack(
+            title,
+            " ".join((requirements, _normalize_rule_text(vacancy.responsibilities))),
+            profile_tokens,
+        ):
+            rejected.append("обязательный клиентский стек полной разработки не подтверждён")
+        if self._unsupported_sql_specialization(title, requirements):
+            rejected.append("основной специализированный стек SQL не подтверждён")
+        if self._unsupported_data_specialization(
+            title,
+            self._mandatory_skill_gaps(vacancy, profile_tokens),
+            has_data_duties=any(
+                evidence.kind is TechnicalDuty.DATA for evidence in technical_duty_evidence(vacancy)
+            ),
+        ):
+            rejected.append("обязательный промышленный стек обработки данных не подтверждён")
+        if self._unsupported_ml_science_role(title, duties, requirements):
+            rejected.append(
+                "основная работа требует неподтверждённой Data Science/ML-специализации"
+            )
+        if self._unsupported_system_software_role(title, duties, requirements):
+            rejected.append("основная работа — системные компоненты или сетевая ОС")
+        model_training_context = self._model_training_awareness_pattern.sub(
+            " ", " ".join((title, duties, requirements))
+        )
+        if self._model_training_pattern.search(model_training_context):
+            rejected.append(
+                "основная работа — обучение моделей на неподтверждённом промышленном ML-стеке"
+            )
+        return tuple(rejected)
+
     def evaluate(
         self,
         vacancy: VacancyData,
@@ -861,30 +990,10 @@ class PythonBackendRules:
         complete_text = " ".join((title, description, responsibilities, requirements, skills))
         experience = self._normalize_experience(vacancy.experience)
         reasons: list[str] = []
-        rejected: list[str] = []
+        rejected = list(self._general_constraints(vacancy, context))
         stretch_reasons: list[str] = []
         components: list[RuleComponent] = []
 
-        if not any(
-            (
-                description,
-                responsibilities,
-                requirements,
-                _normalize_rule_text(vacancy.preferred_qualifications),
-            )
-        ):
-            rejected.append("описание вакансии отсутствует")
-        if vacancy.availability is not VacancyAvailability.ACTIVE:
-            rejected.append(f"вакансия недоступна: {vacancy.availability.value}")
-        if self._is_too_old(vacancy.published_at):
-            rejected.append("вакансия опубликована более 30 дней назад")
-        scam = next((marker for marker in self._scam_markers if marker in complete_text), None)
-        if scam is not None:
-            rejected.append(f"подозрительное требование: {scam}")
-        if self._unpaid_compensation_pattern.search(complete_text):
-            rejected.append("работа явно не предусматривает денежную оплату")
-        if self._negative_candidate_exclusion_pattern.search(" ".join((requirements, description))):
-            rejected.append("работодатель прямо исключил кандидатов с текущим профилем разработки")
         if self._cover_letter_questions_pattern.search(description):
             reasons.append(
                 "работодатель просит отдельный ответ в сопроводительном письме; "
@@ -1006,7 +1115,7 @@ class PythonBackendRules:
             reasons.append(
                 "требование от двух лет опыта снижает приоритет, но само по себе не блокирует"
             )
-        level_reason, level_rejection = self._senior_level_outcome(
+        level_reason, _ = self._senior_level_outcome(
             title,
             experience_requirements,
             responsibilities,
@@ -1028,8 +1137,6 @@ class PythonBackendRules:
                     "старший или ведущий уровень вместе с высоким требованием к стажу "
                     "идёт после вакансий текущего уровня"
                 )
-        if level_rejection is not None:
-            rejected.append(level_rejection)
         if self._internship_title_pattern.search(title):
             stretch_reasons.append(
                 "стажировка допустима, но идёт после штатных вакансий целевого уровня"
@@ -1112,6 +1219,7 @@ class PythonBackendRules:
                 rejected.append(reason)
                 break
         profile_tokens = self._profile_skill_tokens(context.skills)
+        rejected.extend(self._primary_duty_constraints(vacancy, context))
         other_stack = self._primary_other_stack(title)
         has_python_backend_title = "python" in title and any(
             marker in title for marker in VacancyRoleRouter._backend_markers
@@ -1127,69 +1235,10 @@ class PythonBackendRules:
                 f"в названии вместе с Python указан другой основной стек: {other_stack}; "
                 "вакансия идёт после более точных совпадений"
             )
-        mandatory_other_stack = self._mandatory_other_stack(experience_requirements)
-        if mandatory_other_stack is not None:
-            rejected.append(f"другой обязательный основной стек: {mandatory_other_stack}")
         primary_duty_text = self._without_optional_requirements(
             primary_duties(vacancy.description, vacancy.responsibilities)
         )
-        primary_duty_other_stack = self._primary_duty_other_stack(
-            primary_duty_text,
-            profile_tokens,
-        )
-        if primary_duty_other_stack is not None:
-            rejected.append(f"основные обязанности требуют другой стек: {primary_duty_other_stack}")
-        described_other_stack = self._described_other_stack(description)
-        if described_other_stack is not None:
-            rejected.append(f"основной стек вакансии — {described_other_stack}")
         mandatory_skill_gaps = self._mandatory_skill_gaps(vacancy, profile_tokens)
-        administration_gaps = unsupported_administration(
-            vacancy, experience_requirements, context.skills
-        )
-        if administration_gaps:
-            rejected.append(
-                "основная работа требует неподтверждённой специализации администрирования: "
-                + "; ".join(administration_gaps)
-            )
-        if self._mandatory_fullstack_client_stack(
-            title,
-            " ".join((experience_requirements, responsibilities)),
-            profile_tokens,
-        ):
-            rejected.append("обязательный клиентский стек полной разработки не подтверждён")
-        if self._unsupported_sql_specialization(title, experience_requirements):
-            rejected.append("основной специализированный стек SQL не подтверждён")
-        if self._unsupported_data_specialization(
-            title,
-            mandatory_skill_gaps,
-            has_data_duties=any(
-                evidence.kind is TechnicalDuty.DATA for evidence in technical_duty_evidence(vacancy)
-            ),
-        ):
-            rejected.append("обязательный промышленный стек обработки данных не подтверждён")
-        if self._unsupported_ml_science_role(
-            title,
-            " ".join((responsibilities, description)),
-            experience_requirements,
-        ):
-            rejected.append(
-                "основная работа требует неподтверждённой Data Science/ML-специализации"
-            )
-        if self._unsupported_system_software_role(
-            title,
-            " ".join((responsibilities, description)),
-            experience_requirements,
-        ):
-            rejected.append("основная работа — системные компоненты или сетевая ОС")
-        model_training_context = " ".join((title, primary_duty_text, experience_requirements))
-        model_training_context = self._model_training_awareness_pattern.sub(
-            " ",
-            model_training_context,
-        )
-        if self._model_training_pattern.search(model_training_context):
-            rejected.append(
-                "основная работа — обучение моделей на неподтверждённом промышленном ML-стеке"
-            )
         if self.scope is DirectionScope.IT_ADJACENT:
             adjacent_priority_reason = self._adjacent_role_priority_reason(
                 title,
@@ -1221,16 +1270,9 @@ class PythonBackendRules:
         ):
             rejected.append("обязательные технологии не связаны с подтверждённым опытом")
 
-        if self._relocation_conflicts(complete_text, context):
-            rejected.append("обязательный переезд противоречит подтверждённым настройкам")
-        if self._location_conflicts(vacancy, context):
-            rejected.append("офис или гибрид находится вне выбранных регионов")
         format_score = self._work_format_score(vacancy, context)
-        if format_score is not None:
-            if format_score == 0:
-                rejected.append("обязательный формат работы противоречит настройкам")
-            else:
-                self._component(components, reasons, "format", format_score, 10, "формат работы")
+        if format_score is not None and format_score != 0:
+            self._component(components, reasons, "format", format_score, 10, "формат работы")
 
         region_score = self._region_score(vacancy, context)
         if region_score is not None:
@@ -1692,11 +1734,17 @@ class PythonBackendRules:
             r"(?:базов\w*\s+уровн\w*|читать|небольш\w*\s+правк\w*)"
             r")"
         )
+        corporate_context = re.compile(r"\bкомпани\w*[^.!?;\n]{0,60}\b(?:использу\w*|применя\w*)")
         for clause in re.split(r"[.!?;\n]+", text):
             if (
                 not clause
                 or optional_clause.search(clause)
                 or auxiliary_language_clause.search(clause)
+            ):
+                continue
+            if corporate_context.search(clause) and not re.search(
+                r"\b(?:обязател\w*|требу\w*|разраб\w*|писать|develop\w*|write)\b",
+                clause,
             ):
                 continue
             if "python" in clause and re.search(
@@ -2295,16 +2343,17 @@ class PythonBackendRules:
         elevated_level = (
             cls._elevated_level_pattern.search(level_context) is not None
             or cls._candidate_level_description_pattern.search(description) is not None
+            or re.search(r"\b(?:head|architect)\b|\bруководител|\bархитектор", title) is not None
         )
-        senior_responsibilities = " ".join((responsibilities, requirements, description))
+        senior_responsibilities = cls._supervisor_level_context_pattern.sub(
+            " ", " ".join((responsibilities, requirements, description))
+        )
         senior_responsibilities = cls._negated_senior_responsibility_pattern.sub(
             "",
             senior_responsibilities,
         )
-        if re.search(r"\b(?:head|architect)\b|\bруководител|\bархитектор", title):
-            return None, "руководящая или архитектурная роль выше целевого"
-        if elevated_level and cls._senior_responsibility_pattern.search(senior_responsibilities):
-            return None, "уровень Senior/Lead с обязанностями, существенно выше текущего опыта"
+        if cls._senior_responsibility_pattern.search(senior_responsibilities):
+            return None, "роль с управленческими обязанностями, существенно выше текущего опыта"
         if elevated_level:
             return "уровень Senior/Lead снижает приоритет, но сам по себе не блокирует", None
         return None, None
@@ -2918,6 +2967,7 @@ class VacancyAnalysisService:
                 **({"manual_override": "ACCEPT"} if manual_accept else {}),
                 "accepted": evaluation.accepted,
                 "category": evaluation.category.value,
+                "score_version": FIT_SCORE_VERSION if semantic is not None else None,
                 "fit_tier": int(evaluation.fit.tier) if evaluation.fit else None,
                 "fit_reason": evaluation.fit.reason if evaluation.fit else None,
                 "matched_capabilities": (
