@@ -8,11 +8,13 @@ import sys
 import threading
 import unicodedata
 import urllib.request
-from collections.abc import Callable
-from contextlib import suppress
-from dataclasses import dataclass
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager, suppress
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from email.parser import BytesParser
+from email.policy import default as email_policy
 from email.utils import parsedate_to_datetime
 from ipaddress import IPv4Address
 from math import ceil
@@ -20,7 +22,8 @@ from pathlib import Path
 from time import monotonic, sleep
 from types import TracebackType
 from typing import BinaryIO
-from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
+from urllib.parse import parse_qs, urlencode, urljoin, urlparse, urlunparse
+from uuid import uuid4
 
 from hugin.diagnostics import OperationJournal
 from hugin.domain.screening_questions import is_fixed_choice, sensitive_question_text
@@ -48,6 +51,7 @@ from playwright.sync_api import (
     TimeoutError as PlaywrightTimeoutError,
 )
 
+from hugin.adapters.codex_cli import _WindowsProcessJob
 from hugin.core.network import usable_source_ipv4
 from hugin.domain.communications import (
     MessageSendFailureCode,
@@ -89,6 +93,7 @@ from hugin.services.requirement_sections import description_sections
 
 _PROFILE_LOCK_FILENAME = ".hugin-browser.lock"
 _PROFILE_LOCK_TIMEOUT_SECONDS = 180.0
+_BROWSER_CLOSE_TIMEOUT_SECONDS = 10.0
 _PROFILE_LOCK_RETRY_SECONDS = 0.25
 _RESUME_OPTIONS_TIMEOUT_MS = 10_000
 _WINDOW_LIVENESS_SCRIPT = "() => true"
@@ -166,7 +171,7 @@ def _is_temporary_navigation_error(error: PlaywrightError) -> bool:
 def _close_browser_resource(close: Callable[[], None]) -> None:
     try:
         close()
-    except PlaywrightError as error:
+    except Exception as error:
         if not any(
             marker in str(error)
             for marker in (
@@ -227,8 +232,29 @@ PROFILE_SNAPSHOT_SCRIPT = """
 }
 """
 
-VACANCY_SEARCH_READY_SCRIPT = """
+VACANCY_SEARCH_CARD_LINK_SCRIPT = """
+const vacancyLink = (card) => {
+    const href = card.querySelector('[data-qa="serp-item__title"]')?.href || '';
+    try {
+        const url = new URL(href, window.location.href);
+        if (url.protocol !== 'https:' || url.hostname !== 'adsrv.hh.ru' ||
+            url.pathname !== '/click') return href;
+        const ids = new Set(Array.from(card.querySelectorAll('[id]'))
+            .map((element) => element.id).filter((id) => /^[1-9]\\d*$/.test(id)));
+        if (ids.size === 1) return `https://hh.ru/vacancy/${Array.from(ids)[0]}`;
+    } catch {
+        return href;
+    }
+    return href;
+};
+"""
+
+VACANCY_SEARCH_READY_SCRIPT = (
+    """
 () => {
+"""
+    + VACANCY_SEARCH_CARD_LINK_SCRIPT
+    + """
     const results = document.querySelector('[data-qa="vacancy-serp__results"]');
     if (!results) return false;
     const fiberKey = Object.keys(results).find((key) => key.startsWith('__reactFiber$'));
@@ -237,10 +263,10 @@ VACANCY_SEARCH_READY_SCRIPT = """
         const vacancies = fiber.memoizedProps?.vacancySearchResult?.vacancies;
         if (!Array.isArray(vacancies)) continue;
         const renderedIds = new Set(Array.from(
-            results.querySelectorAll('[data-qa="serp-item__title"]')
-        ).map((link) => {
+            results.querySelectorAll('[data-qa~="vacancy-serp__vacancy"]')
+        ).map((card) => {
             try {
-                return new URL(link.href, window.location.href).pathname
+                return new URL(vacancyLink(card), window.location.href).pathname
                     .match(/\\/vacancy\\/(\\d+)/)?.[1] || '';
             } catch {
                 return '';
@@ -256,9 +282,14 @@ VACANCY_SEARCH_READY_SCRIPT = """
     return false;
 }
 """
+)
 
-VACANCY_SEARCH_SCRIPT = """
+VACANCY_SEARCH_SCRIPT = (
+    """
 () => {
+"""
+    + VACANCY_SEARCH_CARD_LINK_SCRIPT
+    + """
 const publicationDate = (card, href) => {
     let vacancyId = '';
     try {
@@ -306,10 +337,10 @@ return ({
         document.querySelector('[data-qa="vacancies-search-header"]')?.textContent || ''
     ).trim(),
     vacancies: Array.from(
-        document.querySelectorAll('[data-qa="vacancy-serp__vacancy"]')
+        document.querySelectorAll('[data-qa~="vacancy-serp__vacancy"]')
     ).map((card) => {
         const titleLink = card.querySelector('[data-qa="serp-item__title"]');
-        const href = titleLink?.href || '';
+        const href = vacancyLink(card);
         return ({
             title: (titleLink?.textContent || '').trim(),
             href,
@@ -337,6 +368,7 @@ return ({
     }),
 })}
 """
+)
 
 VACANCY_DETAILS_SCRIPT = """
 () => {
@@ -1264,31 +1296,68 @@ OPEN_NEGOTIATION_CHAT_SCRIPT = """
 }
 """
 
-CHAT_MESSAGES_SCRIPT = """
-(vacancyId) => Array.from(
+CHAT_IDENTITY_SCRIPT = """
+(vacancyId) => {
+const headers = Array.from(document.querySelectorAll(
+    'a[data-qa="chatik-header-vacancy-link"]'
+)).filter((node) => !node.closest('[data-qa^="chatik-chat-message-"]'));
+if (headers.length !== 1) return false;
+let target;
+try { target = new URL(headers[0].getAttribute('href') || '', location.href); }
+catch { return false; }
+const match = target.pathname.match(/^\\/vacancy\\/(\\d+)\\/?$/);
+if (target.protocol !== 'https:' ||
+    !(target.hostname === 'hh.ru' || target.hostname.endsWith('.hh.ru')) ||
+    !match || match[1] !== vacancyId) return false;
+return true;
+}
+"""
+
+CHAT_MESSAGES_SCRIPT = (
+    "(vacancyId) => { if (!("
+    + CHAT_IDENTITY_SCRIPT
+    + ")(vacancyId)) return null;"
+    + """
+return Array.from(
     document.querySelectorAll(
         '[data-qa^="chatik-chat-message-"]:not([data-qa$="-text"])'
     )
-).map((message) => {
+).filter((message) => /^chatik-chat-message-\\d+$/.test(
+    message.getAttribute('data-qa') || ''
+)).map((message) => {
     const qa = message.getAttribute('data-qa') || '';
-    const own = Boolean(
-        message.querySelector('[data-qa="desktop-message-menu-wrapper"], ' +
-            '[data-qa="chat-bubble-icon-read"]')
+    const text = message.querySelector('[data-qa="chat-bubble-text"]');
+    const outsideText = (selector) => Array.from(message.querySelectorAll(selector))
+        .some((node) => !text?.contains(node));
+    const bubble = Array.from(message.querySelectorAll(
+        '[data-qa~="chatik-chat-message-bubble"]'
+    )).find((node) => !text?.contains(node));
+    const own = outsideText(
+        '[data-qa="desktop-message-menu-wrapper"], ' +
+        '[data-qa="chat-bubble-icon-read"], [data-qa="chat-bubble-icon-sent"]'
+    ) || Array.from(bubble?.classList || []).some(
+        (name) => name.startsWith('magritte-outgoing___')
     );
+    const employer = outsideText('[data-qa="chat-bubble-avatar"]');
+    if (own && employer) throw new Error('hh.ru: противоречивые признаки отправителя');
     return {
         vacancyId,
         messageId: qa.replace('chatik-chat-message-', ''),
         direction: own ? 'OUTGOING' : 'INCOMING',
-        directionInferred: !own,
+        directionInferred: !own && !employer,
         body: (
             message.querySelector('[data-qa="chat-bubble-text"]')?.textContent || ''
         ).trim(),
         displayedTime: (
-            message.querySelector('[data-qa="chat-buble-display-time"]')?.textContent || ''
+            message.querySelector(
+                '[data-qa="chat-bubble-display-time"], [data-qa="chat-buble-display-time"]'
+            )?.textContent || ''
         ).trim(),
     };
-}).filter((message) => message.messageId && message.body)
+}).filter((message) => message.messageId && message.body);
+}
 """
+)
 
 ALLOWED_SEARCH_FILTERS = frozenset(
     {
@@ -1332,6 +1401,8 @@ class _ApplicationSnapshot:
 class _SubmissionAttempt:
     started: bool = False
     blocked: bool = False
+    click_attempted: bool = False
+    evidence: dict[str, object] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1664,6 +1735,8 @@ class VisibleHhBrowser:
         timeout_ms: int,
         *,
         start_minimized: bool = False,
+        headless: bool = False,
+        browser_channel: str = "chromium",
         browser_source_ip: str | None = None,
         profile_lock_timeout_seconds: float | None = None,
         journal: OperationJournal | None = None,
@@ -1678,14 +1751,21 @@ class VisibleHhBrowser:
         self._search_url = search_url
         self._timeout_ms = timeout_ms
         self._start_minimized = start_minimized
+        self._headless = headless
+        if browser_channel not in {"chromium", "chrome", "msedge"}:
+            raise ValueError("Браузер должен быть chromium, chrome или msedge")
+        self._browser_channel = browser_channel
         self._browser_source_ip = browser_source_ip
         self._shared_endpoint = shared_endpoint
         self._remote_debugging = remote_debugging
         self._message_send_allowed = message_send_allowed
         self._network_proxy: _HhHttpProxy | None = None
         self._playwright: Playwright | None = None
+        self._driver_job: _WindowsProcessJob | None = None
+        self._authentication_read_active = False
         self._context: BrowserContext | None = None
         self._page: Page | None = None
+        self._manual_page: Page | None = None
         lock_timeout = (
             _PROFILE_LOCK_TIMEOUT_SECONDS
             if profile_lock_timeout_seconds is None
@@ -1704,12 +1784,27 @@ class VisibleHhBrowser:
             self._profile_lock.acquire()
         try:
             self._playwright = sync_playwright().start()
+            self._attach_driver_job()
             if self._shared_endpoint is not None:
                 connected = self._playwright.chromium.connect_over_cdp(
                     self._shared_endpoint(), timeout=self._timeout_ms
                 )
                 self._context = connected.contexts[0]
-                self._page = self._context.new_page()
+                if self._start_minimized:
+                    # Обычный new_page активирует вкладку и может поднять окно над игрой.
+                    # Уникальный адрес отделяет события параллельных работников.
+                    url = f"about:blank#hugin-{uuid4().hex}"
+                    session = connected.new_browser_cdp_session()
+                    try:
+                        with self._context.expect_page(
+                            predicate=lambda page: page.url == url, timeout=self._timeout_ms
+                        ) as created:
+                            session.send("Target.createTarget", {"url": url, "background": True})
+                        self._page = created.value
+                    finally:
+                        session.detach()
+                else:
+                    self._page = self._context.new_page()
                 self._page.set_default_timeout(self._timeout_ms)
                 self._page.set_default_navigation_timeout(self._timeout_ms)
                 if not self._start_minimized:
@@ -1736,28 +1831,21 @@ class VisibleHhBrowser:
                 chromium_args.append(f"--proxy-pac-url={self._network_proxy.pac_url}")
             self._context = self._playwright.chromium.launch_persistent_context(
                 str(self._profile_dir),
-                headless=False,
+                headless=self._headless,
                 no_viewport=True,
                 args=chromium_args,
+                channel=self._browser_channel if self._browser_channel != "chromium" else None,
+                ignore_default_args=(
+                    ["--disable-extensions"] if self._browser_channel != "chromium" else None
+                ),
             )
             self._page = self._context.pages[0] if self._context.pages else self._context.new_page()
             self._page.set_default_timeout(self._timeout_ms)
             self._page.set_default_navigation_timeout(self._timeout_ms)
             self._minimize_window()
         except BaseException:
-            if self._shared_endpoint is not None and self._page is not None:
-                with suppress(Exception):
-                    self._page.close()
-            if self._playwright is not None:
-                with suppress(Exception):
-                    self._playwright.stop()
-            self._playwright = None
-            self._context = None
-            self._page = None
-            if self._network_proxy is not None:
-                self._network_proxy.stop()
-                self._network_proxy = None
-            self._profile_lock.release()
+            with suppress(Exception):
+                self._close_resources()
             raise
         return self
 
@@ -1773,6 +1861,24 @@ class VisibleHhBrowser:
         if not self._start_minimized or self._context is None or self._page is None:
             return
         self._set_window_state("minimized")
+
+    def ensure_visible(self) -> None:
+        """Открывает окно владельца только после передачи ручного управления."""
+        if not self._headless:
+            return
+        if self._shared_endpoint is not None:
+            raise RuntimeError("Окно открывает владелец общего браузера")
+        self._close_resources()
+        self._headless = False
+        self._start_minimized = False
+        self.__enter__()
+
+    def return_to_background(self) -> None:
+        if not self._headless:
+            self._close_resources()
+            self._headless = True
+            self._start_minimized = True
+            self.__enter__()
 
     def _set_window_state(self, state: str) -> None:
         if self._context is None or self._page is None:
@@ -1800,18 +1906,92 @@ class VisibleHhBrowser:
         exc_value: BaseException | None,
         traceback: TracebackType | None,
     ) -> None:
+        self._close_resources()
+
+    def _attach_driver_job(self) -> None:
+        if sys.platform != "win32" or self._playwright is None:
+            return
+        implementation = getattr(self._playwright, "_impl_obj", None)
+        connection = getattr(implementation, "_connection", None)
+        transport = getattr(connection, "_transport", None)
+        process = getattr(transport, "_proc", None)
+        pid = getattr(process, "pid", None)
+        job: _WindowsProcessJob | None = None
         try:
-            if self._shared_endpoint is not None and self._page is not None:
-                _close_browser_resource(self._page.close)
-            elif self._context is not None:
-                _close_browser_resource(self._context.close)
-        finally:
+            if (
+                not isinstance(pid, int)
+                or pid < 1
+                or getattr(process, "returncode", None) is not None
+            ):
+                raise RuntimeError("Не найден собственный работающий драйвер браузера")
+            job = _WindowsProcessJob()
+            job.assign(pid)
+        except (OSError, RuntimeError) as error:
+            if job is not None:
+                job.close()
+            if self._journal is not None:
+                self._journal.record("browser", "cleanup_guard", status="failed", error=str(error))
+        else:
+            self._driver_job = job
+
+    def _stop_unresponsive_driver(self, job: _WindowsProcessJob) -> None:
+        try:
+            if not job.active():
+                return
+            job.stop()
+        except OSError as error:
+            if self._journal is not None:
+                self._journal.record("browser", "cleanup_stop", status="failed", error=str(error))
+        else:
+            if self._journal is not None:
+                self._journal.record(
+                    "browser",
+                    "cleanup_timeout",
+                    status="failed",
+                    error=(
+                        "Закрытие браузера превысило отведённое время; собственная группа завершена"
+                    ),
+                    timeout_seconds=_BROWSER_CLOSE_TIMEOUT_SECONDS,
+                )
+
+    def _close_resources(self) -> None:
+        job = self._driver_job
+        timer = None
+        if job is not None:
+            timer = threading.Timer(
+                _BROWSER_CLOSE_TIMEOUT_SECONDS, self._stop_unresponsive_driver, args=(job,)
+            )
+            timer.daemon = True
             try:
+                timer.start()
+            except RuntimeError as error:
+                timer = None
+                if self._journal is not None:
+                    self._journal.record(
+                        "browser", "cleanup_guard", status="failed", error=str(error)
+                    )
+        try:
+            try:
+                if self._shared_endpoint is not None:
+                    if self._page is not None:
+                        _close_browser_resource(self._page.close)
+                elif self._context is not None:
+                    _close_browser_resource(self._context.close)
+            finally:
                 if self._playwright is not None:
                     _close_browser_resource(self._playwright.stop)
+        finally:
+            try:
+                if timer is not None:
+                    timer.cancel()
+                    timer.join()
+                if job is not None:
+                    job.close()
             finally:
+                self._driver_job = None
                 self._context = None
                 self._page = None
+                self._manual_page = None
                 self._playwright = None
                 if self._network_proxy is not None:
                     self._network_proxy.stop()
@@ -1885,9 +2065,52 @@ class VisibleHhBrowser:
             return False
         return True
 
+    def _goto_read_page(self, page: Page, url: str, *, page_kind: str) -> Response | None:
+        if self._journal is None:
+            return page.goto(url, wait_until="domcontentloaded")
+        started = monotonic()
+        document_response_ms: int | None = None
+        document_response_status: int | None = None
+        domcontentloaded_ms: int | None = None
+
+        def document_response(response: Response) -> None:
+            nonlocal document_response_ms, document_response_status
+            request = response.request
+            if request.is_navigation_request() and request.frame == page.main_frame:
+                document_response_ms = max(0, round((monotonic() - started) * 1000))
+                document_response_status = response.status
+
+        def document_loaded(_page: Page) -> None:
+            nonlocal domcontentloaded_ms
+            domcontentloaded_ms = max(0, round((monotonic() - started) * 1000))
+
+        page.on("response", document_response)
+        page.on("domcontentloaded", document_loaded)
+        status = "completed"
+        error_type: str | None = None
+        try:
+            return page.goto(url, wait_until="domcontentloaded")
+        except Exception as error:
+            status, error_type = "failed", type(error).__name__
+            raise
+        finally:
+            page.remove_listener("response", document_response)
+            page.remove_listener("domcontentloaded", document_loaded)
+            self._journal.record(
+                "browser",
+                "page_navigation",
+                status=status,
+                page_kind=page_kind,
+                duration_ms=max(0, round((monotonic() - started) * 1000)),
+                document_response_ms=document_response_ms,
+                document_response_status=document_response_status,
+                domcontentloaded_ms=domcontentloaded_ms,
+                error_type=error_type,
+            )
+
     def read_profile(self) -> HhProfileData:
         page = self._require_page()
-        page.goto(self._resumes_url, wait_until="domcontentloaded")
+        self._goto_read_page(page, self._resumes_url, page_kind="profile")
         page.locator("template.ResumeProfileFront-InitialState").first.wait_for(
             state="attached",
             timeout=self._timeout_ms,
@@ -1944,7 +2167,7 @@ class VisibleHhBrowser:
 
         page = self._require_page()
         try:
-            page.goto(url, wait_until="domcontentloaded")
+            self._goto_read_page(page, url, page_kind="search")
             self._raise_for_captcha(page, verification_url=url)
             page.locator('[data-qa="vacancies-search-header"]').first.wait_for(
                 state="visible",
@@ -1996,10 +2219,53 @@ class VisibleHhBrowser:
         )
 
     def read_vacancy_details(self, source_url: str) -> VacancyData:
+        if self._journal is None:
+            return self._read_vacancy_details(source_url)
+        vacancy_id, _ = self._vacancy_id_and_url(source_url)
+        run = self._journal.start("browser", "vacancy_details", vacancy_id=vacancy_id)
+        phase_started_at = monotonic()
+        phase = "navigation"
+        durations: dict[str, int] = {}
+
+        def mark_phase(name: str) -> None:
+            nonlocal phase, phase_started_at
+            now = monotonic()
+            durations[phase] = durations.get(phase, 0) + max(
+                0, round((now - phase_started_at) * 1000)
+            )
+            phase, phase_started_at = name, now
+
+        def timing_details() -> dict[str, object]:
+            mark_phase("finished")
+            return {"phase_durations_ms": durations}
+
+        try:
+            result = self._read_vacancy_details(source_url, mark_phase=mark_phase)
+        except VacancyUnavailableError as error:
+            run.skip(availability=error.availability.value, **timing_details())
+            raise
+        except HhSyncBlockedError as error:
+            run.block(error_code=error.code, **timing_details())
+            raise
+        except Exception as error:
+            run.fail(error, **timing_details())
+            raise
+        else:
+            run.succeed(**timing_details())
+            return result
+
+    def _read_vacancy_details(
+        self,
+        source_url: str,
+        *,
+        mark_phase: Callable[[str], None] | None = None,
+    ) -> VacancyData:
         vacancy_id, normalized_url = self._vacancy_id_and_url(source_url)
         page = self._require_page()
         try:
             response = page.goto(normalized_url, wait_until="domcontentloaded")
+            if mark_phase is not None:
+                mark_phase("initial_checks")
             self._raise_for_captcha(page, verification_url=normalized_url)
             payload = page.evaluate(VACANCY_DETAILS_SCRIPT)
             availability = self._vacancy_availability(response, payload)
@@ -2010,10 +2276,14 @@ class VisibleHhBrowser:
                 availability = VacancyAvailability.UNAVAILABLE
             if availability is not VacancyAvailability.ACTIVE:
                 raise VacancyUnavailableError(vacancy_id, normalized_url, availability)
+            if mark_phase is not None:
+                mark_phase("title_wait")
             page.locator('[data-qa="vacancy-title"]').first.wait_for(
                 state="visible",
                 timeout=self._timeout_ms,
             )
+            if mark_phase is not None:
+                mark_phase("final_checks")
             self._raise_for_captcha(page, verification_url=normalized_url)
             payload = page.evaluate(VACANCY_DETAILS_SCRIPT)
             availability = self._vacancy_availability(response, payload)
@@ -2027,6 +2297,8 @@ class VisibleHhBrowser:
         except PlaywrightTimeoutError as error:
             self._raise_for_captcha(page, verification_url=normalized_url)
             raise RuntimeError(f"Страница вакансии {vacancy_id} не загрузилась") from error
+        if mark_phase is not None:
+            mark_phase("parse")
         if not isinstance(payload, dict):
             raise RuntimeError("hh.ru вернул некорректные подробности вакансии")
 
@@ -2081,6 +2353,13 @@ class VisibleHhBrowser:
 
     def _raise_for_captcha(self, page: Page, *, verification_url: str) -> None:
         if self._has_captcha(page):
+            if urlparse(page.url).path.rstrip("/") == "/account/captcha":
+                try:
+                    self._validate_verification_url(page.url)
+                except ValueError:
+                    pass
+                else:
+                    verification_url = page.url
             raise HhSyncBlockedError(
                 "CAPTCHA_REQUIRED",
                 "hh.ru запросил проверку; пройдите CAPTCHA в браузере Hugin",
@@ -2092,6 +2371,21 @@ class VisibleHhBrowser:
         page = self._require_page()
         page.goto(url, wait_until="domcontentloaded")
         self._validate_verification_url(page.url)
+
+    def show_verification(self, url: str) -> None:
+        self._validate_verification_url(url)
+        if self._context is None:
+            raise RuntimeError("Браузер ещё не открыт")
+        page = self._manual_page
+        if page is None or page.is_closed() or page.url != url:
+            page = self._context.new_page()
+            page.set_default_timeout(self._timeout_ms)
+            page.set_default_navigation_timeout(self._timeout_ms)
+            page.goto(url, wait_until="domcontentloaded")
+            self._validate_verification_url(page.url)
+            self._manual_page = page
+        self._set_window_state("normal")
+        page.bring_to_front()
 
     @staticmethod
     def _validate_verification_url(url: str) -> None:
@@ -2155,7 +2449,35 @@ class VisibleHhBrowser:
         )
 
     def read_application_statuses(self) -> tuple[HhNegotiationData, ...]:
+        statuses: dict[str, HhNegotiationData] = {}
+        for status in self._iter_application_statuses():
+            statuses[status.vacancy_id] = status
+        return tuple(statuses.values())
+
+    def _iter_application_statuses(self) -> Iterator[HhNegotiationData]:
         page = self._open_negotiations()
+        page_number = 1
+        while True:
+            paginated = bool(self._negotiation_page_numbers(page))
+            if paginated:
+                self._select_negotiation_page(page, page_number)
+            yield from self._read_negotiation_statuses(
+                page, page_number=page_number if paginated else None
+            )
+            if urlparse(page.url).path != "/applicant/negotiations":
+                page = self._open_negotiations()
+                if paginated:
+                    self._select_negotiation_page(page, page_number)
+            next_pages = [
+                number for number in self._negotiation_page_numbers(page) if number > page_number
+            ]
+            if not next_pages:
+                return
+            page_number = min(next_pages)
+
+    def _read_negotiation_statuses(
+        self, page: Page, *, page_number: int | None
+    ) -> tuple[HhNegotiationData, ...]:
         payload = self._negotiations_payload(page)
         statuses: list[HhNegotiationData] = []
         for position, item in enumerate(payload):
@@ -2170,6 +2492,7 @@ class VisibleHhBrowser:
                 vacancy_id = self._vacancy_id_from_negotiation_card(
                     position=position,
                     expected_count=len(payload),
+                    page_number=page_number,
                 )
             status_qa = self._optional_string(item, "statusQa").casefold()
             status_label = self._optional_string(item, "statusLabel")
@@ -2366,6 +2689,8 @@ class VisibleHhBrowser:
 
     @staticmethod
     def _dismiss_negotiation_promotion(page: Page) -> None:
+        VisibleHhBrowser._dismiss_negotiation_notices(page)
+        VisibleHhBrowser._dismiss_negotiation_feedback(page)
         promotion = page.locator(
             '[data-qa="magritte-alert"]:has(a[href^="/applicant-services/hhpro"]):visible'
         )
@@ -2402,6 +2727,94 @@ class VisibleHhBrowser:
             ) from error
 
     @staticmethod
+    def _dismiss_negotiation_notices(page: Page) -> None:
+        cookie_selector = '[data-qa="cookies-policy-informer"]:visible'
+        review_selector = (
+            '.bloko-notification__plate:has([data-qa="employer-review-chips-recommend-YES"])'
+            ':has([data-qa="employer-review-chips-recommend-NO"]):visible'
+        )
+        notices = (
+            (
+                cookie_selector,
+                '[data-qa="cookies-policy-informer-accept"]',
+                None,
+                "Чтобы сайт был удобнее, используем",
+            ),
+            (
+                review_selector,
+                '[data-qa="notification-close-button"]',
+                ".bloko-notification__heading",
+                "Рекомендуете ли вы своего работодателя?",
+            ),
+        )
+        for selector, close_selector, heading_selector, expected_heading in notices:
+            notice = page.locator(selector)
+            if not notice.count():
+                continue
+            try:
+                heading = (
+                    page.locator(f"{selector} {heading_selector}") if heading_selector else notice
+                )
+                close = page.locator(f"{selector} {close_selector}")
+                if (
+                    notice.count() != 1
+                    or heading.count() != 1
+                    or not " ".join(heading.inner_text(timeout=3_000).split()).startswith(
+                        expected_heading
+                    )
+                    or close.count() != 1
+                ):
+                    raise HhSyncRetryableError(
+                        "HH_PAGE_OBSTRUCTED",
+                        "Уведомление hh.ru изменилось; чтение приостановлено",
+                        retry_after_seconds=60,
+                    )
+                close.click(timeout=3_000)
+                notice.wait_for(state="hidden", timeout=3_000)
+            except PlaywrightError as error:
+                raise HhSyncRetryableError(
+                    "HH_PAGE_OBSTRUCTED",
+                    "Уведомление hh.ru перекрывает страницу и не закрылось",
+                    retry_after_seconds=60,
+                ) from error
+
+    @staticmethod
+    def _dismiss_negotiation_feedback(page: Page) -> None:
+        feedback = page.locator('[data-qa="vacancy-feedback__title"]:visible')
+        if not feedback.count():
+            return
+        overlay = page.locator(
+            '[data-qa="bottom-sheet-css-variables"]:has('
+            '[data-qa="vacancy-feedback__title"]:visible) '
+            '[data-qa="bottom-sheet-overlay"]:visible'
+        )
+        try:
+            if (
+                feedback.count() != 1
+                or not " ".join(feedback.inner_text(timeout=3_000).split()).startswith(
+                    "Вы посмотрели вакансию, но не откликнулись."
+                )
+                or overlay.count() != 1
+                or page.locator('[data-qa="bottom-sheet-overlay"]:visible').count() != 1
+                or page.locator(
+                    '[data-qa="magritte-alert"]:visible, [role="alertdialog"]:visible'
+                ).count()
+            ):
+                raise HhSyncRetryableError(
+                    "HH_PAGE_OBSTRUCTED",
+                    "Окно обратной связи hh.ru перекрыто другим окном; чтение приостановлено",
+                    retry_after_seconds=60,
+                )
+            overlay.click(position={"x": 5, "y": 5}, timeout=3_000)
+            feedback.wait_for(state="hidden", timeout=3_000)
+        except PlaywrightError as error:
+            raise HhSyncRetryableError(
+                "HH_PAGE_OBSTRUCTED",
+                "Окно обратной связи hh.ru не закрылось; чтение приостановлено",
+                retry_after_seconds=60,
+            ) from error
+
+    @staticmethod
     def _negotiations_payload(page: Page) -> list[dict[object, object]]:
         payload = page.evaluate(NEGOTIATIONS_SCRIPT)
         if not isinstance(payload, list) or not all(isinstance(item, dict) for item in payload):
@@ -2415,6 +2828,7 @@ class VisibleHhBrowser:
         vacancy_id: str,
     ) -> list[dict[object, object]]:
         attempts = max(min(self._timeout_ms // 500, 20), 1)
+        target_confirmed = False
         for _attempt in range(attempts):
             try:
                 payload = frame.evaluate(CHAT_MESSAGES_SCRIPT, vacancy_id)
@@ -2423,6 +2837,10 @@ class VisibleHhBrowser:
                     "HH_CHAT_READ_FAILED",
                     f"Не удалось прочитать переписку вакансии {vacancy_id}",
                 ) from error
+            if payload is None:
+                page.wait_for_timeout(500)
+                continue
+            target_confirmed = True
             if not isinstance(payload, list) or not all(isinstance(item, dict) for item in payload):
                 raise _HhChatReadError(
                     "HH_CHAT_INVALID",
@@ -2432,8 +2850,8 @@ class VisibleHhBrowser:
                 return payload
             page.wait_for_timeout(500)
         raise _HhChatReadError(
-            "HH_CHAT_EMPTY",
-            f"Переписка вакансии {vacancy_id} открылась, но hh.ru не отдал ни одного сообщения",
+            "HH_CHAT_EMPTY" if target_confirmed else "HH_CHAT_TARGET_UNCONFIRMED",
+            f"Не получена подтверждённая переписка вакансии {vacancy_id}",
         )
 
     def apply_to_vacancy(
@@ -2449,8 +2867,20 @@ class VisibleHhBrowser:
     ) -> HhApplyResult:
         page = self._require_page()
         attempt = _SubmissionAttempt()
+        started_at = phase_started_at = monotonic()
+        phase = "vacancy_navigation"
+        durations: dict[str, int] = {}
+
+        def mark_phase(name: str) -> None:
+            nonlocal phase, phase_started_at
+            now = monotonic()
+            durations[phase] = durations.get(phase, 0) + max(
+                0, round((now - phase_started_at) * 1000)
+            )
+            phase, phase_started_at = name, now
+
         try:
-            return self._apply_to_vacancy(
+            result = self._apply_to_vacancy(
                 source_url,
                 expected_resume_hh_id=expected_resume_hh_id,
                 expected_resume_title=expected_resume_title,
@@ -2459,21 +2889,35 @@ class VisibleHhBrowser:
                 submit_guard=submit_guard,
                 screening_submission=screening_submission,
                 attempt=attempt,
+                mark_phase=mark_phase,
             )
         except Exception as error:
             details = str(error).strip().splitlines()[0][:500]
             suffix = f": {details}" if details else ""
             if attempt.started:
-                return HhApplyResult(
+                result = HhApplyResult(
                     HhApplyStatus.UNKNOWN_RESULT,
                     page.url,
                     f"Ошибка после начала отправки: {type(error).__name__}{suffix}",
                 )
-            return HhApplyResult(
-                HhApplyStatus.RETRYABLE_ERROR,
-                page.url,
-                f"Ошибка до нажатия кнопки отправки: {type(error).__name__}{suffix}",
+            else:
+                result = HhApplyResult(
+                    HhApplyStatus.RETRYABLE_ERROR,
+                    page.url,
+                    f"Ошибка до нажатия кнопки отправки: {type(error).__name__}{suffix}",
+                )
+        mark_phase("finished")
+        if self._journal is not None:
+            self._journal.record(
+                "browser",
+                "application_timing",
+                status="completed",
+                submit=submit,
+                result=result.status.value,
+                phase_durations_ms=durations,
+                total_duration_ms=max(0, round((phase_started_at - started_at) * 1000)),
             )
+        return replace(result, submission_evidence=attempt.evidence)
 
     def _apply_to_vacancy(
         self,
@@ -2486,6 +2930,7 @@ class VisibleHhBrowser:
         submit_guard: Callable[[], bool] | None,
         screening_submission: HhScreeningSubmission | None,
         attempt: _SubmissionAttempt,
+        mark_phase: Callable[[str], None],
     ) -> HhApplyResult:
         vacancy_id, _normalized_url = self._vacancy_id_and_url(source_url)
         vacancy_url = self._canonical_vacancy_url(source_url)
@@ -2502,6 +2947,7 @@ class VisibleHhBrowser:
                 f"Не загрузилась страница вакансии: {details or type(error).__name__}",
                 retry_after_seconds=(_NETWORK_RETRY_SECONDS if is_network_error else None),
             )
+        mark_phase("vacancy_checks")
         body_text = self._page_body_text(page)
         if initial_response is not None and initial_response.status == 429:
             return HhApplyResult(
@@ -2516,6 +2962,14 @@ class VisibleHhBrowser:
         if self._vacancy_is_closed(initial_response, body_text):
             return HhApplyResult(HhApplyStatus.VACANCY_CLOSED, page.url)
         if initial_response is not None and initial_response.status == 403:
+            if not self._contains_any(body_text, *_ACCOUNT_WARNING_MARKERS) and (
+                self._application_captcha(page, body_text)
+            ):
+                return HhApplyResult(
+                    HhApplyStatus.CAPTCHA_REQUIRED,
+                    page.url,
+                    "hh.ru запросил капчу; пройдите её в браузере Hugin",
+                )
             return HhApplyResult(
                 HhApplyStatus.ACCOUNT_WARNING,
                 page.url,
@@ -2538,11 +2992,52 @@ class VisibleHhBrowser:
                 "На странице вакансии нет стандартной кнопки отклика",
             )
         try:
-            response_links.first.click(no_wait_after=True, timeout=min(self._timeout_ms, 10_000))
-            page.locator('[data-qa="resume-title"]').first.wait_for(
-                state="visible",
-                timeout=self._timeout_ms,
-            )
+            mark_phase("form_open")
+            response_link = response_links.first
+            form_url = urljoin(vacancy_url, response_link.get_attribute("href") or "")
+            try:
+                response_link.click(no_wait_after=True, timeout=min(self._timeout_ms, 10_000))
+                page.locator('[data-qa="resume-title"]').first.wait_for(
+                    state="visible", timeout=min(self._timeout_ms, 10_000)
+                )
+            except PlaywrightError:
+                # The popup can remain loading while its ordinary GET form still works.
+                target = urlparse(form_url)
+                if not (
+                    target.scheme == "https"
+                    and target.netloc == urlparse(vacancy_url).netloc
+                    and target.path == "/applicant/vacancy_response"
+                    and parse_qs(target.query).get("vacancyId") == [vacancy_id]
+                ):
+                    raise
+                access_error = self._application_access_error(page, self._page_body_text(page))
+                if access_error is not None:
+                    return access_error
+                form_response = page.goto(form_url, wait_until="domcontentloaded")
+                body_text = self._page_body_text(page)
+                access_error = self._application_access_error(page, body_text)
+                if access_error is not None:
+                    return access_error
+                if form_response is not None and form_response.status == 403:
+                    return HhApplyResult(
+                        HhApplyStatus.ACCOUNT_WARNING,
+                        page.url,
+                        "hh.ru запретил доступ к форме отклика; требуется проверка аккаунта",
+                    )
+                if form_response is not None and form_response.status == 429:
+                    return HhApplyResult(
+                        HhApplyStatus.RETRYABLE_ERROR,
+                        page.url,
+                        "hh.ru временно ограничил обращения к форме отклика",
+                        retry_after_seconds=(
+                            self._retry_after_seconds(form_response)
+                            or _TEMPORARY_REQUEST_RETRY_SECONDS
+                        ),
+                        retry_blocks_queue=True,
+                    )
+                page.locator('[data-qa="resume-title"]').first.wait_for(
+                    state="visible", timeout=self._timeout_ms
+                )
             page.wait_for_timeout(500)
         except PlaywrightError as error:
             details = str(error).strip().splitlines()[0][:500]
@@ -2552,6 +3047,7 @@ class VisibleHhBrowser:
                 f"Кнопка отклика не открыла форму: {details or type(error).__name__}",
             )
 
+        mark_phase("form_checks")
         initial = self._application_snapshot(page)
         vacancy_error = self._application_vacancy_error(page, vacancy_id, initial)
         if vacancy_error is not None:
@@ -2586,6 +3082,7 @@ class VisibleHhBrowser:
             )
 
         try:
+            mark_phase("resume_selection")
             initial = self._select_exact_resume(
                 page,
                 expected_resume_hh_id=expected_resume_hh_id,
@@ -2603,6 +3100,7 @@ class VisibleHhBrowser:
                 confirmation=str(error),
                 warnings=initial.warnings,
             )
+        mark_phase("form_fill")
         vacancy_error = self._application_vacancy_error(page, vacancy_id, initial)
         if vacancy_error is not None:
             return vacancy_error
@@ -2690,6 +3188,7 @@ class VisibleHhBrowser:
                 warnings=initial.warnings,
             )
 
+        mark_phase("submit_checks")
         final = self._application_snapshot(page)
         vacancy_error = self._application_vacancy_error(page, vacancy_id, final)
         if vacancy_error is not None:
@@ -2789,7 +3288,6 @@ class VisibleHhBrowser:
         if guard_error is not None:
             return guard_error
 
-        parsed = urlparse(self._resumes_url)
         response: Response | None = None
         submit_button.first.click(
             trial=True,
@@ -2814,7 +3312,7 @@ class VisibleHhBrowser:
         if guard_error is not None:
             return guard_error
 
-        route_pattern = "**/*vacancy_response*"
+        route_pattern = re.compile(r"/[^?#]*vacancy_response[^#]*$")
 
         def guard_submission_request(route: Route, request: Request) -> None:
             nonlocal guard_error
@@ -2847,6 +3345,7 @@ class VisibleHhBrowser:
             )
         try:
             try:
+                mark_phase("submission_response")
                 with page.expect_response(
                     lambda candidate: self._is_application_submission_response_for_target(
                         candidate,
@@ -2855,6 +3354,7 @@ class VisibleHhBrowser:
                     ),
                     timeout=min(self._timeout_ms, _SUBMISSION_RESPONSE_TIMEOUT_MS),
                 ) as response_info:
+                    attempt.click_attempted = True
                     submit_button.first.click(no_wait_after=True)
                 response = response_info.value
                 page.wait_for_timeout(1_500)
@@ -2870,8 +3370,17 @@ class VisibleHhBrowser:
                     warnings=initial.warnings,
                 )
         finally:
+            mark_phase("submission_evidence")
             with suppress(PlaywrightError):
                 page.unroute(route_pattern, guard_submission_request)
+            if attempt.click_attempted:
+                attempt.evidence = self._capture_submission_evidence(
+                    page,
+                    response,
+                    attempt,
+                    vacancy_id=vacancy_id,
+                    resume_hh_id=expected_resume_hh_id,
+                )
 
         if guard_error is not None and not attempt.started:
             return guard_error
@@ -2886,6 +3395,7 @@ class VisibleHhBrowser:
                 warnings=ready.warnings,
             )
 
+        mark_phase("confirmation")
         submission_error = self._application_submission_error(page, response)
         if submission_error is not None:
             return submission_error
@@ -2900,12 +3410,24 @@ class VisibleHhBrowser:
                     screening_submission.version_hash if screening_submission is not None else None
                 ),
             )
-        if self._vacancy_in_negotiations(
-            page,
-            parsed.scheme,
-            parsed.netloc,
-            vacancy_id,
-        ):
+        try:
+            mark_phase("history")
+            found_in_history = self._vacancy_in_negotiations(vacancy_id)
+        except (HhSyncBlockedError, HhSyncRetryableError) as error:
+            return HhApplyResult(
+                HhApplyStatus.UNKNOWN_RESULT,
+                page.url,
+                f"Запрос уже отправлен; сверка результата недоступна: {error}",
+                warnings=initial.warnings,
+                reconciliation_error_code=error.code,
+                screening_form_version_hash=(
+                    screening_submission.version_hash if screening_submission is not None else None
+                ),
+                retry_after_seconds=(
+                    error.retry_after_seconds if isinstance(error, HhSyncRetryableError) else None
+                ),
+            )
+        if found_in_history:
             return HhApplyResult(
                 HhApplyStatus.APPLIED,
                 page.url,
@@ -3079,8 +3601,12 @@ class VisibleHhBrowser:
                 page.url,
                 body_text[:1000],
             )
-        if self._any_present(page, _CAPTCHA_SELECTOR):
-            return HhApplyResult(HhApplyStatus.CAPTCHA_REQUIRED, page.url)
+        if self._application_captcha(page, body_text):
+            return HhApplyResult(
+                HhApplyStatus.CAPTCHA_REQUIRED,
+                page.url,
+                "hh.ru запросил капчу; пройдите её в браузере Hugin",
+            )
         if self._contains_any(body_text, *_APPLICATION_LIMIT_MARKERS):
             return HhApplyResult(
                 HhApplyStatus.RETRYABLE_ERROR,
@@ -3397,6 +3923,15 @@ class VisibleHhBrowser:
             )
         response: Response | None = None
         try:
+            target_confirmed = frame.evaluate(CHAT_IDENTITY_SCRIPT, vacancy_id) is True
+        except PlaywrightError:
+            target_confirmed = False
+        if not target_confirmed:
+            return MessageSendResult(
+                MessageSendOutcome.FAILED,
+                failure_code=MessageSendFailureCode.SNAPSHOT_UNAVAILABLE,
+            )
+        try:
             with page.expect_response(
                 self._is_message_submission_response,
                 timeout=self._timeout_ms,
@@ -3445,6 +3980,7 @@ class VisibleHhBrowser:
         return tuple(sorted(numbers))
 
     def _select_negotiation_page(self, page: Page, page_number: int) -> None:
+        self._dismiss_negotiation_promotion(page)
         selected = page.locator('[data-qa*="number-pages-selected"]')
         if selected.count() == 1 and selected.first.inner_text().strip() == str(page_number):
             return
@@ -3452,8 +3988,18 @@ class VisibleHhBrowser:
         if button.count() != 1:
             raise RuntimeError(f"hh.ru не показал страницу откликов {page_number}")
         try:
-            button.first.click(no_wait_after=True)
-            page.wait_for_timeout(1_500)
+            button.first.click(no_wait_after=True, timeout=min(self._timeout_ms, 5_000))
+            page.wait_for_function(
+                f"""() => {{
+                    const selected = document.querySelectorAll(
+                        '[data-qa*="number-pages-selected"]'
+                    );
+                    return document.readyState !== 'loading' && selected.length === 1 &&
+                        selected[0].textContent.trim() === '{page_number}';
+                }}""",
+                timeout=self._timeout_ms,
+                polling=100,
+            )
         except PlaywrightError as error:
             raise RuntimeError(f"Не удалось открыть страницу откликов {page_number}") from error
 
@@ -3541,36 +4087,48 @@ class VisibleHhBrowser:
             retry_at = retry_at.replace(tzinfo=UTC)
         return max(ceil((retry_at - datetime.now(UTC)).total_seconds()), 0)
 
-    def _vacancy_in_negotiations(
+    def _capture_submission_evidence(
         self,
         page: Page,
-        scheme: str,
-        netloc: str,
+        response: Response | None,
+        attempt: _SubmissionAttempt,
+        *,
         vacancy_id: str,
-    ) -> bool:
-        negotiations_url = urlunparse((scheme, netloc, "/applicant/negotiations", "", "", ""))
+        resume_hh_id: str,
+    ) -> dict[str, object]:
+        evidence: dict[str, object] = {
+            "schema_version": 1,
+            "captured_at": datetime.now(UTC).isoformat(),
+            "vacancy_id": vacancy_id,
+            "resume_hh_id": resume_hh_id,
+            "request_started": attempt.started,
+            "request_blocked": attempt.blocked,
+            "response_status": response.status if response is not None else None,
+            "response_url": response.url[:1000] if response is not None else None,
+            "response_text": None,
+            "page_url": page.url[:1000],
+            "page_text": None,
+        }
+        if response is not None:
+            try:
+                evidence["response_text"] = response.text()[:8000]
+            except Exception as error:
+                evidence["response_body_error"] = type(error).__name__
         try:
-            page.goto(negotiations_url, wait_until="domcontentloaded")
-            page.wait_for_timeout(3_000)
-            payload = page.evaluate(NEGOTIATIONS_SCRIPT)
-            if not isinstance(payload, list) or not all(isinstance(item, dict) for item in payload):
-                return False
-            for position, item in enumerate(payload):
-                react_id = self._optional_string(item, "vacancyId")
-                if react_id and not react_id.isdigit():
-                    return False
-                direct_id = self._vacancy_id_from_href(self._optional_string(item, "vacancyHref"))
-                current_id = (
-                    react_id
-                    or direct_id
-                    or self._vacancy_id_from_negotiation_card(
-                        position=position,
-                        expected_count=len(payload),
-                    )
-                )
-                if current_id == vacancy_id:
-                    return True
-            return False
+            evidence["page_text"] = page.locator("body").inner_text(
+                timeout=min(self._timeout_ms, 3000)
+            )[:8000]
+        except Exception as error:
+            evidence["page_text_error"] = type(error).__name__
+        return evidence
+
+    def _vacancy_in_negotiations(self, vacancy_id: str) -> bool:
+        try:
+            return any(
+                status.vacancy_id == vacancy_id for status in self._iter_application_statuses()
+            )
+        except (HhSyncBlockedError, HhSyncRetryableError):
+            raise
         except (PlaywrightError, RuntimeError):
             return False
 
@@ -3620,8 +4178,11 @@ class VisibleHhBrowser:
         *,
         position: int,
         expected_count: int,
+        page_number: int | None = None,
     ) -> str:
         page = self._open_negotiations()
+        if page_number is not None:
+            self._select_negotiation_page(page, page_number)
         cards = page.locator('[data-qa="negotiations-item"]')
         if cards.count() != expected_count:
             raise RuntimeError(
@@ -3834,6 +4395,41 @@ class VisibleHhBrowser:
             return None
 
         if isinstance(post_data, str) and post_data.strip():
+            if post_data.startswith("--"):
+                boundary = post_data.partition("\r\n")[0][2:]
+                if not re.fullmatch(r"[A-Za-z0-9'()+_,./:=?\-]{1,200}", boundary):
+                    return None
+                message = BytesParser(policy=email_policy).parsebytes(
+                    (
+                        f'Content-Type: multipart/form-data; boundary="{boundary}"\r\n'
+                        "MIME-Version: 1.0\r\n\r\n" + post_data
+                    ).encode("utf-8")
+                )
+                if not message.is_multipart() or message.defects:
+                    return None
+                for part in message.walk():
+                    if part.is_multipart():
+                        continue
+                    name = part.get_param("name", header="content-disposition")
+                    if not isinstance(name, str):
+                        continue
+                    normalized = name.replace("_", "").replace("-", "").casefold()
+                    if normalized not in {"vacancyid", "resumeid", "resumehash"}:
+                        continue
+                    part_value = part.get_payload(decode=True)
+                    if (
+                        part.defects
+                        or part.get_filename() is not None
+                        or not isinstance(part_value, bytes)
+                    ):
+                        return None
+                    try:
+                        collect({name: part_value.decode(part.get_content_charset() or "utf-8")})
+                    except (LookupError, UnicodeError):
+                        return None
+                if invalid:
+                    return None
+                return frozenset(vacancy_ids), frozenset(resume_ids)
             try:
                 collect(json.loads(post_data))
             except json.JSONDecodeError:
@@ -3879,7 +4475,11 @@ class VisibleHhBrowser:
         if payload.get("error") or payload.get("errors"):
             return ""
         outcomes = {key: payload[key] for key in ("success", "status", "result") if key in payload}
-        if not outcomes or ("success" in outcomes and outcomes["success"] is not True):
+        if not outcomes or (
+            "success" in outcomes
+            and outcomes["success"] is not True
+            and outcomes["success"] != "true"
+        ):
             return ""
         if any(
             not isinstance(value, str) or value.strip().casefold() != "success"
@@ -3888,6 +4488,26 @@ class VisibleHhBrowser:
         ):
             return ""
         return "hh.ru подтвердил отправку отклика"
+
+    def _application_captcha(self, page: Page, body_text: str) -> bool:
+        compact = " ".join(body_text.split())
+        return (
+            self._has_captcha(page)
+            or self._response_requests_captcha(body_text)
+            or (
+                self._contains_any(compact, "пройдите капчу")
+                and self._contains_any(compact, "текст с картинки")
+            )
+        )
+
+    @staticmethod
+    def _response_requests_captcha(response_text: str) -> bool:
+        try:
+            payload = json.loads(response_text)
+        except ValueError:
+            return False
+        captcha = payload.get("hhcaptcha") if isinstance(payload, dict) else None
+        return isinstance(captcha, dict) and captcha.get("isBot") is True
 
     def _application_submission_error(
         self,
@@ -3900,17 +4520,25 @@ class VisibleHhBrowser:
                 response_text = response.text()
         page_text = self._page_body_text(page)
         combined_text = f"{response_text}\n{page_text}"
-        if response is not None and response.status == 403:
-            return HhApplyResult(
-                HhApplyStatus.ACCOUNT_WARNING,
-                page.url,
-                "hh.ru отклонил отправку и запросил ручную проверку аккаунта",
-            )
         if self._contains_any(combined_text, *_ACCOUNT_WARNING_MARKERS):
             return HhApplyResult(
                 HhApplyStatus.ACCOUNT_WARNING,
                 page.url,
                 "hh.ru показал предупреждение безопасности; требуется ручная проверка аккаунта",
+            )
+        if response is not None and response.status == 403:
+            if self._response_requests_captcha(response_text) or self._application_captcha(
+                page, page_text
+            ):
+                return HhApplyResult(
+                    HhApplyStatus.CAPTCHA_REQUIRED,
+                    page.url,
+                    "hh.ru запросил капчу; пройдите её в браузере Hugin",
+                )
+            return HhApplyResult(
+                HhApplyStatus.ACCOUNT_WARNING,
+                page.url,
+                "hh.ru отклонил отправку и запросил ручную проверку аккаунта",
             )
         if response is not None and response.status == 429:
             return HhApplyResult(
@@ -3954,6 +4582,10 @@ class VisibleHhBrowser:
         return str(value)[:128] if isinstance(value, (int, str)) and str(value).strip() else None
 
     def is_authenticated(self) -> bool:
+        with self._authentication_read_deadline():
+            return self._is_authenticated()
+
+    def _is_authenticated(self) -> bool:
         page = self._require_page()
         parsed_url = urlparse(page.url)
         hostname = parsed_url.hostname or ""
@@ -4090,6 +4722,10 @@ class VisibleHhBrowser:
         page.locator('[data-qa="magritte-phone-input-national-number-input"]').fill(digits)
 
     def _classify(self, page: Page) -> LoginStatus:
+        with self._authentication_read_deadline():
+            return self._classify_login_page(page)
+
+    def _classify_login_page(self, page: Page) -> LoginStatus:
         if self.has_account_warning():
             return LoginStatus.ACCOUNT_WARNING
         if self._has_captcha(page):
@@ -4101,6 +4737,59 @@ class VisibleHhBrowser:
         if self._any_visible(page, '[data-qa="form-helper-error"]'):
             return LoginStatus.INVALID_CREDENTIALS
         return LoginStatus.MANUAL_ACTION_REQUIRED
+
+    @contextmanager
+    def _authentication_read_deadline(self) -> Iterator[None]:
+        job = self._driver_job
+        if job is None or self._authentication_read_active:
+            yield
+            return
+        expired = threading.Event()
+
+        def stop_stalled_read() -> None:
+            try:
+                if not job.active():
+                    return
+                expired.set()
+                job.stop()
+            except OSError as error:
+                if self._journal is not None:
+                    self._journal.record(
+                        "browser", "authentication_read_stop", status="failed", error=str(error)
+                    )
+
+        # Locator.count и другие чтения DOM не принимают тайм-аут Playwright.
+        # The shared Edge process is outside this driver job.
+        timer = threading.Timer(self._timeout_ms / 1000, stop_stalled_read)
+        timer.daemon = True
+        try:
+            timer.start()
+        except RuntimeError as error:
+            raise HhSyncRetryableError(
+                "HH_BROWSER_GUARD_UNAVAILABLE",
+                "Не удалось включить ограничение проверки браузера; проверка отложена",
+                retry_after_seconds=_NETWORK_RETRY_SECONDS,
+            ) from error
+        self._authentication_read_active = True
+        try:
+            yield
+        finally:
+            timer.cancel()
+            timer.join()
+            self._authentication_read_active = False
+            if expired.is_set():
+                if self._journal is not None:
+                    self._journal.record(
+                        "browser",
+                        "authentication_read_timeout",
+                        status="failed",
+                        timeout_ms=self._timeout_ms,
+                    )
+                raise HhSyncRetryableError(
+                    "HH_BROWSER_UNRESPONSIVE",
+                    "Драйвер hh.ru не ответил при проверке входа; проверка будет повторена",
+                    retry_after_seconds=_NETWORK_RETRY_SECONDS,
+                )
 
     @staticmethod
     def _any_visible(page: Page, selector: str) -> bool:
@@ -4558,6 +5247,16 @@ class VisibleHhBrowser:
     @classmethod
     def _vacancy_is_closed(cls, response: Response | None, body_text: str) -> bool:
         if response is not None and response.status in {404, 410}:
+            return True
+        if (
+            response is not None
+            and response.status == 403
+            and cls._contains_any(
+                " ".join(body_text.split()),
+                "нет доступа к этой вакансии",
+                "работодатель ограничил доступ к вакансии",
+            )
+        ):
             return True
         return cls._contains_any(
             body_text,

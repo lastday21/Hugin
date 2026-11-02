@@ -65,6 +65,8 @@ class HhLoginService:
         self._validate_account_id(account_id)
 
         current_status = self._current_status(browser)
+        if current_status is LoginStatus.AUTHENTICATED:
+            return LoginResult(current_status)
         if current_status not in {
             LoginStatus.CONFIRMATION_REQUIRED,
             LoginStatus.CAPTCHA_REQUIRED,

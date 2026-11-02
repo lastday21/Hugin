@@ -7,7 +7,7 @@ import threading
 import time
 import webbrowser
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager, suppress
+from contextlib import AbstractContextManager, contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from importlib import import_module
@@ -34,6 +34,7 @@ from hugin.adapters.notification_gateway import (
 )
 from hugin.adapters.postgres_backup import DockerPostgresBackupAdapter
 from hugin.adapters.shared_hh_browser import SharedHhBrowser
+from hugin.browser_control import BrowserControl
 from hugin.core.settings import Settings, get_settings
 from hugin.database import create_database, upgrade_database
 from hugin.database.models import ApplicationModel, VacancyModel
@@ -62,6 +63,7 @@ from hugin.services.screening_forms import ScreeningDraft, ScreeningDraftService
 from hugin.workers.applications import ApplicationWorker
 from hugin.workers.automation import AutomationWorker
 from hugin.workers.backups import BackupWorker
+from hugin.workers.captcha_agent import CaptchaAgentWorker
 from hugin.workers.hh_search import HhSearchJobHandler
 from hugin.workers.hh_sync import HhSyncJobHandler
 from hugin.workers.notifications import NotificationWorker
@@ -154,7 +156,7 @@ class DesktopBridge:
         settings: Settings,
         account_id: int = 1,
         *,
-        browser_lock: threading.Lock | None = None,
+        browser_lock: AbstractContextManager[object] | None = None,
         journal: OperationJournal | None = None,
         shared_endpoint: Callable[[], str] | None = None,
     ) -> None:
@@ -167,6 +169,15 @@ class DesktopBridge:
         self._form_review_guard = threading.Lock()
         self._form_review_thread: threading.Thread | None = None
         self._form_review_commands: Queue[_FormReviewCommand | None] | None = None
+
+    def browser_control_status(self) -> dict[str, object]:
+        try:
+            value = BrowserControl(self._settings.data_dir, self._account_id).read_active()
+        except (OSError, ValueError, RuntimeError):
+            return {"state": "unavailable", "expires_at": None}
+        if not value:
+            return {"state": "automatic", "expires_at": None}
+        return {"state": value["state"], "expires_at": value["expires_at"]}
 
     def open_form(self, vacancy_id: str) -> dict[str, object]:
         return self._record_action(
@@ -192,6 +203,8 @@ class DesktopBridge:
                 self._settings.hh_browser_timeout_ms,
                 start_minimized=False,
                 shared_endpoint=self._shared_endpoint,
+                journal=self._journal,
+                browser_channel=self._settings.hh_browser_channel,
                 browser_source_ip=(
                     str(self._settings.hh_browser_source_ip)
                     if self._settings.hh_browser_source_ip is not None
@@ -201,6 +214,8 @@ class DesktopBridge:
         ):
             try:
                 urls = self._captcha_verification_urls()
+                active_verification = urls[0] if urls else None
+                completed_captchas: set[str] = set()
                 if urls:
                     browser.open_verification(urls[0])
                 else:
@@ -208,8 +223,17 @@ class DesktopBridge:
                 while browser.is_open():
                     status = browser.authentication_status()
                     if status is LoginStatus.AUTHENTICATED:
+                        if (
+                            active_verification is not None
+                            and urlsplit(active_verification).path.rstrip("/") == "/account/captcha"
+                        ):
+                            # Reopening the challenge starts another CAPTCHA, not an access check.
+                            completed_captchas.add(active_verification)
                         for url in urls:
+                            if url in completed_captchas:
+                                continue
                             browser.open_verification(url)
+                            active_verification = url
                             status = browser.authentication_status()
                             if status is not LoginStatus.AUTHENTICATED:
                                 break
@@ -245,7 +269,9 @@ class DesktopBridge:
         database = create_database(self._settings)
         try:
             with database.sessions.begin() as session:
-                ApplicationAutomationService(session).resume_after_authentication()
+                ApplicationAutomationService(session).resume_after_authentication(
+                    account_id=self._account_id
+                )
                 scheduler = AutomationSchedulerService(session)
                 for job in scheduler.list_for_account(self._account_id):
                     if (
@@ -376,6 +402,8 @@ class DesktopBridge:
                 self._settings.hh_search_url,
                 self._settings.hh_browser_timeout_ms,
                 shared_endpoint=self._shared_endpoint,
+                journal=self._journal,
+                browser_channel=self._settings.hh_browser_channel,
                 browser_source_ip=(
                     str(self._settings.hh_browser_source_ip)
                     if self._settings.hh_browser_source_ip is not None
@@ -668,6 +696,8 @@ class DesktopBridge:
                     self._settings.hh_search_url,
                     self._settings.hh_browser_timeout_ms,
                     shared_endpoint=self._shared_endpoint,
+                    journal=self._journal,
+                    browser_channel=self._settings.hh_browser_channel,
                     browser_source_ip=(
                         str(self._settings.hh_browser_source_ip)
                         if self._settings.hh_browser_source_ip is not None
@@ -992,21 +1022,39 @@ def main() -> None:
         startup_status.close()
     browser_lock = threading.Lock()
     search_browser_lock = threading.Lock()
-    shared_browser = SharedHhBrowser(settings, journal=journal)
-    application_worker = ApplicationWorker(
-        settings,
-        browser_lock=browser_lock,
-        journal=journal,
-        release_browser_after_turn=True,
-        shared_endpoint=shared_browser.endpoint,
-        execution_allowed=lambda: process_worker.has_ownership(),
+    shared_browser = SharedHhBrowser(
+        settings, journal=journal, browser_locks=(browser_lock, search_browser_lock)
     )
+
+    def browser_execution_allowed() -> bool:
+        return shared_browser.automatic_allowed() and process_worker.has_ownership()
+
+    def create_application_worker() -> ApplicationWorker:
+        return ApplicationWorker(
+            settings,
+            browser_lock=browser_lock,
+            journal=journal,
+            release_browser_after_turn=True,
+            shared_endpoint=shared_browser.endpoint,
+            execution_allowed=browser_execution_allowed,
+        )
+
+    def create_reply_worker() -> ReplyWorker:
+        return ReplyWorker(
+            settings,
+            browser_lock=browser_lock,
+            journal=journal,
+            shared_endpoint=shared_browser.endpoint,
+            execution_allowed=browser_execution_allowed,
+        )
+
+    application_worker = create_application_worker()
     search_handler = HhSearchJobHandler(
         settings,
         browser_lock=search_browser_lock,
         incremental=True,
         shared_endpoint=shared_browser.endpoint,
-        execution_allowed=lambda: process_worker.has_ownership(),
+        execution_allowed=browser_execution_allowed,
     )
     messages_handler = HhSyncJobHandler(
         settings,
@@ -1014,7 +1062,7 @@ def main() -> None:
         browser_lock=search_browser_lock,
         incremental=True,
         shared_endpoint=shared_browser.endpoint,
-        execution_allowed=lambda: process_worker.has_ownership(),
+        execution_allowed=browser_execution_allowed,
     )
     statuses_handler = HhSyncJobHandler(
         settings,
@@ -1022,7 +1070,7 @@ def main() -> None:
         browser_lock=search_browser_lock,
         incremental=True,
         shared_endpoint=shared_browser.endpoint,
-        execution_allowed=lambda: process_worker.has_ownership(),
+        execution_allowed=browser_execution_allowed,
     )
     worker = AutomationWorker(
         settings,
@@ -1037,13 +1085,7 @@ def main() -> None:
     notification_worker = NotificationWorker(settings, journal=journal)
     backup_worker = BackupWorker(settings, journal=journal)
     semantic_worker = SemanticSelectionWorker(settings, journal=journal, max_calls_per_turn=1)
-    reply_worker = ReplyWorker(
-        settings,
-        browser_lock=browser_lock,
-        journal=journal,
-        shared_endpoint=shared_browser.endpoint,
-        execution_allowed=lambda: process_worker.has_ownership(),
-    )
+    reply_worker = create_reply_worker()
 
     def synchronize(token: int | None) -> bool:
         messages_handler.one_shot_token = statuses_handler.one_shot_token = token
@@ -1074,6 +1116,17 @@ def main() -> None:
         semantic_worker.stop(timeout_seconds=0)
         reply_worker.stop()
 
+    def resume_processes() -> bool:
+        nonlocal application_worker, semantic_worker, reply_worker
+        # Старое следующее письмо сохраняет свой сигнал отмены до завершения.
+        if application_worker.running:
+            return False
+        application_worker.stop(timeout_seconds=0)
+        application_worker = create_application_worker()
+        semantic_worker = SemanticSelectionWorker(settings, journal=journal, max_calls_per_turn=1)
+        reply_worker = create_reply_worker()
+        return True
+
     process_worker = BackgroundProcessWorker(
         settings,
         journal=journal,
@@ -1085,15 +1138,23 @@ def main() -> None:
             "replies": lambda _token: reply_worker.run_once(),
         },
         cancel=cancel_processes,
+        resume=resume_processes,
+        authentication_recovery=worker.recover_authentication,
         parallel=True,
     )
     bridge = DesktopBridge(
         settings,
-        browser_lock=browser_lock,
+        browser_lock=shared_browser.manual_lock(),
         journal=journal,
         shared_endpoint=shared_browser.endpoint,
     )
     workers: tuple[BackgroundWorker, ...] = (
+        shared_browser,
+        *(
+            (CaptchaAgentWorker(settings, journal=journal),)
+            if settings.captcha_agent_thread_id
+            else ()
+        ),
         process_worker,
         notification_worker,
         backup_worker,

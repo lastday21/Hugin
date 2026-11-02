@@ -7,6 +7,7 @@ from hugin.adapters.credentials import WindowsCredentialStore
 from hugin.adapters.hh_browser import VisibleHhBrowser
 from hugin.core.settings import Settings
 from hugin.database import create_database
+from hugin.diagnostics import OperationJournal
 from hugin.domain.automation import AutomationJobKind, AutomationJobRecord, AutomationJobResult
 from hugin.domain.hh_sync import HhSyncBlockedError, HhSyncRetryableError
 from hugin.services.background_processes import BackgroundProcessService
@@ -87,6 +88,8 @@ class HhSearchJobHandler:
                     self._settings.hh_search_url,
                     self._settings.hh_browser_timeout_ms,
                     start_minimized=True,
+                    journal=OperationJournal(self._settings.data_dir),
+                    browser_channel=self._settings.hh_browser_channel,
                     browser_source_ip=(
                         str(self._settings.hh_browser_source_ip)
                         if self._settings.hh_browser_source_ip is not None
@@ -106,13 +109,52 @@ class HhSearchJobHandler:
                         self._login_message(login.status),
                     )
                 if isinstance(self._cycle, PeriodSearchCycle):
-                    return self._cycle.run(
-                        account_id=self._account_id,
-                        search_query_id=job.search_query_id,
-                        browser=browser,
-                        progress=job.last_result,
-                        allowed=self._allowed,
+                    progress = job.last_result
+                    totals = dict.fromkeys(
+                        (
+                            "pages_loaded",
+                            "details_loaded",
+                            "details_failed",
+                            "new_vacancies",
+                            "new_links",
+                            "queued",
+                        ),
+                        0,
                     )
+                    for _ in range(self._settings.hh_background_search_pages):
+                        progress = self._cycle.run(
+                            account_id=self._account_id,
+                            search_query_id=job.search_query_id,
+                            browser=browser,
+                            progress=progress,
+                            allowed=self._allowed,
+                        )
+                        for key in totals:
+                            value = progress.get(key)
+                            if isinstance(value, int):
+                                totals[key] += value
+                        # Reuse the session for depth after its descriptions have
+                        # loaded; otherwise it waits another full queue rotation.
+                        loaded_details = progress.get("details_loaded")
+                        depth_after_details = (
+                            progress.get("pages_loaded") == 0
+                            and isinstance(loaded_details, int)
+                            and loaded_details > 0
+                            and progress.get("depth_waited_for_details") is True
+                        )
+                        if (
+                            progress.get("round_complete") is True
+                            or progress.get("continuation") is not True
+                            or (
+                                not depth_after_details
+                                and (
+                                    progress.get("pages_loaded") != 1
+                                    or progress.get("observed_search_kind") != "depth"
+                                )
+                            )
+                        ):
+                            break
+                    return {**progress, **totals}
                 return self._cycle.run(
                     account_id=self._account_id,
                     search_query_id=job.search_query_id,

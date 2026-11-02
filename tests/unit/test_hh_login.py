@@ -76,7 +76,7 @@ def test_existing_browser_session_is_reused_without_loading_password() -> None:
     result = HhLoginService(store).authenticate(1, browser)
 
     assert result.authenticated
-    assert browser.opened
+    assert not browser.opened
     assert browser.submitted is None
     assert store.loaded_account_id is None
 

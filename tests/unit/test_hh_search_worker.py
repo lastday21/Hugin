@@ -8,6 +8,7 @@ import pytest
 
 import hugin.workers.hh_search as search_worker_module
 from hugin.core.settings import Settings
+from hugin.diagnostics import OperationJournal
 from hugin.domain import (
     AutomationJobKind,
     AutomationJobRecord,
@@ -16,6 +17,7 @@ from hugin.domain import (
 )
 from hugin.domain.hh_sync import HhSyncBlockedError, HhSyncRetryableError
 from hugin.services.hh_login import LoginResult, LoginStatus
+from hugin.services.period_search import PeriodSearchCycle
 from hugin.workers.automation import AutomationJobBlocked, AutomationJobDeferred, AutomationJobRetry
 from hugin.workers.hh_search import HhSearchJobHandler
 
@@ -156,6 +158,71 @@ def prepare_handler(
 
 
 @pytest.mark.parametrize(
+    "boundary",
+    ["budget", "stopped", "fresh", "completed", "failure", "details_first", "other_direction"],
+)
+def test_period_depth_reuses_browser_within_budget_and_respects_boundaries(
+    monkeypatch: pytest.MonkeyPatch, boundary: str
+) -> None:
+    handler, _, browsers, login_calls = prepare_handler(monkeypatch, LoginStatus.AUTHENTICATED)
+    calls: list[AutomationJobResult] = []
+
+    class DepthCycle(PeriodSearchCycle):
+        def run(self, **kwargs: object) -> AutomationJobResult:
+            previous = kwargs["progress"]
+            assert isinstance(previous, dict)
+            calls.append(dict(previous))
+            if boundary in {"details_first", "other_direction"} and len(calls) == 1:
+                return {
+                    **previous,
+                    "pages_loaded": 0,
+                    "details_loaded": 3 if boundary == "details_first" else 0,
+                    "depth_waited_for_details": True,
+                    "observed_search_kind": "fresh",
+                    "continuation": True,
+                }
+            if boundary == "failure" and len(calls) == 2:
+                raise HhSyncRetryableError("HH_NETWORK_TIMEOUT", "Сеть", retry_after_seconds=30)
+            if boundary == "stopped" and len(calls) == 2:
+                return {**previous, "pages_loaded": 0, "reason": "Поиск остановлен"}
+            return {
+                "cursor_signature": "same-period",
+                "checkpoint": len(calls) - (boundary == "details_first"),
+                "pages_loaded": 1,
+                "new_vacancies": 2,
+                "observed_search_kind": "fresh" if boundary == "fresh" else "depth",
+                "round_complete": boundary == "completed",
+                "continuation": boundary != "completed",
+            }
+
+    handler._cycle = DepthCycle(handler._settings)
+    original: AutomationJobResult = {"cursor_signature": "same-period", "checkpoint": 0}
+    job = make_job(last_result=original)
+    if boundary == "failure":
+        with pytest.raises(AutomationJobRetry) as error:
+            handler(job)
+        assert error.value.code == "HH_NETWORK_TIMEOUT"
+        assert len(calls) == 2
+    else:
+        result = handler(job)
+        expected_pages = {"budget": 3, "details_first": 2, "other_direction": 0}.get(boundary, 1)
+        assert result["pages_loaded"] == expected_pages
+        assert result["checkpoint"] == expected_pages
+        expected_calls = {"stopped": 2, "details_first": 3, "other_direction": 1}.get(
+            boundary, expected_pages
+        )
+        assert len(calls) == expected_calls
+        if boundary == "budget":
+            assert result["new_vacancies"] == 6
+        if boundary == "details_first":
+            assert result["details_loaded"] == 3
+            assert result["new_vacancies"] == 4
+    assert job.last_result == original
+    assert len(browsers) == len(login_calls) == 1
+    assert browsers[0].exited
+
+
+@pytest.mark.parametrize(
     "job",
     [
         make_job(kind=AutomationJobKind.MESSAGES, search_query_id=None),
@@ -234,8 +301,12 @@ def test_search_handler_runs_cycle_after_successful_login(
     settings = Settings(environment="test")
     assert browsers[0].arguments[0] == settings.browser_profile_dir(1)
     assert browsers[0].arguments[-1] == settings.hh_browser_timeout_ms
+    journal = browsers[0].keyword_arguments.pop("journal")
+    assert isinstance(journal, OperationJournal)
+    assert journal.log_dir == settings.data_dir / "logs"
     assert browsers[0].keyword_arguments == {
         "start_minimized": True,
+        "browser_channel": settings.hh_browser_channel,
         "browser_source_ip": (
             str(settings.hh_browser_source_ip)
             if settings.hh_browser_source_ip is not None

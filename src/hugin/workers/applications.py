@@ -920,6 +920,8 @@ class ApplicationWorker:
             self._settings.hh_browser_timeout_ms,
             start_minimized=True,
             shared_endpoint=self._shared_endpoint,
+            journal=self._journal,
+            browser_channel=self._settings.hh_browser_channel,
             browser_source_ip=(
                 str(self._settings.hh_browser_source_ip)
                 if self._settings.hh_browser_source_ip is not None

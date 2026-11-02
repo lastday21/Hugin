@@ -7,6 +7,7 @@ from hugin.adapters.credentials import WindowsCredentialStore
 from hugin.adapters.hh_browser import VisibleHhBrowser
 from hugin.core.settings import get_settings
 from hugin.database import create_database, upgrade_database
+from hugin.diagnostics import OperationJournal
 from hugin.domain.hh import HhFormReviewStatus
 from hugin.services.hh_login import HhLoginService, LoginStatus
 from hugin.services.screening_forms import ScreeningDraft, ScreeningDraftService
@@ -68,6 +69,8 @@ def run(argv: Sequence[str] | None = None) -> int:
         settings.hh_resumes_url,
         settings.hh_search_url,
         settings.hh_browser_timeout_ms,
+        journal=OperationJournal(settings.data_dir),
+        browser_channel=settings.hh_browser_channel,
         browser_source_ip=(
             str(settings.hh_browser_source_ip)
             if settings.hh_browser_source_ip is not None

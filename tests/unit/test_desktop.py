@@ -24,6 +24,7 @@ from hugin.adapters.notification_gateway import (
     NotificationGatewayTimeout,
     PairingLink,
 )
+from hugin.browser_control import BrowserControl
 from hugin.core.settings import Settings
 from hugin.domain import HhFormReviewResult, HhFormReviewStatus, HhScreeningForm
 from hugin.domain.automation import AutomationJobState
@@ -112,10 +113,13 @@ class FakeBrowser:
     def __init__(
         self,
         *_args: object,
+        journal: object = None,
         browser_source_ip: str | None = None,
+        browser_channel: str = "chromium",
         shared_endpoint: Callable[[], str] | None = None,
     ) -> None:
         self.closed = False
+        self.journal = journal
         self.opened_login = False
         self.browser_source_ip = browser_source_ip
         self.shared_endpoint = shared_endpoint
@@ -177,6 +181,55 @@ def prepare_bridge(
     return desktop.DesktopBridge(Settings(environment="test", data_dir=tmp_path))
 
 
+def test_bridge_reads_browser_handover_without_starting_work(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def unexpected(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("Reading browser handover must not start a browser or open a database")
+
+    monkeypatch.setattr(desktop, "create_database", unexpected)
+    monkeypatch.setattr(desktop, "VisibleHhBrowser", unexpected)
+    bridge = desktop.DesktopBridge(Settings(environment="test", data_dir=tmp_path))
+    control = BrowserControl(tmp_path, 1)
+    assert bridge.browser_control_status() == {"state": "automatic", "expires_at": None}
+    request = control.acquire("https://hh.ru/account/captcha")
+    original = control.path.read_bytes()
+    assert bridge.browser_control_status() == {
+        "state": "requested",
+        "expires_at": request["expires_at"],
+    }
+    assert control.path.read_bytes() == original
+    control.mark_ready(str(request["token"]))
+    assert bridge.browser_control_status() == {
+        "state": "ready",
+        "expires_at": request["expires_at"],
+    }
+    control.release(str(request["token"]))
+    assert bridge.browser_control_status() == {"state": "automatic", "expires_at": None}
+    old = datetime(2026, 1, 1, tzinfo=UTC)
+    control.acquire(None, minutes=1, now=old)
+    assert bridge.browser_control_status() == {"state": "automatic", "expires_at": None}
+
+
+def test_bridge_reports_failed_handover_without_exposing_private_details(tmp_path: Path) -> None:
+    bridge = desktop.DesktopBridge(Settings(environment="test", data_dir=tmp_path))
+    control = BrowserControl(tmp_path, 1)
+    request = control.acquire("https://hh.ru/account/captcha")
+    control.mark_ready(str(request["token"]), error="Private browser context")
+    assert bridge.browser_control_status() == {
+        "state": "failed",
+        "expires_at": request["expires_at"],
+    }
+
+
+def test_bridge_does_not_describe_unreadable_handover_as_automatic(tmp_path: Path) -> None:
+    bridge = desktop.DesktopBridge(Settings(environment="test", data_dir=tmp_path))
+    control = BrowserControl(tmp_path, 1)
+    control.path.parent.mkdir(parents=True)
+    control.path.write_text("broken json", "utf8")
+    assert bridge.browser_control_status() == {"state": "unavailable", "expires_at": None}
+
+
 def test_bridge_opens_manual_hh_login_and_restores_work(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -216,7 +269,8 @@ def test_bridge_opens_manual_hh_login_and_restores_work(
         def __init__(self, _session: object) -> None:
             pass
 
-        def resume_after_authentication(self) -> None:
+        def resume_after_authentication(self, *, account_id: int) -> None:
+            assert account_id == 1
             events.append("resumed")
 
     blocked_job = SimpleNamespace(
@@ -326,6 +380,49 @@ def test_manual_login_checks_every_captcha_source_before_restoring_work(
     assert ("resumed" in events) is resolve
     if resolve:
         assert events[-3:] == [urls[0], urls[1], "resumed"]
+
+
+def test_manual_login_does_not_restart_completed_standalone_captchas(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    urls = ("https://hh.ru/account/captcha", "https://uchaly.hh.ru/account/captcha")
+    opened: list[str] = []
+    resumed: list[bool] = []
+
+    class LoginBrowser:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            self.pending = True
+
+        def __enter__(self) -> LoginBrowser:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            pass
+
+        def open_verification(self, url: str) -> None:
+            assert url not in opened, "Completed CAPTCHA page was reopened"
+            opened.append(url)
+            self.pending = True
+
+        def is_open(self) -> bool:
+            return True
+
+        def authentication_status(self) -> LoginStatus:
+            return LoginStatus.CAPTCHA_REQUIRED if self.pending else LoginStatus.AUTHENTICATED
+
+        def wait_for_authentication(self) -> bool:
+            self.pending = False
+            return True
+
+    monkeypatch.setattr(desktop, "VisibleHhBrowser", LoginBrowser)
+    monkeypatch.setattr(desktop.DesktopBridge, "_captcha_verification_urls", lambda _self: urls)
+    monkeypatch.setattr(
+        desktop.DesktopBridge, "_resume_after_hh_login", lambda _self: resumed.append(True)
+    )
+    result = desktop.DesktopBridge(Settings(environment="test", data_dir=tmp_path)).login_hh()
+    assert result["status"] == "READY"
+    assert opened == list(urls)
+    assert resumed == [True]
 
 
 @pytest.mark.parametrize("warning", [False, True])
@@ -455,7 +552,7 @@ def test_bridge_keeps_saved_form_open_without_submitting(
     }
     assert second["status"] == "READY"
     assert len(FakeBrowser.instances) == 1
-    assert all(browser.opened_login for browser in FakeBrowser.instances)
+    assert all(not browser.opened_login for browser in FakeBrowser.instances)
     assert all(not browser.closed for browser in FakeBrowser.instances)
     configured_source = Settings(
         environment="test",
@@ -1285,6 +1382,10 @@ def test_main_starts_window_and_always_closes_bridge(
     parallel: bool,
 ) -> None:
     settings = Settings(environment="development", data_dir=tmp_path, resource_mode=mode)
+    if mode == "normal":
+        settings = settings.model_copy(
+            update={"captcha_agent_thread_id": "00000000-0000-4000-8000-000000000001"}
+        )
     events: list[object] = []
     parallel_values: list[object] = []
     created: list[tuple[tuple[object, ...], dict[str, object]]] = []
@@ -1297,6 +1398,22 @@ def test_main_starts_window_and_always_closes_bridge(
 
         def start(self, *, debug: bool = False, icon: str | None = None) -> None:
             events.append(("start", debug, icon))
+            parent = next(worker for worker in executors if "resume" in worker.options)
+            old_app = next(
+                worker for worker in executors if worker.options.get("release_browser_after_turn")
+            )
+            cancel, resume = parent.options["cancel"], parent.options["resume"]
+            assert callable(cancel) and callable(resume)
+            recovery = parent.options["authentication_recovery"]
+            assert callable(recovery) and recovery()
+            cancel()
+            old_app.running = True  # Следующее письмо ещё заканчивает прежний вызов.
+            assert not resume() and old_app.cancelled
+            old_app.running = False
+            assert resume() and old_app.cancelled
+            new_app = executors[-3]
+            assert new_app is not old_app and not new_app.cancelled
+            assert not executors[-2].cancelled and not executors[-1].cancelled
 
     class FakeBridge:
         def __init__(self, selected: Settings, **_kwargs: object) -> None:
@@ -1318,14 +1435,18 @@ def test_main_starts_window_and_always_closes_bridge(
         def start(self) -> None:
             events.append("worker-start")
 
-        def stop(self) -> None:
+        def stop(self, timeout_seconds: float = 10) -> None:
+            self.cancelled = True
             events.append("worker-stop")
 
         def has_pending_work(self) -> bool:
             return False
 
         def request_stop(self) -> None:
-            pass
+            self.cancelled = True
+
+        def recover_authentication(self) -> bool:
+            return "authentication_recovery" in self.options
 
     class FakeStartupStatus:
         def update(self, _message: str) -> None:
@@ -1365,6 +1486,7 @@ def test_main_starts_window_and_always_closes_bridge(
     monkeypatch.setattr(desktop, "SemanticSelectionWorker", FakeWorker)
     monkeypatch.setattr(desktop, "BackgroundProcessWorker", FakeWorker)
     monkeypatch.setattr(desktop, "ReplyWorker", FakeWorker)
+    monkeypatch.setattr(desktop, "CaptchaAgentWorker", FakeWorker)
 
     desktop.main()
 
@@ -1374,7 +1496,8 @@ def test_main_starts_window_and_always_closes_bridge(
     assert parallel_values == [parallel]
     assert events.index("tray-start") < events.index(("start", False, str(desktop.APP_ICON)))
     assert events.index("tray-stop") < events.index("close")
-    assert events[-4:] == ["close", "worker-stop", "worker-stop", "worker-stop"]
+    stopped_workers = 4 if settings.captcha_agent_thread_id else 3
+    assert events[-stopped_workers - 1 :] == ["close", *["worker-stop"] * stopped_workers]
     assert created[0][0] == ("Hugin — поиск работы", settings.desktop_api_url)
 
 
@@ -1382,10 +1505,15 @@ def test_main_explains_missing_window_dependency(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
+    resource_modes: list[str] = []
     monkeypatch.setattr(
         desktop,
         "get_settings",
-        lambda: Settings(environment="test", data_dir=tmp_path),
+        lambda: Settings(environment="test", data_dir=tmp_path, resource_mode="gaming"),
+    )
+    monkeypatch.setattr(desktop, "configure_process", lambda selected: {"mode": selected})
+    monkeypatch.setattr(
+        desktop, "configure_containers", lambda *args: resource_modes.append(args[-1])
     )
     monkeypatch.setattr(desktop, "ensure_services", lambda _settings, **_kwargs: None)
     monkeypatch.setattr(
@@ -1401,6 +1529,7 @@ def test_main_explains_missing_window_dependency(
 
     with pytest.raises(RuntimeError, match="оконную часть"):
         desktop.main()
+    assert resource_modes == ["gaming"]
 
 
 def test_single_instance_rejects_second_copy() -> None:

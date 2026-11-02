@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import threading
 from collections.abc import Callable
+from dataclasses import asdict
+from urllib.parse import urlsplit
 
 from hugin.adapters.credentials import WindowsCredentialStore
 from hugin.adapters.hh_browser import VisibleHhBrowser
@@ -33,6 +35,7 @@ from hugin.services.autonomous_replies import (
 )
 from hugin.services.background_processes import BackgroundProcessService
 from hugin.services.communications import CommunicationService
+from hugin.services.decision_evidence import fingerprint
 from hugin.services.hh_login import HhLoginService, LoginResult, LoginStatus
 from hugin.services.hh_sync import HhSynchronizationService
 from hugin.workers.automation import (
@@ -137,6 +140,7 @@ class HhSyncJobHandler:
                     self._settings.hh_browser_timeout_ms,
                     journal=OperationJournal(self._settings.data_dir),
                     start_minimized=True,
+                    browser_channel=self._settings.hh_browser_channel,
                     browser_source_ip=(
                         str(self._settings.hh_browser_source_ip)
                         if self._settings.hh_browser_source_ip is not None
@@ -248,14 +252,18 @@ class HhSyncJobHandler:
             system_state = self._authentication_system_state()
             if system_state not in AUTHENTICATION_SYSTEM_STATES:
                 return False
+            if system_state is SystemState.CAPTCHA_REQUIRED and self._application_captcha_pending():
+                return False
             with VisibleHhBrowser(
                 self._settings.browser_profile_dir(self._account_id),
                 self._settings.hh_login_url,
                 self._settings.hh_resumes_url,
                 self._settings.hh_search_url,
                 self._settings.hh_browser_timeout_ms,
-                start_minimized=False,
+                start_minimized=True,
                 shared_endpoint=self._shared_endpoint,
+                journal=OperationJournal(self._settings.data_dir),
+                browser_channel=self._settings.hh_browser_channel,
                 browser_source_ip=(
                     str(self._settings.hh_browser_source_ip)
                     if self._settings.hh_browser_source_ip is not None
@@ -294,6 +302,8 @@ class HhSyncJobHandler:
             login = service.observe_authentication(self._account_id, browser, open_login=False)
             if not login.authenticated:
                 return login
+            if urlsplit(url).path.rstrip("/") == "/account/captcha":
+                continue
             browser.open_verification(url)
             login = LoginResult(browser.authentication_status())
             if not login.authenticated:
@@ -318,6 +328,14 @@ class HhSyncJobHandler:
         finally:
             database.close()
 
+    def _application_captcha_pending(self) -> bool:
+        database = create_database(self._settings)
+        try:
+            with database.sessions() as session:
+                return ApplicationAutomationService(session).application_captcha_pending()
+        finally:
+            database.close()
+
     def _restore_after_authentication(self) -> bool:
         database = create_database(self._settings)
         try:
@@ -325,7 +343,9 @@ class HhSyncJobHandler:
                 system = SystemStateRepository(session)
                 if system.lock().state not in AUTHENTICATION_SYSTEM_STATES:
                     return False
-                ApplicationAutomationService(session).resume_after_authentication()
+                ApplicationAutomationService(session).resume_after_authentication(
+                    account_id=self._account_id
+                )
                 scheduler = AutomationSchedulerService(session)
                 for job in scheduler.list_for_account(self._account_id):
                     if (
@@ -355,10 +375,38 @@ class HhSyncJobHandler:
         database = create_database(self._settings)
         try:
             with database.sessions.begin() as session:
-                return HhSynchronizationService(session).synchronize_messages(
+                result = HhSynchronizationService(session).synchronize_messages_with_new_ids(
                     account_id=self._account_id,
                     messages=messages,
                 )
+            journal = OperationJournal(self._settings.data_dir)
+            for items, event, status in (
+                (result.conflicting_messages, "message_content_conflict", "blocked"),
+                (result.resolved_sender_messages, "message_sender_confirmed", "completed"),
+            ):
+                for item in items:
+                    payload = asdict(item)
+                    evidence_id = fingerprint(payload)
+                    path = (
+                        self._settings.data_dir
+                        / "evidence"
+                        / "models"
+                        / f"{evidence_id}-response.json"
+                    )
+                    exists = path.exists()
+                    saved = exists or journal.save_evidence(evidence_id, "response", payload)
+                    if not exists or event == "message_sender_confirmed":
+                        journal.record(
+                            "hh",
+                            event,
+                            status=status,
+                            vacancy_id=item.vacancy_id,
+                            hh_message_id=item.hh_id,
+                            direction=item.direction.value,
+                            evidence_id=evidence_id,
+                            response_evidence_saved=saved,
+                        )
+            return result.metrics
         finally:
             database.close()
 
@@ -390,6 +438,8 @@ class HhSyncJobHandler:
                 self._settings.hh_search_url,
                 self._settings.hh_browser_timeout_ms,
                 start_minimized=True,
+                journal=OperationJournal(self._settings.data_dir),
+                browser_channel=self._settings.hh_browser_channel,
                 browser_source_ip=(
                     str(self._settings.hh_browser_source_ip)
                     if self._settings.hh_browser_source_ip is not None

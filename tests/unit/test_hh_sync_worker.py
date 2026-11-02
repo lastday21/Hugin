@@ -138,6 +138,7 @@ def prepare_handler(
     monkeypatch.setattr(handler, "_tracked_vacancy_ids", lambda: ("101",))
     if settings is None:
         monkeypatch.setattr(handler, "_captcha_verification_urls", lambda: ())
+        monkeypatch.setattr(handler, "_application_captcha_pending", lambda: False, raising=False)
         monkeypatch.setattr(handler, "_protect_system", lambda _state: None)
     return handler
 
@@ -497,7 +498,8 @@ def test_recovery_restores_mode_and_only_unblocks_login_errors(
         def __init__(self, session: object) -> None:
             self._session = session
 
-        def resume_after_authentication(self) -> None:
+        def resume_after_authentication(self, *, account_id: int) -> None:
+            assert account_id == 1
             resumed.append(self._session)
 
     class FakeScheduler:
@@ -530,7 +532,7 @@ def test_recovery_restores_mode_and_only_unblocks_login_errors(
     assert FakeLoginService.credential_store is credential_store
     assert FakeLoginService.authentication_calls == [1]
     assert FakeLoginService.observation_calls == []
-    assert FakeBrowser.initialization_options[-1]["start_minimized"] is False
+    assert FakeBrowser.initialization_options[-1]["start_minimized"] is True
     assert len(resumed) == 1
     assert unblocked == ["messages:1", "statuses:1"]
     assert database.closed
@@ -569,7 +571,8 @@ def test_recovery_never_clears_account_warning(
         def __init__(self, _session: object) -> None:
             pass
 
-        def resume_after_authentication(self) -> None:
+        def resume_after_authentication(self, *, account_id: int) -> None:
+            assert account_id == 1
             nonlocal resumed
             resumed += 1
 
@@ -620,8 +623,10 @@ def test_recovery_keeps_system_blocked_until_login_service_confirms_success(
     assert protected == [SystemState.CAPTCHA_REQUIRED]
 
 
-def test_captcha_recovery_only_observes_visible_browser(
+@pytest.mark.parametrize("application_captcha", [False, True])
+def test_captcha_recovery_observes_browser_without_raising_window(
     monkeypatch: pytest.MonkeyPatch,
+    application_captcha: bool,
 ) -> None:
     handler = prepare_handler(monkeypatch, AutomationJobKind.MESSAGES)
     monkeypatch.setattr(
@@ -632,11 +637,16 @@ def test_captcha_recovery_only_observes_visible_browser(
     monkeypatch.setattr(FakeLoginService, "status", LoginStatus.AUTHENTICATED)
     monkeypatch.setattr(handler, "_captcha_verification_urls", lambda: (), raising=False)
     monkeypatch.setattr(handler, "_restore_after_authentication", lambda: True)
+    monkeypatch.setattr(handler, "_application_captcha_pending", lambda: application_captcha)
 
-    assert handler.recover_authentication()
+    assert handler.recover_authentication() is not application_captcha
     assert FakeLoginService.authentication_calls == []
+    if application_captcha:
+        assert FakeLoginService.observation_calls == []
+        assert FakeBrowser.initialization_options == []
+        return
     assert FakeLoginService.observation_calls == [1]
-    assert FakeBrowser.initialization_options[-1]["start_minimized"] is False
+    assert FakeBrowser.initialization_options[-1]["start_minimized"] is True
 
 
 @pytest.mark.parametrize("source_blocked", [True, False])
@@ -690,11 +700,17 @@ def test_captcha_recovery_checks_every_blocked_source_before_restoring(
     )
 
 
+@pytest.mark.parametrize("standalone_captcha", [False, True])
 def test_captcha_recovery_rechecks_source_after_authenticated_observation(
     monkeypatch: pytest.MonkeyPatch,
+    standalone_captcha: bool,
 ) -> None:
     handler = prepare_handler(monkeypatch, AutomationJobKind.MESSAGES)
-    urls = ("https://hh.ru/vacancy/123", "https://hh.ru/vacancy/456")
+    urls = (
+        ("https://hh.ru/account/captcha",)
+        if standalone_captcha
+        else ("https://hh.ru/vacancy/123", "https://hh.ru/vacancy/456")
+    )
     opened: list[str] = []
     monkeypatch.setattr(
         handler, "_authentication_system_state", lambda: SystemState.CAPTCHA_REQUIRED
@@ -713,10 +729,14 @@ def test_captcha_recovery_rechecks_source_after_authenticated_observation(
     monkeypatch.setattr(
         handler,
         "_restore_after_authentication",
-        lambda: pytest.fail("Исходная страница остаётся заблокированной"),
+        lambda: (
+            True
+            if standalone_captcha
+            else pytest.fail("Исходная страница остаётся заблокированной")
+        ),
     )
-    assert not handler.recover_authentication()
-    assert opened == [urls[0], urls[0]]
+    assert handler.recover_authentication() is standalone_captcha
+    assert opened == ([urls[0]] if standalone_captcha else [urls[0], urls[0]])
 
 
 def test_recovery_promotes_real_account_warning_and_does_not_restore(
@@ -790,9 +810,13 @@ def test_handler_database_helpers_close_every_connection(
             assert account_id == 1
             return ("101", "202")
 
-        def synchronize_messages(self, **values: object) -> dict[str, int]:
+        def synchronize_messages_with_new_ids(self, **values: object) -> object:
+            from hugin.services.hh_sync import MessageSynchronizationResult
+
             assert values["account_id"] == 1
-            return {"created": len(cast(tuple[object, ...], values["messages"]))}
+            return MessageSynchronizationResult(
+                {"created": len(cast(tuple[object, ...], values["messages"]))}, ()
+            )
 
         def synchronize_statuses(self, **values: object) -> dict[str, int]:
             assert values["account_id"] == 1

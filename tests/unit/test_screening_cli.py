@@ -7,6 +7,7 @@ from typing import ClassVar
 import pytest
 
 from hugin import screening_cli
+from hugin.diagnostics import OperationJournal
 from hugin.domain import AnswerSource, ScreeningFormState
 from hugin.domain.hh import (
     HhFormReviewResult,
@@ -77,11 +78,13 @@ class FakeDatabase:
 
 
 class FakeSettings:
+    data_dir = Path(".")
     hh_login_url = "https://hh.ru/account/login"
     hh_resumes_url = "https://hh.ru/applicant/resumes"
     hh_search_url = "https://hh.ru/search/vacancy"
     hh_browser_timeout_ms = 5_000
     hh_browser_source_ip = None
+    hh_browser_channel = "chromium"
 
     @staticmethod
     def browser_profile_dir(account_id: int) -> Path:
@@ -141,9 +144,13 @@ class FakeBrowser:
     def __init__(
         self,
         *args: object,
+        journal: OperationJournal | None = None,
         browser_source_ip: str | None = None,
+        browser_channel: str = "chromium",
     ) -> None:
         assert args
+        assert journal is not None
+        assert journal.log_dir == FakeSettings.data_dir / "logs"
         self.browser_source_ips.append(browser_source_ip)
 
     def __enter__(self) -> FakeBrowser:
@@ -161,7 +168,8 @@ class FakeBrowser:
 
 
 @pytest.fixture(autouse=True)
-def fake_dependencies(monkeypatch: pytest.MonkeyPatch) -> None:
+def fake_dependencies(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(FakeSettings, "data_dir", tmp_path)
     FakeDraftService.draft = make_draft()
     FakeDraftService.captured = []
     FakeDraftService.invalidated = []

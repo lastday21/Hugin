@@ -604,7 +604,7 @@ hh.ru. Полный срок `Retry-After` площадки без сокращ�
 проверочное письмо. Каждое событие получает постоянный внешний номер, поэтому повтор после
 временной ошибки не создаёт второе сообщение.
 
-При местном запуске служба находится в `F:\Pycharm\Hugin_tg_bot` и слушает
+При местном запуске установите службу в отдельную папку `Hugin_tg_bot`; она слушает
 `127.0.0.1:8088`. Hugin хранит только ограниченный ключ связи в защищённом хранилище Windows.
 При обычном запуске Hugin проверяет уже настроенную соседнюю службу `Hugin_tg_bot`
 и при необходимости поднимает её существующий образ. При потере связи во время
@@ -613,7 +613,7 @@ hh.ru. Полный срок `Retry-After` площадки без сокращ�
 Для отдельного ручного восстановления службы:
 
 ```powershell
-Set-Location F:\Pycharm\Hugin_tg_bot
+Set-Location C:\path\Hugin_tg_bot
 docker compose up -d --no-build
 Invoke-RestMethod http://127.0.0.1:8088/ready
 ```
@@ -625,7 +625,7 @@ Invoke-RestMethod http://127.0.0.1:8088/ready
 
 ```dotenv
 HUGIN_NOTIFICATION_GATEWAY_URL=http://127.0.0.1:8088
-HUGIN_NOTIFICATION_GATEWAY_KEY_FILE=F:/Pycharm/Hugin_tg_bot/.secrets/service_key
+HUGIN_NOTIFICATION_GATEWAY_KEY_FILE=C:/path/Hugin_tg_bot/.secrets/service_key
 ```
 
 Уведомление считается отправленным только после подтверждения службы. Временная ошибка оставляет

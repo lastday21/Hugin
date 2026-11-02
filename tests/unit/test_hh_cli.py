@@ -66,14 +66,18 @@ class FakeBrowser:
         search_url: str,
         timeout_ms: int,
         *,
+        journal: OperationJournal | None = None,
         browser_source_ip: str | None = None,
+        browser_channel: str = "chromium",
     ) -> None:
         self.profile_dir = profile_dir
         self.login_url = login_url
         self.resumes_url = resumes_url
         self.search_url = search_url
         self.timeout_ms = timeout_ms
+        self.journal = journal
         self.browser_source_ip = browser_source_ip
+        self.browser_channel = browser_channel
         self.opened = False
         self.details_read: list[str] = []
         self.applications: list[tuple[str, str, str]] = []
@@ -252,8 +256,12 @@ def test_login_reuses_authenticated_profile(
 
     assert hh_cli.run(["login", "--account-id", "2"]) == 0
     assert FakeBrowser.created is not None
-    assert FakeBrowser.created.opened
-    assert FakeBrowser.created.profile_dir == tmp_path / "browser-profiles" / "account-2"
+    assert not FakeBrowser.created.opened
+    assert FakeBrowser.created.profile_dir == Settings(
+        environment="test", data_dir=tmp_path
+    ).browser_profile_dir(2)
+    assert FakeBrowser.created.journal is not None
+    assert FakeBrowser.created.journal.log_dir == tmp_path / "logs"
     configured_source = Settings(
         environment="test",
         data_dir=tmp_path,
@@ -327,7 +335,8 @@ def test_successful_login_resumes_protected_checks(
         def __init__(self, _session: object) -> None:
             pass
 
-        def resume_after_authentication(self) -> None:
+        def resume_after_authentication(self, *, account_id: int) -> None:
+            assert account_id == 2
             resumed.append(True)
 
     class FakeScheduler:

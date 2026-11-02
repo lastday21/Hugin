@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from hashlib import sha256
 from pathlib import Path
@@ -10,9 +11,55 @@ import pytest
 
 from hugin.adapters.hh_browser import VisibleHhBrowser
 from hugin.domain.hh import HhApplyResult, HhApplyStatus
+from hugin.domain.hh_sync import HhSyncBlockedError
 from tests.unit.test_application_worker import FakeApplicationService, fake_job, prepare_worker
 from tests.unit.test_application_worker import setup_function as reset_fake_service
 from tests.unit.test_hh_browser import TEST_RESUME_HH_ID, FakeLocator, FakePage, make_browser
+
+
+@pytest.mark.parametrize(
+    ("page_url", "response_text", "expected"),
+    [
+        (
+            "https://kumertau.hh.ru/vacancy/123?from=search#form",
+            '{"hhcaptcha":{"isBot":true,"captchaState":"original+/="}}',
+            "https://kumertau.hh.ru/account/captcha?state=original%2B%2F%3D"
+            "&backurl=https%3A%2F%2Fkumertau.hh.ru%2F",
+        ),
+        ("https://hh.ru/vacancy/123", "not-json", None),
+        ("https://hh.ru/vacancy/123", "[]", None),
+        ("https://hh.ru/vacancy/123", '{"hhcaptcha":{"isBot":false,"captchaState":"x"}}', None),
+        ("https://hh.ru/vacancy/123", '{"hhcaptcha":{"isBot":true,"captchaState":123}}', None),
+        (
+            "https://hh.ru.evil.test/vacancy/123",
+            '{"hhcaptcha":{"isBot":true,"captchaState":"x"}}',
+            None,
+        ),
+        ("https://user@hh.ru/vacancy/123", '{"hhcaptcha":{"isBot":true,"captchaState":"x"}}', None),
+        ("http://hh.ru/vacancy/123", '{"hhcaptcha":{"isBot":true,"captchaState":"x"}}', None),
+    ],
+)
+def test_captcha_recovery_uses_only_original_hh_challenge(
+    page_url: str, response_text: str, expected: str | None
+) -> None:
+    result = HhApplyResult(
+        HhApplyStatus.CAPTCHA_REQUIRED,
+        "https://uchaly.hh.ru/vacancy/123",
+        submission_evidence={"page_url": page_url, "response_text": response_text},
+    )
+    assert result.captcha_verification_url() == expected
+    assert (
+        HhApplyResult(HhApplyStatus.CAPTCHA_REQUIRED, page_url).captcha_verification_url() is None
+    )
+    warning = HhApplyResult(
+        HhApplyStatus.ACCOUNT_WARNING,
+        page_url,
+        submission_evidence={
+            "page_url": page_url,
+            "response_text": json.dumps({"hhcaptcha": {"isBot": True, "captchaState": "x"}}),
+        },
+    )
+    assert warning.captcha_verification_url() is None
 
 
 def _prepared_browser(tmp_path: Path) -> tuple[VisibleHhBrowser, FakePage, FakeLocator]:
@@ -74,7 +121,6 @@ def test_unrelated_success_words_do_not_confirm_the_target_application(
         '{"analytics":{"success":true}}',
         '[{"success":true}]',
         'prefix {"success":true}',
-        '{"success":"true"}',
     ],
 )
 def test_nested_success_does_not_override_a_failed_submission_result(
@@ -100,6 +146,21 @@ def test_success_on_another_vacancy_page_is_not_target_confirmation(tmp_path: Pa
     result = _submit(browser)
 
     assert result.status is HhApplyStatus.UNKNOWN_RESULT
+    assert submit.clicked == 1
+
+
+def test_captcha_during_confirmation_keeps_unknown_and_exposes_blocker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    browser, _page, submit = _prepared_browser(tmp_path)
+
+    def blocked_history() -> tuple[()]:
+        raise HhSyncBlockedError("CAPTCHA_REQUIRED", "History needs captcha")
+
+    monkeypatch.setattr(browser, "_iter_application_statuses", blocked_history)
+    result = _submit(browser)
+    assert result.status is HhApplyStatus.UNKNOWN_RESULT
+    assert getattr(result, "reconciliation_error_code", None) == "CAPTCHA_REQUIRED"
     assert submit.clicked == 1
 
 

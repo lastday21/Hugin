@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import socket
 import subprocess
+import sys
+import threading
 import urllib.request
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
@@ -15,11 +18,12 @@ from typing import cast
 from urllib.request import Request
 
 import pytest
+from playwright._impl._helper import url_matches
 from playwright.sync_api import Error, Frame, Locator, Page, Response, TimeoutError, sync_playwright
 
 from hugin.adapters import hh_browser as browser_module
 from hugin.adapters.hh_browser import VisibleHhBrowser
-from hugin.diagnostics import OperationJournal
+from hugin.diagnostics import OperationJournal, operation_context
 from hugin.domain.communications import MessageSendFailureCode, MessageSendOutcome
 from hugin.domain.content import MessageDirection
 from hugin.domain.hh import (
@@ -143,7 +147,7 @@ class FakeLocator:
     def is_enabled(self) -> bool:
         return self.enabled
 
-    def inner_text(self) -> str:
+    def inner_text(self, *, timeout: int | None = None) -> str:
         return self.text
 
     def get_attribute(self, name: str) -> str | None:
@@ -175,6 +179,7 @@ class FakeKeyboard:
 
 class FakePage:
     def __init__(self, url: str = "https://hh.ru/account/login?role=applicant") -> None:
+        self.listeners: dict[str, list[Callable[..., object]]] = {}
         self.url = url
         self.locators: dict[str, FakeLocator] = {}
         self.goto_calls: list[tuple[str, str]] = []
@@ -211,6 +216,7 @@ class FakePage:
         self.window_probe_error: Error | None = None
         self.closed = False
         self.route_handler: Callable[[object, object], None] | None = None
+        self.route_pattern: str | re.Pattern[str] = ""
         self.last_route: FakeRoute | None = None
         self.locators['[data-qa="resume-title"]'] = FakeLocator()
         self.locators['[data-qa="vacancy-response-link-top"]:visible'] = FakeLocator()
@@ -230,6 +236,12 @@ class FakePage:
 
     def locator(self, selector: str) -> FakeLocator:
         return self.locators.setdefault(selector, FakeLocator(0))
+
+    def on(self, event: str, listener: Callable[..., object]) -> None:
+        self.listeners.setdefault(event, []).append(listener)
+
+    def remove_listener(self, event: str, listener: Callable[..., object]) -> None:
+        self.listeners[event].remove(listener)
 
     def goto(self, url: str, *, wait_until: str) -> FakeResponse | None:
         self.goto_calls.append((url, wait_until))
@@ -326,19 +338,26 @@ class FakePage:
         route = FakeRoute()
         self.last_route = route
         self.response.request.url = self.response.url
-        if self.route_handler is not None:
+        if self.route_handler is not None and url_matches(
+            None, self.response.url, self.route_pattern
+        ):
             self.route_handler(route, self.response.request)
         return FakeResponseInfo(
             self.response,
             matches=not route.aborted and bool(predicate(self.response)),
         )
 
-    def route(self, pattern: str, handler: Callable[[object, object], None]) -> None:
-        assert "vacancy_response" in pattern
+    def route(
+        self, pattern: str | re.Pattern[str], handler: Callable[[object, object], None]
+    ) -> None:
+        assert "vacancy_response" in (pattern if isinstance(pattern, str) else pattern.pattern)
+        self.route_pattern = pattern
         self.route_handler = handler
 
-    def unroute(self, pattern: str, handler: Callable[[object, object], None]) -> None:
-        assert "vacancy_response" in pattern
+    def unroute(
+        self, pattern: str | re.Pattern[str], handler: Callable[[object, object], None]
+    ) -> None:
+        assert pattern == self.route_pattern
         if self.route_handler is handler:
             self.route_handler = None
 
@@ -357,11 +376,14 @@ class FakeFrame:
         self.messages_payloads = messages_payloads
         self.messages_payload_index = 0
         self.evaluated_vacancy_ids: list[str] = []
+        self.chat_identity = True
 
     def locator(self, selector: str) -> FakeLocator:
         return self.locators.setdefault(selector, FakeLocator(0))
 
     def evaluate(self, expression: str, argument: object = None) -> object:
+        if expression == getattr(browser_module, "CHAT_IDENTITY_SCRIPT", "missing"):
+            return self.chat_identity
         if expression != browser_module.CHAT_MESSAGES_SCRIPT:
             raise AssertionError("unexpected frame script")
         assert isinstance(argument, str)
@@ -714,8 +736,35 @@ def test_credentials_are_never_filled_outside_secure_hh(
     assert password.filled == []
 
 
-def test_profile_and_resumes_are_read_from_page(tmp_path: Path) -> None:
-    page = FakePage()
+@pytest.mark.parametrize("navigation", ["ready", "before_response", "after_response"])
+def test_profile_and_resumes_are_read_from_page(tmp_path: Path, navigation: str) -> None:
+    class TimedPage(FakePage):
+        main_frame = object()
+
+        def goto(self, url: str, *, wait_until: str) -> FakeResponse | None:
+            result = super().goto(url, wait_until=wait_until)
+            if navigation != "before_response":
+                response = SimpleNamespace(
+                    request=SimpleNamespace(
+                        is_navigation_request=lambda: True, frame=self.main_frame
+                    ),
+                    status=200,
+                )
+                for listener in self.listeners.get("response", []):
+                    listener(response)
+            child_response = SimpleNamespace(
+                request=SimpleNamespace(is_navigation_request=lambda: True, frame=object()),
+                status=503,
+            )
+            for listener in self.listeners.get("response", []):
+                listener(child_response)
+            if navigation != "ready":
+                raise TimeoutError("navigation timed out")
+            for listener in self.listeners.get("domcontentloaded", []):
+                listener(self)
+            return result
+
+    page = TimedPage()
     page.profile_payload = {
         "externalId": "12345",
         "firstName": "Иван",
@@ -732,8 +781,26 @@ def test_profile_and_resumes_are_read_from_page(tmp_path: Path) -> None:
         ],
     }
     browser = make_browser(page, tmp_path)
+    browser._journal = OperationJournal(tmp_path / "journal")
 
-    profile = browser.read_profile()
+    if navigation == "ready":
+        profile = browser.read_profile()
+    else:
+        with pytest.raises(TimeoutError, match="navigation timed out"):
+            browser.read_profile()
+    rows = [r for r in browser._journal.entries() if r["event"] == "page_navigation"]
+    assert len(rows) == 1
+    details = rows[0]["details"]
+    assert details["page_kind"] == "profile"
+    assert rows[0]["status"] == ("completed" if navigation == "ready" else "failed")
+    assert details["document_response_status"] == (None if navigation == "before_response" else 200)
+    assert (details["document_response_ms"] is not None) is (navigation != "before_response")
+    assert (details["domcontentloaded_ms"] is not None) is (navigation == "ready")
+    assert details["duration_ms"] >= 0
+    assert all(not listeners for listeners in page.listeners.values())
+    assert page.goto_calls == [("https://hh.ru/applicant/resumes", "domcontentloaded")]
+    if navigation != "ready":
+        return
 
     assert profile == HhProfileData(
         external_id="12345",
@@ -743,7 +810,6 @@ def test_profile_and_resumes_are_read_from_page(tmp_path: Path) -> None:
             HhResumeData(hh_id="second-resume", title="Инженер"),
         ),
     )
-    assert page.goto_calls == [("https://hh.ru/applicant/resumes", "domcontentloaded")]
 
 
 def test_profile_rejects_resume_link_from_another_site(tmp_path: Path) -> None:
@@ -853,6 +919,26 @@ def test_search_waits_for_all_current_page_cards_including_empty_page() -> None:
             page.evaluate("window.renderCards(Array.from({length: 50}, (_, i) => i + 1))")
             assert page.evaluate(browser_module.VACANCY_SEARCH_READY_SCRIPT) is True
             page.evaluate("""() => {
+                const card = document.querySelector('article');
+                card.dataset.qa = 'vacancy-serp__vacancy vacancy-serp-item_clickme';
+                card.innerHTML = `<div id="1"><a data-qa="serp-item__title"
+                    data-adv-click-stage="true"
+                    href="https://adsrv.hh.ru/click?b=123&clickType=link_to_vacancy">
+                    Рекламная вакансия</a></div>`;
+            }""")
+            assert page.evaluate(browser_module.VACANCY_SEARCH_READY_SCRIPT) is True
+            payload = page.evaluate(browser_module.VACANCY_SEARCH_SCRIPT)
+            assert len(payload["vacancies"]) == 50
+            assert payload["vacancies"][0]["href"] == "https://hh.ru/vacancy/1"
+            assert payload["vacancies"][1]["href"] == "https://hh.ru/vacancy/2"
+            page.evaluate("document.getElementById('1').id = '999'")
+            assert page.evaluate(browser_module.VACANCY_SEARCH_READY_SCRIPT) is False
+            page.evaluate("""() => {
+                document.getElementById('999').id = '1';
+                document.querySelector('a').href = 'https://example.org/click';
+            }""")
+            assert page.evaluate(browser_module.VACANCY_SEARCH_READY_SCRIPT) is False
+            page.evaluate("""() => {
                 document.querySelector('section').__reactFiber$test.memoizedProps
                     .vacancySearchResult.vacancies = [];
                 window.renderCards([]);
@@ -880,13 +966,14 @@ def test_search_rejects_unknown_filter(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("operation", ["search", "details"])
-@pytest.mark.parametrize("surface", ["redirect", "widget"])
+@pytest.mark.parametrize("surface", ["redirect", "widget", "untrusted_redirect"])
 def test_vacancy_reading_reports_captcha_before_waiting_for_content(
     tmp_path: Path, operation: str, surface: str
 ) -> None:
     page = FakePage()
-    if surface == "redirect":
-        page.goto_final_url = "https://uchaly.hh.ru/account/captcha"
+    if surface in {"redirect", "untrusted_redirect"}:
+        host = "uchaly.hh.ru" if surface == "redirect" else "hh.ru.example.org"
+        page.goto_final_url = f"https://{host}/account/captcha?state=original-state"
     else:
         page.locators[browser_module._CAPTCHA_SELECTOR] = FakeLocator()
     content = (
@@ -896,6 +983,7 @@ def test_vacancy_reading_reports_captcha_before_waiting_for_content(
     )
     page.locators[content] = FakeLocator(wait_error=True)
     browser = make_browser(page, tmp_path)
+    browser._journal = OperationJournal(tmp_path / "journal")
 
     with pytest.raises(HhSyncBlockedError) as error:
         if operation == "search":
@@ -904,8 +992,15 @@ def test_vacancy_reading_reports_captcha_before_waiting_for_content(
             browser.read_vacancy_details("https://uchaly.hh.ru/vacancy/137870570")
 
     assert error.value.code == "CAPTCHA_REQUIRED"
-    assert error.value.verification_url == page.goto_calls[0][0]
+    assert error.value.verification_url == (
+        page.goto_final_url if surface == "redirect" else page.goto_calls[0][0]
+    )
     assert page.function_waits == []
+    if operation == "details":
+        rows = list(browser._journal.entries())
+        assert rows[-1]["status"] == "blocked"
+        assert rows[-1]["details"]["error_code"] == "CAPTCHA_REQUIRED"
+        assert set(rows[-1]["details"]["phase_durations_ms"]) == {"navigation", "initial_checks"}
 
 
 @pytest.mark.parametrize("operation", ["search", "details"])
@@ -916,7 +1011,7 @@ def test_vacancy_reading_reports_captcha_appearing_during_content_wait(
 
     class RedirectingLocator(FakeLocator):
         def wait_for(self, *, state: str, timeout: int) -> None:
-            page.url = "https://uchaly.hh.ru/account/captcha"
+            page.url = "https://uchaly.hh.ru/account/captcha?state=late-state"
             raise TimeoutError("captcha redirect while waiting for content")
 
     content = (
@@ -934,7 +1029,7 @@ def test_vacancy_reading_reports_captcha_appearing_during_content_wait(
             browser.read_vacancy_details("https://uchaly.hh.ru/vacancy/137870570")
 
     assert error.value.code == "CAPTCHA_REQUIRED"
-    assert error.value.verification_url == page.goto_calls[0][0]
+    assert error.value.verification_url == page.url
 
 
 def test_verification_opens_source_and_recognizes_captcha_without_widget(tmp_path: Path) -> None:
@@ -972,7 +1067,8 @@ def test_verification_rejects_external_redirect(tmp_path: Path) -> None:
         make_browser(page, tmp_path).open_verification("https://hh.ru/vacancy/123")
 
 
-def test_vacancy_details_are_read_from_page(tmp_path: Path) -> None:
+@pytest.mark.parametrize("navigation_timeout", [False, True])
+def test_vacancy_details_are_read_from_page(tmp_path: Path, navigation_timeout: bool) -> None:
     page = FakePage()
     page.details_payload = {
         "title": "Python-разработчик",
@@ -994,9 +1090,40 @@ def test_vacancy_details_are_read_from_page(tmp_path: Path) -> None:
         "availability": "ACTIVE",
     }
 
-    vacancy = make_browser(page, tmp_path).read_vacancy_details(
-        "https://ufa.hh.ru/vacancy/123?from=search"
-    )
+    browser = make_browser(page, tmp_path)
+    ticks = iter([1.0, 1.017])
+    browser._journal = OperationJournal(tmp_path / "journal", timer=lambda: next(ticks))
+    if navigation_timeout:
+        page.goto_error = TimeoutError("Page.goto: Timeout 60000ms exceeded")
+        with operation_context(job_key="search:55"), pytest.raises(RuntimeError) as error:
+            browser.read_vacancy_details("https://ufa.hh.ru/vacancy/123?from=search")
+        assert error.value.__cause__ is page.goto_error
+        rows = list(browser._journal.entries())
+        assert [r["status"] for r in rows] == ["started", "failed"]
+        assert rows[-1]["details"]["duration_ms"] == 17
+        assert rows[-1]["details"]["job_key"] == "search:55"
+        assert set(rows[-1]["details"]["phase_durations_ms"]) == {"navigation"}
+        saved = next((tmp_path / "journal/evidence").glob("*/*-failure.json"))
+        failure = json.loads(saved.read_text("utf8"))["payload"]
+        assert failure["error_type"] == "RuntimeError"
+        assert "Page.goto: Timeout 60000ms exceeded" in failure["traceback"]
+        return
+    with operation_context(job_key="search:55"):
+        vacancy = browser.read_vacancy_details("https://ufa.hh.ru/vacancy/123?from=search")
+    rows = list(browser._journal.entries())
+    assert [r["status"] for r in rows] == ["started", "completed"]
+    assert rows[-1]["details"]["duration_ms"] == 17
+    assert rows[-1]["details"]["vacancy_id"] == "123"
+    assert rows[-1]["details"]["job_key"] == "search:55"
+    assert set(rows[-1]["details"]["phase_durations_ms"]) == {
+        "navigation",
+        "initial_checks",
+        "title_wait",
+        "final_checks",
+        "parse",
+    }
+    assert all(value >= 0 for value in rows[-1]["details"]["phase_durations_ms"].values())
+    assert str(page.details_payload["description"]) not in str(rows)
 
     assert vacancy.hh_id == "123"
     assert vacancy.source_url == "https://ufa.hh.ru/vacancy/123"
@@ -1044,10 +1171,16 @@ def test_unavailable_vacancy_details_are_reported_before_title_wait(
         "availability": (availability.value if status == 200 else VacancyAvailability.ACTIVE.value)
     }
 
+    browser = make_browser(page, tmp_path)
+    browser._journal = OperationJournal(tmp_path / "journal")
     with pytest.raises(VacancyUnavailableError) as error:
-        make_browser(page, tmp_path).read_vacancy_details("https://hh.ru/vacancy/123")
+        browser.read_vacancy_details("https://hh.ru/vacancy/123")
 
     assert error.value.availability is availability
+    rows = list(browser._journal.entries())
+    assert rows[-1]["status"] == "skipped"
+    assert rows[-1]["details"]["availability"] == availability.value
+    assert set(rows[-1]["details"]["phase_durations_ms"]) == {"navigation", "initial_checks"}
 
 
 def test_restricted_vacancy_page_is_reported_without_waiting_for_title(
@@ -1402,6 +1535,57 @@ def test_application_statuses_open_current_negotiation_cards(tmp_path: Path) -> 
     assert second.clicked == 1
 
 
+@pytest.mark.parametrize("target", [None, "101", "202", "404"])
+def test_application_statuses_follow_pages_and_open_cards_on_their_page(
+    tmp_path: Path,
+    target: str | None,
+) -> None:
+    page = FakePage("https://hh.ru/applicant/resumes")
+    page.negotiations_payload = [{"vacancyId": "101", "statusLabel": "Не просмотрен"}]
+    selected = FakeLocator(text="1")
+    first = FakeLocator(text="1")
+    second = FakeLocator(text="2")
+    third = FakeLocator(text="3")
+    page.locators['[data-qa^="number-pages-"]'] = FakeLocator(items=[first, second])
+    page.locators['[data-qa*="number-pages-selected"]'] = selected
+    page.locators['[data-qa^="number-pages-1"]'] = first
+    page.locators['[data-qa^="number-pages-2"]'] = second
+    page.locators['[data-qa^="number-pages-3"]'] = third
+
+    def open_second() -> None:
+        selected.text = "2"
+        page.negotiations_payload = [
+            {"vacancyId": "101", "statusLabel": "Не просмотрен"},
+            {"vacancyHref": "", "statusQa": "negotiations-item-discard"},
+        ]
+        page.locators['[data-qa^="number-pages-"]'] = FakeLocator(items=[first, second, third])
+        page.locators['[data-qa="negotiations-item"]'] = FakeLocator(
+            items=[
+                FakeLocator(),
+                FakeLocator(on_click=lambda: setattr(page, "url", "https://hh.ru/vacancy/202")),
+            ]
+        )
+
+    def open_third() -> None:
+        selected.text = "3"
+        page.negotiations_payload = [{"vacancyId": "303", "statusLabel": "Приглашение"}]
+
+    second.on_click = open_second
+    third.on_click = open_third
+    browser = make_browser(page, tmp_path)
+    if target is not None:
+        assert browser._vacancy_in_negotiations(target) is (target != "404")
+        assert second.clicked == (0 if target == "101" else 1)
+        assert third.clicked == (1 if target == "404" else 0)
+        return
+    statuses = browser.read_application_statuses()
+
+    assert [status.vacancy_id for status in statuses] == ["101", "202", "303"]
+    assert statuses[1].status is HhNegotiationStatus.REJECTED
+    assert third.clicked == 1
+    assert page.url == "https://hh.ru/applicant/negotiations"
+
+
 def test_application_statuses_stop_if_current_list_changes(tmp_path: Path) -> None:
     page = FakePage("https://hh.ru/applicant/resumes")
     page.negotiations_payload = [
@@ -1416,6 +1600,168 @@ def test_application_statuses_stop_if_current_list_changes(tmp_path: Path) -> No
 
     with pytest.raises(RuntimeError, match="изменился"):
         make_browser(page, tmp_path).read_application_statuses()
+
+
+@pytest.mark.parametrize("feedback", [False, True])
+def test_negotiation_page_waits_for_delayed_navigation_before_reading(
+    tmp_path: Path, feedback: bool
+) -> None:
+    first_html = """
+        <button data-qa="number-pages-1 number-pages-selected">1</button>
+        <button data-qa="number-pages-2"
+            onclick="setTimeout(() => location.assign('?page=1'), 1800)">2</button>
+        <div data-qa="negotiations-item">
+            <a data-qa="negotiations-item-vacancy" href="/vacancy/101">First</a>
+        </div>
+    """
+    if feedback:
+        first_html += """
+            <div data-qa="bottom-sheet-css-variables">
+                <div data-qa="bottom-sheet-overlay"
+                    style="position:fixed;inset:0;z-index:10;background:#8888"
+                    onclick="this.parentElement.remove()"></div>
+                <div style="position:fixed;left:20%;top:30%;z-index:11;background:white">
+                    <span data-qa="vacancy-feedback__title">
+                        Вы&nbsp;посмотрели вакансию, но&nbsp;не&nbsp;откликнулись. Почему?
+                    </span>
+                    <button onclick="document.body.dataset.feedbackSent='yes'">Отправить</button>
+                </div>
+            </div>
+        """
+    second_html = """
+        <button data-qa="number-pages-1">1</button>
+        <button data-qa="number-pages-2 number-pages-selected">2</button>
+        <div data-qa="negotiations-item">
+            <a data-qa="negotiations-item-vacancy" href="/vacancy/202">Second</a>
+        </div>
+    """
+    with sync_playwright() as playwright:
+        chromium = playwright.chromium.launch()
+        try:
+            page = chromium.new_page()
+            page.route(
+                "https://hh.ru/applicant/negotiations*",
+                lambda route: route.fulfill(
+                    body=second_html if "page=1" in route.request.url else first_html,
+                    content_type="text/html; charset=utf-8",
+                ),
+            )
+            page.goto("https://hh.ru/applicant/negotiations")
+            page.set_default_timeout(3_000)
+            browser = make_browser(cast(FakePage, page), tmp_path)
+
+            browser._select_negotiation_page(page, 2)
+            statuses = browser._read_negotiation_statuses(page, page_number=2)
+
+            assert [status.vacancy_id for status in statuses] == ["202"]
+            assert page.url == "https://hh.ru/applicant/negotiations?page=1"
+            assert page.locator('[data-qa="vacancy-feedback__title"]').count() == 0
+        finally:
+            chromium.close()
+
+
+@pytest.mark.parametrize("notice_state", ["dismissible", "changed_review", "stuck_cookie"])
+def test_negotiation_page_handles_cookie_notice_and_employer_review(
+    tmp_path: Path, notice_state: str
+) -> None:
+    cookie_action = "" if notice_state == "stuck_cookie" else "this.parentElement.remove()"
+    review_title = (
+        "Подтвердите условия"
+        if notice_state == "changed_review"
+        else "Рекомендуете ли вы своего работодателя?"
+    )
+    first_html = f"""
+        <button data-qa="number-pages-1 number-pages-selected">1</button>
+        <button data-qa="number-pages-6" style="position:fixed;bottom:20px;right:20px"
+            onclick="location.assign('?page=5')">6</button>
+        <div class="bloko-notification__plate"
+            style="position:fixed;bottom:0;left:0;right:0;height:100px;z-index:10;background:white">
+            <div class="bloko-notification__heading">{review_title}</div>
+            <button data-qa="employer-review-chips-recommend-YES"
+                onclick="sessionStorage.setItem('vote','yes')">Да</button>
+            <button data-qa="employer-review-chips-recommend-NO"
+                onclick="sessionStorage.setItem('vote','no')">Нет</button>
+            <button data-qa="notification-close-button"
+                onclick="this.parentElement.remove()">Закрыть</button>
+        </div>
+        <div data-qa="cookies-policy-informer"
+            style="position:fixed;bottom:0;left:0;right:0;height:100px;z-index:20;background:white">
+            Чтобы сайт был удобнее, используем <a href="/article/cookie_policy">cookies</a>
+            <button data-qa="cookies-policy-informer-accept"
+                onclick="{cookie_action}">Понятно</button>
+        </div>
+    """
+    second_html = """
+        <button data-qa="number-pages-1">1</button>
+        <button data-qa="number-pages-6 number-pages-selected">6</button>
+        <div data-qa="negotiations-item">
+            <a data-qa="negotiations-item-vacancy" href="/vacancy/202">Second</a>
+        </div>
+    """
+    with sync_playwright() as playwright:
+        chromium = playwright.chromium.launch()
+        try:
+            page = chromium.new_page(viewport={"width": 1280, "height": 720})
+            page.route(
+                "https://hh.ru/applicant/negotiations*",
+                lambda route: route.fulfill(
+                    body=second_html if "page=5" in route.request.url else first_html,
+                    content_type="text/html; charset=utf-8",
+                ),
+            )
+            page.goto("https://hh.ru/applicant/negotiations")
+            page.set_default_timeout(3_000)
+            browser = make_browser(cast(FakePage, page), tmp_path)
+            if notice_state == "dismissible":
+                browser._select_negotiation_page(page, 6)
+                statuses = browser._read_negotiation_statuses(page, page_number=6)
+                assert [status.vacancy_id for status in statuses] == ["202"]
+                assert page.url == "https://hh.ru/applicant/negotiations?page=5"
+            else:
+                with pytest.raises(HhSyncRetryableError) as captured:
+                    browser._select_negotiation_page(page, 6)
+                assert captured.value.code == "HH_PAGE_OBSTRUCTED"
+                assert page.locator('[data-qa*="number-pages-selected"]').inner_text() == "1"
+                assert page.url == "https://hh.ru/applicant/negotiations"
+            assert page.evaluate("sessionStorage.getItem('vote')") is None
+        finally:
+            chromium.close()
+
+
+@pytest.mark.parametrize("obstruction", ["different_title", "another_alert", "does_not_close"])
+def test_negotiation_feedback_does_not_dismiss_unknown_or_stuck_window(
+    tmp_path: Path, obstruction: str
+) -> None:
+    page = FakePage("https://hh.ru/applicant/negotiations")
+    feedback = FakeLocator(
+        visible=True,
+        text=(
+            "Подтвердите новые условия сервиса"
+            if obstruction == "different_title"
+            else "Вы посмотрели вакансию, но не откликнулись. Почему?"
+        ),
+        wait_error=True,
+    )
+    overlay = FakeLocator()
+    page.locators['[data-qa="vacancy-feedback__title"]:visible'] = feedback
+    page.locators[
+        '[data-qa="bottom-sheet-css-variables"]:has('
+        '[data-qa="vacancy-feedback__title"]:visible) '
+        '[data-qa="bottom-sheet-overlay"]:visible'
+    ] = overlay
+    page.locators['[data-qa="bottom-sheet-overlay"]:visible'] = overlay
+    if obstruction == "another_alert":
+        page.locators['[data-qa="magritte-alert"]:visible, [role="alertdialog"]:visible'] = (
+            FakeLocator(text="Подтвердите действие")
+        )
+
+    with pytest.raises(HhSyncRetryableError) as captured:
+        make_browser(page, tmp_path)._select_negotiation_page(cast(Page, page), 2)
+
+    assert captured.value.code == "HH_PAGE_OBSTRUCTED"
+    assert overlay.clicked == (1 if obstruction == "does_not_close" else 0)
+    assert not any(overlay.force_clicks)
+    assert not page.keyboard.pressed
 
 
 def test_recruiter_messages_are_read_from_tracked_chats(tmp_path: Path) -> None:
@@ -2093,6 +2439,76 @@ def test_application_with_questions_is_not_submitted(tmp_path: Path) -> None:
     assert result.status is HhApplyStatus.QUESTIONS_REQUIRED
     assert result.questions == ("Укажите Telegram",)
     assert page.goto_calls[0][0] == "https://hh.ru/vacancy/123"
+
+
+@pytest.mark.parametrize("click_fails", [False, True])
+def test_application_form_falls_back_to_its_link_when_popup_stalls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, click_fails: bool
+) -> None:
+    page = FakePage("https://hh.ru/applicant/resumes")
+    page.application_payload = {
+        "fields": [],
+        "warnings": [],
+        "resumeTitle": "Python backend разработчик",
+        "bodyText": "Форма отклика",
+    }
+    title = FakeLocator(wait_error=True)
+    page.locators['[data-qa="resume-title"]'] = title
+    page.locators['[data-qa="vacancy-response-submit-popup"]'] = FakeLocator()
+    page.locators['[data-qa="vacancy-response-link-top"]:visible'] = FakeLocator(
+        href="/applicant/vacancy_response?vacancyId=123&employerId=456",
+        click_error=click_fails,
+    )
+    original_goto = page.goto
+
+    def goto(url: str, *, wait_until: str) -> FakeResponse | None:
+        response = original_goto(url, wait_until=wait_until)
+        if "/applicant/vacancy_response?" in url:
+            title.wait_error = False
+        return response
+
+    monkeypatch.setattr(page, "goto", goto)
+    result = make_browser(page, tmp_path).apply_to_vacancy(
+        "https://hh.ru/vacancy/123",
+        expected_resume_hh_id=TEST_RESUME_HH_ID,
+        expected_resume_title="Python backend разработчик",
+        cover_letter="",
+        submit=False,
+    )
+
+    assert result.status is HhApplyStatus.MANUAL_REVIEW_REQUIRED, result.confirmation
+    assert page.goto_calls[-1][0] == (
+        "https://hh.ru/applicant/vacancy_response?vacancyId=123&employerId=456"
+    )
+    assert page.locator('[data-qa="vacancy-response-submit-popup"]').clicked == 0
+
+
+@pytest.mark.parametrize(
+    "href",
+    [
+        "https://example.org/applicant/vacancy_response?vacancyId=123",
+        "/applicant/vacancy_response?vacancyId=999",
+        "/applicant/vacancy_response?vacancyId=123&vacancyId=999",
+    ],
+)
+def test_application_form_fallback_rejects_external_or_different_target(
+    tmp_path: Path,
+    href: str,
+) -> None:
+    page = FakePage("https://hh.ru/applicant/resumes")
+    page.locators['[data-qa="resume-title"]'] = FakeLocator(wait_error=True)
+    page.locators['[data-qa="vacancy-response-link-top"]:visible'] = FakeLocator(href=href)
+
+    result = make_browser(page, tmp_path).apply_to_vacancy(
+        "https://hh.ru/vacancy/123",
+        expected_resume_hh_id=TEST_RESUME_HH_ID,
+        expected_resume_title="Python backend разработчик",
+        cover_letter="",
+        submit=False,
+    )
+
+    assert result.status is HhApplyStatus.RETRYABLE_ERROR
+    assert len(page.goto_calls) == 1
 
 
 def test_empty_letter_preflight_accepts_disabled_submit_but_real_submit_does_not(
@@ -2878,8 +3294,31 @@ def test_changed_form_is_not_refilled(tmp_path: Path) -> None:
     assert page.fill_payload is None
 
 
-def test_application_is_submitted_once_after_all_checks(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "transport", ["classic", "popup", "popup_wrong_resume", "popup_incomplete"]
+)
+def test_application_is_submitted_once_after_all_checks(
+    tmp_path: Path, transport: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
     page = FakePage("https://hh.ru/applicant/resumes")
+    if transport.startswith("popup"):
+        page.response.url = "https://meleuz.hh.ru/applicant/vacancy_response/popup"
+        page.response.request.post_data = (
+            "------WebKitFormBoundaryExample\r\n"
+            'Content-Disposition: form-data; name="vacancyId"\r\n\r\n123\r\n'
+            "------WebKitFormBoundaryExample\r\n"
+            'Content-Disposition: form-data; name="resumeHash"\r\n\r\n'
+            f"{TEST_RESUME_HH_ID}\r\n------WebKitFormBoundaryExample--\r\n"
+        )
+        page.response.body = '{"success":"true","vacancy_id":"123"}'
+        if transport == "popup_wrong_resume":
+            page.response.request.post_data = page.response.request.post_data.replace(
+                TEST_RESUME_HH_ID, "wrong-resume"
+            )
+        elif transport == "popup_incomplete":
+            page.response.request.post_data = page.response.request.post_data.removesuffix(
+                "------WebKitFormBoundaryExample--\r\n"
+            )
     page.application_payload = {
         "questions": [],
         "warnings": ["Город не указан"],
@@ -2894,7 +3333,11 @@ def test_application_is_submitted_once_after_all_checks(tmp_path: Path) -> None:
     page.locators[submit_selector] = FakeLocator()
     page.locators["body"] = FakeLocator(text="Отклик отправлен")
 
-    result = make_browser(page, tmp_path).apply_to_vacancy(
+    browser = make_browser(page, tmp_path)
+    browser._journal = OperationJournal(tmp_path / "journal")
+    ticks = iter(range(1000))
+    monkeypatch.setattr(browser_module, "monotonic", lambda: next(ticks) / 100)
+    result = browser.apply_to_vacancy(
         "https://hh.ru/vacancy/123",
         expected_resume_hh_id=TEST_RESUME_HH_ID,
         expected_resume_title="Python backend разработчик",
@@ -2903,8 +3346,42 @@ def test_application_is_submitted_once_after_all_checks(tmp_path: Path) -> None:
         submit_guard=lambda: True,
     )
 
+    timing = next(row for row in browser._journal.entries() if row["event"] == "application_timing")
+    details = timing["details"]
+    assert details["submit"] is True
+    assert details["result"] == result.status.value
+    phases = details["phase_durations_ms"]
+    expected_phases = {
+        "vacancy_navigation",
+        "vacancy_checks",
+        "form_open",
+        "form_checks",
+        "resume_selection",
+        "form_fill",
+        "submit_checks",
+        "submission_response",
+        "submission_evidence",
+    }
+    if transport in {"classic", "popup"}:
+        expected_phases.add("confirmation")
+    assert set(phases) == expected_phases
+    assert all(isinstance(value, int) and value > 0 for value in phases.values())
+    assert abs(sum(phases.values()) - details["total_duration_ms"]) <= len(phases)
+    assert "Содержательное письмо" not in str(timing)
+
+    if transport in {"popup_wrong_resume", "popup_incomplete"}:
+        assert result.status is HhApplyStatus.MANUAL_REVIEW_REQUIRED
+        assert page.last_route is not None and page.last_route.aborted
+        assert result.submission_evidence is not None
+        assert result.submission_evidence["request_started"] is False
+        assert result.submission_evidence["request_blocked"] is True
+        assert page.locators[submit_selector].clicked == 1
+        return
     assert result.status is HhApplyStatus.APPLIED
     assert result.confirmation == "hh.ru подтвердил отправку отклика"
+    assert result.submission_evidence is not None
+    assert result.submission_evidence["request_started"] is True
+    assert result.submission_evidence["response_status"] == 200
     assert result.warnings == ("Город не указан",)
     assert page.locators[toggle_selector].clicked == 1
     assert page.locators[letter_selector].filled == ["Содержательное письмо"]
@@ -3281,7 +3758,9 @@ def test_application_navigation_timeout_delays_only_current_vacancy(
     page = FakePage("https://hh.ru/applicant/resumes")
     page.goto_error = TimeoutError("Page.goto: Timeout 60000ms exceeded")
 
-    result = make_browser(page, tmp_path).apply_to_vacancy(
+    browser = make_browser(page, tmp_path)
+    browser._journal = OperationJournal(tmp_path / "journal")
+    result = browser.apply_to_vacancy(
         "https://hh.ru/vacancy/123",
         expected_resume_hh_id=TEST_RESUME_HH_ID,
         expected_resume_title="Python backend разработчик",
@@ -3294,12 +3773,36 @@ def test_application_navigation_timeout_delays_only_current_vacancy(
     assert result.retry_after_seconds == browser_module._NETWORK_RETRY_SECONDS
     assert not result.retry_blocks_queue
 
+    timing = next(row for row in browser._journal.entries() if row["event"] == "application_timing")
+    assert list(timing["details"]["phase_durations_ms"]) == ["vacancy_navigation"]
+    assert timing["details"]["result"] == HhApplyStatus.RETRYABLE_ERROR.value
 
-def test_application_http_403_requires_manual_account_review(tmp_path: Path) -> None:
+
+@pytest.mark.parametrize(
+    ("body_text", "expected_status"),
+    [
+        ("", HhApplyStatus.ACCOUNT_WARNING),
+        (
+            "Чтобы откликнуться на эту вакансию, поменяйте видимость резюме "
+            "на «Видно всем работодателям, зарегистрированным на hh.ru»",
+            HhApplyStatus.ACCOUNT_WARNING,
+        ),
+        (
+            "Пройдите капчу\nЧтобы подтвердить, что вы\u00a0не\u00a0робот, "
+            "введите текст с\u00a0картинки:\nEnglish\nТекст с\u00a0картинки\n"
+            "Неверный текст. Пожалуйста, повторите попытку.",
+            HhApplyStatus.CAPTCHA_REQUIRED,
+        ),
+    ],
+)
+def test_application_http_403_distinguishes_captcha_from_account_warning(
+    tmp_path: Path, body_text: str, expected_status: HhApplyStatus
+) -> None:
     page = FakePage("https://hh.ru/applicant/resumes")
     response = FakeResponse()
     response.status = 403
     page.goto_response = response
+    page.locators["body"] = FakeLocator(text=body_text)
 
     result = make_browser(page, tmp_path).apply_to_vacancy(
         "https://hh.ru/vacancy/123",
@@ -3310,24 +3813,32 @@ def test_application_http_403_requires_manual_account_review(tmp_path: Path) -> 
         submit_guard=lambda: True,
     )
 
-    assert result.status is HhApplyStatus.ACCOUNT_WARNING
+    assert result.status is expected_status
     assert result.retry_after_seconds is None
-    assert "ручная проверка" in result.confirmation
+    if expected_status is HhApplyStatus.ACCOUNT_WARNING:
+        assert "ручная проверка" in result.confirmation
+    else:
+        assert "капч" in result.confirmation.casefold()
 
 
+@pytest.mark.parametrize(
+    "body_text",
+    [
+        "Вам недоступна эта вакансия. Войдите как пользователь, "
+        "у которого есть доступ на просмотр.",
+        "У\u00a0вас нет доступа к\u00a0этой вакансии. "
+        "Работодатель ограничил доступ к\u00a0вакансии.",
+    ],
+)
 def test_application_http_403_for_inaccessible_vacancy_skips_only_vacancy(
     tmp_path: Path,
+    body_text: str,
 ) -> None:
     page = FakePage("https://hh.ru/applicant/resumes")
     response = FakeResponse()
     response.status = 403
     page.goto_response = response
-    page.locators["body"] = FakeLocator(
-        text=(
-            "Вам недоступна эта вакансия. Войдите как пользователь, "
-            "у которого есть доступ на просмотр."
-        )
-    )
+    page.locators["body"] = FakeLocator(text=body_text)
 
     result = make_browser(page, tmp_path).apply_to_vacancy(
         "https://hh.ru/vacancy/123",
@@ -3492,6 +4003,55 @@ def test_application_uses_history_when_response_body_is_unavailable(tmp_path: Pa
     assert page.locators['[data-qa="vacancy-response-submit-popup"]'].clicked == 1
     assert page.goto_calls[0][0] == "https://hh.ru/vacancy/123"
     assert page.goto_calls[-1][0] == "https://hh.ru/applicant/negotiations"
+    assert result.submission_evidence is not None
+    assert result.submission_evidence["response_text"] is None
+    assert result.submission_evidence["response_body_error"] == "Error"
+
+
+@pytest.mark.parametrize("history_vacancy_id", ["123", "999"])
+def test_application_checks_later_history_pages_without_clicking_again(
+    tmp_path: Path, history_vacancy_id: str
+) -> None:
+    page = FakePage("https://hh.ru/applicant/resumes")
+    page.application_payload = {
+        "questions": [],
+        "warnings": [],
+        "resumeTitle": "Python backend разработчик",
+        "bodyText": "Форма отклика",
+    }
+    page.response.body = "{}"
+    page.negotiations_payload = [{"vacancyId": "101"}]
+    page.locators['[data-qa="vacancy-response-popup-form-letter-input"]'] = FakeLocator()
+    submit = FakeLocator()
+    page.locators['[data-qa="vacancy-response-submit-popup"]'] = submit
+    selected = FakeLocator(text="1")
+    first = FakeLocator(text="1")
+    second = FakeLocator(text="2")
+    page.locators['[data-qa^="number-pages-"]'] = FakeLocator(items=[first, second])
+    page.locators['[data-qa*="number-pages-selected"]'] = selected
+    page.locators['[data-qa^="number-pages-1"]'] = first
+    page.locators['[data-qa^="number-pages-2"]'] = second
+
+    def open_second() -> None:
+        selected.text = "2"
+        page.negotiations_payload = [{"vacancyId": history_vacancy_id}]
+
+    second.on_click = open_second
+    result = make_browser(page, tmp_path).apply_to_vacancy(
+        "https://hh.ru/vacancy/123",
+        expected_resume_hh_id=TEST_RESUME_HH_ID,
+        expected_resume_title="Python backend разработчик",
+        cover_letter="Письмо",
+        submit=True,
+        submit_guard=lambda: True,
+    )
+
+    expected = (
+        HhApplyStatus.APPLIED if history_vacancy_id == "123" else HhApplyStatus.UNKNOWN_RESULT
+    )
+    assert result.status is expected
+    assert second.clicked == 1
+    assert submit.clicked == 1
 
 
 def test_unexpected_form_payload_before_submit_is_retryable(tmp_path: Path) -> None:
@@ -3512,9 +4072,13 @@ def test_unexpected_form_payload_before_submit_is_retryable(tmp_path: Path) -> N
     assert result.status is HhApplyStatus.RETRYABLE_ERROR
     assert "до нажатия" in result.confirmation
     assert page.locators[submit_selector].clicked == 0
+    assert result.submission_evidence is None
 
 
-def test_application_marks_unknown_result_without_confirmation(tmp_path: Path) -> None:
+@pytest.mark.parametrize("page_read_fails", [False, True])
+def test_application_marks_unknown_result_without_confirmation(
+    tmp_path: Path, page_read_fails: bool
+) -> None:
     page = FakePage("https://hh.ru/applicant/resumes")
     page.application_payload = {
         "questions": [],
@@ -3525,7 +4089,16 @@ def test_application_marks_unknown_result_without_confirmation(tmp_path: Path) -
     page.response.body = "{}"
     page.locators['[data-qa="vacancy-response-popup-form-letter-input"]'] = FakeLocator()
     page.locators['[data-qa="vacancy-response-submit-popup"]'] = FakeLocator()
-    page.locators["body"] = FakeLocator(text="Форма отклика")
+
+    class UnreadableBody(FakeLocator):
+        def inner_text(self, *, timeout: int | None = None) -> str:
+            raise Error("page text unavailable")
+
+    page.locators["body"] = (
+        UnreadableBody(text="Форма отклика")
+        if page_read_fails
+        else FakeLocator(text="Форма отклика")
+    )
     page.negotiations_payload = [
         {
             "vacancyId": "999",
@@ -3549,13 +4122,44 @@ def test_application_marks_unknown_result_without_confirmation(tmp_path: Path) -
     assert "нажата один раз" in result.confirmation
     assert page.locators['[data-qa="vacancy-response-submit-popup"]'].clicked == 1
     assert page.goto_calls[-1][0] == "https://hh.ru/applicant/negotiations"
+    assert result.submission_evidence is not None
+    assert result.submission_evidence["page_url"] == "https://hh.ru/vacancy/123"
+    assert result.submission_evidence["page_text"] == (None if page_read_fails else "Форма отклика")
+    if page_read_fails:
+        assert result.submission_evidence["page_text_error"] == "Error"
+    assert result.submission_evidence["response_status"] == 200
+    assert result.submission_evidence["response_text"] == "{}"
+    assert result.submission_evidence["request_started"] is True
+    assert result.submission_evidence["vacancy_id"] == "123"
+    assert result.submission_evidence["resume_hh_id"] == TEST_RESUME_HH_ID
 
 
 @pytest.mark.parametrize(
-    ("status", "expected_status", "retry_after"),
+    ("status", "expected_status", "retry_after", "after_click_text", "response_text"),
     [
-        (429, HhApplyStatus.RETRYABLE_ERROR, 73),
-        (403, HhApplyStatus.ACCOUNT_WARNING, None),
+        (429, HhApplyStatus.RETRYABLE_ERROR, 73, "Форма отклика", "{}"),
+        (403, HhApplyStatus.ACCOUNT_WARNING, None, "Форма отклика", "{}"),
+        (
+            403,
+            HhApplyStatus.CAPTCHA_REQUIRED,
+            None,
+            "Пройдите капчу\nТекст с\u00a0картинки\nНеверный текст. Пожалуйста, повторите попытку.",
+            "{}",
+        ),
+        (
+            403,
+            HhApplyStatus.CAPTCHA_REQUIRED,
+            None,
+            "Форма отклика",
+            '{"hhcaptcha":{"isBot":true,"captchaState":"test","captchaError":false}}',
+        ),
+        (
+            403,
+            HhApplyStatus.ACCOUNT_WARNING,
+            None,
+            "Форма отклика",
+            '{"hhcaptcha":{"isBot":false}}',
+        ),
     ],
 )
 def test_application_classifies_post_limit_and_security_response_after_click(
@@ -3563,6 +4167,8 @@ def test_application_classifies_post_limit_and_security_response_after_click(
     status: int,
     expected_status: HhApplyStatus,
     retry_after: int | None,
+    after_click_text: str,
+    response_text: str,
 ) -> None:
     page = FakePage("https://hh.ru/applicant/resumes")
     page.application_payload = {
@@ -3572,11 +4178,13 @@ def test_application_classifies_post_limit_and_security_response_after_click(
         "bodyText": "Форма отклика",
     }
     page.response.status = status
+    page.response.body = response_text
     page.response.headers["retry-after"] = "73"
     page.locators['[data-qa="vacancy-response-popup-form-letter-input"]'] = FakeLocator()
     submit = FakeLocator()
     page.locators['[data-qa="vacancy-response-submit-popup"]'] = submit
     page.locators["body"] = FakeLocator(text="Форма отклика")
+    submit.on_click = lambda: setattr(page.locators["body"], "text", after_click_text)
 
     result = make_browser(page, tmp_path).apply_to_vacancy(
         "https://hh.ru/vacancy/123",
@@ -3593,8 +4201,10 @@ def test_application_classifies_post_limit_and_security_response_after_click(
     assert page.goto_calls == [("https://hh.ru/vacancy/123", "domcontentloaded")]
 
 
+@pytest.mark.parametrize("status", [200, 403])
 def test_application_security_warning_after_click_blocks_account(
     tmp_path: Path,
+    status: int,
 ) -> None:
     page = FakePage("https://hh.ru/applicant/resumes")
     page.application_payload = {
@@ -3604,10 +4214,14 @@ def test_application_security_warning_after_click_blocks_account(
         "bodyText": "Форма отклика",
     }
     page.response.body = "Подозрительная активность. Подтвердите аккаунт."
+    page.response.status = status
     page.locators['[data-qa="vacancy-response-popup-form-letter-input"]'] = FakeLocator()
     submit = FakeLocator()
     page.locators['[data-qa="vacancy-response-submit-popup"]'] = submit
     page.locators["body"] = FakeLocator(text="Форма отклика")
+    submit.on_click = lambda: setattr(
+        page.locators["body"], "text", "Пройдите капчу\nТекст с\u00a0картинки"
+    )
 
     result = make_browser(page, tmp_path).apply_to_vacancy(
         "https://hh.ru/vacancy/123",
@@ -3955,6 +4569,23 @@ def test_recruiter_message_is_not_clicked_after_execution_permission_is_lost(
     browser._message_send_allowed = lambda: False
     result = browser.send_recruiter_message("https://hh.ru/vacancy/101", "Буду на связи.")
     assert result.outcome is MessageSendOutcome.FAILED
+    assert submit.clicked == 0
+
+
+def test_recruiter_message_is_not_clicked_after_chat_identity_changes(tmp_path: Path) -> None:
+    page = FakePage("https://hh.ru/applicant/resumes")
+    frame = FakeFrame(messages_payloads=[[]])
+    frame.locators['[data-qa="chatik-new-message-text"]'] = FakeLocator(
+        on_fill=lambda _value: setattr(frame, "chat_identity", False)
+    )
+    submit = FakeLocator()
+    frame.locators['[data-qa="chatik-do-send-message"]'] = submit
+    page.frames = [cast(Frame, frame)]
+    result = make_browser(page, tmp_path).send_recruiter_message(
+        "https://hh.ru/vacancy/101", "Ответ"
+    )
+    assert result.outcome is MessageSendOutcome.FAILED
+    assert result.failure_code is MessageSendFailureCode.SNAPSHOT_UNAVAILABLE
     assert submit.clicked == 0
 
 
@@ -4658,11 +5289,40 @@ def test_shared_tabs_keep_other_pages_and_profile_owner_alive(
             return SimpleNamespace(send=send, detach=lambda: None)
 
     context = Context(Tab())
+    background_targets: list[dict[str, object]] = []
+    pending_page = SimpleNamespace(value=None)
+
+    class PageEvent:
+        def __enter__(self) -> object:
+            return pending_page
+
+        def __exit__(self, *_args: object) -> None:
+            pass
+
+    def expect_page(*, predicate: Callable[[object], bool], timeout: int) -> PageEvent:
+        assert timeout == 4000
+        return PageEvent()
+
+    def create_target(command: str, params: dict[str, object]) -> dict[str, str]:
+        assert command == "Target.createTarget"
+        assert params["background"] is True
+        page = context.new_page()
+        page.url = str(params["url"])
+        pending_page.value = page
+        background_targets.append(params)
+        return {"targetId": "test-target"}
+
+    context.expect_page = expect_page  # type: ignore[attr-defined]
 
     class Chromium(FakeChromium):
         def connect_over_cdp(self, endpoint: str, **_kwargs: object) -> object:
             assert endpoint == "http://127.0.0.1:12345"
-            return SimpleNamespace(contexts=[context])
+            return SimpleNamespace(
+                contexts=[context],
+                new_browser_cdp_session=lambda: SimpleNamespace(
+                    send=create_target, detach=lambda: None
+                ),
+            )
 
     monkeypatch.setattr(
         browser_module,
@@ -4686,6 +5346,7 @@ def test_shared_tabs_keep_other_pages_and_profile_owner_alive(
             assert context.window_state == ("minimized" if background else "normal")
             assert isinstance(first._page, Tab)
             assert first._page.foreground is (not background)
+            assert len(background_targets) == int(background)
             with VisibleHhBrowser(
                 tmp_path,
                 "login",
@@ -4740,12 +5401,18 @@ def test_profile_lock_wait_is_bounded(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("original_failure", [True, False])
+@pytest.mark.parametrize("cleanup_error_type", [Error, Exception])
 def test_closed_driver_cleanup_releases_profile_and_preserves_original_failure(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, original_failure: bool
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    original_failure: bool,
+    cleanup_error_type: type[Exception],
 ) -> None:
     class ClosedContext(FakeContext):
         def close(self) -> None:
-            raise Error("BrowserContext.close: Connection closed while reading from the driver")
+            raise cleanup_error_type(
+                "BrowserContext.close: Connection closed while reading from the driver"
+            )
 
     context = ClosedContext(FakePage())
     playwright = FakePlaywright(FakeChromium(context))
@@ -4767,8 +5434,245 @@ def test_closed_driver_cleanup_releases_profile_and_preserves_original_failure(
     contender.release()
 
 
+@pytest.mark.parametrize(
+    "cleanup_failure",
+    [
+        Error("Unexpected cleanup failure"),
+        Exception("Unexpected cleanup failure"),
+        KeyboardInterrupt("Connection closed while reading from the driver"),
+        SystemExit("Connection closed while reading from the driver"),
+    ],
+)
+def test_cleanup_propagates_unexpected_failure_and_releases_profile(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, cleanup_failure: BaseException
+) -> None:
+    class FailingContext(FakeContext):
+        def close(self) -> None:
+            raise cleanup_failure
+
+    context = FailingContext(FakePage())
+    playwright = FakePlaywright(FakeChromium(context))
+    monkeypatch.setattr(browser_module, "sync_playwright", lambda: FakeStarter(playwright))
+    browser = VisibleHhBrowser(tmp_path, "login", "resumes", "search", 4000)
+
+    with pytest.raises(type(cleanup_failure)) as raised, browser:
+        pass
+
+    assert raised.value is cleanup_failure
+    assert playwright.stopped
+    contender = browser_module._BrowserProfileLock(
+        tmp_path / browser_module._PROFILE_LOCK_FILENAME, timeout_seconds=0
+    )
+    contender.acquire()
+    contender.release()
+
+
+@pytest.mark.parametrize("phase", ["context", "page", "stop", "startup", "guard_unavailable"])
+def test_hung_browser_cleanup_stops_only_its_driver_job(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, phase: str
+) -> None:
+    released = threading.Event()
+    stopped: list[object] = []
+    closed: list[object] = []
+
+    class Job:
+        def active(self) -> bool:
+            return not released.is_set()
+
+        def stop(self) -> None:
+            stopped.append(self)
+            released.set()
+
+        def close(self) -> None:
+            closed.append(self)
+
+    own_job = Job()
+    other_job = Job()
+    context = FakeContext(FakePage())
+    playwright = FakePlaywright(FakeChromium(context, fail=phase == "startup"))
+    monkeypatch.setattr(browser_module, "sync_playwright", lambda: FakeStarter(playwright))
+    monkeypatch.setattr(browser_module, "_BROWSER_CLOSE_TIMEOUT_SECONDS", 0.01, raising=False)
+
+    def attach(browser: VisibleHhBrowser) -> None:
+        monkeypatch.setattr(browser, "_driver_job", own_job, raising=False)
+
+    monkeypatch.setattr(VisibleHhBrowser, "_attach_driver_job", attach, raising=False)
+
+    def blocked_close() -> None:
+        assert released.wait(1), "Browser cleanup remained blocked"
+        raise Exception("Connection closed while reading from the driver")
+
+    if phase == "context":
+        monkeypatch.setattr(context, "close", blocked_close)
+    elif phase == "page":
+        monkeypatch.setattr(context.pages[0], "close", blocked_close, raising=False)
+    elif phase in {"stop", "startup"}:
+        monkeypatch.setattr(playwright, "stop", blocked_close)
+    if phase == "guard_unavailable":
+
+        class UnavailableTimer:
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                pass
+
+            def start(self) -> None:
+                raise RuntimeError("cannot start timer thread")
+
+        monkeypatch.setattr(threading, "Timer", UnavailableTimer)
+    journal = OperationJournal(tmp_path / "journal")
+    browser = VisibleHhBrowser(
+        tmp_path / "profile", "login", "resumes", "search", 4000, journal=journal
+    )
+    if phase == "startup":
+        with pytest.raises(RuntimeError, match="cannot start"):
+            browser.__enter__()
+    else:
+        with browser:
+            if phase == "page":
+                browser._shared_endpoint = lambda: "shared"
+    assert stopped == ([] if phase == "guard_unavailable" else [own_job])
+    assert closed == [own_job]
+    assert other_job not in stopped
+    assert context.closed is (phase in {"stop", "guard_unavailable"})
+    contender = browser_module._BrowserProfileLock(
+        tmp_path / "profile" / browser_module._PROFILE_LOCK_FILENAME, timeout_seconds=0
+    )
+    contender.acquire()
+    contender.release()
+    events = [
+        json.loads(line)
+        for line in next((tmp_path / "journal" / "logs").glob("*.jsonl"))
+        .read_text("utf8")
+        .splitlines()
+    ]
+    assert any(
+        row["event"] == ("cleanup_guard" if phase == "guard_unavailable" else "cleanup_timeout")
+        for row in events
+    )
+
+
+@pytest.mark.parametrize("reader", ["authentication_status", "is_authenticated"])
+@pytest.mark.parametrize("late_result", [False, True])
+def test_hung_authentication_read_stops_only_own_driver_and_never_accepts_late_result(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, reader: str, late_result: bool
+) -> None:
+    released = threading.Event()
+    stopped: list[object] = []
+
+    class Job:
+        def active(self) -> bool:
+            return True
+
+        def stop(self) -> None:
+            stopped.append(self)
+            released.set()
+
+    own_job, other_job = Job(), Job()
+    page = FakePage(url="https://hh.ru/applicant/resumes")
+    captcha = FakeLocator(0)
+
+    def blocked_count() -> int:
+        assert released.wait(0.3), "Authentication read remained blocked"
+        if not late_result:
+            raise Exception("Locator.count: Connection closed while reading from the driver")
+        return 0
+
+    monkeypatch.setattr(captcha, "count", blocked_count)
+    page.locators['[data-qa*="captcha"], iframe[src*="captcha"]'] = captcha
+    browser = make_browser(page, tmp_path)
+    monkeypatch.setattr(browser, "_driver_job", own_job)
+    monkeypatch.setattr(browser, "_timeout_ms", 20)
+    journal = OperationJournal(tmp_path / "journal")
+    monkeypatch.setattr(browser, "_journal", journal)
+
+    with pytest.raises(HhSyncRetryableError) as caught:
+        getattr(browser, reader)()
+
+    assert caught.value.code == "HH_BROWSER_UNRESPONSIVE"
+    assert stopped == [own_job]
+    assert other_job not in stopped
+    assert not page.closed
+    events = [
+        json.loads(line)
+        for line in next((tmp_path / "journal/logs").glob("*.jsonl")).read_text("utf8").splitlines()
+    ]
+    assert any(row["event"] == "authentication_read_timeout" for row in events)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows driver process ownership")
+def test_driver_cleanup_job_keeps_another_playwright_driver_alive(tmp_path: Path) -> None:
+    journal = OperationJournal(tmp_path / "journal")
+    browser = VisibleHhBrowser(
+        tmp_path / "profile", "login", "resumes", "search", 4000, journal=journal
+    )
+    ready = threading.Event()
+    finish = threading.Event()
+    other_processes: list[subprocess.Popen[bytes]] = []
+    errors: list[Exception] = []
+
+    def other_driver() -> None:
+        try:
+            with sync_playwright() as other:
+                process = getattr(other._impl_obj._connection._transport, "_proc", None)
+                assert process is not None
+                other_processes.append(process._transport.get_extra_info("subprocess"))
+                ready.set()
+                assert finish.wait(10)
+        except Exception as error:
+            errors.append(error)
+            ready.set()
+
+    thread = threading.Thread(target=other_driver, daemon=True)
+    thread.start()
+    try:
+        assert ready.wait(5) and not errors
+        browser._playwright = sync_playwright().start()
+        try:
+            browser._attach_driver_job()
+            job = browser._driver_job
+            assert job is not None and job.active()
+            browser._stop_unresponsive_driver(job)
+            browser._close_resources()
+            assert other_processes[0].poll() is None
+            browser._playwright = sync_playwright().start()
+            browser._attach_driver_job()
+            assert browser._driver_job is not None
+            browser._timeout_ms = 20
+            with (
+                pytest.raises(HhSyncRetryableError, match="не ответил"),
+                browser._authentication_read_deadline(),
+            ):
+                assert threading.Event().wait(0.06) is False
+            browser._close_resources()
+            assert other_processes[0].poll() is None
+            browser._playwright = sync_playwright().start()
+            browser._attach_driver_job()
+            job = browser._driver_job
+            assert job is not None
+            with browser._authentication_read_deadline():
+                pass
+            threading.Event().wait(0.06)
+            assert job.active()
+            browser._close_resources()
+            assert other_processes[0].poll() is None
+        finally:
+            browser._close_resources()
+    finally:
+        finish.set()
+        thread.join(5)
+    assert not thread.is_alive() and not errors
+    events = [
+        json.loads(line)
+        for line in next((tmp_path / "journal" / "logs").glob("*.jsonl"))
+        .read_text("utf8")
+        .splitlines()
+    ]
+    assert len([row for row in events if row["event"] == "cleanup_timeout"]) == 1
+    assert len([row for row in events if row["event"] == "authentication_read_timeout"]) == 1
+
+
+@pytest.mark.parametrize("channel", ["chromium", "chrome", "msedge"])
 def test_context_starts_visible_persistent_browser(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, channel: str
 ) -> None:
     page = FakePage()
     context = FakeContext(page)
@@ -4781,6 +5685,7 @@ def test_context_starts_visible_persistent_browser(
         "https://hh.ru/applicant/resumes",
         "https://hh.ru/search/vacancy",
         4_000,
+        browser_channel=channel,
     )
 
     with browser:
@@ -4789,6 +5694,12 @@ def test_context_starts_visible_persistent_browser(
         assert chromium.calls[0]["headless"] is False
         assert chromium.calls[0]["no_viewport"] is True
         assert chromium.calls[0]["args"] == ["--start-maximized"]
+        if channel in {"chrome", "msedge"}:
+            assert chromium.calls[0]["channel"] == channel
+            assert chromium.calls[0]["ignore_default_args"] == ["--disable-extensions"]
+        else:
+            assert chromium.calls[0].get("channel") is None
+            assert chromium.calls[0].get("ignore_default_args") is None
         contender = browser_module._BrowserProfileLock(
             tmp_path / "profile" / browser_module._PROFILE_LOCK_FILENAME,
             timeout_seconds=0,
@@ -4824,6 +5735,106 @@ def test_background_context_starts_minimized_with_quiet_chromium(
         assert arguments[0] == "--start-minimized"
         assert "--mute-audio" in arguments
         assert "--start-maximized" not in arguments
+
+
+def test_windowless_owner_can_be_opened_manually_and_returned_to_background(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    contexts: list[FakeContext] = []
+    launches: list[dict[str, object]] = []
+
+    class Chromium(FakeChromium):
+        def __init__(self) -> None:
+            super().__init__(FakeContext(FakePage()))
+
+        def launch_persistent_context(self, profile: str, **options: object) -> FakeContext:
+            context = FakeContext(FakePage())
+            contexts.append(context)
+            launches.append(options)
+            return context
+
+    monkeypatch.setattr(
+        browser_module, "sync_playwright", lambda: FakeStarter(FakePlaywright(Chromium()))
+    )
+    with VisibleHhBrowser(
+        tmp_path / "profile",
+        "login",
+        "resumes",
+        "search",
+        4000,
+        start_minimized=True,
+        headless=True,
+    ) as browser:
+        assert launches[0]["headless"] is True
+        browser.ensure_visible()
+        assert contexts[0].closed
+        assert launches[1]["headless"] is False
+        assert "--start-maximized" in cast(list[str], launches[1]["args"])
+        assert browser.is_open()
+        browser.ensure_visible()
+        assert len(launches) == 2
+        browser.return_to_background()
+        assert contexts[1].closed
+        assert launches[2]["headless"] is True
+        assert browser.is_open()
+    assert all(context.closed for context in contexts)
+
+
+def test_manual_control_uses_separate_tab_and_preserves_owner(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class ForegroundPage(FakePage):
+        def bring_to_front(self) -> None:
+            pass
+
+    owner, manual = ForegroundPage(), ForegroundPage()
+
+    class Context(FakeContext):
+        def new_page(self) -> ForegroundPage:
+            return manual
+
+    context = Context(owner)
+    playwright = FakePlaywright(FakeChromium(context))
+    monkeypatch.setattr(browser_module, "sync_playwright", lambda: FakeStarter(playwright))
+    with VisibleHhBrowser(tmp_path / "profile", "login", "resumes", "search", 4000) as browser:
+        browser.show_verification("https://hh.ru/account/captcha")
+        assert not owner.goto_calls
+        assert manual.url == "https://hh.ru/account/captcha"
+        browser.show_verification("https://hh.ru/account/captcha")
+        assert len(manual.goto_calls) == 1
+        manual.closed = True
+        assert browser.is_open()
+
+
+def test_failed_shared_tab_creation_never_closes_owner_context(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class Context(FakeContext):
+        def new_page(self) -> FakePage:
+            raise RuntimeError("tab creation failed")
+
+    context = Context(FakePage())
+
+    class Chromium(FakeChromium):
+        def connect_over_cdp(self, _endpoint: str, *, timeout: int) -> SimpleNamespace:
+            return SimpleNamespace(contexts=[context])
+
+    playwright = FakePlaywright(Chromium(context))
+    monkeypatch.setattr(browser_module, "sync_playwright", lambda: FakeStarter(playwright))
+    with (
+        pytest.raises(RuntimeError, match="tab creation failed"),
+        VisibleHhBrowser(
+            tmp_path / "profile",
+            "login",
+            "resumes",
+            "search",
+            4000,
+            shared_endpoint=lambda: "http://127.0.0.1:12345",
+        ),
+    ):
+        pass
+    assert not context.closed
+    assert playwright.stopped
 
 
 @pytest.mark.parametrize(
@@ -5134,22 +6145,35 @@ def test_application_response_must_match_requested_vacancy_and_resume() -> None:
     )
 
 
-def test_application_confirmation_accepts_success_response_payload(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("payload", "confirmed"),
+    [
+        ({"status": "success"}, True),
+        ({"success": "true"}, True),
+        ({"success": "false"}, False),
+        ({"success": False}, False),
+        ({"success": 1}, False),
+    ],
+)
+def test_application_confirmation_accepts_success_response_payload(
+    tmp_path: Path, payload: dict[str, object], confirmed: bool
+) -> None:
     page = FakePage()
     page.locators["body"] = FakeLocator(text="")
     response = FakeResponse()
-    response.body = '{"status":"success"}'
+    response.body = json.dumps(payload)
     browser = make_browser(page, tmp_path)
 
     assert browser._application_confirmation(cast(Page, page), None) == ""
-    assert browser._application_confirmation(cast(Page, page), cast(Response, response)).startswith(
-        "hh.ru"
+    assert (
+        bool(browser._application_confirmation(cast(Page, page), cast(Response, response)))
+        is confirmed
     )
 
 
 def test_text_helpers_handle_unavailable_page_body(tmp_path: Path) -> None:
     class BrokenTextLocator(FakeLocator):
-        def inner_text(self) -> str:
+        def inner_text(self, *, timeout: int | None = None) -> str:
             raise Error("body unavailable")
 
     page = FakePage()
