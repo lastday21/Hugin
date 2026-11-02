@@ -10,6 +10,8 @@ from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import RequestResponseEndpoint
 
 from hugin import __version__
+from hugin.api.concurrent_reads import ConcurrentReads
+from hugin.api.form_reconciliation import FormReconciliationJobs
 from hugin.api.routes.background_processes import router as background_processes_router
 from hugin.api.routes.communications import router as communications_router
 from hugin.api.routes.development import router as development_router
@@ -17,6 +19,7 @@ from hugin.api.routes.diagnostics import router as diagnostics_router
 from hugin.api.routes.health import router as health_router
 from hugin.api.routes.profile import router as profile_router
 from hugin.api.routes.workspace import router as workspace_router
+from hugin.api.workspace_reads import WorkspaceReads
 from hugin.core.settings import Settings, get_settings
 from hugin.database import create_database
 from hugin.diagnostics import OperationJournal
@@ -30,6 +33,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     resolved_settings = settings or get_settings()
     database = create_database(resolved_settings)
     journal = OperationJournal(resolved_settings.data_dir)
+    workspace_reads = WorkspaceReads(database, journal)
+    concurrent_reads = ConcurrentReads(on_invalidate=workspace_reads.invalidate)
+    form_reconciliation_jobs = FormReconciliationJobs(
+        database, journal, after_commit=concurrent_reads.invalidate
+    )
 
     @asynccontextmanager
     async def lifespan(_application: FastAPI) -> AsyncIterator[None]:
@@ -43,6 +51,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         try:
             yield
         finally:
+            form_reconciliation_jobs.close()
+            workspace_reads.close()
             database.close()
             journal.record(
                 "server",
@@ -61,6 +71,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     application.state.settings = resolved_settings
     application.state.database = database
     application.state.journal = journal
+    application.state.form_reconciliation_jobs = form_reconciliation_jobs
+    application.state.concurrent_reads = concurrent_reads
+    application.state.workspace_reads = workspace_reads
     application.state.session_key = secrets.token_urlsafe(32)
 
     @application.middleware("http")

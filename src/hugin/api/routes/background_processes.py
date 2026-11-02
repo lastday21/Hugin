@@ -1,10 +1,12 @@
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.orm import Session
 
+from hugin.api.concurrent_reads import ConcurrentReads
 from hugin.api.dependencies import read_session, require_session_key, write_session
+from hugin.api.workspace_reads import WorkspaceReads
 from hugin.database.models import HhAccountModel
 from hugin.services.background_processes import BackgroundProcessService, ProcessKey
 
@@ -32,9 +34,24 @@ def _service(session: Session, account_id: int) -> BackgroundProcessService:
     return BackgroundProcessService(session, account_id)
 
 
-@router.get("")
-def processes(session: ReadSession, account_id: AccountId = 1) -> dict[str, object]:
-    return BackgroundProcessService(session, account_id).snapshot()
+@router.get("", response_model=dict[str, object])
+def processes(
+    request: Request,
+    session: ReadSession,
+    account_id: AccountId = 1,
+    background: bool = Query(default=False),
+) -> dict[str, object] | Response:
+    if background:
+        jobs: WorkspaceReads = request.app.state.workspace_reads
+        return jobs.start(
+            "processes",
+            account_id,
+            lambda reading, account: BackgroundProcessService(reading, account).snapshot(),
+        )
+    reads: ConcurrentReads = request.app.state.concurrent_reads
+    return reads.run(
+        ("processes", account_id), lambda: BackgroundProcessService(session, account_id).snapshot()
+    )
 
 
 @router.post("/start-all")

@@ -5,6 +5,7 @@ from collections.abc import Iterator
 from fastapi import Header, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
+from hugin.api.concurrent_reads import ConcurrentReads
 from hugin.database.engine import Database
 
 
@@ -23,6 +24,8 @@ def read_session(request: Request) -> Iterator[Session]:
 def write_session(request: Request) -> Iterator[Session]:
     with database(request).sessions.begin() as session:
         yield session
+    reads: ConcurrentReads = request.app.state.concurrent_reads
+    reads.invalidate()
 
 
 def require_session_key(

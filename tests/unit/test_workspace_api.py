@@ -3,12 +3,15 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from io import BytesIO
+from urllib.request import Request as UrlRequest
 
 import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient, Response
 from sqlalchemy import select
 
+from hugin.adapters.hh_vacancy_status import HhVacancyStatusProbe
 from hugin.api.app import create_app
 from hugin.core.settings import Settings
 from hugin.database import create_database, upgrade_database
@@ -21,6 +24,7 @@ from hugin.database.models import (
     IncidentModel,
     InvitationModel,
     RecruiterMessageModel,
+    ScreeningFormModel,
     VacancyDiscoveryModel,
     VacancyModel,
 )
@@ -55,6 +59,84 @@ from hugin.services.ai_prompts import DEFAULT_AI_PROMPTS
 from hugin.services.screening_forms import ScreeningDraftService
 
 pytestmark = pytest.mark.integration
+
+
+@pytest.mark.parametrize(
+    ("state", "enabled", "stop_during_check", "expected_requests", "expected_recorded"),
+    (
+        (SystemState.PAUSED, False, False, 0, False),
+        (SystemState.CAPTCHA_REQUIRED, True, False, 0, False),
+        (SystemState.PAUSED, True, False, 1, True),
+        (SystemState.PAUSED, True, True, 1, False),
+    ),
+    ids=("disabled", "captcha", "paused-with-sync", "stopped-during-check"),
+)
+def test_form_reconciliation_obeys_synchronization_controls(
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    state: SystemState,
+    enabled: bool,
+    stop_during_check: bool,
+    expected_requests: int,
+    expected_recorded: bool,
+) -> None:
+    account_id, _, _ = seed_workspace(settings)
+    database = create_database(settings)
+    network_requests: list[str] = []
+
+    class Page(BytesIO):
+        status = 200
+
+    def transport(probe_request: UrlRequest, *, timeout: float) -> Page:
+        network_requests.append(probe_request.full_url)
+        if stop_during_check:
+            with database.sessions.begin() as session:
+                policy = session.get(ApplicationSettingsModel, 1)
+                assert policy is not None
+                policy.synchronization_enabled = False
+        return Page(b"<main>Python backend vacancy</main>")
+
+    monkeypatch.setattr(
+        "hugin.api.routes.workspace.HhVacancyStatusProbe",
+        lambda: HhVacancyStatusProbe(transport),
+    )
+    app = create_app(settings)
+    try:
+        with database.sessions.begin() as session:
+            policy = session.get(ApplicationSettingsModel, 1)
+            assert policy is not None
+            policy.synchronization_enabled = enabled
+            system = SystemStateRepository(session)
+            system.transition(SystemState.RUNNING)
+            if state is not SystemState.RUNNING:
+                system.transition(state)
+            form = session.scalar(select(ScreeningFormModel))
+            assert form is not None
+            form_id = form.id
+            application = session.get(ApplicationModel, form.application_id)
+            assert application is not None
+            application.state = ApplicationState.APPLYING
+            vacancy = session.get(VacancyModel, application.vacancy_id)
+            assert vacancy is not None
+            vacancy.source_url = "https://hh.ru/vacancy/900000001"
+        key = request(app, "GET", "/api/session").json()["key"]
+        response = request(
+            app,
+            "POST",
+            f"/api/forms/reconcile?account_id={account_id}",
+            headers={"X-Hugin-Session": key},
+        )
+        assert response.status_code == 200
+        assert len(network_requests) == expected_requests
+        assert response.json()[0]["questions"][0]["field_key"] == "motivation"
+        assert response.json()[0]["questions"][0]["answer"] is None
+        with database.sessions() as session:
+            stored = session.get(ScreeningFormModel, form_id)
+            assert stored is not None
+            assert (stored.availability_checked_at is not None) is expected_recorded
+    finally:
+        app.state.database.close()
+        database.close()
 
 
 def test_daily_confirmed_sends_exclude_unknown_results(settings: Settings) -> None:
@@ -455,6 +537,7 @@ def test_workspace_endpoints_return_real_data_and_protect_changes(settings: Sett
             "last_error": None,
             "letter_state": "READY",
             "form_state": "INPUT_REQUIRED",
+            "reapplication_review_available": False,
         }
 
         forms = request(app, "GET", f"/api/forms?account_id={account_id}")

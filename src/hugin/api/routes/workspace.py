@@ -5,13 +5,16 @@ from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from hugin.adapters.hh_vacancy_status import HhVacancyStatusProbe
+from hugin.api.concurrent_reads import ConcurrentReads
 from hugin.api.dependencies import read_session, require_session_key, write_session
+from hugin.api.form_reconciliation import FormReconciliationJobs, FormReconciliationStatus
+from hugin.api.workspace_reads import WorkspaceReads
 from hugin.database.models import (
     ApplicationModel,
     ApplicationSettingsModel,
@@ -22,20 +25,27 @@ from hugin.database.models import (
 from hugin.diagnostics import OperationJournal
 from hugin.domain.applications import (
     ApplicationReconciliationResult,
+    ApplicationState,
     ReconciliationStatus,
 )
 from hugin.domain.content import AnswerSource
 from hugin.domain.directions import EmploymentForm, SearchRegion, WorkFormat
+from hugin.domain.tasks import TaskState
 from hugin.domain.time import day_start_utc
+from hugin.repositories.applications import ApplicationRepository
+from hugin.repositories.vacancies import VacancyRepository
+from hugin.services.application_automation import ApplicationAutomationService
 from hugin.services.application_reconciliation import ApplicationReconciliationService
 from hugin.services.automation import AutomationSchedulerService
 from hugin.services.autonomy import AutonomyPolicy, AutonomyPolicyService
+from hugin.services.background_processes import BackgroundProcessService
 from hugin.services.career_directions import (
     COMMON_REGIONS,
     RUSSIA_REGION,
     CareerDirectionService,
 )
 from hugin.services.queue import QueueService
+from hugin.services.reapplication_policy import ReapplicationDecision, ReapplicationPolicyService
 from hugin.services.screening_forms import ScreeningDraft, ScreeningDraftService
 from hugin.services.search_outcomes import SearchOutcomes, SearchOutcomeService
 from hugin.services.ui_workspace import UiWorkspaceService
@@ -167,6 +177,29 @@ class QueueItemResponse(BaseModel):
     last_error: str | None
     letter_state: str | None
     form_state: str | None
+    reapplication_review_available: bool = False
+
+
+class ReapplicationPreviousResponse(BaseModel):
+    application_id: int
+    title: str
+    source_url: str
+
+
+class ReapplicationReviewResponse(BaseModel):
+    allowed: bool
+    code: str | None
+    reason: str
+    recheck_at: datetime | None
+    review_key: str | None
+    can_review: bool
+    previous: tuple[ReapplicationPreviousResponse, ...]
+
+
+class ReapplicationReviewUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    reason: str = Field(min_length=20, max_length=5000)
+    review_key: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
 class RejectedVacancyResponse(BaseModel):
@@ -365,12 +398,35 @@ SessionGuard = Annotated[None, Depends(require_session_key)]
 
 @router.get("/outcomes", response_model=SearchOutcomes)
 def search_outcomes(
-    session: ReadSession, account_id: int = Query(default=1, ge=1)
-) -> SearchOutcomes:
+    request: Request,
+    session: ReadSession,
+    account_id: int = Query(default=1, ge=1),
+    background: bool = Query(default=False),
+) -> SearchOutcomes | Response:
+    if background:
+        jobs: WorkspaceReads = request.app.state.workspace_reads
+        return jobs.start(
+            "outcomes",
+            account_id,
+            lambda reading, account: SearchOutcomeService(reading).snapshot(account),
+        )
+    reads: ConcurrentReads = request.app.state.concurrent_reads
     try:
-        return SearchOutcomeService(session).snapshot(account_id)
+        return reads.run(
+            ("outcomes", account_id), lambda: SearchOutcomeService(session).snapshot(account_id)
+        )
     except LookupError as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
+
+
+@router.get("/workspace-reads/{job_id}", response_model=None)
+def workspace_read_status(
+    request: Request,
+    job_id: str,
+    account_id: int = Query(default=1, ge=1),
+) -> Response:
+    jobs: WorkspaceReads = request.app.state.workspace_reads
+    return jobs.get(account_id, job_id)
 
 
 @router.get("/session", response_model=SessionResponse)
@@ -514,39 +570,79 @@ def queue(
 
 @router.get("/forms", response_model=tuple[FormDraftResponse, ...])
 def forms(
+    request: Request,
     session: ReadSession,
     account_id: int = Query(default=1, ge=1),
 ) -> tuple[FormDraftResponse, ...]:
-    drafts = ScreeningDraftService(session).list_pending(account_id)
-    return tuple(_form_response(draft) for draft in drafts)
+    reads: ConcurrentReads = request.app.state.concurrent_reads
+    return reads.run(
+        ("forms", account_id),
+        lambda: tuple(
+            _form_response(draft)
+            for draft in ScreeningDraftService(session).list_pending(account_id)
+        ),
+    )
 
 
-@router.post("/forms/reconcile", response_model=tuple[FormDraftResponse, ...])
+@router.post(
+    "/forms/reconcile", response_model=tuple[FormDraftResponse, ...] | FormReconciliationStatus
+)
 def reconcile_forms(
-    session: WriteSession,
+    request: Request,
+    session: ReadSession,
     _guard: SessionGuard,
     account_id: int = Query(default=1, ge=1),
-) -> tuple[FormDraftResponse, ...]:
+    background: bool = Query(default=False),
+) -> tuple[FormDraftResponse, ...] | FormReconciliationStatus:
+    if background:
+        jobs: FormReconciliationJobs = request.app.state.form_reconciliation_jobs
+        return jobs.start(account_id, _reconcile_form_drafts)
+    with session.begin():
+        _reconcile_form_drafts(session, account_id)
+        result = tuple(
+            _form_response(draft)
+            for draft in ScreeningDraftService(session).list_pending(account_id)
+        )
+    reads: ConcurrentReads = request.app.state.concurrent_reads
+    reads.invalidate()
+    return result
+
+
+@router.get("/forms/reconcile/{job_id}", response_model=FormReconciliationStatus)
+def form_reconciliation_status(
+    request: Request,
+    job_id: str,
+    account_id: int = Query(default=1, ge=1),
+) -> FormReconciliationStatus:
+    jobs: FormReconciliationJobs = request.app.state.form_reconciliation_jobs
+    try:
+        return jobs.get(account_id, job_id)
+    except LookupError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+
+
+def _reconcile_form_drafts(session: Session, account_id: int) -> int:
     service = ScreeningDraftService(session)
     checked_at = datetime.now(UTC)
     checks = service.pending_availability_checks(
         account_id,
         checked_before=checked_at - timedelta(minutes=15),
     )
-    if checks:
+    processes = BackgroundProcessService(session, account_id)
+    if checks and processes.enabled("synchronization"):
         probe = HhVacancyStatusProbe()
         with ThreadPoolExecutor(max_workers=min(8, len(checks))) as pool:
             results = tuple(pool.map(lambda item: probe.check(item.source_url), checks))
-        for check, availability in zip(checks, results, strict=True):
-            if availability is not None:
-                service.record_availability_check(
-                    account_id,
-                    check.form_id,
-                    availability,
-                    checked_at=checked_at,
-                )
-    service.reconcile_pending_answers(account_id)
-    return tuple(_form_response(draft) for draft in service.list_pending(account_id))
+        if processes.enabled("synchronization"):
+            for check, availability in zip(checks, results, strict=True):
+                if availability is not None:
+                    service.record_availability_check(
+                        account_id,
+                        check.form_id,
+                        availability,
+                        checked_at=checked_at,
+                    )
+    return service.reconcile_pending_answers(account_id)
 
 
 @router.post("/forms/{form_id}/answers", response_model=FormDraftResponse)
@@ -660,6 +756,91 @@ def resume_queue(
         raise HTTPException(status_code=409, detail=str(error)) from error
     run.succeed(state=state.state.value, commit_pending=True)
     return QueueControlResponse(state=state.state.value, updated_at=state.updated_at)
+
+
+def _reapplication_row(
+    session: Session, task_id: int, account_id: int
+) -> tuple[ApplicationTaskModel, ApplicationModel, VacancyModel]:
+    row = session.execute(
+        select(ApplicationTaskModel, ApplicationModel, VacancyModel)
+        .join(ApplicationModel, ApplicationModel.id == ApplicationTaskModel.application_id)
+        .join(VacancyModel, VacancyModel.id == ApplicationModel.vacancy_id)
+        .where(ApplicationTaskModel.id == task_id, ApplicationModel.account_id == account_id)
+    ).first()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Отклик не найден")
+    task, application, vacancy = row
+    if (
+        application.state is not ApplicationState.APPLYING
+        or task.state is not TaskState.REVIEW_REQUIRED
+        or not (task.last_error_code or "").startswith("REPOST_")
+    ):
+        raise HTTPException(
+            status_code=409, detail="Разбор доступен только для остановленного повторного отклика"
+        )
+    return task, application, vacancy
+
+
+def _reapplication_response(
+    session: Session, application: ApplicationModel, decision: ReapplicationDecision
+) -> ReapplicationReviewResponse:
+    previous = session.execute(
+        select(ApplicationModel.id, VacancyModel.title, VacancyModel.source_url)
+        .join(VacancyModel, VacancyModel.id == ApplicationModel.vacancy_id)
+        .where(
+            ApplicationModel.account_id == application.account_id,
+            ApplicationModel.id.in_(decision.previous_application_ids),
+        )
+        .order_by(ApplicationModel.id)
+    ).all()
+    record = ApplicationRepository(session).get(application.id)
+    return ReapplicationReviewResponse(
+        allowed=decision.allowed,
+        code=decision.code,
+        reason=decision.reason,
+        recheck_at=decision.recheck_at,
+        review_key=decision.review_key,
+        can_review=(
+            decision.code in {"REPOST_CHANGED", "REPOST_PROFILE_CHANGED"}
+            and bool(decision.review_key)
+            and ApplicationAutomationService(session)._application_selection_current(record)
+        ),
+        previous=tuple(
+            ReapplicationPreviousResponse(application_id=app_id, title=title, source_url=url)
+            for app_id, title, url in previous
+        ),
+    )
+
+
+@router.get("/queue/{task_id}/reapplication-review", response_model=ReapplicationReviewResponse)
+def reapplication_preview(
+    task_id: int, session: ReadSession, account_id: int = Query(default=1, ge=1)
+) -> ReapplicationReviewResponse:
+    _task, application, vacancy = _reapplication_row(session, task_id, account_id)
+    decision = ReapplicationPolicyService(session).evaluate(
+        account_id,
+        VacancyRepository(session).get(vacancy.id),
+        exclude_application_id=application.id,
+    )
+    return _reapplication_response(session, application, decision)
+
+
+@router.post("/queue/{task_id}/reapplication-review", response_model=ReapplicationReviewResponse)
+def reapplication_review(
+    task_id: int,
+    values: ReapplicationReviewUpdate,
+    session: WriteSession,
+    _guard: SessionGuard,
+    account_id: int = Query(default=1, ge=1),
+) -> ReapplicationReviewResponse:
+    _task, application, _vacancy = _reapplication_row(session, task_id, account_id)
+    try:
+        decision = ReapplicationPolicyService(session).review_changed_application(
+            account_id, application.id, reason=values.reason, expected_review_key=values.review_key
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    return _reapplication_response(session, application, decision)
 
 
 @router.post(
