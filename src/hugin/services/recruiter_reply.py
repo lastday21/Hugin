@@ -126,6 +126,7 @@ class RecruiterReplyService:
                 select(RecruiterMessageModel)
                 .where(
                     RecruiterMessageModel.application_id == application.id,
+                    RecruiterMessageModel.state != RecruiterMessageState.CANCELLED,
                     (RecruiterMessageModel.direction == MessageDirection.INCOMING)
                     | (RecruiterMessageModel.state == RecruiterMessageState.SENT),
                 )
@@ -160,6 +161,7 @@ class RecruiterReplyService:
                 for message in communications.messages(account_id)
                 if message.application_id == application.id
                 and message.direction is MessageDirection.OUTGOING
+                and message.state is not RecruiterMessageState.CANCELLED
             ),
             None,
         )
@@ -254,12 +256,14 @@ class RecruiterReplyService:
             draft = communications.create_outgoing_draft(
                 application_id=application.id,
                 body=body,
+                reply_to_message_id=latest_incoming.id,
             )
         else:
             draft = communications.edit_outgoing_draft(
                 account_id=account_id,
                 message_id=outgoing.id,
                 body=body,
+                reply_to_message_id=latest_incoming.id,
             )
 
         self._session.execute(

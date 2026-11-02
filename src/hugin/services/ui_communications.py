@@ -227,7 +227,9 @@ class UiCommunicationService:
             )
             sender_review = any(message.sender_review_required for message in messages)
             unread_count = sum(
-                message.direction is MessageDirection.INCOMING and message.read_at is None
+                message.direction is MessageDirection.INCOMING
+                and message.read_at is None
+                and message.state is not RecruiterMessageState.CANCELLED
                 for message, _application, _vacancy in rows
             )
             latest = rows[-1][0]
@@ -236,6 +238,7 @@ class UiCommunicationService:
                     message
                     for message, _application, _vacancy in reversed(rows)
                     if message.direction is MessageDirection.INCOMING
+                    and message.state is not RecruiterMessageState.CANCELLED
                 ),
                 None,
             )
@@ -480,6 +483,19 @@ class UiCommunicationService:
         messages: tuple[RecruiterMessageModel, ...],
         actions_by_message: dict[int, list[RecruiterMessageActionModel]],
     ) -> bool:
+        messages = tuple(
+            item
+            for item in messages
+            if item.state is not RecruiterMessageState.CANCELLED
+            and not (
+                item.direction is MessageDirection.OUTGOING
+                and item.state is RecruiterMessageState.SENT
+                and item.sent_at is None
+            )
+        )
+        if not messages:
+            return False
+        message = messages[-1]
         if repeated_incoming_already_answered(messages):
             return False
         if latest_incoming is not None:

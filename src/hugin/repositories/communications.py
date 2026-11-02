@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import cast
 
-from sqlalchemy import or_, select, update
+from sqlalchemy import String, exists, func, or_, select, update
+from sqlalchemy import cast as sql_cast
 from sqlalchemy.dialects.postgresql import insert
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, aliased
 
 from hugin.database.models import (
     ApplicationModel,
+    IncidentModel,
     InvitationModel,
     NotificationModel,
     RecruiterMessageActionModel,
@@ -25,9 +27,11 @@ from hugin.domain.communications import (
     RecruiterMessageActionRecord,
     RecruiterMessageRecord,
     StaleMessageDraftError,
+    SyncedMessageConflictError,
 )
 from hugin.domain.content import (
     DeliveryState,
+    IncidentState,
     InvitationState,
     MessageDirection,
     NotificationChannel,
@@ -43,6 +47,7 @@ _NON_RETRYABLE_NOTIFICATION_ERRORS = frozenset(
     {
         "EMAIL_NOT_CONFIGURED",
         "HISTORICAL_EVENT_SUPPRESSED",
+        "SOURCE_NO_LONGER_CURRENT",
         "NOTIFICATION_SERVICE_NOT_CONFIGURED",
         "TELEGRAM_NOT_CONFIGURED",
     }
@@ -71,7 +76,25 @@ def _message_record(model: RecruiterMessageModel) -> RecruiterMessageRecord:
         auto_send_approved=model.auto_send_approved,
         reply_template_key=model.reply_template_key,
         created_at=as_utc(model.created_at),
+        reply_to_message_id=model.reply_to_message_id,
+        superseded_by_id=model.superseded_by_id,
     )
+
+
+def _require_synced_message_identity(
+    model: RecruiterMessageModel,
+    direction: MessageDirection,
+    body: str,
+    direction_inferred: bool,
+) -> None:
+    known_sent_direction = (
+        direction_inferred
+        and direction is MessageDirection.INCOMING
+        and model.direction is MessageDirection.OUTGOING
+        and model.state is RecruiterMessageState.SENT
+    )
+    if model.body != body or not (model.direction is direction or known_sent_direction):
+        raise SyncedMessageConflictError(model.id)
 
 
 def _message_action_record(model: RecruiterMessageActionModel) -> RecruiterMessageActionRecord:
@@ -194,6 +217,8 @@ class CommunicationRepository:
         direction: MessageDirection,
         body: str,
         occurred_at: datetime,
+        direction_inferred: bool = False,
+        allow_sender_correction: bool = False,
     ) -> tuple[RecruiterMessageRecord, bool]:
         self._require_application(application_id)
         selected_at = as_utc(occurred_at)
@@ -206,10 +231,20 @@ class CommunicationRepository:
             .with_for_update()
         )
         if existing is not None:
-            if existing.direction is not direction or existing.body != body:
-                raise CommunicationStateError(
-                    "Идентификатор сообщения hh.ru уже связан с другим содержимым"
-                )
+            if (
+                allow_sender_correction
+                and not direction_inferred
+                and direction is MessageDirection.OUTGOING
+                and existing.direction is MessageDirection.INCOMING
+                and existing.state is RecruiterMessageState.RECEIVED
+                and existing.body == body
+            ):
+                # Проверено то же сообщение hh.ru. Время чтения не становится
+                # временем новой отправки: текст, версии и даты сохраняются.
+                existing.direction = MessageDirection.OUTGOING
+                existing.state = RecruiterMessageState.SENT
+                self._session.flush()
+            _require_synced_message_identity(existing, direction, body, direction_inferred)
             return _message_record(existing), False
 
         incoming = direction is MessageDirection.INCOMING
@@ -250,10 +285,7 @@ class CommunicationRepository:
             )
             if model is None:
                 raise RuntimeError("Не удалось получить синхронизированное сообщение")
-            if model.direction is not direction or model.body != body:
-                raise CommunicationStateError(
-                    "Идентификатор сообщения hh.ru уже связан с другим содержимым"
-                )
+            _require_synced_message_identity(model, direction, body, direction_inferred)
         else:
             model = self._session.get(RecruiterMessageModel, message_id)
             if model is None:
@@ -428,6 +460,7 @@ class CommunicationRepository:
         if (
             outgoing.direction is not MessageDirection.OUTGOING
             or outgoing.state is not RecruiterMessageState.SENT
+            or outgoing.sent_at is None
         ):
             return None
         incoming = self._session.scalar(
@@ -435,6 +468,7 @@ class CommunicationRepository:
             .where(
                 RecruiterMessageModel.application_id == outgoing.application_id,
                 RecruiterMessageModel.direction == MessageDirection.INCOMING,
+                RecruiterMessageModel.state != RecruiterMessageState.CANCELLED,
                 RecruiterMessageModel.id < outgoing.id,
             )
             .order_by(RecruiterMessageModel.id.desc())
@@ -456,6 +490,7 @@ class CommunicationRepository:
             .where(
                 RecruiterMessageModel.application_id == outgoing.application_id,
                 RecruiterMessageModel.direction == MessageDirection.INCOMING,
+                RecruiterMessageModel.state != RecruiterMessageState.CANCELLED,
                 RecruiterMessageModel.id <= incoming.id,
                 RecruiterMessageModel.body == incoming.body,
                 RecruiterMessageActionModel.kind == RecruiterActionKind.REPLY,
@@ -482,8 +517,10 @@ class CommunicationRepository:
         content_hash: str,
         auto_send_approved: bool = False,
         reply_template_key: str | None = None,
+        reply_to_message_id: int | None = None,
     ) -> RecruiterMessageRecord:
         self._require_application(application_id)
+        self._require_reply_source(application_id, reply_to_message_id)
         model = RecruiterMessageModel(
             application_id=application_id,
             direction=MessageDirection.OUTGOING,
@@ -493,10 +530,67 @@ class CommunicationRepository:
             state=RecruiterMessageState.REVIEW_REQUIRED,
             auto_send_approved=auto_send_approved,
             reply_template_key=reply_template_key,
+            reply_to_message_id=reply_to_message_id,
         )
         self._session.add(model)
         self._session.flush()
         return _message_record(model)
+
+    def _require_reply_source(self, application_id: int, message_id: int | None) -> None:
+        if message_id is None:
+            return
+        source = self._session.get(RecruiterMessageModel, message_id)
+        if source is None or (
+            source.application_id != application_id
+            or source.direction is not MessageDirection.INCOMING
+            or source.state is RecruiterMessageState.CANCELLED
+        ):
+            raise CommunicationStateError("Источник ответа не является вопросом этого диалога")
+
+    def cancel_unneeded_generated_replies(self, *, account_id: int) -> int:
+        source = aliased(RecruiterMessageModel)
+        drafts = tuple(
+            self._session.scalars(
+                select(RecruiterMessageModel)
+                .join(ApplicationModel, ApplicationModel.id == RecruiterMessageModel.application_id)
+                .join(source, source.id == RecruiterMessageModel.reply_to_message_id)
+                .where(
+                    ApplicationModel.account_id == account_id,
+                    RecruiterMessageModel.direction == MessageDirection.OUTGOING,
+                    RecruiterMessageModel.hh_id.is_(None),
+                    RecruiterMessageModel.sent_at.is_(None),
+                    RecruiterMessageModel.state.in_(
+                        (
+                            RecruiterMessageState.DRAFT,
+                            RecruiterMessageState.REVIEW_REQUIRED,
+                            RecruiterMessageState.CONFIRMED,
+                            RecruiterMessageState.FAILED,
+                        )
+                    ),
+                    or_(
+                        source.direction != MessageDirection.INCOMING,
+                        source.state == RecruiterMessageState.CANCELLED,
+                    ),
+                )
+                .with_for_update(of=RecruiterMessageModel)
+            )
+        )
+        for draft in drafts:
+            draft.state = RecruiterMessageState.CANCELLED
+            draft.auto_send_approved = False
+            for incident in self._session.scalars(
+                select(IncidentModel).where(
+                    IncidentModel.code == "RECRUITER_MESSAGE_SEND_FAILED",
+                    IncidentModel.scope_type == "recruiter_message",
+                    IncidentModel.scope_id == draft.id,
+                    IncidentModel.state == IncidentState.OPEN,
+                )
+            ):
+                incident.state = IncidentState.RESOLVED
+                incident.resolved_at = datetime.now(UTC)
+        if drafts:
+            self._session.flush()
+        return len(drafts)
 
     def _reconcile_unknown_outgoing(
         self,
@@ -543,17 +637,22 @@ class CommunicationRepository:
         message_id: int,
         body: str,
         content_hash: str,
+        reply_to_message_id: int | None = None,
     ) -> RecruiterMessageRecord:
         model = self._message_model(account_id, message_id, for_update=True)
         self._require_outgoing(model)
         if model.state in {
             RecruiterMessageState.SENT,
             RecruiterMessageState.UNKNOWN_RESULT,
+            RecruiterMessageState.CANCELLED,
         }:
             raise CommunicationStateError(
                 "Отправленную версию или сообщение с неизвестным результатом нельзя менять"
             )
+        self._require_reply_source(model.application_id, reply_to_message_id)
+        model.reply_to_message_id = reply_to_message_id
         if model.body == body and model.content_hash == content_hash:
+            self._session.flush()
             return _message_record(model)
         model.body = body
         model.content_hash = content_hash
@@ -767,6 +866,21 @@ class CommunicationRepository:
         )
         return len(tuple(closed_ids))
 
+    def close_message_invitations(
+        self, application_id: int, hh_id: str, updated_at: datetime
+    ) -> int:
+        closed = self._session.scalars(
+            update(InvitationModel)
+            .where(
+                InvitationModel.application_id == application_id,
+                InvitationModel.hh_id == f"message:{hh_id}",
+                InvitationModel.state != InvitationState.CLOSED,
+            )
+            .values(state=InvitationState.CLOSED, updated_at=as_utc(updated_at))
+            .returning(InvitationModel.id)
+        )
+        return len(tuple(closed))
+
     def mark_invitation_seen(
         self,
         account_id: int,
@@ -823,6 +937,7 @@ class CommunicationRepository:
         return _notification_record(model)
 
     def claim_due_notification(self, now: datetime) -> NotificationRecord | None:
+        self.cancel_obsolete_notifications()
         model = self._session.scalar(
             select(NotificationModel)
             .where(
@@ -843,6 +958,50 @@ class CommunicationRepository:
             .limit(1)
         )
         return _notification_record(model) if model is not None else None
+
+    def cancel_obsolete_notifications(self) -> int:
+        self._session.flush()
+        source_id = func.split_part(NotificationModel.deduplication_key, ":", 2)
+        obsolete_message = exists(
+            select(RecruiterMessageModel.id).where(
+                sql_cast(RecruiterMessageModel.id, String) == source_id,
+                or_(
+                    RecruiterMessageModel.direction != MessageDirection.INCOMING,
+                    RecruiterMessageModel.state == RecruiterMessageState.CANCELLED,
+                ),
+            )
+        )
+        obsolete_invitation = exists(
+            select(InvitationModel.id).where(
+                sql_cast(InvitationModel.id, String) == source_id,
+                InvitationModel.state == InvitationState.CLOSED,
+            )
+        )
+        resolved_incident = exists(
+            select(IncidentModel.id).where(
+                IncidentModel.id == NotificationModel.incident_id,
+                IncidentModel.state == IncidentState.RESOLVED,
+            )
+        )
+        ids = self._session.scalars(
+            update(NotificationModel)
+            .where(
+                NotificationModel.state != DeliveryState.SENT,
+                NotificationModel.error_code.is_distinct_from("SOURCE_NO_LONGER_CURRENT"),
+                or_(
+                    resolved_incident,
+                    (NotificationModel.event_type == "NEW_MESSAGE")
+                    & NotificationModel.deduplication_key.like("message:%")
+                    & obsolete_message,
+                    (NotificationModel.event_type == "INVITATION")
+                    & NotificationModel.deduplication_key.like("invitation:%")
+                    & obsolete_invitation,
+                ),
+            )
+            .values(state=DeliveryState.FAILED, error_code="SOURCE_NO_LONGER_CURRENT")
+            .returning(NotificationModel.id)
+        )
+        return len(tuple(ids))
 
     def mark_notification_sent(
         self,

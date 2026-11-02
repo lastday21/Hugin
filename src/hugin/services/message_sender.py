@@ -7,6 +7,8 @@ from hugin.database.models import ApplicationModel, IncidentModel, RecruiterMess
 from hugin.domain.content import IncidentState
 
 UNCERTAIN_MESSAGE_SENDER = "HH_MESSAGE_SENDER_UNCERTAIN"
+CONFLICTING_MESSAGE_CONTENT = "HH_MESSAGE_CONTENT_CONFLICT"
+_REVIEW_REQUIRED_CODES = (UNCERTAIN_MESSAGE_SENDER, CONFLICTING_MESSAGE_CONTENT)
 
 
 def uncertain_sender_message_ids(session: Session, *, account_id: int) -> frozenset[int]:
@@ -18,7 +20,7 @@ def uncertain_sender_message_ids(session: Session, *, account_id: int) -> frozen
             .where(
                 ApplicationModel.account_id == account_id,
                 IncidentModel.scope_type == "recruiter_message",
-                IncidentModel.code == UNCERTAIN_MESSAGE_SENDER,
+                IncidentModel.code.in_(_REVIEW_REQUIRED_CODES),
                 IncidentModel.state == IncidentState.OPEN,
             )
         )
@@ -33,7 +35,7 @@ def has_uncertain_sender(session: Session, *, application_id: int) -> bool:
             .where(
                 RecruiterMessageModel.application_id == application_id,
                 IncidentModel.scope_type == "recruiter_message",
-                IncidentModel.code == UNCERTAIN_MESSAGE_SENDER,
+                IncidentModel.code.in_(_REVIEW_REQUIRED_CODES),
                 IncidentModel.state == IncidentState.OPEN,
             )
             .limit(1)

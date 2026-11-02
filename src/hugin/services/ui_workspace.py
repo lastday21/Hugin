@@ -106,6 +106,13 @@ def _queue_error_text(error_code: str | None) -> str | None:
         "ACCOUNT_WARNING": "hh.ru ограничил работу аккаунта",
         "RESUME_MISMATCH": "в форме выбрано не то резюме",
         "SEMANTIC_SELECTION_STALE": "текст вакансии или профиль изменился; нужен новый разбор",
+        "REPOST_INTERVAL": "повтор той же роли: 30 дней после последней отправки",
+        "REPOST_LIMIT": "повтор той же роли: уже две попытки за 90 дней",
+        "REPOST_REJECTION": "на эту роль был отказ; нужны существенные изменения",
+        "REPOST_CONVERSATION": "по этой роли уже есть приглашение или недавняя переписка",
+        "REPOST_PROFILE_CHANGED": "опыт изменился; проверить основания для повторного отклика",
+        "REPOST_CHANGED": "связанная публикация изменилась; проверить роль и клиента",
+        "REPOST_HISTORY_UNKNOWN": "прежний отклик имеет неизвестную дату; сверить историю hh.ru",
     }
     return descriptions.get(error_code, "требуется проверка причины")
 
@@ -194,6 +201,7 @@ class UiQueueItem:
     last_error: str | None
     letter_state: str | None
     form_state: str | None
+    reapplication_review_available: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -413,6 +421,7 @@ class UiWorkspaceService:
                 .where(
                     ApplicationModel.account_id == account_id,
                     RecruiterMessageModel.direction == MessageDirection.INCOMING,
+                    RecruiterMessageModel.state != RecruiterMessageState.CANCELLED,
                     RecruiterMessageModel.read_at.is_(None),
                 )
             )
@@ -646,6 +655,7 @@ class UiWorkspaceService:
                 DirectionVacancyModel.rules_score,
                 DirectionVacancyModel.rules_details["fit_tier"],
                 DirectionVacancyModel.rules_details["fit_reason"],
+                DirectionVacancyModel.rules_details["repeat_policy"],
             )
             .options(
                 load_only(ApplicationModel.id),
@@ -699,9 +709,17 @@ class UiWorkspaceService:
                 fit_tier=stored_fit_tier({"fit_tier": fit_tier}),
                 fit_reason=fit_reason,
                 scheduled_at=task.scheduled_at,
-                last_error=_queue_error_text(task.last_error_code),
+                last_error=(
+                    repeat_policy.get("reason")
+                    if isinstance(repeat_policy, dict) and repeat_policy.get("allowed") is False
+                    else _queue_error_text(task.last_error_code)
+                ),
                 letter_state=stored_letter_state.value if stored_letter_state is not None else None,
                 form_state=stored_form_state.value if stored_form_state is not None else None,
+                reapplication_review_available=(
+                    task.state is TaskState.REVIEW_REQUIRED
+                    and task.last_error_code in {"REPOST_CHANGED", "REPOST_PROFILE_CHANGED"}
+                ),
             )
             for (
                 task,
@@ -714,6 +732,7 @@ class UiWorkspaceService:
                 rules_score,
                 fit_tier,
                 fit_reason,
+                repeat_policy,
             ) in rows
         )
 

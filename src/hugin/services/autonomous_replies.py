@@ -6,7 +6,7 @@ from base64 import urlsafe_b64encode
 from collections.abc import Callable, Collection
 from dataclasses import dataclass
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from hugin.adapters.codex_cli import CodexCliError
@@ -32,6 +32,7 @@ from hugin.domain.content import (
     RecruiterActionState,
     RecruiterMessageState,
 )
+from hugin.repositories.communications import CommunicationRepository
 from hugin.services.autonomy import AutonomyPolicyService
 from hugin.services.communications import CommunicationService, RecordingMessageSender
 from hugin.services.message_sender import has_uncertain_sender, uncertain_sender_message_ids
@@ -143,6 +144,9 @@ class AutonomousReplyService:
         policy = AutonomyPolicyService(self._session).get()
         if not policy.auto_prepare_replies and not policy.auto_send_approved_replies:
             return AutonomousReplyBatch((), 0, 0, 0)
+        CommunicationRepository(self._session).cancel_unneeded_generated_replies(
+            account_id=account_id
+        )
 
         messages = tuple(
             self._session.scalars(
@@ -163,6 +167,16 @@ class AutonomousReplyService:
         )
         by_application: dict[int, list[RecruiterMessageModel]] = {}
         for message in messages:
+            if message.state is RecruiterMessageState.CANCELLED:
+                continue
+            if (
+                message.direction is MessageDirection.OUTGOING
+                and message.state is RecruiterMessageState.SENT
+                and message.sent_at is None
+            ):
+                # Исправленная при чтении старая копия без времени отправки
+                # не доказывает, что на более поздний вопрос уже ответили.
+                continue
             by_application.setdefault(message.application_id, []).append(message)
 
         blocked_applications = set(
@@ -202,6 +216,9 @@ class AutonomousReplyService:
         eligible_incoming_ids = set(incoming_message_ids)
         auto_send_incoming_ids = set(incoming_message_ids)
         uncertain_senders = uncertain_sender_message_ids(self._session, account_id=account_id)
+        sender_review_applications = {
+            message.application_id for message in messages if message.id in uncertain_senders
+        }
         if include_backlog:
             backlog_ids: list[int] = []
             for conversation in by_application.values():
@@ -230,7 +247,7 @@ class AutonomousReplyService:
         for application_id, conversation in by_application.items():
             if can_continue is not None and not can_continue():
                 break
-            if any(message.id in uncertain_senders for message in conversation):
+            if application_id in sender_review_applications:
                 skipped_manual += 1
                 continue
             incoming = next(
@@ -444,6 +461,7 @@ class AutonomousReplyService:
                 draft = communications.create_outgoing_draft(
                     application_id=application_id,
                     body=exact_salary_reply,
+                    reply_to_message_id=incoming.id,
                     auto_send_approved=auto_send,
                     reply_template_key=(_SALARY_EXPECTATION_APPROVAL_KEY if auto_send else None),
                 )
@@ -474,6 +492,7 @@ class AutonomousReplyService:
                 draft = communications.create_outgoing_draft(
                     application_id=application_id,
                     body=template.response_text,
+                    reply_to_message_id=incoming.id,
                     auto_send_approved=True,
                     reply_template_key=template.key,
                 )
@@ -699,6 +718,7 @@ class AutonomousReplyService:
             .where(
                 RecruiterMessageModel.application_id == application.id,
                 RecruiterMessageModel.direction == MessageDirection.INCOMING,
+                RecruiterMessageModel.state != RecruiterMessageState.CANCELLED,
             )
             .order_by(RecruiterMessageModel.id.desc())
             .limit(1)
@@ -725,6 +745,11 @@ class AutonomousReplyService:
             .where(
                 RecruiterMessageModel.application_id == application.id,
                 RecruiterMessageModel.direction == MessageDirection.OUTGOING,
+                RecruiterMessageModel.state != RecruiterMessageState.CANCELLED,
+                or_(
+                    RecruiterMessageModel.state != RecruiterMessageState.SENT,
+                    RecruiterMessageModel.sent_at.is_not(None),
+                ),
             )
             .order_by(RecruiterMessageModel.id.desc())
             .limit(1)

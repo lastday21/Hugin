@@ -5,19 +5,26 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import Text, case, cast, func, select
+from sqlalchemy import JSON, Text, case, cast, func, select
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Session
 from sqlalchemy.sql.elements import ColumnElement
 
 from hugin.database.models import (
     ApplicationEventModel,
     ApplicationModel,
+    ApplicationSettingsModel,
     ApplicationStatusObservationModel,
 )
 from hugin.domain.applications import ApplicationEventType, ApplicationState
 from hugin.domain.time import as_utc
 from hugin.repositories.directions import AccountRepository
 from hugin.services.application_outcomes import ApplicationOutcomeService
+from hugin.services.application_statistics import (
+    ApplicationPeriod,
+    RepeatRole,
+    application_statistics,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,6 +71,9 @@ class SearchOutcomes:
     limitations: tuple[str, ...]
     versions: tuple[OutcomeVersionCohort, ...] = ()
     comparison_limitations: tuple[str, ...] = ()
+    period_timezone: str = "UTC"
+    periods: tuple[ApplicationPeriod, ...] = ()
+    repeat_groups: tuple[RepeatRole, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,48 +93,86 @@ class SearchOutcomeService:
         AccountRepository(self._session).get(account_id)
         measured_at = as_utc(now or datetime.now(UTC))
         events: dict[int, list[OutcomeEvent]] = defaultdict(list)
-        legacy_json = cast(ApplicationEventModel.payload, Text).op("~")(
-            r"\\u(0000|[dD][89aAbBcCdDeEfF][0-9a-fA-F]{2})"
+        # Histories without a recorded send cannot contribute to this summary.
+        recorded_sends = (
+            select(ApplicationEventModel.application_id)
+            .where(
+                ApplicationEventModel.event_type == ApplicationEventType.APPLIED,
+                ApplicationEventModel.created_at <= measured_at,
+            )
+            .correlate(None)
         )
-        account_events = (
+        raw_payload = cast(ApplicationEventModel.payload, Text)
+        # Only rare unsupported Unicode escapes need the full regular expression.
+        legacy_json = case(
+            (
+                (func.strpos(raw_payload, r"\u0000") > 0)
+                | (func.strpos(raw_payload, r"\ud") > 0)
+                | (func.strpos(raw_payload, r"\uD") > 0),
+                raw_payload.op("~")(r"\\u(0000|[dD][89aAbBcCdDeEfF][0-9a-fA-F]{2})"),
+            ),
+            else_=False,
+        )
+        # A separate materialized step keeps the legacy scan shared by both branches.
+        classified_events = (
             select(
                 ApplicationEventModel.id,
                 ApplicationEventModel.application_id,
                 ApplicationEventModel.event_type,
                 ApplicationEventModel.created_at,
-                ApplicationEventModel.payload["source"].label("source"),
-                ApplicationEventModel.payload["hh_status"].label("hh_status"),
-                ApplicationEventModel.payload["state"].label("state"),
-                ApplicationEventModel.payload["rules_version"].label("rules_version"),
-                ApplicationEventModel.payload["snapshot_missing"].label("snapshot_missing"),
-                ApplicationEventModel.payload["outcome_context"].label("outcome_context"),
+                ApplicationEventModel.payload.label("original_payload"),
+                legacy_json.label("legacy_json"),
             )
             .join(ApplicationModel)
             .where(
                 ApplicationModel.account_id == account_id,
                 ApplicationEventModel.created_at <= measured_at,
-                ~legacy_json,
+                ApplicationEventModel.application_id.in_(recorded_sends),
+            )
+            .cte("classified_events")
+            .prefix_with("MATERIALIZED")
+        )
+        account_events = (
+            select(
+                classified_events.c.id,
+                classified_events.c.application_id,
+                classified_events.c.event_type,
+                classified_events.c.created_at,
+                classified_events.c.legacy_json,
+                case(
+                    (classified_events.c.legacy_json, classified_events.c.original_payload),
+                    else_=None,
+                ).label("original_payload"),
+                case(
+                    (
+                        ~classified_events.c.legacy_json,
+                        cast(classified_events.c.original_payload, JSONB),
+                    ),
+                    else_=None,
+                ).label("payload"),
             )
             .cte("account_events")
             .prefix_with("MATERIALIZED")
         )
-        context = account_events.c.outcome_context
+        # Parse each large event once before extracting several nested fields.
+        payload = account_events.c.payload
+        context = payload["outcome_context"]
         profile = context["profile"]
         vacancy = context["vacancy"]
 
         def content_presence(value: ColumnElement[Any]) -> ColumnElement[Any]:
             return case(
                 (
-                    func.json_typeof(value) == "string",
-                    func.to_json(cast(value, Text) != '""'),
+                    func.jsonb_typeof(value) == "string",
+                    func.to_jsonb(cast(value, Text) != '""'),
                 ),
                 else_=value,
             )
 
         summary_context = case(
             (
-                func.json_typeof(context) == "object",
-                func.json_build_object(
+                func.jsonb_typeof(context) == "object",
+                func.jsonb_build_object(
                     "schema_version",
                     context["schema_version"],
                     "letter_sha256",
@@ -132,8 +180,8 @@ class SearchOutcomeService:
                     "profile",
                     case(
                         (
-                            func.json_typeof(profile) == "object",
-                            func.json_build_object(
+                            func.jsonb_typeof(profile) == "object",
+                            func.jsonb_build_object(
                                 "resume_content",
                                 content_presence(profile["resume_content"]),
                                 "resume_content_sha256",
@@ -147,8 +195,8 @@ class SearchOutcomeService:
                     "vacancy",
                     case(
                         (
-                            func.json_typeof(vacancy) == "object",
-                            func.json_build_object(
+                            func.jsonb_typeof(vacancy) == "object",
+                            func.jsonb_build_object(
                                 "description",
                                 content_presence(vacancy["description"]),
                                 "description_sha256",
@@ -170,41 +218,29 @@ class SearchOutcomeService:
                 account_events.c.application_id,
                 account_events.c.event_type,
                 account_events.c.created_at,
-                func.json_build_object(
-                    "source",
-                    account_events.c.source,
-                    "hh_status",
-                    account_events.c.hh_status,
-                    "state",
-                    account_events.c.state,
-                    "rules_version",
-                    account_events.c.rules_version,
-                    "snapshot_missing",
-                    account_events.c.snapshot_missing,
-                    "outcome_context",
-                    summary_context,
+                case(
+                    (account_events.c.legacy_json, account_events.c.original_payload),
+                    else_=cast(
+                        func.jsonb_build_object(
+                            "source",
+                            payload["source"],
+                            "hh_status",
+                            payload["hh_status"],
+                            "state",
+                            payload["state"],
+                            "rules_version",
+                            payload["rules_version"],
+                            "snapshot_missing",
+                            payload["snapshot_missing"],
+                            "outcome_context",
+                            summary_context,
+                        ),
+                        JSON,
+                    ),
                 ),
             ).order_by(account_events.c.created_at, account_events.c.id)
         ):
             event_rows.append(OutcomeEvent(*row))
-        event_rows.extend(
-            OutcomeEvent(*row)
-            for row in self._session.execute(
-                select(
-                    ApplicationEventModel.id,
-                    ApplicationEventModel.application_id,
-                    ApplicationEventModel.event_type,
-                    ApplicationEventModel.created_at,
-                    ApplicationEventModel.payload,
-                )
-                .join(ApplicationModel)
-                .where(
-                    ApplicationModel.account_id == account_id,
-                    ApplicationEventModel.created_at <= measured_at,
-                    legacy_json,
-                )
-            )
-        )
         for event in sorted(event_rows, key=lambda item: (item.created_at, item.id)):
             events[event.application_id].append(event)
         observations: dict[int, list[ApplicationStatusObservationModel]] = defaultdict(list)
@@ -342,6 +378,36 @@ class SearchOutcomeService:
         for app_id, outcome in outcomes.items():
             if app_id in sent and outcome.rejection_reason and outcome.rejection_evidence:
                 reasons[outcome.rejection_reason] += 1
+        policy = self._session.get(ApplicationSettingsModel, 1)
+        timezone_name = policy.timezone_name if policy else "UTC"
+        periods, repeat_groups = application_statistics(
+            self._session,
+            {app_id: event.created_at for app_id, event in sent.items()},
+            now=measured_at,
+            timezone_name=timezone_name,
+            viewed={app_id for app_id in sent if witnessed_state(app_id, ApplicationState.VIEWED)},
+            rejected={
+                app_id
+                for app_id in sent
+                if witnessed_state(app_id, ApplicationState.REJECTED)
+                or (
+                    app_id in outcomes
+                    and outcomes[app_id].rejection_evidence
+                    and outcomes[app_id].rejection_reason
+                )
+            },
+            invited=invited,
+            interviewed=confirmed_invited,
+            scheduled=scheduled,
+            recently_checked={
+                app_id
+                for app_id in sent
+                if any(
+                    measured_at - timedelta(hours=48) <= as_utc(item.checked_at)
+                    for item in observations[app_id]
+                )
+            },
+        )
         return SearchOutcomes(
             measured_at=measured_at,
             sent_by_hugin=len(sent),
@@ -352,6 +418,9 @@ class SearchOutcomeService:
             confirmed_rejection_reasons=dict(reasons),
             cohorts=tuple(cohorts),
             versions=tuple(versions),
+            period_timezone=timezone_name,
+            periods=periods,
+            repeat_groups=repeat_groups,
             comparison_limitations=(
                 "Это описательные группы. Разный возраст откликов, время отправки и состав "
                 "вакансий могут объяснять разницу долей; рост эффекта Hugin пока не установлен.",

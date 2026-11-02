@@ -82,7 +82,10 @@ class ReplyWorker:
                 RecruiterMessageModel.application_id.label("application_id"),
                 func.max(RecruiterMessageModel.id).label("message_id"),
             )
-            .where(RecruiterMessageModel.direction == MessageDirection.INCOMING)
+            .where(
+                RecruiterMessageModel.direction == MessageDirection.INCOMING,
+                RecruiterMessageModel.state != RecruiterMessageState.CANCELLED,
+            )
             .group_by(RecruiterMessageModel.application_id)
             .subquery()
         )
@@ -105,6 +108,7 @@ class ReplyWorker:
                             outgoing.application_id == incoming.c.application_id,
                             outgoing.direction == MessageDirection.OUTGOING,
                             outgoing.state == RecruiterMessageState.SENT,
+                            outgoing.sent_at.is_not(None),
                             outgoing.id > incoming.c.message_id,
                         )
                     ),

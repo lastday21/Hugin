@@ -34,6 +34,141 @@ from hugin.services.hh_sync import HhSynchronizationService
 pytestmark = pytest.mark.integration
 
 
+@pytest.mark.parametrize("observation", ["inferred", "explicit", "changed", "quote"])
+def test_known_sent_message_is_not_reclassified_by_missing_sender_marker(
+    settings: Settings, observation: str
+) -> None:
+    from hugin.services.message_sender import has_uncertain_sender
+
+    database = create_database(settings)
+    occurred_at = datetime(2026, 10, 22, 9, tzinfo=UTC)
+    try:
+        with database.sessions.begin() as session:
+            account = AccountRepository(session).create("Known message identity")
+            resume = ResumeRepository(session).upsert(account.id, "identity-resume", "Python")
+            vacancy = VacancyRepository(session).upsert(
+                VacancyData("known-sender", "Python", "https://hh.ru/vacancy/known-sender")
+            )
+            application = ApplicationRepository(session).create_apply_intent(
+                account.id, vacancy.id, resume.id
+            )
+            sent, _ = CommunicationRepository(session).save_synced_message(
+                application_id=application.id,
+                hh_id="sent-101",
+                direction=MessageDirection.OUTGOING,
+                body="Здравствуйте! Мой опыт — Python.",
+                occurred_at=occurred_at,
+            )
+            observed = HhChatMessageData(
+                "known-sender",
+                "new-quote" if observation == "quote" else "sent-101",
+                MessageDirection.INCOMING,
+                "Текст изменён" if observation == "changed" else sent.body,
+                direction_inferred=observation != "explicit",
+            )
+            service = HhSynchronizationService(session)
+            first = service.synchronize_messages_with_new_ids(
+                account_id=account.id, messages=(observed,)
+            )
+            second = service.synchronize_messages_with_new_ids(
+                account_id=account.id, messages=(observed,)
+            )
+            messages = CommunicationRepository(session).list_messages_for_account(account.id)
+            stored = next(m for m in messages if m.id == sent.id)
+            assert stored == sent
+            assert stored.sent_at == occurred_at
+            if observation == "inferred":
+                assert first.metrics.get("message_conflicts", 0) == 0
+                assert first.conflicting_messages == ()
+                assert first.metrics["preserved_outgoing_directions"] == 1
+                assert second.metrics["preserved_outgoing_directions"] == 1
+                assert first.metrics["created"] == 0
+                assert first.new_incoming_message_ids == ()
+                assert not has_uncertain_sender(session, application_id=application.id)
+            elif observation == "quote":
+                assert first.metrics["created"] == 1
+                assert (
+                    next(m for m in messages if m.hh_id == "new-quote").direction
+                    is MessageDirection.INCOMING
+                )
+                assert has_uncertain_sender(session, application_id=application.id)
+            else:
+                assert first.metrics["message_conflicts"] == 1
+                assert first.conflicting_messages == (observed,)
+                assert has_uncertain_sender(session, application_id=application.id)
+            assert second.metrics["created"] == 0
+    finally:
+        database.close()
+
+
+@pytest.mark.parametrize("change_direction", [False, True])
+def test_conflicting_message_preserves_history_and_does_not_discard_other_chats(
+    settings: Settings, change_direction: bool
+) -> None:
+    from sqlalchemy import select
+
+    from hugin.database.models import IncidentModel
+    from hugin.services.message_sender import has_uncertain_sender
+
+    database = create_database(settings)
+    try:
+        with database.sessions.begin() as session:
+            account = AccountRepository(session).create("Message conflict")
+            resume = ResumeRepository(session).upsert(account.id, "conflict-resume", "Python")
+            apps = []
+            for vacancy_id in ("conflict-one", "unaffected-two"):
+                vacancy = VacancyRepository(session).upsert(
+                    VacancyData(vacancy_id, "Python", f"https://hh.ru/vacancy/{vacancy_id}")
+                )
+                apps.append(
+                    ApplicationRepository(session).create_apply_intent(
+                        account.id, vacancy.id, resume.id
+                    )
+                )
+            old, _ = CommunicationRepository(session).save_synced_message(
+                application_id=apps[0].id,
+                hh_id="same-id",
+                direction=MessageDirection.INCOMING,
+                body="Original message",
+                occurred_at=datetime(2026, 10, 25, tzinfo=UTC),
+            )
+            messages = (
+                HhChatMessageData(
+                    "conflict-one",
+                    "same-id",
+                    MessageDirection.OUTGOING if change_direction else MessageDirection.INCOMING,
+                    "Original message" if change_direction else "Changed message",
+                ),
+                HhChatMessageData(
+                    "unaffected-two",
+                    "new-id",
+                    MessageDirection.INCOMING,
+                    "What salary do you expect?",
+                ),
+            )
+            service = HhSynchronizationService(session)
+            first = service.synchronize_messages_with_new_ids(
+                account_id=account.id, messages=messages
+            )
+            second = service.synchronize_messages_with_new_ids(
+                account_id=account.id, messages=messages
+            )
+            assert first.metrics["message_conflicts"] == 1
+            assert first.metrics["created"] == 1
+            assert first.conflicting_messages == (messages[0],)
+            assert len(first.new_incoming_message_ids) == 1
+            assert second.metrics["created"] == 0
+            stored = CommunicationRepository(session).list_messages_for_account(account.id)
+            assert len(stored) == 2
+            assert next(m for m in stored if m.id == old.id).body == "Original message"
+            assert next(m for m in stored if m.id == old.id).direction is MessageDirection.INCOMING
+            assert has_uncertain_sender(session, application_id=apps[0].id)
+            assert not has_uncertain_sender(session, application_id=apps[1].id)
+            assert len(list(session.scalars(select(IncidentModel)))) == 1
+    finally:
+        database.close()
+
+
 def test_observation_date_requires_a_matching_status_and_does_not_regress(
     settings: Settings,
 ) -> None:

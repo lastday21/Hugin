@@ -151,6 +151,150 @@ def test_mature_cohorts_exclude_imports_deduplicate_and_show_observation_gaps(
             assert versions["v2"].invitations_per_100 == 0
             assert all(row.with_outcome_context == 0 for row in result.versions)
             assert len(result.comparison_limitations) == 3
+            periods = {period.key: period for period in result.periods}
+            assert periods["today"].applications == 0
+            assert periods["month"].mature_applications <= periods["month"].applications
+            assert all(period.replies == 0 for period in periods.values())
+    finally:
+        database.close()
+
+
+def test_periods_use_local_calendar_and_keep_repeat_history_outside_period(
+    settings: Settings,
+) -> None:
+    from hugin.database.models import ApplicationSettingsModel, RecruiterMessageModel
+    from hugin.domain.content import MessageDirection, RecruiterMessageState
+
+    database = create_database(settings)
+    now = datetime(2026, 10, 10, 20, 30, tzinfo=UTC)  # October 11 in UTC+05.
+    try:
+        with database.sessions.begin() as session:
+            policy = session.get(ApplicationSettingsModel, 1)
+            assert policy is not None
+            policy.timezone_name = "UTC+05:00"
+            account = AccountRepository(session).create("Periods")
+            resume = ResumeRepository(session).upsert(account.id, "periods", "Python")
+            ids: list[int] = []
+            for index, sent_at in enumerate((now - timedelta(days=40), now - timedelta(hours=1))):
+                vacancy = VacancyRepository(session).upsert(
+                    VacancyData(
+                        f"period-{index}",
+                        "Python backend" if index == 0 else "  PYTHON\tBACKEND  ",
+                        f"https://hh.ru/vacancy/period-{index}",
+                        employer_name="Agency" if index == 0 else "  AGENCY\u00a0",
+                        description=(
+                            "Develop Python services for client A."
+                            if index == 0
+                            else "  DEVELOP\nPYTHON\u00a0SERVICES FOR CLIENT A.  "
+                        ),
+                        region="Kazan" if index == 0 else " KAZAN ",
+                        work_format="Office" if index == 0 else " OFFICE ",
+                        details_fetched_at=sent_at,
+                    )
+                )
+                app = ApplicationRepository(session).create_apply_intent(
+                    account.id, vacancy.id, resume.id
+                )
+                ids.append(app.id)
+                session.add(
+                    ApplicationEventModel(
+                        application_id=app.id,
+                        event_type=ApplicationEventType.APPLIED,
+                        created_at=sent_at,
+                        payload={"source": "hugin_send", "hh_status": "APPLIED"},
+                    )
+                )
+            # Reconciliation must not count the same send twice.
+            session.add(
+                ApplicationEventModel(
+                    application_id=ids[1],
+                    event_type=ApplicationEventType.APPLIED,
+                    created_at=now,
+                    payload={"source": "hugin_reconciliation", "hh_status": "APPLIED"},
+                )
+            )
+            for state in (ApplicationState.VIEWED, ApplicationState.REJECTED):
+                session.add(
+                    ApplicationStatusObservationModel(
+                        application_id=ids[1], state=state, checked_at=now, recorded_at=now
+                    )
+                )
+            session.add(
+                RecruiterMessageModel(
+                    application_id=ids[1],
+                    direction=MessageDirection.INCOMING,
+                    body="Reply",
+                    state=RecruiterMessageState.RECEIVED,
+                    received_at=now,
+                    created_at=now,
+                )
+            )
+            session.flush()
+            result = SearchOutcomeService(session).snapshot(account.id, now=now)
+            today = result.periods[0]
+            assert result.period_timezone == "UTC+05:00"
+            assert today.starts_at == datetime(2026, 10, 10, 19, tzinfo=UTC)
+            assert today.applications == today.unique_roles == today.unique_employers == 1
+            assert (
+                today.repeated_applications
+                == today.viewed
+                == today.rejections
+                == today.replies
+                == 1
+            )
+            assert today.mature_applications == 0
+            assert today.reply_percent == 100
+            assert len(result.repeat_groups) == 1
+            assert result.repeat_groups[0].application_ids == tuple(ids)
+            # Another agency client must remain a separate role.
+            second = session.scalar(select(ApplicationModel).where(ApplicationModel.id == ids[1]))
+            assert second is not None
+            from hugin.database.models import VacancyModel
+
+            row = session.get(VacancyModel, second.vacancy_id)
+            assert row is not None
+            row.description = "Develop Python services for client B."
+            session.flush()
+            assert (
+                SearchOutcomeService(session)
+                .snapshot(account.id, now=now)
+                .periods[0]
+                .repeated_applications
+                == 0
+            )
+            for suffix, employer, description in (
+                ("blank-description", "Agency", " \t\n\u00a0"),
+                ("unknown-employer", " \u00a0", "Develop Python services for client A."),
+            ):
+                vacancy = VacancyRepository(session).upsert(
+                    VacancyData(
+                        suffix,
+                        "Python backend",
+                        f"https://hh.ru/vacancy/{suffix}",
+                        employer_name=employer,
+                        description=description,
+                        region="Kazan",
+                        work_format="Office",
+                    )
+                )
+                app = ApplicationRepository(session).create_apply_intent(
+                    account.id, vacancy.id, resume.id
+                )
+                session.add(
+                    ApplicationEventModel(
+                        application_id=app.id,
+                        event_type=ApplicationEventType.APPLIED,
+                        created_at=now,
+                        payload={"source": "hugin_send", "hh_status": "APPLIED"},
+                    )
+                )
+            session.flush()
+            final = SearchOutcomeService(session).snapshot(account.id, now=now)
+            assert final.periods[0].applications == final.periods[0].unique_roles == 3
+            assert final.periods[0].unique_employers == 1
+            assert final.periods[0].unknown_roles == 2
+            assert final.periods[0].unknown_employers == 1
+            assert not final.repeat_groups
     finally:
         database.close()
 

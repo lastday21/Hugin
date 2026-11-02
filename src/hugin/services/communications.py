@@ -245,6 +245,7 @@ class CommunicationService:
         body: str,
         auto_send_approved: bool = False,
         reply_template_key: str | None = None,
+        reply_to_message_id: int | None = None,
     ) -> RecruiterMessageRecord:
         exact_body = self._body(body)
         selected_template_key = reply_template_key.strip() if reply_template_key else None
@@ -258,6 +259,7 @@ class CommunicationService:
             content_hash=self.content_hash(exact_body),
             auto_send_approved=auto_send_approved,
             reply_template_key=selected_template_key,
+            reply_to_message_id=reply_to_message_id,
         )
 
     def edit_outgoing_draft(
@@ -266,6 +268,7 @@ class CommunicationService:
         account_id: int,
         message_id: int,
         body: str,
+        reply_to_message_id: int | None = None,
     ) -> RecruiterMessageRecord:
         exact_body = self._body(body)
         return self._repository.edit_outgoing_draft(
@@ -273,6 +276,7 @@ class CommunicationService:
             message_id=self._positive_id(message_id),
             body=exact_body,
             content_hash=self.content_hash(exact_body),
+            reply_to_message_id=reply_to_message_id,
         )
 
     def confirm_outgoing_draft(

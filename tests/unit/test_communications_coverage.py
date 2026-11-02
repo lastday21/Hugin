@@ -10,7 +10,7 @@ from sqlalchemy import delete, select
 from hugin.api.app import create_app
 from hugin.core.settings import Settings
 from hugin.database import create_database, upgrade_database
-from hugin.database.models import ApplicationModel, ApplicationSettingsModel
+from hugin.database.models import ApplicationModel, ApplicationSettingsModel, RecruiterMessageModel
 from hugin.domain.applications import ApplicationState
 from hugin.domain.communications import (
     CommunicationNotFoundError,
@@ -47,6 +47,15 @@ def test_communications_api_edits_draft_and_rejects_foreign_data(
                 select(ApplicationModel.id).where(ApplicationModel.account_id == account_id)
             )
             assert application_id is not None
+            obsolete = CommunicationService(
+                session, RecordingMessageSender()
+            ).create_outgoing_draft(
+                application_id=application_id,
+                body="Отменённый автоматический ответ",
+            )
+            obsolete_row = session.get(RecruiterMessageModel, obsolete.id)
+            assert obsolete_row is not None
+            obsolete_row.state = RecruiterMessageState.CANCELLED
             foreign_account_id, _foreign_application_id = create_application(
                 session,
                 account_label="Другой аккаунт",
@@ -92,8 +101,19 @@ def test_communications_api_edits_draft_and_rejects_foreign_data(
         first = next(
             message
             for message in created.json()["conversations"][0]["messages"]
-            if message["direction"] == "OUTGOING"
+            if message["direction"] == "OUTGOING" and message["state"] != "CANCELLED"
         )
+
+        with create_database(settings).sessions.begin() as session:
+            obsolete = CommunicationService(
+                session, RecordingMessageSender()
+            ).create_outgoing_draft(
+                application_id=application_id,
+                body="Ещё один отменённый ответ",
+            )
+            obsolete_row = session.get(RecruiterMessageModel, obsolete.id)
+            assert obsolete_row is not None
+            obsolete_row.state = RecruiterMessageState.CANCELLED
 
         edited = request(
             app,
@@ -106,7 +126,7 @@ def test_communications_api_edits_draft_and_rejects_foreign_data(
         second = next(
             message
             for message in edited.json()["conversations"][0]["messages"]
-            if message["direction"] == "OUTGOING"
+            if message["direction"] == "OUTGOING" and message["state"] != "CANCELLED"
         )
         assert second["id"] == first["id"]
         assert second["body"] == "Исправленный вариант ответа"

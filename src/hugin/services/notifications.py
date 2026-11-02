@@ -26,6 +26,7 @@ from hugin.domain.content import (
     InvitationState,
     MessageDirection,
     NotificationChannel,
+    RecruiterMessageState,
 )
 from hugin.domain.tasks import TaskState
 from hugin.domain.time import as_utc, timezone_by_name
@@ -51,6 +52,7 @@ class NotificationService:
     def _collect(self, account_id: int, now: datetime | None = None) -> int:
         selected_at = now or datetime.now(UTC)
         created = 0
+        self._communications.cancel_obsolete_notifications()
 
         incoming = self._session.execute(
             select(
@@ -68,6 +70,7 @@ class NotificationService:
             .where(
                 ApplicationModel.account_id == account_id,
                 RecruiterMessageModel.direction == MessageDirection.INCOMING,
+                RecruiterMessageModel.state != RecruiterMessageState.CANCELLED,
             )
         )
         for (
@@ -379,6 +382,7 @@ class NotificationService:
             .where(
                 ApplicationModel.account_id == account_id,
                 RecruiterMessageModel.direction == MessageDirection.INCOMING,
+                RecruiterMessageModel.state != RecruiterMessageState.CANCELLED,
                 RecruiterMessageModel.received_at >= day_start,
             )
         )

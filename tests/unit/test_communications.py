@@ -255,7 +255,7 @@ def test_communications_migration_preserves_existing_rows(settings: Settings) ->
         database.close()
 
     upgrade_database(settings)
-    assert current_revision(settings) == "0033_background_processes"
+    assert current_revision(settings) == "0036_message_lifecycle"
     check_database_schema(settings)
 
     migrated = create_database(settings)
@@ -919,6 +919,16 @@ def test_exact_approved_safe_reply_is_prepared_for_automatic_send(
             assert outgoing.state is RecruiterMessageState.CONFIRMED
             assert outgoing.auto_send_approved is True
             assert outgoing.reply_template_key == "interest"
+            cancelled = CommunicationService(
+                session, RecordingMessageSender()
+            ).create_outgoing_draft(
+                application_id=application_id,
+                body="Отменённый ответ",
+            )
+            cancelled_row = session.get(RecruiterMessageModel, cancelled.id)
+            assert cancelled_row is not None
+            cancelled_row.state = RecruiterMessageState.CANCELLED
+            session.flush()
             assert AutonomousReplyService(session).approved_for_send(
                 account_id=account_id,
                 message_id=outgoing.id,
@@ -938,6 +948,7 @@ def test_exact_approved_safe_reply_is_prepared_for_automatic_send(
                             RecordingMessageSender(),
                         ).messages(account_id)
                         if message.direction is MessageDirection.OUTGOING
+                        and message.state is not RecruiterMessageState.CANCELLED
                     )
                 )
                 == 1

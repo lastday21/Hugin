@@ -242,6 +242,7 @@ def mark_conversation_read(
             if (
                 message.application_id == application_id
                 and message.direction is MessageDirection.INCOMING
+                and message.state is not RecruiterMessageState.CANCELLED
                 and message.read_at is None
             ):
                 service.mark_incoming_read(
@@ -310,6 +311,7 @@ def save_reply_draft(
                 for message in service.messages(account_id)
                 if message.application_id == application_id
                 and message.direction is MessageDirection.OUTGOING
+                and message.state is not RecruiterMessageState.CANCELLED
             ),
             None,
         )
