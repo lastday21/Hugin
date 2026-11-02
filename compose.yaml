@@ -3,6 +3,7 @@ name: hugin
 services:
   db:
     image: postgres:18-bookworm
+    init: true
     environment:
       POSTGRES_DB: ${HUGIN_DATABASE_NAME:-hugin}
       POSTGRES_USER: ${HUGIN_DATABASE_USER:-hugin}
