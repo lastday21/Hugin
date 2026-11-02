@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
-    "check": "tsc -b --pretty false"
+    "check": "tsc -b --pretty false && tsc -p tsconfig.test.json && node --test tests/workspace-loading.test.mjs"
   },
   "dependencies": {
     "lucide-react": "1.25.0",

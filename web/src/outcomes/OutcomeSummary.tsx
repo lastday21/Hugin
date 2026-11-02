@@ -2,6 +2,10 @@ import type { SearchOutcomes } from "../types";
 
 export function OutcomeSummary({ outcomes }: { outcomes: SearchOutcomes }) {
   const reasons = Object.entries(outcomes.confirmed_rejection_reasons);
+  const periods = outcomes.periods ?? [];
+  const percent = (count: number, total: number) => total
+    ? `${count} / ${total} (${(100 * count / total).toLocaleString("ru-RU", { maximumFractionDigits: 1 })}%)`
+    : "0 / 0 (—)";
   return (
     <section className="dashboard-card outcome-card" aria-labelledby="outcome-title">
       <div className="card-heading">
@@ -21,6 +25,45 @@ export function OutcomeSummary({ outcomes }: { outcomes: SearchOutcomes }) {
         себе не доказывает нехватку опыта или ошибку программы. Если подтверждения ещё
         не записаны, ноль в счётчике не означает, что приглашений не было.
       </p>
+      {periods.length > 0 && <div className="outcome-table-scroll">
+        <table>
+          <caption>Отклики за календарные периоды, {outcomes.period_timezone}. Неделя начинается в понедельник. Результаты относятся к откликам, отправленным в этом периоде.</caption>
+          <thead><tr><th scope="col">Показатель</th>{periods.map((period) => <th scope="col" key={period.key}>{({ today: "Сегодня", week: "Неделя", month: "Месяц" })[period.key]}</th>)}</tr></thead>
+          <tbody>
+            {([
+              ["applications", "Подтверждённые отправки"],
+              ["unique_roles", "Разные роли по сохранённым публикациям"],
+              ["unique_employers", "Разные работодатели"],
+              ["repeated_applications", "Повторы роли, включая прошлые периоды"],
+              ["mature_applications", "Отклики возрастом от 14 дней"],
+              ["checked_last_48_hours", "Статус проверен за 48 часов"],
+              ["unknown_roles", "Недостаточно сведений для сравнения роли"],
+              ["unknown_employers", "Работодатель не сохранён"],
+            ] as const).map(([key, label]) => <tr key={key}><th scope="row">{label}</th>{periods.map((period) => <td key={period.key}>{period[key]}</td>)}</tr>)}
+            {([
+              ["viewed", "Был просмотр по статусу hh.ru"],
+              ["rejections", "Зафиксирован отказ"],
+              ["replies", "Получен ответ работодателя"],
+              ["invitations", "Было приглашение по статусу hh.ru"],
+              ["confirmed_interview_invitations", "Подтверждено приглашение на собеседование"],
+              ["scheduled_interviews", "Записана дата собеседования"],
+            ] as const).map(([key, label]) => <tr key={key}><th scope="row">{label}</th>{periods.map((period) => <td key={period.key}>{percent(period[key], period.applications)}</td>)}</tr>)}
+          </tbody>
+        </table>
+        <p>Свежим откликам нужно время на ответ. Показатели могут пересекаться: после просмотра или приглашения возможен отказ. Ответ включает автоматические сообщения; он сам по себе не означает приглашение.</p>
+        <p>Повторы определяются по одинаковому полному описанию, названию, работодателю, городу и формату работы. Изменённые и неполные публикации могут остаться нераспознанными. Неизвестные роли учитываются по отдельности. Дата отправки — дата сохранённого подтверждения; она может быть позже фактической отправки при восстановлении.</p>
+      </div>}
+      <details className="outcome-details">
+        <summary>Повторные отклики на одинаковые публикации: {(outcomes.repeat_groups ?? []).length} групп</summary>
+        {(outcomes.repeat_groups ?? []).map((group) => <article key={group.application_ids[0]}>
+          <h4>{group.employer} — {group.title}</h4>
+          <p>{group.region ?? "Город не сохранён"}. Отправок: {group.application_ids.length}; просмотров: {group.viewed}; отказов: {group.rejections}; ответов: {group.replies}; подтверждений собеседования: {group.confirmed_interview_invitations}.</p>
+          <ul>{group.publications.map((publication) => <li key={publication.application_id}>
+            <a href={`https://hh.ru/vacancy/${publication.hh_id}`} target="_blank" rel="noreferrer">Вакансия {publication.hh_id}</a>; отклик №{publication.application_id}; публикация: {publication.published_at ? new Date(publication.published_at).toLocaleDateString("ru-RU") : "дата неизвестна"}; подтверждение: {new Date(publication.confirmed_at).toLocaleString("ru-RU")}.
+          </li>)}</ul>
+        </article>)}
+        {(outcomes.repeat_groups ?? []).length === 0 && <p>Подтверждённых повторов одинаковых публикаций не найдено. Это не исключает повторов изменённых объявлений.</p>}
+      </details>
       <details className="outcome-details">
         <summary>Результаты через 14 и 21 день и полнота сведений</summary>
         <div className="outcome-table-scroll">

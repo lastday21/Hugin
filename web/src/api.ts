@@ -19,6 +19,7 @@ import type {
   Profile,
   QueueItem,
   QueueSettings,
+  ReapplicationReview,
   RejectedVacancy,
   ResumePreview,
   SentApplication,
@@ -85,19 +86,60 @@ export const workspaceSectionNames: Record<WorkspaceSection, string> = {
 };
 
 const workspacePaths: Record<WorkspaceSection, string> = {
-  processes: `/api/processes?account_id=${ACCOUNT_ID}`,
+  processes: `/api/processes?account_id=${ACCOUNT_ID}&background=true`,
   dashboard: `/api/dashboard?account_id=${ACCOUNT_ID}`,
+  queue: `/api/queue?account_id=${ACCOUNT_ID}`,
+  forms: `/api/forms?account_id=${ACCOUNT_ID}`,
+  outcomes: `/api/outcomes?account_id=${ACCOUNT_ID}&background=true`,
   autonomy: "/api/autonomy",
   directionOptions: "/api/directions/options",
   profile: `/api/profile?account_id=${ACCOUNT_ID}`,
-  queue: `/api/queue?account_id=${ACCOUNT_ID}`,
-  forms: `/api/forms?account_id=${ACCOUNT_ID}`,
   rejected: `/api/rejected?account_id=${ACCOUNT_ID}&limit=1000`,
   sent: `/api/sent?account_id=${ACCOUNT_ID}&limit=1000`,
   communications: `/api/communications?account_id=${ACCOUNT_ID}`,
   development: "/api/development",
-  outcomes: `/api/outcomes?account_id=${ACCOUNT_ID}`,
 };
+
+function waitForJob(signal?: AbortSignal): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new DOMException("Aborted", "AbortError"));
+      return;
+    }
+    const abort = () => {
+      window.clearTimeout(timer);
+      reject(new DOMException("Aborted", "AbortError"));
+    };
+    const timer = window.setTimeout(() => {
+      signal?.removeEventListener("abort", abort);
+      resolve();
+    }, 1_000);
+    signal?.addEventListener("abort", abort, { once: true });
+  });
+}
+
+interface PendingWorkspaceRead {
+  kind: "workspace-read";
+  job_id: string;
+  state: "running";
+}
+
+function isPendingWorkspaceRead(value: unknown): value is PendingWorkspaceRead {
+  return typeof value === "object" && value !== null && "kind" in value
+    && value.kind === "workspace-read" && "job_id" in value && typeof value.job_id === "string";
+}
+
+async function loadWorkspaceSection(section: WorkspaceSection, signal: AbortSignal): Promise<WorkspaceData[WorkspaceSection]> {
+  let value = await request<WorkspaceData[WorkspaceSection] | PendingWorkspaceRead>(workspacePaths[section], { signal });
+  while (isPendingWorkspaceRead(value)) {
+    await waitForJob(signal);
+    value = await request<WorkspaceData[WorkspaceSection] | PendingWorkspaceRead>(
+      `/api/workspace-reads/${encodeURIComponent(value.job_id)}?account_id=${ACCOUNT_ID}`,
+      { signal },
+    );
+  }
+  return value;
+}
 
 async function changeProcesses(path: string, method: "PUT" | "POST", body?: object): Promise<BackgroundProcesses> {
   const session = await request<{ key: string }>("/api/session");
@@ -135,18 +177,26 @@ export async function loadWorkspace(
   onSection: (section: WorkspaceSection, update: Partial<WorkspaceData>, error?: string) => void,
   signal: AbortSignal,
 ): Promise<void> {
-  await Promise.all(
-    (Object.keys(workspacePaths) as WorkspaceSection[]).map(async (section) => {
-      try {
-        const value = await request<WorkspaceData[typeof section]>(workspacePaths[section], { signal });
-        if (!signal.aborted) onSection(section, { [section]: value });
-      } catch (reason) {
-        if (!signal.aborted) {
-          onSection(section, {}, reason instanceof Error ? reason.message : "Не удалось получить данные");
+  const sections = Object.keys(workspacePaths) as WorkspaceSection[];
+  const main: WorkspaceSection[] = ["processes", "dashboard", "queue", "forms", "outcomes"];
+  // Finish the main view before large secondary sections compete for database/CPU time.
+  for (const pending of [main, sections.filter((section) => !main.includes(section))]) {
+    const loadNext = async () => {
+      while (!signal.aborted) {
+        const section = pending.shift();
+        if (!section) return;
+        try {
+          const value = await loadWorkspaceSection(section, signal);
+          if (!signal.aborted) onSection(section, { [section]: value });
+        } catch (reason) {
+          if (!signal.aborted) {
+            onSection(section, {}, reason instanceof Error ? reason.message : "Не удалось получить данные");
+          }
         }
       }
-    }),
-  );
+    };
+    await Promise.all([loadNext(), loadNext()]);
+  }
 }
 
 export async function saveApplicationOutcome(
@@ -199,12 +249,35 @@ export async function updateDevelopmentItem(
   });
 }
 
-export async function reconcileForms(): Promise<FormDraft[]> {
-  const session = await request<{ key: string }>("/api/session");
-  return request<FormDraft[]>(`/api/forms/reconcile?account_id=${ACCOUNT_ID}`, {
+interface FormReconciliationStatus {
+  job_id: string;
+  state: "pending" | "running" | "completed" | "failed";
+  error: string | null;
+}
+
+export async function reconcileForms(signal?: AbortSignal): Promise<void> {
+  const session = await request<{ key: string }>("/api/session", { signal });
+  let status = await request<FormReconciliationStatus | FormDraft[]>(`/api/forms/reconcile?account_id=${ACCOUNT_ID}&background=true`, {
     method: "POST",
     headers: { "X-Hugin-Session": session.key },
+    signal,
   });
+  // An older API may still return its synchronous result during an application update.
+  if (Array.isArray(status)) return;
+  while (status.state === "pending" || status.state === "running") {
+    await waitForJob(signal);
+    status = await request<FormReconciliationStatus>(
+      `/api/forms/reconcile/${encodeURIComponent(status.job_id)}?account_id=${ACCOUNT_ID}`,
+      { signal },
+    );
+  }
+  if (status.state === "failed") {
+    throw new Error(status.error ?? "Не удалось проверить анкеты");
+  }
+}
+
+export function loadForms(): Promise<FormDraft[]> {
+  return request<FormDraft[]>(workspacePaths.forms);
 }
 
 export function loadVacancy(vacancyId: string): Promise<VacancyCard> {
@@ -253,6 +326,28 @@ export async function reconcileApplication(
     headers: { "X-Hugin-Session": session.key },
     body: JSON.stringify({ status }),
   });
+}
+
+export async function loadReapplicationReview(taskId: number): Promise<ReapplicationReview> {
+  return request<ReapplicationReview>(
+    `/api/queue/${taskId}/reapplication-review?account_id=${ACCOUNT_ID}`,
+  );
+}
+
+export async function saveReapplicationReview(
+  taskId: number,
+  reason: string,
+  reviewKey: string,
+): Promise<ReapplicationReview> {
+  const session = await request<{ key: string }>("/api/session");
+  return request<ReapplicationReview>(
+    `/api/queue/${taskId}/reapplication-review?account_id=${ACCOUNT_ID}`,
+    {
+      method: "POST",
+      headers: { "X-Hugin-Session": session.key },
+      body: JSON.stringify({ reason, review_key: reviewKey }),
+    },
+  );
 }
 
 export async function updateQueueSettings(

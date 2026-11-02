@@ -39,6 +39,7 @@ import {
   dismissProfileQuestion,
   importResume,
   loadCommunications,
+  loadForms,
   loadVacancy,
   loadWorkspace,
   reconcileForms,
@@ -70,10 +71,12 @@ import {
   type DashboardWidget,
 } from "./dashboardPreferences";
 import { DevelopmentView } from "./development/DevelopmentView";
+import { BrowserControlNotice } from "./BrowserControlNotice";
 import { OutcomeSummary } from "./outcomes/OutcomeSummary";
 import { OutcomeEditor } from "./outcomes/OutcomeEditor";
 import { DailyProgress } from "./DailyProgress";
 import { ProcessPanel } from "./processes/ProcessPanel";
+import { ReapplicationReview } from "./reapplication/ReapplicationReview";
 import type {
   BackgroundProcesses,
   AiModelSettings,
@@ -200,6 +203,7 @@ const stateNames: Record<string, string> = {
   INPUT_REQUIRED: "Нужно заполнить",
   SKIPPED: "Пропущено",
   UNKNOWN_RESULT: "Нужно уточнить",
+  CANCELLED: "Отменено; сохранено в истории",
   COMPLETED: "Готово",
   FILTERED_OUT: "Не подходит",
   REVIEW: "Нужен разбор",
@@ -345,6 +349,7 @@ export default function App() {
   const [loadedSections, setLoadedSections] = useState<Partial<Record<WorkspaceSection, boolean>>>({});
   const [formCheckFailed, setFormCheckFailed] = useState(false);
   const refreshController = useRef<AbortController | null>(null);
+  const reconcileTrigger = useRef<(() => void) | null>(null);
   const sectionRevisions = useRef<Partial<Record<WorkspaceSection, number>>>({});
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
   const [selectedVacancy, setSelectedVacancy] = useState<VacancyCard | null>(null);
@@ -383,12 +388,16 @@ export default function App() {
     if (!controller.signal.aborted) {
       setInitialLoading(false);
       setRefreshing(false);
+      refreshController.current = null;
+      reconcileTrigger.current?.();
     }
   }, []);
 
   useEffect(() => {
     void refresh(true);
-    const timer = window.setInterval(() => void refresh(false), 30_000);
+    const timer = window.setInterval(() => {
+      if (!refreshController.current) void refresh(false);
+    }, 30_000);
     return () => {
       window.clearInterval(timer);
       refreshController.current?.abort();
@@ -398,14 +407,32 @@ export default function App() {
   useEffect(() => {
     let disposed = false;
     let running = false;
+    let lastStarted: number | null = null;
+    const controller = new AbortController();
     const reconcile = async () => {
-      if (running) return;
+      const startedAt = Date.now();
+      if (
+        disposed || running || refreshController.current
+        || (lastStarted !== null && startedAt - lastStarted < 60_000)
+      ) return;
       running = true;
+      lastStarted = startedAt;
       try {
-        await reconcileForms();
+        await reconcileForms(controller.signal);
+        if (disposed) return;
+        const revision = (sectionRevisions.current.forms ?? 0) + 1;
+        sectionRevisions.current.forms = revision;
+        const forms = await loadForms();
         if (!disposed) {
           setFormCheckFailed(false);
-          void refresh(false);
+          if (sectionRevisions.current.forms === revision) {
+            sectionRevisions.current.forms += 1;
+            setWorkspace((current) => ({ ...(current ?? emptyWorkspace), forms }));
+            setLoadedSections((current) => ({ ...current, forms: true }));
+            setSectionErrors((current) => ({ ...current, forms: undefined }));
+            setLastUpdated(new Date());
+            setInitialLoading(false);
+          }
         }
       } catch {
         if (!disposed) setFormCheckFailed(true);
@@ -413,10 +440,17 @@ export default function App() {
         running = false;
       }
     };
-    void reconcile();
-    const timer = window.setInterval(() => void reconcile(), 60_000);
-    return () => { disposed = true; window.clearInterval(timer); };
-  }, [refresh]);
+    const trigger = () => { void reconcile(); };
+    reconcileTrigger.current = trigger;
+    trigger();
+    const timer = window.setInterval(trigger, 60_000);
+    return () => {
+      disposed = true;
+      reconcileTrigger.current = null;
+      controller.abort();
+      window.clearInterval(timer);
+    };
+  }, []);
 
   useEffect(() => {
     pageTitleRef.current?.focus();
@@ -656,6 +690,7 @@ export default function App() {
         </header>
 
         <main className="main-content">
+          <BrowserControlNotice />
           {workspace?.dashboard?.system_state === "CAPTCHA_REQUIRED" && view !== "dashboard" && (
             <div className="data-warning" role="alert">
               <AlertTriangle size={20} aria-hidden="true" />
@@ -724,6 +759,7 @@ export default function App() {
                   loading={vacancyLoading}
                   onOpenVacancy={openVacancy}
                   onReconcile={reconcileUnknown}
+                  onReviewSaved={() => void refresh(false)}
                 />
               )}
               {view === "attention" && ready && (
@@ -1394,6 +1430,7 @@ function VacanciesView({
   loading,
   onOpenVacancy,
   onReconcile,
+  onReviewSaved,
 }: {
   queue: QueueItem[];
   sent: SentApplication[];
@@ -1403,6 +1440,7 @@ function VacanciesView({
   loading: boolean;
   onOpenVacancy: (vacancyId: string) => Promise<void>;
   onReconcile: (taskId: number, status: "APPLIED" | "NOT_FOUND") => Promise<void>;
+  onReviewSaved: () => void;
 }) {
   const [search, setSearch] = useState("");
   const [reconcilingTask, setReconcilingTask] = useState<number | null>(null);
@@ -1612,6 +1650,9 @@ function VacanciesView({
                       </div>
                     )}
                   </div>
+                  {item.reapplication_review_available && (
+                    <ReapplicationReview taskId={item.task_id} onSaved={onReviewSaved} />
+                  )}
                 </li>
               ))}
             </ul>

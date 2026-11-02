@@ -317,6 +317,17 @@ export interface QueueItem {
   last_error: string | null;
   letter_state: string | null;
   form_state: string | null;
+  reapplication_review_available: boolean;
+}
+
+export interface ReapplicationReview {
+  allowed: boolean;
+  code: string | null;
+  reason: string;
+  recheck_at: string | null;
+  review_key: string | null;
+  can_review: boolean;
+  previous: { application_id: number; title: string; source_url: string }[];
 }
 
 export interface SearchOutcomes {
@@ -356,6 +367,43 @@ export interface SearchOutcomes {
     oldest_days: number;
   }[];
   comparison_limitations: string[];
+  period_timezone?: string;
+  periods?: {
+    key: "today" | "week" | "month";
+    starts_at: string;
+    applications: number;
+    unique_roles: number;
+    unique_employers: number;
+    unknown_roles: number;
+    unknown_employers: number;
+    repeated_applications: number;
+    viewed: number;
+    rejections: number;
+    replies: number;
+    invitations: number;
+    confirmed_interview_invitations: number;
+    scheduled_interviews: number;
+    mature_applications: number;
+    checked_last_48_hours: number;
+    reply_percent: number | null;
+    interview_percent: number | null;
+  }[];
+  repeat_groups?: {
+    employer: string;
+    title: string;
+    region: string | null;
+    application_ids: number[];
+    publications: {
+      application_id: number;
+      hh_id: string;
+      published_at: string | null;
+      confirmed_at: string;
+    }[];
+    viewed: number;
+    rejections: number;
+    replies: number;
+    confirmed_interview_invitations: number;
+  }[];
 }
 
 export interface FormQuestion {
@@ -552,6 +600,11 @@ export interface VacancyCard {
   events: VacancyEvent[];
 }
 
+export interface BrowserControlStatus {
+  state: "automatic" | "requested" | "ready" | "failed" | "unavailable";
+  expires_at: string | null;
+}
+
 export interface BridgeResult {
   status: string;
   message: string;
@@ -570,6 +623,7 @@ declare global {
   interface Window {
     pywebview?: {
       api: {
+        browser_control_status?: () => Promise<BrowserControlStatus>;
         login_hh: () => Promise<BridgeResult>;
         open_form: (vacancyId: string) => Promise<BridgeResult>;
         open_invitation: (invitationId: number) => Promise<BridgeResult>;

@@ -110,6 +110,13 @@ def test_record_result_reload_conflict_and_mobile(
         page.on("pageerror", lambda error: errors.append(str(error)))
         page.goto(address)
         expect(page.get_by_role("heading", name="Результат поиска")).to_be_visible()
+        expect(page.get_by_role("columnheader", name="Сегодня", exact=True)).to_be_visible()
+        expect(
+            page.get_by_role("rowheader", name="Подтверждённые отправки", exact=True)
+        ).to_be_visible()
+        expect(
+            page.get_by_role("rowheader", name="Получен ответ работодателя", exact=True)
+        ).to_be_visible()
         expect(page.locator(".outcome-totals dd").first).to_have_text("0")
         page.get_by_role("button", name="Общение", exact=True).click()
         conversation_time = page.get_by_role("list", name="Переписки").locator("time")
@@ -172,7 +179,7 @@ def test_record_result_reload_conflict_and_mobile(
         page.get_by_role("button", name="Главная", exact=True).click()
         page.wait_for_function("window.scrollY === 0")
         expect(page.locator(".outcome-totals dd").first).to_have_text("1")
-        page.locator(".outcome-details summary").click()
+        page.get_by_text("Результаты через 14 и 21 день и полнота сведений", exact=True).click()
         page.evaluate("window.scrollTo(0, 0)")
         page.screenshot(path=str(tmp_path / "outcome-summary-mobile.png"), full_page=True)
         assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
@@ -456,7 +463,12 @@ def test_dashboard_and_profile_remain_available_when_auxiliary_sections_fail(
         browser = playwright.chromium.launch(headless=True)
         page = browser.new_page(viewport={"width": 1360, "height": 1000})
         page.on("pageerror", lambda error: errors.append(str(error)))
-        page.route("**/api/forms/reconcile?*", lambda route: held.append(route))
+
+        def hold_reconciliation(route: Route) -> None:
+            held.append(route)
+            page.evaluate("window.formReconciliationHeld = true")
+
+        page.route("**/api/forms/reconcile?*", hold_reconciliation)
         page.route(
             "**/api/development",
             lambda route: route.fulfill(status=503, json={"detail": "Проверочная недоступность"}),
@@ -464,6 +476,7 @@ def test_dashboard_and_profile_remain_available_when_auxiliary_sections_fail(
         page.goto(address)
         expect(page.get_by_role("heading", name="Результат поиска")).to_be_visible(timeout=5000)
         expect(page.get_by_text("Часть разделов недоступна", exact=True)).to_be_visible()
+        page.wait_for_function("window.formReconciliationHeld === true")
         assert held
         page.get_by_role("button", name="Профиль", exact=True).click()
         expect(page.get_by_role("heading", name="Сведения о кандидате", exact=True)).to_be_visible()
@@ -483,6 +496,7 @@ def test_delayed_form_check_does_not_replace_a_saved_answer(
 ) -> None:
     address, _ = local_ui
     held: list[Route] = []
+    dashboard_requests: list[str] = []
     saved_answer = "Подтверждённый ответ кандидата"
     questions: list[dict[str, object]] = [
         {
@@ -515,6 +529,12 @@ def test_delayed_form_check_does_not_replace_a_saved_answer(
         browser = playwright.chromium.launch(headless=True)
         page = browser.new_page()
         page.set_default_timeout(5000)
+        page.on(
+            "request",
+            lambda request: (
+                dashboard_requests.append(request.url) if "/api/dashboard?" in request.url else None
+            ),
+        )
         page.add_init_script("""(() => {
           const originalFetch = window.fetch.bind(window);
           window.formResponses = [];
@@ -527,12 +547,14 @@ def test_delayed_form_check_does_not_replace_a_saved_answer(
             return response;
           };
         })();""")
-        page.route(
-            "**/api/forms/reconcile?*",
-            lambda route: (
-                held.append(route) if delayed_source == "reconcile" else route.fulfill(json=[])
-            ),
-        )
+
+        def reconcile(route: Route) -> None:
+            if delayed_source == "reconcile":
+                held.append(route)
+            else:
+                route.fulfill(json=[])
+
+        page.route("**/api/forms/reconcile?*", reconcile)
         page.route("**/api/forms?*", lambda route: route.fulfill(json=[stored]))
 
         def save_answer(route: Route) -> None:
@@ -544,7 +566,8 @@ def test_delayed_form_check_does_not_replace_a_saved_answer(
             route.fulfill(json=stored)
 
         page.route("**/api/forms/1/answers?*", save_answer)
-        page.goto(address)
+        with page.expect_request("**/api/forms/reconcile?*"):
+            page.goto(address, wait_until="domcontentloaded")
         page.get_by_role("button", name="Требует внимания", exact=True).click()
         expect(page.get_by_role("heading", name="Вакансия с анкетой")).to_be_visible()
         page.get_by_text("Показать вопросы", exact=True).click()
@@ -559,13 +582,116 @@ def test_delayed_form_check_does_not_replace_a_saved_answer(
         page.locator(".form-answer-editor").first.get_by_role("button").click()
         expect(page.get_by_text(saved_answer, exact=True)).to_be_visible()
         assert held
+        if delayed_source == "reconcile":
+            expect(page.get_by_role("button", name="Обновить данные", exact=True)).to_be_enabled()
+        dashboard_count = len(dashboard_requests)
         page.evaluate("window.formResponses = []")
         for route in held:
             route.fulfill(json=[stale])
         page.wait_for_function(
             "window.formResponses.some(forms => forms[0]?.questions[0]?.answer === null)"
         )
+        if delayed_source == "reconcile":
+            page.wait_for_function("window.formResponses.length >= 2")
+            assert len(dashboard_requests) == dashboard_count
         page.wait_for_timeout(200)
         expect(page.get_by_text(saved_answer, exact=True)).to_be_visible()
         expect(page.get_by_label("Ответ на вопрос: Опишите опыт")).to_have_count(0)
         browser.close()
+
+
+def test_automatic_refresh_waits_for_pending_sections_and_resumes_after_completion(
+    local_ui: tuple[str, int],
+) -> None:
+    address, _ = local_ui
+    held: list[tuple[Route, dict[str, object]]] = []
+    reads: list[str] = []
+    checks: list[str] = []
+    hold = True
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
+        context = browser.new_context()
+        context.add_init_script("""
+            const originalNow = Date.now;
+            window.testClockAdvance = 0;
+            Date.now = () => originalNow() + window.testClockAdvance;
+            const originalSetInterval = window.setInterval;
+            window.setInterval = function (callback, delay, ...args) {
+                if (delay === 30000) window.workspaceRefreshTick = () => callback(...args);
+                if (delay === 60000) window.formReconciliationTick = () => callback(...args);
+                return originalSetInterval.call(window, callback, delay, ...args);
+            };
+        """)
+        page = context.new_page()
+
+        def route_request(route: Route) -> None:
+            if not route.request.url.startswith(address + "/"):
+                route.abort()
+            elif "/api/forms/reconcile" in route.request.url:
+                checks.append(route.request.url)
+                route.fulfill(json=[])
+            else:
+                if route.request.method == "GET" and "/api/" in route.request.url:
+                    reads.append(route.request.url)
+                if hold and "/api/development" in route.request.url:
+                    held.append((route, route.fetch().json()))
+                    page.evaluate("window.workspaceRefreshHeld = true")
+                else:
+                    route.continue_()
+
+        context.route("**/*", route_request)
+        try:
+            page.goto(address)
+            page.wait_for_function("window.workspaceRefreshHeld === true")
+            refresh = page.get_by_role("button", name="Обновить данные", exact=True)
+            expect(refresh).to_be_disabled()
+            assert not checks, "Form reconciliation must wait for the last workspace section"
+            initial_reads = len(reads)
+            page.evaluate("window.workspaceRefreshTick(); window.formReconciliationTick()")
+            page.evaluate(
+                "() => new Promise(resolve => "
+                "requestAnimationFrame(() => requestAnimationFrame(resolve)))"
+            )
+            assert len(reads) == initial_reads, "Automatic refresh must not abort pending sections"
+            assert len(held) == 1
+            assert not checks
+
+            hold = False
+            route, payload = held.pop()
+            with page.expect_request("**/api/forms/reconcile?*"):
+                route.fulfill(json=payload)
+            expect(refresh).to_be_enabled()
+            assert len(checks) == 1
+            with page.expect_request(address + "/api/processes?account_id=1&background=true"):
+                page.evaluate("window.workspaceRefreshTick()")
+            expect(refresh).to_be_enabled()
+            assert len(reads) > initial_reads
+            assert len(checks) == 1, "Finishing another refresh must preserve the minute interval"
+
+            with page.expect_request(address + "/api/processes?account_id=1&background=true"):
+                refresh.click()
+            expect(refresh).to_be_enabled()
+            assert len(checks) == 1
+
+            hold = True
+            page.evaluate("window.testClockAdvance += 60001; window.workspaceRefreshHeld = false")
+            page.evaluate("window.workspaceRefreshTick()")
+            page.wait_for_function("window.workspaceRefreshHeld === true")
+            page.evaluate("window.formReconciliationTick()")
+            page.evaluate(
+                "() => new Promise(resolve => "
+                "requestAnimationFrame(() => requestAnimationFrame(resolve)))"
+            )
+            assert len(checks) == 1, "A due form check must wait while refresh is running"
+            hold = False
+            route, payload = held.pop()
+            with page.expect_request("**/api/forms/reconcile?*"):
+                route.fulfill(json=payload)
+            expect(refresh).to_be_enabled()
+            assert len(checks) == 2, "The completed refresh must trigger exactly one deferred check"
+            page.reload()
+            expect(page.get_by_role("button", name="Обновить данные", exact=True)).to_be_enabled()
+            expect(page.get_by_text("Не удалось обновить данные", exact=True)).to_have_count(0)
+        finally:
+            context.close()
+            browser.close()

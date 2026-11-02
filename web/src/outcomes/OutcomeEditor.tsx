@@ -1,4 +1,4 @@
-import { useEffect, useId, useState, type FormEvent } from "react";
+import { useEffect, useId, useRef, useState, type FormEvent } from "react";
 import { loadCommunications, saveApplicationOutcome } from "../api";
 import type { ApplicationOutcome, Communications } from "../types";
 
@@ -25,16 +25,18 @@ export function OutcomeEditor({ applicationId, outcome = emptyOutcome, onSaved }
   const id = useId();
   const [values, setValues] = useState(() => editable(outcome));
   const [dirty, setDirty] = useState(false);
+  const edited = useRef(false);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
   const [failed, setFailed] = useState(false);
   const stale = values.revision !== outcome.revision;
 
   useEffect(() => {
-    if (!dirty) setValues(editable(outcome));
-  }, [outcome, dirty]);
+    setValues((current) => edited.current ? current : editable(outcome));
+  }, [outcome]);
 
   function change(key: "interview_at" | "interview_evidence" | "rejection_reason" | "rejection_evidence", value: string) {
+    edited.current = true;
     setValues((current) => ({ ...current, [key]: value }));
     setDirty(true);
     setMessage("");
@@ -55,6 +57,7 @@ export function OutcomeEditor({ applicationId, outcome = emptyOutcome, onSaved }
       });
       const saved = result.outcomes[applicationId] ?? emptyOutcome;
       setValues(editable(saved));
+      edited.current = false;
       setDirty(false);
       onSaved(result);
       setMessage("Результат сохранён в Hugin.");
@@ -107,7 +110,7 @@ export function OutcomeEditor({ applicationId, outcome = emptyOutcome, onSaved }
           <small>Если причина неизвестна, оставьте оба поля пустыми. Для исправления ошибочной записи очистите соответствующие поля и сохраните.</small>
         </fieldset>
         {stale && dirty && <p role="alert">Сохранённые сведения изменились. <button type="button" className="text-button"
-          onClick={() => { setValues(editable(outcome)); setDirty(false); setMessage(""); setFailed(false); }}>Загрузить сохранённое</button></p>}
+          onClick={() => { edited.current = false; setValues(editable(outcome)); setDirty(false); setMessage(""); setFailed(false); }}>Загрузить сохранённое</button></p>}
         <div className="outcome-save">
           <button type="submit" className="secondary-button" disabled={busy || !dirty || stale}>{busy ? "Сохраняем…" : "Сохранить результат"}</button>
           {message && <p role={failed ? "alert" : "status"}>{message}</p>}

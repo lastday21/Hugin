@@ -369,6 +369,18 @@ ol {
   font-size: 12px;
 }
 
+.browser-control-notice.manual {
+  color: var(--blue);
+  background: var(--blue-soft);
+  border-color: #c9d9ee;
+}
+
+.browser-control-notice.pending {
+  color: var(--amber);
+  background: var(--amber-soft);
+  border-color: #e9d4ab;
+}
+
 .loading-state {
   display: flex;
   align-items: center;
@@ -3983,3 +3995,9 @@ ol {
   .process-toggle { margin-top: 0; flex-shrink: 0; }
 }
 .section-context { margin: 0; color: #576760; line-height: 1.5; font-size: 14px; }
+.reapplication-review { grid-column: 1 / -1; min-width: 0; font-size: 14px; }
+.reapplication-review > div { padding-top: 12px; max-width: 760px; }
+.reapplication-review p { line-height: 1.5; }
+.reapplication-review form { display: grid; gap: 8px; }
+.reapplication-review textarea { width: 100%; box-sizing: border-box; resize: vertical; }
+.reapplication-review button { justify-self: start; }
