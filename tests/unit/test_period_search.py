@@ -21,6 +21,8 @@ from hugin.domain.hh_sync import HhSyncBlockedError, HhSyncRetryableError
 from hugin.domain.search_coverage import SearchCoverage
 from hugin.domain.vacancies import VacancySearchResult
 from hugin.repositories.automation import search_configuration_key
+from hugin.repositories.directions import DirectionRepository
+from hugin.repositories.vacancies import VacancyRepository
 from hugin.services.automation import AutomationSchedulerService
 from hugin.services.background_processes import BackgroundProcessService
 from hugin.services.decision_evidence import fingerprint
@@ -106,21 +108,30 @@ def test_deleted_pages_relocate_boundary_before_finishing_coverage(settings: Set
     assert {str(i) for i in range(116, 124)} <= ids
 
 
+@pytest.mark.parametrize("promoted_dated", [True, False])
 def test_fresh_publication_flood_is_read_without_resetting_depth_or_duplicates(
     settings: Settings,
+    promoted_dated: bool,
 ) -> None:
     account, query = seed(settings)
     browser = PeriodBrowser()
+    promoted = browser.vacancies.pop()
+    if not promoted_dated:
+        promoted = replace(promoted, published_at=None)
+    browser.vacancies.insert(0, promoted)
     cycle = PeriodSearchCycle(settings)
     progress = cycle.run(account_id=account, search_query_id=query, browser=browser)
+    assert coverage(progress).variants[0].head_id == "100"
     saved_depth = coverage(progress).variants[0].depth.model_dump()
+    saved_boundary = coverage(progress).boundary
+    published_at = datetime.now(UTC)
     new = [
-        VacancyData(str(i), "Python", f"https://hh.ru/vacancy/{i}", published_at=datetime.now(UTC))
+        VacancyData(str(i), "Python", f"https://hh.ru/vacancy/{i}", published_at=published_at)
         for i in range(1000, 1028)
     ]
-    browser.vacancies = new + browser.vacancies
+    browser.vacancies = [promoted, *new, *browser.vacancies[1:]]
     progress["fresh_search_at"] = (datetime.now(UTC) - timedelta(days=2)).isoformat()
-    for _ in range(12):
+    for _ in range(30):
         progress = PeriodSearchCycle(settings).run(
             account_id=account, search_query_id=query, browser=browser, progress=progress
         )
@@ -128,7 +139,9 @@ def test_fresh_publication_flood_is_read_without_resetting_depth_or_duplicates(
             break
     state = coverage(progress)
     assert state.fresh_started_at is None
-    assert state.variants[0].depth.model_dump() == saved_depth
+    assert state.variants[0].head_id == "1000"
+    assert state.variants[0].depth.page >= saved_depth["page"]
+    assert state.boundary == saved_boundary
     with create_database(settings).sessions() as session:
         ids = list(session.scalars(select(VacancyModel.hh_id)))
     assert len(ids) == len(set(ids))
@@ -196,6 +209,39 @@ def test_unknown_publication_date_does_not_close_the_period(settings: Settings) 
     assert 3 in [page for _, _, page in browser.pages]
 
 
+def test_daily_interruptions_finish_depth_instead_of_restarting_fresh_regions(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    account, query = seed(settings, regions=(SearchRegion("1", "Москва"), SearchRegion("2", "СПб")))
+    current = datetime.now(UTC).replace(hour=8, minute=0, second=0, microsecond=0)
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz: tzinfo | None = None) -> Self:
+            return cls.fromtimestamp(current.timestamp(), tz=tz or UTC)
+
+    monkeypatch.setattr("hugin.services.period_search.datetime", Clock)
+    browser = PeriodBrowser()
+    browser.vacancies = [
+        replace(v, description="Python API", details_fetched_at=datetime.now(UTC))
+        for v in browser.vacancies
+    ]
+    progress: AutomationJobResult = {}
+    for _ in range(100):
+        progress = PeriodSearchCycle(settings).run(
+            account_id=account,
+            search_query_id=query,
+            browser=browser,
+            progress=deepcopy(progress),
+        )
+        if progress.get("coverage_complete"):
+            break
+        current += timedelta(days=1)
+    assert progress.get("coverage_complete") is True
+    assert all(v.depth.complete for v in coverage(progress).variants)
+    assert {area for _, area, page in browser.pages if page >= 3} == {"1", "2"}
+
+
 def test_page_failure_and_user_stop_preserve_checkpoint(settings: Settings) -> None:
     account, query = seed(settings)
     browser = PeriodBrowser()
@@ -211,7 +257,7 @@ def test_page_failure_and_user_stop_preserve_checkpoint(settings: Settings) -> N
     )
     assert stopped["search_coverage"] == previous["search_coverage"]
     assert len(browser.pages) == 1
-    progress["next_step"] = "search"
+    progress = {**stopped, "deferred": True, "reason": "DISABLED", "next_step": "search"}
     previous = deepcopy(progress)
     browser.fail = True
     with pytest.raises(RuntimeError, match="network failure"):
@@ -223,6 +269,8 @@ def test_page_failure_and_user_stop_preserve_checkpoint(settings: Settings) -> N
     )
     assert browser.pages[-1] == browser.pages[-2]
     assert resumed["pages_loaded"] == 1
+    assert not resumed.get("deferred")
+    assert "reason" not in resumed
 
 
 def test_period_boundary_stops_only_ordered_fully_dated_pages(settings: Settings) -> None:
@@ -341,7 +389,11 @@ def test_repeated_page_for_another_number_cannot_loop_forever(settings: Settings
             )
 
 
-def test_pipeline_drains_details_and_current_selection_before_depth(settings: Settings) -> None:
+@pytest.mark.parametrize("other_direction", [False, True])
+def test_pipeline_gives_depth_a_turn_while_fresh_details_keep_arriving(
+    settings: Settings,
+    other_direction: bool,
+) -> None:
     account, query = seed(settings)
     browser = PeriodBrowser()
     cycle = PeriodSearchCycle(settings)
@@ -362,23 +414,57 @@ def test_pipeline_drains_details_and_current_selection_before_depth(settings: Se
             **progress,
             "fresh_search_configuration": search_configuration_key(stored_query),
         }
-    for expected in (3, 1):
-        progress = cycle.run(
-            account_id=account, search_query_id=query, browser=browser, progress=progress
+        pending_direction = direction.id
+        if other_direction:
+            pending_direction = DirectionRepository(session).create(account, "Other").id
+            for vacancy in session.scalars(select(VacancyModel)):
+                vacancy.details_fetched_at = datetime.now(UTC)
+    initial_boundary = coverage(progress).boundary
+    for batch in range(3):
+        with create_database(settings).sessions.begin() as session:
+            for offset in range(4):
+                hh_id = str(1000 + batch * 4 + offset)
+                added = VacancyRepository(session).upsert(
+                    VacancyData(
+                        hh_id,
+                        "Python",
+                        f"https://hh.ru/vacancy/{hh_id}",
+                        published_at=datetime.now(UTC),
+                    )
+                )
+                DirectionRepository(session).track_vacancy(pending_direction, added.id)
+        pages_before = len(browser.pages)
+        details_before = len(browser.details)
+        for step in range(2):
+            # A new worker must retain the turn saved by its predecessor.
+            progress = PeriodSearchCycle(settings).run(
+                account_id=account, search_query_id=query, browser=browser, progress=progress
+            )
+            if batch == 0 and step == 0:
+                saved = deepcopy(progress)
+                browser.fail = True
+                with pytest.raises(RuntimeError, match="network failure"):
+                    cycle.run(
+                        account_id=account,
+                        search_query_id=query,
+                        browser=browser,
+                        progress=progress,
+                    )
+                browser.fail = False
+                assert progress == saved
+                # The failed attempt is not a successfully loaded page.
+                pages_before += 1
+        assert len(browser.pages) == pages_before + 1
+        assert 0 <= len(browser.details) - details_before <= 3
+        if not other_direction:
+            assert len(browser.details) == details_before + 3
+        assert coverage(progress).boundary == initial_boundary
+    assert browser.pages[-1][2] > 0
+    with create_database(settings).sessions() as session:
+        assert all(
+            row.rules_version != RULES_VERSION
+            for row in session.scalars(select(DirectionVacancyModel))
         )
-        assert progress["details_loaded"] == expected and len(browser.pages) == 1
-    waiting = cycle.run(
-        account_id=account, search_query_id=query, browser=browser, progress=progress
-    )
-    assert len(browser.pages) == 1 and "Ожидает оценки" in str(waiting["reason"])
-    assert waiting["search_coverage"] == progress["search_coverage"]
-    with create_database(settings).sessions.begin() as session:
-        for row in session.scalars(select(DirectionVacancyModel)):
-            row.rules_version = RULES_VERSION
-    resumed = cycle.run(
-        account_id=account, search_query_id=query, browser=browser, progress=waiting
-    )
-    assert resumed["pages_loaded"] == 1
 
 
 @pytest.mark.parametrize("captcha", [False, True], ids=["closed_browser", "captcha"])

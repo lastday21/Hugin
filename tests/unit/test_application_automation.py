@@ -16,6 +16,7 @@ from hugin.database import create_database, upgrade_database
 from hugin.database.models import (
     ApplicationEventModel,
     ApplicationModel,
+    ApplicationTaskModel,
     CandidateProfileModel,
     CoverLetterFactModel,
     CoverLetterModel,
@@ -64,6 +65,7 @@ from hugin.services import application_automation as application_automation_modu
 from hugin.services.ai_prompts import DEFAULT_AI_PROMPTS
 from hugin.services.application_automation import ApplicationAutomationService, ApplyJob
 from hugin.services.application_reconciliation import ApplicationReconciliationService
+from hugin.services.automation import AutomationSchedulerService
 from hugin.services.autonomy import AutonomyPolicyService
 from hugin.services.cover_letter import MANUAL_REVIEW_MODEL, CoverLetterService
 from hugin.services.cover_letter_quality import QUALITY_RUBRIC_VERSION
@@ -233,7 +235,7 @@ def test_repeated_confirmed_form_does_not_loop_in_queue(
     assert values["error_code"] == expected_error
 
 
-def test_form_preflight_claims_only_task_without_current_letter(
+def test_form_preflight_yields_to_ready_task_during_send_delay(
     settings: Settings,
 ) -> None:
     upgrade_database(settings)
@@ -308,6 +310,8 @@ def test_form_preflight_claims_only_task_without_current_letter(
                     ),
                     model_name=MANUAL_REVIEW_MODEL,
                     state=CoverLetterState.READY,
+                    quality_passed=True,
+                    quality_version=QUALITY_RUBRIC_VERSION,
                 )
             )
             session.flush()
@@ -343,8 +347,50 @@ def test_form_preflight_claims_only_task_without_current_letter(
                 89,
                 now,
             )
+            assert (
+                service.claim_next_form_preflight(
+                    account_id=account.id, require_cover_letter_quality=True, now=now
+                )
+                is None
+            )
+            assert QueueTaskRepository(session).get(closed_task.id).attempts == 0
+
+            with session.begin_nested() as turn:
+                assert QueueService(session).claim_next(now, account_id=account.id) is None
+                ready = QueueService(session).claim_next(
+                    now + timedelta(seconds=60),
+                    account_id=account.id,
+                    require_ready_cover_letter=True,
+                    cover_letter_instruction_version=cover_letter_instruction_version(
+                        DEFAULT_AI_PROMPTS.cover_letter
+                    ),
+                    cover_letter_quality_version=QUALITY_RUBRIC_VERSION,
+                )
+                assert ready is not None and ready.id == task.id
+                turn.rollback()
+
+            with session.begin_nested() as failed_quality:
+                letter = session.scalar(
+                    select(CoverLetterModel).where(
+                        CoverLetterModel.application_id == application.id
+                    )
+                )
+                assert letter is not None
+                letter.quality_passed = False
+                session.flush()
+                retry = service.claim_next_form_preflight(
+                    account_id=account.id, require_cover_letter_quality=True, now=now
+                )
+                assert retry is not None and retry.task.id == task.id
+                failed_quality.rollback()
+
+            pending = session.get(ApplicationTaskModel, task.id)
+            assert pending is not None
+            pending.scheduled_at = now + timedelta(minutes=2)
+            session.flush()
             closed_job = service.claim_next_form_preflight(
                 account_id=account.id,
+                require_cover_letter_quality=True,
                 now=now,
             )
             assert closed_job is not None
@@ -652,9 +698,22 @@ def test_automation_prepares_claims_and_records_results(settings: Settings) -> N
             QueueTaskRepository(session).enqueue(uncertain_application.id, 50)
             uncertain_job = service.claim_next(direction.id)
             assert uncertain_job is not None
+            submission_evidence = {
+                "schema_version": 1,
+                "vacancy_id": "300",
+                "request_started": True,
+                "response_status": 200,
+                "response_text": "{}",
+                "page_url": uncertain_vacancy.source_url,
+                "page_text": "Форма отклика",
+            }
             uncertain = service.record_result(
                 uncertain_job,
-                HhApplyResult(HhApplyStatus.UNKNOWN_RESULT, uncertain_vacancy.source_url),
+                HhApplyResult(
+                    HhApplyStatus.UNKNOWN_RESULT,
+                    uncertain_vacancy.source_url,
+                    submission_evidence=submission_evidence,
+                ),
             )
             assert not uncertain.blocking
             assert (
@@ -666,6 +725,7 @@ def test_automation_prepares_claims_and_records_results(settings: Settings) -> N
                 uncertain_job.application.id
             )[-1]
             assert unknown_event.payload["final_url"] == uncertain_vacancy.source_url
+            assert unknown_event.payload["submission_evidence"] == submission_evidence
             attempt_snapshot = unknown_event.payload["selection_snapshot"]
             assert isinstance(attempt_snapshot, dict)
             assert attempt_snapshot["category"] == "MATCH"
@@ -818,14 +878,23 @@ def test_automation_prepares_claims_and_records_results(settings: Settings) -> N
             )
             assert auth_required.blocking
             assert SystemStateRepository(session).get().state is SystemState.AUTH_REQUIRED
-            service.resume_after_authentication()
+            service.resume_after_authentication(account_id=account.id)
             assert SystemStateRepository(session).get().state is SystemState.RUNNING
     finally:
         database.close()
 
 
-def test_retry_after_schedules_next_run_and_account_warning_blocks_queue(
+@pytest.mark.parametrize(
+    ("blocked_status", "system_state"),
+    [
+        (HhApplyStatus.ACCOUNT_WARNING, SystemState.ACCOUNT_WARNING),
+        (HhApplyStatus.CAPTCHA_REQUIRED, SystemState.CAPTCHA_REQUIRED),
+    ],
+)
+def test_retry_after_schedules_next_run_and_protection_blocks_queue(
     settings: Settings,
+    blocked_status: HhApplyStatus,
+    system_state: SystemState,
 ) -> None:
     upgrade_database(settings)
     database = create_database(settings)
@@ -912,14 +981,69 @@ def test_retry_after_schedules_next_run_and_account_warning_blocks_queue(
             warning = service.record_result(
                 warning_job,
                 HhApplyResult(
-                    HhApplyStatus.ACCOUNT_WARNING,
+                    blocked_status,
                     warning_vacancy.source_url,
+                    submission_evidence={
+                        "page_url": "https://kumertau.hh.ru/vacancy/account-warning",
+                        "response_status": 403,
+                        "response_text": '{"hhcaptcha":{"isBot":true,"captchaState":"state+/="}}',
+                    },
                 ),
                 now=now,
             )
 
             assert warning.blocking
-            assert SystemStateRepository(session).get().state is SystemState.ACCOUNT_WARNING
+            assert SystemStateRepository(session).get().state is system_state
+            captcha = blocked_status is HhApplyStatus.CAPTCHA_REQUIRED
+            expected_urls = (
+                (
+                    "https://kumertau.hh.ru/account/captcha?state=state%2B%2F%3D"
+                    "&backurl=https%3A%2F%2Fkumertau.hh.ru%2F",
+                )
+                if captcha
+                else ()
+            )
+            assert (
+                AutomationSchedulerService(session).captcha_verification_urls(account.id)
+                == expected_urls
+            )
+            assert service.application_captcha_pending(account.id) is captcha
+            assert not service.application_captcha_pending(account.id + 1000)
+            other = None
+            if captcha:
+                other = AccountRepository(session).create("Другой", "other-captcha")
+                other_resume = ResumeRepository(session).upsert(other.id, "other-resume", "Python")
+                other_application = ApplicationRepository(session).create_apply_intent(
+                    other.id, warning_vacancy.id, other_resume.id
+                )
+                other_task = QueueTaskRepository(session).enqueue(other_application.id, 40, now)
+                QueueTaskRepository(session).transition(other_task.id, TaskState.RUNNING)
+                QueueTaskRepository(session).transition(
+                    other_task.id,
+                    TaskState.RETRY_SCHEDULED,
+                    scheduled_at=now,
+                    error_code="CAPTCHA_REQUIRED",
+                )
+            before = QueueTaskRepository(session).get(warning_job.task.id)
+            service.resume_after_authentication(account_id=account.id)
+            after = QueueTaskRepository(session).get(warning_job.task.id)
+            assert after.state == before.state
+            assert after.scheduled_at == before.scheduled_at
+            assert after.attempts == before.attempts
+            assert after.last_error_code == (None if captcha else blocked_status.value)
+            assert not service.application_captcha_pending(account.id)
+            assert AutomationSchedulerService(session).captcha_verification_urls(account.id) == ()
+            if other is not None:
+                assert SystemStateRepository(session).get().state is SystemState.CAPTCHA_REQUIRED
+                assert service.application_captcha_pending(other.id)
+                service.resume_after_authentication(account_id=other.id)
+                assert not service.application_captcha_pending()
+            assert SystemStateRepository(session).get().state is (
+                SystemState.RUNNING if captcha else system_state
+            )
+            assert (
+                QueueTaskRepository(session).get(job.task.id).last_error_code == "RETRYABLE_ERROR"
+            )
     finally:
         database.close()
 
@@ -1390,10 +1514,16 @@ def test_rule_change_skips_actionable_task_waiting_for_user(
         database.close()
 
 
-@pytest.mark.parametrize("stale_selection", [False, True])
+@pytest.mark.parametrize(
+    ("stale_selection", "via_worker"), [(False, False), (False, True), (True, True)]
+)
 def test_routed_pending_application_moves_to_target_direction(
-    settings: Settings, stale_selection: bool
+    settings: Settings, stale_selection: bool, via_worker: bool
 ) -> None:
+    from hugin.database.models import ApplicationTaskModel
+    from hugin.services.background_processes import BackgroundProcessService
+    from hugin.workers.applications import ApplicationWorker
+
     upgrade_database(settings)
     database = create_database(settings)
     try:
@@ -1465,11 +1595,12 @@ def test_routed_pending_application_moves_to_target_direction(
                 details={"category": "MATCH", "accepted": True},
                 rules_version=RULES_VERSION,
             )
-            service.prepare_for_account_id(
-                account_id=account.id,
-                direction_name=source.name,
-                include_stretch=False,
-            )
+            if not via_worker or stale_selection:
+                service.prepare_for_account_id(
+                    account_id=account.id,
+                    direction_name=source.name,
+                    include_stretch=False,
+                )
 
             if stale_selection:
                 tasks = QueueTaskRepository(session)
@@ -1479,12 +1610,30 @@ def test_routed_pending_application_moves_to_target_direction(
                     task.id, TaskState.REVIEW_REQUIRED, error_code="SEMANTIC_SELECTION_STALE"
                 )
 
-            created = service.prepare_vacancies(
-                account_external_id=account.external_id or "",
-                vacancy_ids=(vacancy.id,),
-                include_stretch=False,
-            )
+        if via_worker:
+            with database.sessions.begin() as session:
+                BackgroundProcessService(session, account.id).set_enabled("applications", True)
+                if not stale_selection:
+                    delayed = session.get(ApplicationTaskModel, task.id)
+                    assert delayed is not None
+                    delayed.scheduled_at = datetime.now(UTC) + timedelta(minutes=5)
+            worker = ApplicationWorker(settings, account_id=account.id)
+            if not stale_selection:
+                assert worker.prepare_queue() == 0
+                with database.sessions.begin() as session:
+                    delayed = session.get(ApplicationTaskModel, task.id)
+                    assert delayed is not None
+                    delayed.scheduled_at = datetime.now(UTC)
+            created = worker.prepare_queue()
+        else:
+            with database.sessions.begin() as session:
+                created = ApplicationAutomationService(session).prepare_vacancies(
+                    account_external_id=account.external_id or "",
+                    vacancy_ids=(vacancy.id,),
+                    include_stretch=False,
+                )
 
+        with database.sessions() as session:
             assert created == 1
             moved = ApplicationRepository(session).get(application.id)
             assert moved.direction_id == target.id

@@ -8,7 +8,9 @@ from sqlalchemy.orm import Session
 from hugin.core.settings import Settings
 from hugin.database import create_database, upgrade_database
 from hugin.database.models import (
+    ApplicationEventModel,
     ApplicationModel,
+    ApplicationTaskModel,
     CoverLetterModel,
     SystemStateModel,
     VacancyModel,
@@ -46,6 +48,62 @@ from hugin.services import ApplicationAutomationService, QueueService
 from hugin.services.vacancy_analysis import RULES_VERSION
 
 pytestmark = pytest.mark.integration
+
+
+def test_daily_budget_preserves_attempt_dates_and_unresolved_results(settings: Settings) -> None:
+    database = create_database(settings)
+    since = datetime(2026, 10, 25, tzinfo=UTC)
+    try:
+        with database.sessions.begin() as session:
+            account = AccountRepository(session).create("Budget")
+            resume = ResumeRepository(session).upsert(account.id, "budget-resume", "Python")
+            repository = ApplicationRepository(session)
+
+            def add(
+                suffix: str,
+                events: list[tuple[ApplicationEventType, int, dict[str, str]]],
+                task_state: TaskState = TaskState.COMPLETED,
+            ) -> None:
+                vacancy = VacancyRepository(session).upsert(
+                    VacancyData(suffix, "Python", f"https://hh.ru/vacancy/{suffix}")
+                )
+                application = repository.create_apply_intent(account.id, vacancy.id, resume.id)
+                session.add(
+                    ApplicationTaskModel(
+                        application_id=application.id, state=task_state, priority_score=50
+                    )
+                )
+                session.add_all(
+                    ApplicationEventModel(
+                        application_id=application.id,
+                        event_type=kind,
+                        created_at=since + timedelta(seconds=offset),
+                        payload=payload,
+                    )
+                    for kind, offset, payload in events
+                )
+
+            applied = ApplicationEventType.APPLIED
+            unknown = ApplicationEventType.UNKNOWN_RESULT
+            sent = {"source": "hugin_send", "hh_status": "APPLIED"}
+            recovered = {"source": "hugin_reconciliation", "hh_status": "APPLIED"}
+            add("old", [(applied, -1, sent)])
+            add("boundary", [(applied, 0, sent)])
+            add("duplicate", [(applied, 1, sent), (applied, 2, sent)])
+            add("old-attempt", [(unknown, -1, {}), (applied, 3, recovered)])
+            add("new-attempt", [(unknown, 1, {}), (applied, 3, recovered)])
+            add("missing-attempt-date", [(applied, 3, recovered)])
+            add("unknown", [(unknown, 3, {})], TaskState.UNKNOWN_RESULT)
+            add("resolved", [(unknown, 3, {})], TaskState.SKIPPED)
+            add("imported", [(applied, 3, {"source": "hh.ru", "hh_status": "APPLIED"})])
+            session.flush()
+
+            assert repository.count_applied_since(account.id, since) == 5
+            assert repository.count_applied_since(account.id, since + timedelta(seconds=1)) == 4
+            assert repository.count_applied_since(account.id, since - timedelta(seconds=1)) == 7
+            assert repository.count_applied_since(account.id, since + timedelta(seconds=4)) == 0
+    finally:
+        database.close()
 
 
 def create_application(

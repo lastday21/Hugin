@@ -8,8 +8,14 @@ from sqlalchemy import select
 
 from hugin.core.settings import Settings
 from hugin.database import create_database
-from hugin.database.models import CareerDirectionModel, CoverLetterModel, VacancyModel
+from hugin.database.models import (
+    ApplicationEventModel,
+    CareerDirectionModel,
+    CoverLetterModel,
+    VacancyModel,
+)
 from hugin.domain import HhApplyResult, HhApplyStatus, SystemState, VacancyAvailability
+from hugin.domain.applications import ApplicationEventType
 from hugin.repositories import DirectionRepository, SystemStateRepository, VacancyRepository
 from hugin.services.application_automation import ApplicationAutomationService, ApplyJob
 from hugin.services.cover_letter import CoverLetterService
@@ -33,8 +39,11 @@ def _submission_allowed(service: ApplicationAutomationService, job: ApplyJob) ->
 
 
 @pytest.mark.parametrize("blank_lines", [False, True])
+@pytest.mark.parametrize("elapsed_days", [0, 40])
 def test_republication_keeps_models_cached_and_submits_each_number_once(
-    settings: Settings, blank_lines: bool
+    settings: Settings,
+    blank_lines: bool,
+    elapsed_days: int,
 ) -> None:
     database = create_database(settings)
     try:
@@ -45,6 +54,14 @@ def test_republication_keeps_models_cached_and_submits_each_number_once(
             direction.scoring_config = {"semantic_selection": {"enabled": True}}
             vacancy = session.get(VacancyModel, vacancy_ids[0])
             assert vacancy is not None
+            if blank_lines:
+                vacancy.description = "\n".join(
+                    (
+                        vacancy.description or "",
+                        vacancy.responsibilities or "",
+                        vacancy.required_qualifications or "",
+                    )
+                )
             vacancy.published_at = datetime.now(UTC)
             vacancy.details_fetched_at = datetime.now(UTC)
         client = Client()
@@ -79,6 +96,15 @@ def test_republication_keeps_models_cached_and_submits_each_number_once(
                 ),
                 apply_delay=timedelta(0),
             ).sent
+            confirmation = session.scalar(
+                select(ApplicationEventModel).where(
+                    ApplicationEventModel.application_id == job.application.id,
+                    ApplicationEventModel.event_type == ApplicationEventType.APPLIED,
+                )
+            )
+            assert confirmation is not None
+            # Model the interval since the earlier confirmed send without external waiting.
+            confirmation.created_at -= timedelta(days=elapsed_days)
             original = session.get(VacancyModel, original_id)
             assert original is not None
             original.availability = VacancyAvailability.ARCHIVED
@@ -94,6 +120,8 @@ def test_republication_keeps_models_cached_and_submits_each_number_once(
                     description=("\n\n" + (data.description or ""))
                     if blank_lines
                     else data.description,
+                    responsibilities=None if blank_lines else data.responsibilities,
+                    required_qualifications=None if blank_lines else data.required_qualifications,
                     availability=VacancyAvailability.ACTIVE,
                 )
             )
@@ -110,6 +138,12 @@ def test_republication_keeps_models_cached_and_submits_each_number_once(
             )
             letters = CoverLetterService(session, writer, quality_model=judge)
             result = letters.prepare(account_id=account_id, direction_name="Python backend")
+            if elapsed_days == 0:
+                assert result.reused == result.generated == 0
+                assert service.claim_next(direction_id, require_cover_letter=True) is None
+                assert recorded_numbers == ["letter-1"]
+                assert client.calls == len(writer.prompts) == len(judge.prompts) == 1
+                return
             assert result.reused == 1 and result.generated == 0
             assert len(writer.prompts) == len(judge.prompts) == 1
             job = service.claim_next(

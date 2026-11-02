@@ -200,6 +200,18 @@ class AutomationWorker:
         finally:
             database.close()
 
+    def recover_authentication(self, now: datetime | None = None) -> bool:
+        """Check access without claiming ordinary work during a protective stop."""
+        if self._stop.is_set():
+            return False
+        database = create_database(self._settings)
+        try:
+            with database.sessions() as session:
+                state = SystemStateRepository(session).get().state
+        finally:
+            database.close()
+        return self._recover_authentication_if_due(state, now)
+
     def run_once(
         self,
         now: datetime | None = None,

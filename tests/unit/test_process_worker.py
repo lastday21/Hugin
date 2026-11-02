@@ -12,6 +12,60 @@ from hugin.workers.processes import BackgroundProcessWorker
 pytestmark = pytest.mark.integration
 
 
+@pytest.mark.parametrize("parallel", [False, True])
+def test_protected_process_worker_reaches_authentication_recovery(
+    settings: Settings, parallel: bool
+) -> None:
+    from hugin.domain.tasks import SystemState
+    from hugin.repositories.tasks import SystemStateRepository
+    from hugin.workers.automation import AutomationWorker
+
+    database = create_database(settings)
+    with database.sessions.begin() as session:
+        AccountRepository(session).create("Восстановление после проверки")
+        service = BackgroundProcessService(session)
+        service.stop_all()
+        service.set_enabled("search", True)
+        service.set_enabled("applications", True)
+        SystemStateRepository(session).transition(SystemState.CAPTCHA_REQUIRED)
+    verified = threading.Event()
+    searched = threading.Event()
+
+    def recover() -> bool:
+        with database.sessions.begin() as session:
+            SystemStateRepository(session).resume_after_authentication()
+        verified.set()
+        return True
+
+    def search(_token: int | None) -> bool:
+        assert verified.is_set()
+        searched.set()
+        return True
+
+    automation = AutomationWorker(settings, authentication_recovery=recover)
+    worker = BackgroundProcessWorker(
+        settings,
+        steps={"search": search},
+        authentication_recovery=automation.recover_authentication,
+        parallel=parallel,
+        poll_seconds=0.01,
+    )
+    try:
+        if parallel:
+            worker.start()
+            assert searched.wait(5), "Защитная остановка не должна отключать восстановление"
+        else:
+            assert worker.run_once()
+            assert searched.is_set()
+        with database.sessions() as session:
+            service = BackgroundProcessService(session)
+            assert service.enabled("applications")
+            assert not service.enabled("replies")
+    finally:
+        worker.stop()
+        database.close()
+
+
 def test_parallel_search_does_not_hold_evaluation_or_applications(settings: Settings) -> None:
     database = create_database(settings)
     with database.sessions.begin() as session:
@@ -115,6 +169,73 @@ def test_parallel_owner_loss_revokes_execution_before_another_worker_can_continu
         database.close()
 
 
+def test_parallel_executor_recovers_only_after_old_work_has_finished(settings: Settings) -> None:
+    from sqlalchemy import text
+
+    database = create_database(settings)
+    with database.sessions.begin() as session:
+        AccountRepository(session).create("Безопасное восстановление исполнителя")
+        service = BackgroundProcessService(session)
+        service.stop_all()
+        service.set_enabled("search", True)
+    entered = threading.Event()
+    release = threading.Event()
+    cancelled = threading.Event()
+    resumed = threading.Event()
+    recovered = threading.Event()
+    old_letter_finished = threading.Event()
+    calls: list[str] = []
+
+    def search(_token: int | None) -> bool:
+        if not calls:
+            calls.append("old")
+            entered.set()
+            release.wait(10)
+            assert not worker.has_ownership()
+        else:
+            calls.append("new")
+            recovered.set()
+        return True
+
+    def resume() -> bool:
+        resumed.set()
+        return old_letter_finished.is_set()
+
+    worker = BackgroundProcessWorker(
+        settings,
+        steps={"search": search, "replies": lambda _: pytest.fail("Ответы выключены")},
+        parallel=True,
+        cancel=cancelled.set,
+        resume=resume,
+        poll_seconds=0.01,
+        heartbeat_seconds=0.01,
+    )
+    try:
+        worker.start()
+        assert entered.wait(5)
+        assert worker._ownership is not None
+        with database.engine.connect() as connection:
+            assert connection.scalar(
+                text("SELECT pg_terminate_backend(:pid)"), {"pid": worker._ownership[0]}
+            )
+        assert cancelled.wait(5)
+        assert not resumed.is_set() and not worker.has_ownership()
+        release.set()
+        assert resumed.wait(5)
+        assert not recovered.is_set()
+        old_letter_finished.set()
+        assert recovered.wait(5)
+        worker.stop(timeout_seconds=5)
+        count = len(calls)
+        assert not worker.running and not worker.has_ownership()
+        assert len(calls) == count
+    finally:
+        release.set()
+        old_letter_finished.set()
+        worker.stop(timeout_seconds=5)
+        database.close()
+
+
 @pytest.mark.parametrize(
     "state", ["new", "queued", "delay", "review", "limit", "fresh_due", "retry_wait"]
 )
@@ -211,7 +332,7 @@ def test_ready_applications_get_a_turn_before_search_adds_another_batch(
         def step(key: ProcessKey) -> Callable[[int | None], bool]:
             def execute(_token: int | None) -> bool:
                 called.append(key)
-                return True
+                return key != "applications" or state != "queued"
 
             return execute
 
@@ -221,11 +342,18 @@ def test_ready_applications_get_a_turn_before_search_adds_another_batch(
             steps={key: step(key) for key in PROCESS_KEYS},
         )
         assert worker.run_once()
-        assert called == (["applications"] if state in {"new", "queued", "delay"} else ["search"])
-        if state in {"new", "queued", "delay"}:
+        assert called == (
+            ["applications"] if state in {"new", "queued", "delay", "fresh_due"} else ["search"]
+        )
+        if state in {"new", "queued", "delay", "fresh_due"}:
             for _ in range(2):
                 assert worker.run_once()
             assert called == ["applications", "synchronization", "replies"]
+            if state == "queued":
+                # Empty application turns must not indefinitely starve fresh evaluation.
+                assert worker.run_once()
+                assert worker.run_once()
+                assert called[-2:] == ["search", "evaluation"]
     finally:
         database.close()
 
@@ -304,9 +432,7 @@ def test_fresh_search_runs_before_models_without_delaying_replies(
         for _ in range(5):
             assert worker.run_once()
         expected = list(PROCESS_KEYS)
-        if search_state == "due":
-            expected = ["search", "synchronization", "replies", "search", "synchronization"]
-        elif search_state == "details":
+        if search_state == "details":
             expected = ["search", "evaluation", "synchronization", "replies", "search"]
         elif search_state == "evaluation":
             expected = ["evaluation", "synchronization", "replies", "evaluation", "synchronization"]
@@ -324,7 +450,7 @@ def test_fresh_search_runs_before_models_without_delaying_replies(
                 }
             for _ in range(4):
                 assert worker.run_once()
-            assert called[-4:] == ["replies", "search", "evaluation", "applications"]
+            assert called[-4:] == ["search", "evaluation", "applications", "synchronization"]
         elif search_state in {"details", "evaluation"}:
             with database.sessions.begin() as session:
                 assert vacancy_id is not None
@@ -592,7 +718,10 @@ def test_recovery_preserves_disabled_processes_and_does_not_start_work(settings:
             return True
 
         worker = BackgroundProcessWorker(
-            settings, account_id=account.id, steps={"evaluation": evaluate}
+            settings,
+            account_id=account.id,
+            steps={"evaluation": evaluate},
+            authentication_recovery=lambda: pytest.fail("All processes are disabled"),
         )
         assert not worker.run_once()
         assert not calls

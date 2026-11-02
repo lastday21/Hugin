@@ -16,6 +16,7 @@ from hugin.database.models import (
 )
 from hugin.domain.applications import ApplicationState
 from hugin.domain.automation import AutomationJobState
+from hugin.domain.directions import VacancyState
 from hugin.domain.time import as_utc, day_start_utc
 from hugin.domain.vacancies import VacancyAvailability
 from hugin.repositories.automation import search_configuration_key
@@ -31,6 +32,11 @@ class ApplicationSelectionGate:
         self, account_id: int, now: datetime | None = None, *, progressive: bool = False
     ) -> str | None:
         now = as_utc(now or datetime.now(UTC))
+        if progressive:
+            from hugin.services.application_candidate_pool import ApplicationCandidatePool
+
+            if ApplicationCandidatePool.enabled():
+                return ApplicationCandidatePool(self._session).status(account_id, now).reason
         if not progressive and self.fresh_search_pending(account_id, now):
             return "Ожидает просмотра свежих страниц всех активных запросов"
 
@@ -69,11 +75,16 @@ class ApplicationSelectionGate:
         )
 
     def _current_rows(
-        self, account_id: int, now: datetime, *, current_only: bool = True
+        self,
+        account_id: int,
+        now: datetime,
+        *,
+        current_only: bool = True,
+        candidate_categories: frozenset[str] | None = None,
     ) -> SelectionRows:
         settings = self._session.get(ApplicationSettingsModel, 1)
         day_start = day_start_utc(settings.timezone_name if settings else "UTC", now)
-        return self._session.execute(
+        statement = (
             select(DirectionVacancyModel, VacancyModel, CareerDirectionModel)
             .join(VacancyModel, VacancyModel.id == DirectionVacancyModel.vacancy_id)
             .join(
@@ -108,15 +119,35 @@ class ApplicationSelectionGate:
                 ),
             )
             .order_by(DirectionVacancyModel.analyzed_at.asc().nullsfirst())
-        ).all()
+        )
+        if candidate_categories is not None:
+            statement = statement.where(
+                DirectionVacancyModel.state.in_((VacancyState.ANALYZED, VacancyState.QUEUED)),
+                DirectionVacancyModel.rules_version == RULES_VERSION,
+                DirectionVacancyModel.rules_details["category"]
+                .as_string()
+                .in_(candidate_categories),
+                VacancyModel.duplicate_of_id.is_(None),
+                VacancyModel.details_fetched_at.is_not(None),
+                or_(
+                    VacancyModel.published_at.is_(None),
+                    VacancyModel.published_at <= VacancyModel.details_fetched_at,
+                ),
+            )
+        return self._session.execute(statement).all()
 
     def fresh_search_pending(
-        self, account_id: int, now: datetime | None = None, *, due_only: bool = False
+        self,
+        account_id: int,
+        now: datetime | None = None,
+        *,
+        due_only: bool = False,
+        include_paused: bool = False,
     ) -> bool:
         now = as_utc(now or datetime.now(UTC))
         settings = self._session.get(ApplicationSettingsModel, 1)
         day_start = day_start_utc(settings.timezone_name if settings else "UTC", now)
-        if settings is not None and settings.search_enabled:
+        if settings is not None and (settings.search_enabled or include_paused):
             queries = self._session.execute(
                 select(DirectionSearchQueryModel, AutomationJobModel)
                 .join(CareerDirectionModel)

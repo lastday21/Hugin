@@ -25,7 +25,7 @@ from hugin.domain.automation import (
 )
 from hugin.domain.directions import DirectionScope
 from hugin.domain.search_progress import fresh_search_today
-from hugin.domain.time import as_utc
+from hugin.domain.time import as_utc, day_start_utc
 
 CLAIMABLE_STATES = (AutomationJobState.WAITING, AutomationJobState.FAILED)
 
@@ -200,6 +200,7 @@ class AutomationJobRepository:
         if allowed_kinds == (AutomationJobKind.SEARCH,):
             settings = self._session.get(ApplicationSettingsModel, 1)
             timezone_name = settings.timezone_name if settings is not None else "UTC"
+            day_start = day_start_utc(timezone_name, selected_at)
             fresh_keys = []
             rows = select(AutomationJobModel, DirectionSearchQueryModel).join(
                 DirectionSearchQueryModel,
@@ -208,10 +209,19 @@ class AutomationJobRepository:
             if account_id is not None:
                 rows = rows.where(AutomationJobModel.account_id == account_id)
             for job, query in self._session.execute(rows):
-                if not fresh_search_today(job.last_result, selected_at, timezone_name) or (
-                    job.last_result.get("fresh_search_configuration")
-                    != search_configuration_key(query)
-                ):
+                configuration = search_configuration_key(query)
+                needs_fresh_search = (
+                    not fresh_search_today(job.last_result, selected_at, timezone_name)
+                    or job.last_result.get("fresh_search_configuration") != configuration
+                )
+                attempted_today = (
+                    job.last_started_at is not None
+                    and day_start <= as_utc(job.last_started_at) <= selected_at
+                    and job.last_result.get("running_search_configuration") == configuration
+                )
+                # Give the first fresh step priority, then share turns with older depth work.
+                # A failed first attempt must not monopolize the queue on every retry either.
+                if needs_fresh_search and not attempted_today:
                     fresh_keys.append(job.key)
             statement = statement.order_by(None).order_by(
                 case((AutomationJobModel.key.in_(fresh_keys), 0), else_=1),
@@ -282,6 +292,7 @@ class AutomationJobRepository:
                 "completed_search_configuration",
                 "fresh_search_at",
                 "fresh_search_configuration",
+                "running_search_configuration",
             ):
                 if key in previous_result:
                     model.last_result.setdefault(key, previous_result[key])

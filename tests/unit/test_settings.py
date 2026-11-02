@@ -86,6 +86,10 @@ def test_explicit_data_directory_is_preserved(
 
     assert settings.data_dir == tmp_path
     assert settings.browser_profile_dir(3) == tmp_path / "browser-profiles" / "account-3"
+    chrome = Settings(data_dir=tmp_path, hh_browser_channel="chrome")
+    assert chrome.browser_profile_dir(3) == tmp_path / "browser-profiles" / "account-3-chrome"
+    edge = Settings(data_dir=tmp_path, hh_browser_channel="msedge")
+    assert edge.browser_profile_dir(3) == tmp_path / "browser-profiles" / "account-3-edge"
 
 
 def test_browser_profile_requires_positive_account_id(tmp_path: Path) -> None:

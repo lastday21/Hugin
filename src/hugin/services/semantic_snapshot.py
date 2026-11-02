@@ -104,9 +104,13 @@ def selection_source_lines(
     vacancy: VacancyRecord,
     *,
     previous_stages: Iterable[SemanticStageModel] | None = None,
+    source_pair: tuple[list[SourceLine], list[SourceLine]] | None = None,
 ) -> list[SourceLine]:
-    compact = source_lines(vacancy)
-    original = source_lines(vacancy, include_repeated_fields=True)
+    compact, original = (
+        source_pair
+        if source_pair is not None
+        else (source_lines(vacancy), source_lines(vacancy, include_repeated_fields=True))
+    )
     if compact == original:
         return compact
     original_payload = [line.model_dump() for line in original]
@@ -157,6 +161,8 @@ def selection_snapshot(
     session: Session,
     direction: DirectionRecord,
     vacancy: VacancyRecord,
+    *,
+    previous_stages: Iterable[SemanticStageModel] | None = None,
 ) -> SelectionSnapshot | None:
     from hugin.services.vacancy_analysis import RULES_VERSION
 
@@ -213,7 +219,9 @@ def selection_snapshot(
         for row in rows
         if row.content.strip()
     ]
-    lines = selection_source_lines(session, direction.account_id, vacancy)
+    lines = selection_source_lines(
+        session, direction.account_id, vacancy, previous_stages=previous_stages
+    )
     request: dict[str, object] = {
         "version": ROLE_SELECTION_VERSION,
         "rules_version": RULES_VERSION,

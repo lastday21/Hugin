@@ -3,10 +3,12 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 import pytest
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from hugin.core.settings import Settings
 from hugin.database import create_database, upgrade_database
+from hugin.database.models import ApplicationEventModel
 from hugin.domain import (
     ApplicationEventType,
     ApplicationReconciliationResult,
@@ -91,6 +93,19 @@ def test_applied_reconciliation_completes_task_and_writes_event(settings: Settin
             assert reconciliation[0].payload["reconciliation_status"] == "APPLIED"
             assert reconciliation[0].payload["checked_at"] == checked_at.isoformat()
             assert events[-1].event_type is ApplicationEventType.APPLIED
+            unknown = session.scalar(
+                select(ApplicationEventModel).where(
+                    ApplicationEventModel.application_id == application_id,
+                    ApplicationEventModel.event_type == ApplicationEventType.UNKNOWN_RESULT,
+                )
+            )
+            assert unknown is not None
+            unknown.created_at = datetime(2026, 7, 25, 12, tzinfo=UTC)
+            session.flush()
+            account_id = ApplicationRepository(session).get(application_id).account_id
+            service = ApplicationAutomationService(session)
+            assert service.applied_since(account_id, datetime(2026, 7, 26, tzinfo=UTC)) == 0
+            assert service.applied_since(account_id, datetime(2026, 7, 25, tzinfo=UTC)) == 1
 
             with pytest.raises(ValueError, match="неизвестном результате"):
                 ApplicationReconciliationService(session).reconcile(

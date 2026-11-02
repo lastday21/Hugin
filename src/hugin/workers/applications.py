@@ -5,7 +5,7 @@ import threading
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 
 from hugin.adapters.codex_cli import configured_codex_cli_client
 from hugin.adapters.credentials import WindowsCredentialStore
@@ -14,6 +14,7 @@ from hugin.core.settings import Settings
 from hugin.database import create_database, upgrade_database
 from hugin.database.models import (
     ApplicationModel,
+    ApplicationTaskModel,
     BackgroundProcessRunModel,
     CareerDirectionModel,
     DirectionVacancyModel,
@@ -21,10 +22,13 @@ from hugin.database.models import (
     VacancyModel,
 )
 from hugin.diagnostics import JournalRun, OperationJournal, error_details, operation_context
+from hugin.domain.applications import ApplicationState
 from hugin.domain.directions import VacancyState
 from hugin.domain.hh import HhApplyResult, HhApplyStatus
 from hugin.domain.hh_sync import HhSyncBlockedError, HhSyncRetryableError
+from hugin.domain.tasks import TaskState
 from hugin.domain.time import as_utc, day_start_utc
+from hugin.repositories.tasks import SELECTION_RECOVERY_ERRORS
 from hugin.services.application_automation import (
     ApplicationAutomationService,
     ApplyJob,
@@ -71,6 +75,7 @@ class ApplicationWorker:
         self._journal = journal or OperationJournal(settings.data_dir)
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._letter_thread: threading.Thread | None = None
         self._browser: VisibleHhBrowser | None = None
         self._browser_owner: int | None = None
         self._browser_wait: JournalRun | None = None
@@ -99,6 +104,30 @@ class ApplicationWorker:
                         account_id=self._account_id, key="applications"
                     )
                     session.add(runtime)
+                resumable_task = (
+                    select(ApplicationTaskModel.id)
+                    .join(ApplicationModel)
+                    .where(
+                        ApplicationModel.account_id == self._account_id,
+                        ApplicationModel.vacancy_id == VacancyModel.id,
+                        ApplicationModel.state == ApplicationState.APPLYING,
+                        ApplicationTaskModel.scheduled_at <= datetime.now(UTC),
+                        or_(
+                            ApplicationTaskModel.state.in_(
+                                (TaskState.PENDING, TaskState.RETRY_SCHEDULED)
+                            ),
+                            ApplicationTaskModel.state.in_(
+                                (TaskState.REVIEW_REQUIRED, TaskState.SKIPPED)
+                            )
+                            & ApplicationTaskModel.last_error_code.in_(SELECTION_RECOVERY_ERRORS),
+                            (ApplicationTaskModel.state == TaskState.REVIEW_REQUIRED)
+                            & ApplicationTaskModel.last_error_code.startswith(
+                                "REPOST_", autoescape=True
+                            ),
+                        ),
+                    )
+                    .exists()
+                )
                 statement = (
                     select(VacancyModel.id)
                     .join(DirectionVacancyModel)
@@ -109,15 +138,21 @@ class ApplicationWorker:
                     .where(
                         CareerDirectionModel.account_id == self._account_id,
                         CareerDirectionModel.is_active.is_(True),
-                        DirectionVacancyModel.state == VacancyState.ANALYZED,
+                        or_(
+                            DirectionVacancyModel.state == VacancyState.ANALYZED,
+                            (DirectionVacancyModel.state == VacancyState.QUEUED) & resumable_task,
+                        ),
                         DirectionVacancyModel.rules_version == RULES_VERSION,
                         DirectionVacancyModel.rules_details["category"].astext.in_(categories),
-                        ~select(ApplicationModel.id)
-                        .where(
-                            ApplicationModel.account_id == self._account_id,
-                            ApplicationModel.vacancy_id == VacancyModel.id,
-                        )
-                        .exists(),
+                        or_(
+                            ~select(ApplicationModel.id)
+                            .where(
+                                ApplicationModel.account_id == self._account_id,
+                                ApplicationModel.vacancy_id == VacancyModel.id,
+                            )
+                            .exists(),
+                            resumable_task,
+                        ),
                     )
                     .distinct()
                     .order_by(VacancyModel.id.desc())
@@ -140,7 +175,10 @@ class ApplicationWorker:
 
     @property
     def running(self) -> bool:
-        return self._thread is not None and self._thread.is_alive()
+        return any(
+            thread is not None and thread.is_alive()
+            for thread in (self._thread, self._letter_thread)
+        )
 
     def start(self) -> None:
         if self.running:
@@ -173,10 +211,11 @@ class ApplicationWorker:
 
     def stop(self, timeout_seconds: float = 10.0) -> None:
         self._stop.set()
-        thread = self._thread
-        if thread is not None and thread.is_alive():
-            thread.join(timeout_seconds)
-        if thread is not None and thread.is_alive():
+        current = threading.current_thread()
+        for thread in (self._thread, self._letter_thread):
+            if thread is not None and thread.is_alive() and thread is not current:
+                thread.join(timeout_seconds)
+        if self.running:
             self._journal.record(
                 "applications",
                 "worker.lifecycle",
@@ -187,9 +226,9 @@ class ApplicationWorker:
                 reason="WORKER_STOP_TIMEOUT",
             )
             return
-        if thread is None or not thread.is_alive():
-            self._close_browser()
+        self._close_browser()
         self._thread = None
+        self._letter_thread = None
         self._journal.record(
             "applications",
             "worker.lifecycle",
@@ -222,6 +261,8 @@ class ApplicationWorker:
                 return False
             job, may_prepare_letters = self._claim(selected_at)
             if job is None:
+                if self._letter_thread is not None and self._letter_thread.is_alive():
+                    return False
                 if not may_prepare_letters:
                     self._close_browser()
                     return False
@@ -237,12 +278,85 @@ class ApplicationWorker:
                 )
                 return True
 
-            self._process_application(job, selected_at, now_is_fixed=now is not None)
+            self._process_application(
+                job,
+                selected_at,
+                now_is_fixed=now is not None,
+                may_prepare_ahead=may_prepare_letters,
+            )
             return True
         finally:
             if self._release_browser_after_turn:
                 self._close_browser()
             self._browser_lock.release()
+
+    def _prepare_ahead(
+        self,
+        selected_at: datetime,
+        *,
+        now_is_fixed: bool,
+        budget_available: bool | None,
+    ) -> None:
+        if self._letter_thread is not None and self._letter_thread.is_alive():
+            return
+        try:
+            if budget_available is None:
+                budget_available = self._has_ahead_budget(selected_at)
+            if not budget_available:
+                return
+            job = self._claim_form_preflight(selected_at)
+            if job is None or not self._process_form_preflight(
+                job, selected_at, now_is_fixed=now_is_fixed, prepare_letter=False
+            ):
+                return
+            if self._stop.is_set():
+                return
+            prepared_at = selected_at if now_is_fixed else datetime.now(UTC)
+            self._letter_thread = threading.Thread(
+                target=self._prepare_ahead_letter,
+                args=(job, prepared_at),
+                name="hugin-next-cover-letter",
+                daemon=True,
+            )
+            self._letter_thread.start()
+        except Exception as error:
+            self._journal.record(
+                "applications",
+                "cover_letters.prepare_ahead",
+                status="failed",
+                level="ERROR",
+                account_id=self._account_id,
+                **error_details(error),
+            )
+
+    def _has_ahead_budget(self, selected_at: datetime) -> bool:
+        database = create_database(self._settings)
+        try:
+            with database.sessions.begin() as session:
+                service = ApplicationAutomationService(session)
+                if not service.applications_enabled():
+                    return False
+                policy = service.policy()
+                sent_today = service.applied_since(
+                    self._account_id, day_start_utc(policy.timezone_name, selected_at)
+                )
+                return sent_today + 1 < policy.daily_limit
+        finally:
+            database.close()
+
+    def _prepare_ahead_letter(self, job: ApplyJob, selected_at: datetime) -> None:
+        try:
+            self._prepare_exact_letter(job, selected_at)
+        except Exception as error:
+            self._journal.record(
+                "applications",
+                "cover_letters.prepare_ahead",
+                status="failed",
+                level="ERROR",
+                account_id=self._account_id,
+                task_id=job.task.id,
+                **error_details(error),
+            )
 
     def _finish_browser_wait(self, reason: str) -> None:
         if self._browser_wait is not None:
@@ -255,7 +369,14 @@ class ApplicationWorker:
         selected_at: datetime,
         *,
         now_is_fixed: bool,
+        may_prepare_ahead: bool | None = None,
     ) -> None:
+        if not self._stop.is_set():
+            self._prepare_ahead(
+                selected_at,
+                now_is_fixed=now_is_fixed,
+                budget_available=may_prepare_ahead,
+            )
         task = getattr(job, "task", None)
         application = getattr(job, "application", None)
         vacancy = getattr(job, "vacancy", None)
@@ -317,6 +438,19 @@ class ApplicationWorker:
                 f"Ошибка выполнения после начала отклика: {type(error).__name__}",
             )
 
+        if result.status is not HhApplyStatus.APPLIED and result.submission_evidence is not None:
+            run.save_evidence(
+                "response",
+                "applications",
+                account_id=self._account_id,
+                application_id=getattr(application, "id", None),
+                task_id=getattr(task, "id", None),
+                attempt_number=getattr(task, "attempts", None),
+                vacancy_id=getattr(vacancy, "hh_id", None),
+                resume_id=getattr(resume, "id", None),
+                result_status=result.status.value,
+                submission_evidence=result.submission_evidence,
+            )
         finished_at = selected_at if now_is_fixed else datetime.now(UTC)
         database = create_database(self._settings)
         try:
@@ -353,6 +487,7 @@ class ApplicationWorker:
                 retry_after_seconds=result.retry_after_seconds,
                 confirmation=result.confirmation[:1000],
                 final_url=result.final_url[:1000],
+                submission_evidence=result.submission_evidence,
             )
 
     def _process_form_preflight(
@@ -361,7 +496,8 @@ class ApplicationWorker:
         selected_at: datetime,
         *,
         now_is_fixed: bool,
-    ) -> None:
+        prepare_letter: bool = True,
+    ) -> bool:
         run = self._journal.start(
             "applications",
             "form_preflight",
@@ -456,19 +592,21 @@ class ApplicationWorker:
                     warnings=len(result.warnings),
                     retry_after_seconds=result.retry_after_seconds,
                 )
-            return
+            return False
 
         run.succeed(
             result_status="FORM_PREFLIGHT_PASSED",
             questions=len(result.questions),
             warnings=len(result.warnings),
         )
-        prepared_at = selected_at if now_is_fixed else datetime.now(UTC)
-        self._prepare_after_form_preflight(
-            job,
-            prepared_at,
-            now_is_fixed=now_is_fixed,
-        )
+        if prepare_letter:
+            prepared_at = selected_at if now_is_fixed else datetime.now(UTC)
+            self._prepare_after_form_preflight(
+                job,
+                prepared_at,
+                now_is_fixed=now_is_fixed,
+            )
+        return True
 
     def _prepare_after_form_preflight(
         self,
@@ -522,15 +660,13 @@ class ApplicationWorker:
                 if sent_today >= policy.daily_limit:
                     return None, False
                 include_stretch = service.stretch_automation_enabled()
-                return (
-                    service.claim_next(
-                        account_id=self._account_id,
-                        require_cover_letter=True,
-                        require_cover_letter_quality=True,
-                        include_stretch=include_stretch,
-                    ),
-                    True,
+                job = service.claim_next(
+                    account_id=self._account_id,
+                    require_cover_letter=True,
+                    require_cover_letter_quality=True,
+                    include_stretch=include_stretch,
                 )
+                return job, sent_today + int(job is not None) < policy.daily_limit
         finally:
             database.close()
 
@@ -569,6 +705,8 @@ class ApplicationWorker:
             database.close()
 
     def _prepare_exact_letter(self, job: ApplyJob, selected_at: datetime) -> bool:
+        if self._stop.is_set():
+            return False
         try:
             with operation_context(
                 account_id=self._account_id,
@@ -580,6 +718,8 @@ class ApplicationWorker:
             if not prepared:
                 raise RuntimeError("Подготовка письма не завершилась; повтор отложен")
         except (LookupError, RuntimeError, ValueError) as error:
+            if not self._preparation_allowed():
+                return False
             self._journal.record(
                 "applications",
                 "cover_letters.prepare",
@@ -656,6 +796,7 @@ class ApplicationWorker:
                     limit=1,
                     include_stretch=include_stretch,
                 )
+                turn.check()
         finally:
             database.close()
         prepared = result.generated + result.reused + result.already_ready
@@ -671,8 +812,15 @@ class ApplicationWorker:
             return False
         database = create_database(self._settings)
         try:
-            with database.sessions() as session:
-                return BackgroundProcessService(session, self._account_id).enabled("applications")
+            with database.sessions.begin() as session:
+                allowed = ApplicationAutomationService(session).applications_enabled() and (
+                    BackgroundProcessService(session, self._account_id).enabled("applications")
+                )
+            return (
+                allowed
+                and not self._stop.is_set()
+                and (self._execution_allowed is None or self._execution_allowed())
+            )
         finally:
             database.close()
 

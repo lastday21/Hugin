@@ -6,8 +6,9 @@ from ipaddress import IPv4Address
 from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit, urlunsplit
+from uuid import UUID
 
-from pydantic import Field, SecretStr, field_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -39,6 +40,8 @@ class Settings(BaseSettings):
     api_port: int = Field(default=8000, ge=1, le=65535)
     desktop_api_url: str = "http://127.0.0.1:8010"
     resource_mode: Literal["normal", "gaming"] = "normal"
+    application_pool_target: int = Field(default=40, ge=0, le=1000)
+    application_pool_minimum: int = Field(default=30, ge=1, le=1000)
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
     data_dir: Path = Field(default_factory=default_data_dir)
     database_host: str = "127.0.0.1"
@@ -51,6 +54,7 @@ class Settings(BaseSettings):
     hh_resumes_url: str = "https://hh.ru/applicant/resumes"
     hh_search_url: str = "https://hh.ru/search/vacancy"
     hh_browser_timeout_ms: int = Field(default=60_000, ge=1_000, le=120_000)
+    hh_browser_channel: Literal["chromium", "chrome", "msedge"] = "chromium"
     hh_browser_source_ip: IPv4Address | None = None
     hh_background_search_pages: int = Field(default=3, ge=1, le=20)
     hh_background_detail_limit: int = Field(default=20, ge=1, le=50)
@@ -73,21 +77,38 @@ class Settings(BaseSettings):
     yandex_ai_source_ip: IPv4Address | None = None
     yandex_ai_timeout_seconds: int = Field(default=120, ge=1, le=300)
     codex_cli_path: Path | None = None
+    captcha_agent_thread_id: str = ""
+    captcha_agent_codex_path: Path | None = None
     codex_letter_model: str = "gpt-6.1-sol"
     codex_letter_reasoning_effort: Literal["low", "medium", "high"] = "medium"
     codex_letter_timeout_seconds: int = Field(default=180, ge=30, le=300)
     codex_reply_requirement_model: str = "gpt-5.6-luna"
     codex_reply_requirement_timeout_seconds: int = Field(default=60, ge=30, le=300)
 
+    @field_validator("captcha_agent_thread_id")
+    @classmethod
+    def validate_captcha_agent_thread(cls, value: str) -> str:
+        return str(UUID(value.strip())) if value.strip() else ""
+
     @field_validator("hh_login_url", "hh_resumes_url")
     @classmethod
     def use_canonical_hh_account_host(cls, value: str) -> str:
         return canonical_hh_account_url(value)
 
+    @model_validator(mode="after")
+    def validate_application_pool(self) -> Settings:
+        if (
+            self.application_pool_target
+            and self.application_pool_minimum > self.application_pool_target
+        ):
+            raise ValueError("Минимальный запас вакансий превышает целевой")
+        return self
+
     def browser_profile_dir(self, account_id: int) -> Path:
         if account_id < 1:
             raise ValueError("Идентификатор аккаунта должен быть положительным")
-        return self.data_dir / "browser-profiles" / f"account-{account_id}"
+        suffix = {"chromium": "", "chrome": "-chrome", "msedge": "-edge"}[self.hh_browser_channel]
+        return self.data_dir / "browser-profiles" / f"account-{account_id}{suffix}"
 
 
 @lru_cache

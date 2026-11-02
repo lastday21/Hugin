@@ -27,7 +27,7 @@ from hugin.domain.vacancies import (
     VacancyDiscoveryRecord,
     VacancyRecord,
 )
-from hugin.repositories.tasks import FORM_PREFLIGHT_RUNNING
+from hugin.repositories.tasks import FORM_PREFLIGHT_RUNNING, resolve_preparation_incidents
 
 
 def _to_record(model: VacancyModel) -> VacancyRecord:
@@ -277,6 +277,7 @@ class VacancyRepository:
         for task in waiting_tasks:
             task.state = TaskState.SKIPPED
             task.last_error_code = f"VACANCY_{availability.value}"
+            resolve_preparation_incidents(self._session, task.id)
 
     def list_duplicate_candidates(self, vacancy: VacancyRecord) -> list[VacancyRecord]:
         if not vacancy.employer_name:

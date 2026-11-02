@@ -14,6 +14,7 @@ from hugin.database.models import (
     DirectionSearchQueryModel,
 )
 from hugin.domain import (
+    ApplicationEventType,
     AutomationJobKind,
     AutomationJobState,
     SystemState,
@@ -203,8 +204,8 @@ def test_scheduler_processes_the_oldest_due_search_without_direction_starvation(
         database.close()
 
 
-@pytest.mark.parametrize("reason", ["new_day", "changed_query", "page_contract"])
-def test_today_fresh_search_is_due_before_older_depth_continuation(
+@pytest.mark.parametrize("reason", ["new_day", "changed_query", "page_contract", "network_failure"])
+def test_first_fresh_search_precedes_depth_without_starving_continuation(
     settings: Settings, reason: str
 ) -> None:
     account_id, query_id = seed_search_query(settings)
@@ -231,7 +232,9 @@ def test_today_fresh_search_is_due_before_older_depth_continuation(
             assert fresh_model is not None
             fresh_job.last_result = {
                 "continuation": False,
-                "fresh_search_at": (yesterday if reason == "new_day" else now).isoformat(),
+                "fresh_search_at": (
+                    yesterday if reason in {"new_day", "network_failure"} else now
+                ).isoformat(),
                 "fresh_search_configuration": search_configuration_key(fresh_model),
             }
             if reason == "changed_query":
@@ -264,12 +267,24 @@ def test_today_fresh_search_is_due_before_older_depth_continuation(
             assert claimed is not None and claimed.key == fresh_job.key
             previous_fresh = fresh_job.last_result["fresh_search_at"]
             previous_configuration = fresh_job.last_result["fresh_search_configuration"]
-            partial = scheduler.complete(claimed.key, {"continuation": True}, now)
+            if reason == "network_failure":
+                partial = scheduler.fail(
+                    claimed.key,
+                    error_code="HH_NETWORK_TIMEOUT",
+                    error_message="Временный сетевой сбой",
+                    now=now,
+                )
+            else:
+                partial = scheduler.complete(claimed.key, {"continuation": True}, now)
             assert partial.last_result["fresh_search_at"] == previous_fresh
             assert partial.last_result["fresh_search_configuration"] == previous_configuration
             assert ApplicationSelectionGate(session).fresh_search_pending(account_id, now)
 
-            refreshed_at = now + timedelta(seconds=16)
+            refreshed_at = now + timedelta(seconds=61)
+            claimed = scheduler.claim_due(refreshed_at, allowed_kinds=(AutomationJobKind.SEARCH,))
+            assert claimed is not None and claimed.key == deeper_job.key
+            scheduler.complete(claimed.key, {"continuation": True}, refreshed_at)
+            assert ApplicationSelectionGate(session).fresh_search_pending(account_id, refreshed_at)
             claimed = scheduler.claim_due(refreshed_at, allowed_kinds=(AutomationJobKind.SEARCH,))
             assert claimed is not None and claimed.key == fresh_job.key
             finished = scheduler.complete(
@@ -501,6 +516,57 @@ def test_captcha_source_preserves_progress_and_is_scoped_to_account(settings: Se
                 not in next(
                     j for j in scheduler.list_for_account(account_id) if j.key == duplicate.key
                 ).last_result
+            )
+        assert handler._captcha_verification_urls() == ()
+        with database.sessions.begin() as session:
+            tasks = QueueTaskRepository(session)
+            for owner, source in (
+                (account_id, "https://kumertau.hh.ru/vacancy/101?from=search"),
+                (other.id, "https://uchaly.hh.ru/vacancy/102"),
+            ):
+                vacancy = VacancyRepository(session).upsert(
+                    VacancyData(str(owner), "Python", source)
+                )
+                resume = ResumeRepository(session).upsert(owner, str(owner), "Python")
+                application = ApplicationRepository(session).create_apply_intent(
+                    owner, vacancy.id, resume.id
+                )
+                task = tasks.enqueue(application.id, 50, now)
+                tasks.transition(task.id, TaskState.RUNNING)
+                tasks.transition(
+                    task.id,
+                    TaskState.RETRY_SCHEDULED,
+                    scheduled_at=now,
+                    error_code="CAPTCHA_REQUIRED",
+                )
+                if owner == account_id:
+                    own_task = tasks.get(task.id)
+        assert handler._captcha_verification_urls() == ("https://kumertau.hh.ru/account/captcha",)
+        with database.sessions.begin() as session:
+            application_id = own_task.application_id
+            for attempt in (own_task.attempts, own_task.attempts + 1):
+                ApplicationRepository(session).append_event(
+                    application_id,
+                    ApplicationEventType.STATE_CHANGED,
+                    {
+                        "source": "captcha_recovery",
+                        "task_id": own_task.id,
+                        "attempt_number": attempt,
+                        "verification_url": f"https://kumertau.hh.ru/account/captcha?state=attempt{attempt}",
+                    },
+                )
+        assert handler._captcha_verification_urls() == (
+            f"https://kumertau.hh.ru/account/captcha?state=attempt{own_task.attempts}",
+        )
+        with database.sessions.begin() as session:
+            tasks = QueueTaskRepository(session)
+            assert tasks.get(own_task.id) == own_task
+            tasks.transition(own_task.id, TaskState.RUNNING)
+            tasks.transition(
+                own_task.id,
+                TaskState.RETRY_SCHEDULED,
+                scheduled_at=now,
+                error_code="AUTH_REQUIRED",
             )
         assert handler._captcha_verification_urls() == ()
     finally:

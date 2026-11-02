@@ -15,6 +15,10 @@ from hugin.database import postgresql_url, upgrade_database
 def isolated_runtime_data(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     monkeypatch.setenv("HUGIN_DATA_DIR", str(tmp_path / "runtime"))
     monkeypatch.setenv("HUGIN_DATABASE_NAME", f"hugin_test_unconfigured_{uuid4().hex}")
+    # Unrelated queue tests exercise individual jobs; pool tests enable the real thresholds.
+    monkeypatch.setenv("HUGIN_APPLICATION_POOL_TARGET", "0")
+    # A test database must never send requests to the user's real Codex chat.
+    monkeypatch.setenv("HUGIN_CAPTCHA_AGENT_THREAD_ID", "")
     get_settings.cache_clear()
     try:
         yield

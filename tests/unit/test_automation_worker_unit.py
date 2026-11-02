@@ -54,6 +54,10 @@ def make_job(kind: AutomationJobKind = AutomationJobKind.MESSAGES) -> Automation
 
 class FakeSessions:
     @contextmanager
+    def __call__(self) -> Iterator[object]:
+        yield object()
+
+    @contextmanager
     def begin(self) -> Iterator[object]:
         yield object()
 
@@ -370,9 +374,11 @@ def test_worker_returns_false_when_no_job_is_due(
     "system_state",
     [SystemState.AUTH_REQUIRED, SystemState.CAPTCHA_REQUIRED],
 )
+@pytest.mark.parametrize("recovery_only", [False, True])
 def test_worker_retries_authentication_on_a_bounded_interval(
     monkeypatch: pytest.MonkeyPatch,
     system_state: SystemState,
+    recovery_only: bool,
 ) -> None:
     now = datetime(2026, 8, 6, 8, 0, tzinfo=UTC)
     scheduler = FakeScheduler(None)
@@ -389,9 +395,10 @@ def test_worker_retries_authentication_on_a_bounded_interval(
         authentication_recovery_interval_seconds=60,
     )
 
-    assert worker.run_once(now)
-    assert not worker.run_once(now.replace(second=30))
-    assert worker.run_once(now.replace(minute=1))
+    run = worker.recover_authentication if recovery_only else worker.run_once
+    assert run(now)
+    assert not run(now.replace(second=30))
+    assert run(now.replace(minute=1))
 
     assert attempts == [system_state, system_state]
 

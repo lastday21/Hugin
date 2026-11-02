@@ -21,6 +21,7 @@ from hugin.repositories.directions import AccountRepository
 from hugin.repositories.tasks import SystemStateRepository
 from hugin.services.autonomy import AutonomyPolicyService
 from hugin.services.background_processes import PROCESS_KEYS, BackgroundProcessService
+from hugin.services.selection_status import SelectionEvidence, SelectionRows
 from hugin.services.vacancy_analysis import RULES_VERSION
 
 pytestmark = pytest.mark.integration
@@ -99,6 +100,7 @@ def test_start_all_preserves_stopped_state_when_blocked(
     assert state.state == protection
     assert not any(service._configured(key) for key in PROCESS_KEYS)
     assert AutonomyPolicyService(service._session).get() == policy_before
+    assert not service.authentication_recovery_enabled()
 
 
 def test_stop_all_revokes_lease_and_keeps_protection(service: BackgroundProcessService) -> None:
@@ -152,8 +154,13 @@ def test_runtime_stopping_and_interruption(service: BackgroundProcessService) ->
     service.stop_all()
     service.set_enabled("evaluation", True)
     service.started("evaluation")
+    running = cast(dict[str, Any], service.snapshot())["processes"][1]
+    assert running["state"] == "running"
+    assert running["reason"] == "Выполняет текущий ход"
     service.set_enabled("evaluation", False)
-    assert cast(dict[str, Any], service.snapshot())["processes"][1]["state"] == "stopping"
+    stopping = cast(dict[str, Any], service.snapshot())["processes"][1]
+    assert stopping["state"] == "stopping"
+    assert stopping["reason"] == "Завершает текущий ход"
     service.finished("evaluation", worked=True)
     assert cast(dict[str, Any], service.snapshot())["processes"][1]["state"] == "disabled"
     service.set_enabled("evaluation", True)
@@ -210,7 +217,15 @@ def test_rechecks_protection_changed_by_another_session(settings: Settings) -> N
 
 def test_protection_shows_pending_resume_permission_until_explicit_stop(
     service: BackgroundProcessService,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    service.started("applications")
+    service.finished("applications", worked=False)
+
+    def unexpected_waiting_reason(*args: object) -> str:
+        raise AssertionError("Blocked processes must not calculate unused waiting reasons")
+
+    monkeypatch.setattr(service, "_waiting_reason", unexpected_waiting_reason)
     state = service._session.get(SystemStateModel, 1)
     assert state is not None
     state.state = SystemState.AUTH_REQUIRED
@@ -218,10 +233,18 @@ def test_protection_shows_pending_resume_permission_until_explicit_stop(
     service._session.flush()
     item = cast(dict[str, Any], service.snapshot())["processes"][2]
     assert item["enabled"] and item["state"] == "blocked"
+    assert "AUTH_REQUIRED" in item["reason"]
     assert not service.enabled("applications")
+    assert service.authentication_recovery_enabled()
+    state.state = SystemState.ACCOUNT_WARNING
+    service._session.flush()
+    assert not service.authentication_recovery_enabled()
+    state.state = SystemState.AUTH_REQUIRED
     service.set_enabled("applications", False)
     assert state.state == SystemState.AUTH_REQUIRED
     assert state.recovery_state == SystemState.PAUSED
+    service.stop_all()
+    assert not service.authentication_recovery_enabled()
 
 
 def test_funnel_unique_overlap_stale_unknown_and_ready(service: BackgroundProcessService) -> None:
@@ -282,6 +305,7 @@ def test_funnel_existing_exclusions_never_wait_but_keep_uncertain_and_sent_prece
     service: BackgroundProcessService,
     exclusion: str,
     has_details: bool,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from hugin.database.models import ApplicationModel, ApplicationTaskModel
     from hugin.domain.applications import ApplicationState
@@ -315,12 +339,24 @@ def test_funnel_existing_exclusions_never_wait_but_keep_uncertain_and_sent_prece
     )
     session.flush()
 
-    def stage() -> str:
+    selected: list[int] = []
+    semantic_statuses = service.semantic_statuses
+
+    def record_selection(
+        rows: SelectionRows, *, evidence_by_identity: SelectionEvidence | None = None
+    ) -> dict[tuple[int, int], str]:
+        selected[:] = [item.id for _, item, _ in rows]
+        return semantic_statuses(rows, evidence_by_identity=evidence_by_identity)
+
+    monkeypatch.setattr(service, "semantic_statuses", record_selection)
+
+    def stage(*, needs_selection: bool = False) -> str:
         funnel = cast(dict[str, Any], service.snapshot())["funnel"]
         assert funnel["total"] == 1
+        assert selected == ([vacancy.id] if needs_selection else [])
         return next(str(item["key"]) for item in funnel["stages"] if item["count"] == 1)
 
-    assert stage() == (
+    assert stage(needs_selection=exclusion == "duplicate" and has_details) == (
         ("ready" if has_details else "awaiting_details") if exclusion == "duplicate" else "rejected"
     )
     resume = ResumeRepository(session).upsert(service._account_id, "exclusion-resume", "Python")

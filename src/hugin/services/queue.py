@@ -46,6 +46,7 @@ class QueueService:
         cover_letter_quality_version: str | None = None,
         vacancy_rules_version: str | None = None,
         vacancy_rule_categories: frozenset[str] | None = None,
+        expected_task_id: int | None = None,
     ) -> TaskRecord | None:
         selected_at = now or datetime.now(UTC)
         system = self._system.lock()
@@ -66,9 +67,23 @@ class QueueService:
         if direction_id is not None:
             accounts = accounts.where(ApplicationModel.direction_id == direction_id)
         gate = ApplicationSelectionGate(self._session)
+        from hugin.services.application_candidate_pool import ApplicationCandidatePool
+
+        pools = ApplicationCandidatePool(self._session)
+        identities = (
+            (account_id,) if account_id is not None else tuple(self._session.scalars(accounts))
+        )
+        admitted = None
+        if pools.enabled():
+            admitted = {
+                identity: pools.admit(identity, selected_at) or frozenset()
+                for identity in identities
+            }
+        if admitted is not None and not any(admitted.values()):
+            return None
         blocked = frozenset(
             identity
-            for identity in self._session.scalars(accounts)
+            for identity in identities
             if gate.blocking_reason(identity, selected_at, progressive=True) is not None
         )
         return self._tasks.claim_next(
@@ -81,6 +96,9 @@ class QueueService:
             cover_letter_quality_version=cover_letter_quality_version,
             vacancy_rules_version=vacancy_rules_version,
             vacancy_rule_categories=vacancy_rule_categories,
+            allowed_candidates=admitted,
+            rank_before_cover_letter=pools.enabled(),
+            expected_task_id=expected_task_id,
         )
 
     def policy(self, timezone_name: str | None = None) -> ApplicationPolicyRecord:

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from urllib.parse import urlsplit
 
 from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
 from hugin.database.models import (
+    ApplicationEventModel,
     ApplicationModel,
     ApplicationSettingsModel,
     ApplicationTaskModel,
@@ -14,7 +16,9 @@ from hugin.database.models import (
     DirectionSearchQueryModel,
     HhAccountModel,
     SystemStateModel,
+    VacancyModel,
 )
+from hugin.domain.applications import ApplicationEventType
 from hugin.domain.automation import (
     AutomationJobKind,
     AutomationJobRecord,
@@ -208,6 +212,40 @@ class AutomationSchedulerService:
                     if not isinstance(url, str) or not url.strip():
                         raise ValueError("Некорректный адрес проверки hh.ru")
                     urls[url] = None
+        challenge_url = (
+            select(ApplicationEventModel.payload["verification_url"].as_string())
+            .where(
+                ApplicationEventModel.application_id == ApplicationModel.id,
+                ApplicationEventModel.event_type == ApplicationEventType.STATE_CHANGED,
+                ApplicationEventModel.payload["source"].as_string() == "captcha_recovery",
+                ApplicationEventModel.payload["task_id"].as_integer() == ApplicationTaskModel.id,
+                ApplicationEventModel.payload["attempt_number"].as_integer()
+                == ApplicationTaskModel.attempts,
+            )
+            .order_by(ApplicationEventModel.id.desc())
+            .limit(1)
+            .correlate(ApplicationModel, ApplicationTaskModel)
+            .scalar_subquery()
+        )
+        for source_url, saved_challenge in self._session.execute(
+            select(VacancyModel.source_url, challenge_url)
+            .join(ApplicationModel, ApplicationModel.vacancy_id == VacancyModel.id)
+            .join(ApplicationTaskModel, ApplicationTaskModel.application_id == ApplicationModel.id)
+            .where(
+                ApplicationModel.account_id == account_id,
+                ApplicationTaskModel.state == TaskState.RETRY_SCHEDULED,
+                ApplicationTaskModel.last_error_code == "CAPTCHA_REQUIRED",
+            )
+            .order_by(ApplicationTaskModel.id)
+        ):
+            if saved_challenge:
+                urls[saved_challenge] = None
+                continue
+            # A submission can request CAPTCHA while ordinary authenticated pages still open.
+            verification = urlsplit(source_url)._replace(
+                path="/account/captcha", query="", fragment=""
+            )
+            urls[verification.geturl()] = None
         return tuple(urls)
 
     def claim_due(

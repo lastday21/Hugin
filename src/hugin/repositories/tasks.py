@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
+from uuid import uuid4
 
-from sqlalchemy import and_, func, or_, select, update
+from sqlalchemy import and_, false, func, or_, select, text, update
 from sqlalchemy.orm import Session
 
 from hugin.database.models import (
@@ -13,11 +15,16 @@ from hugin.database.models import (
     CareerDirectionModel,
     CoverLetterModel,
     DirectionVacancyModel,
+    IncidentModel,
     SystemStateModel,
     VacancyModel,
 )
 from hugin.domain.applications import ApplicationEventType, ApplicationState, EventPayload
-from hugin.domain.content import CURRENT_COVER_LETTER_INSTRUCTION, CoverLetterState
+from hugin.domain.content import (
+    CURRENT_COVER_LETTER_INSTRUCTION,
+    CoverLetterState,
+    IncidentState,
+)
 from hugin.domain.directions import VacancyState
 from hugin.domain.state_machines import ensure_system_transition, ensure_task_transition
 from hugin.domain.tasks import (
@@ -34,6 +41,7 @@ from hugin.domain.time import as_utc
 from hugin.domain.vacancies import VacancyAvailability
 from hugin.repositories.vacancy_priority import vacancy_ordering
 
+CAPTCHA_AGENT_CHANNEL = "hugin_captcha_required"
 READY_STATES = (TaskState.PENDING, TaskState.RETRY_SCHEDULED)
 ELIGIBILITY_CHECKED_STATES = (
     *READY_STATES,
@@ -145,6 +153,9 @@ class QueueTaskRepository:
         vacancy_rules_version: str | None = None,
         vacancy_rule_categories: frozenset[str] | None = None,
         running_error_code: str | None = None,
+        allowed_candidates: dict[int, frozenset[int]] | None = None,
+        rank_before_cover_letter: bool = False,
+        expected_task_id: int | None = None,
     ) -> TaskRecord | None:
         if require_ready_cover_letter and exclude_ready_cover_letter:
             raise ValueError(
@@ -185,6 +196,19 @@ class QueueTaskRepository:
         )
         if account_id is not None:
             statement = statement.where(ApplicationModel.account_id == account_id)
+        if allowed_candidates is not None:
+            statement = statement.where(
+                or_(
+                    *(
+                        and_(
+                            ApplicationModel.account_id == identity,
+                            ApplicationModel.vacancy_id.in_(ids),
+                        )
+                        for identity, ids in allowed_candidates.items()
+                    ),
+                    false(),
+                )
+            )
         if excluded_account_ids:
             statement = statement.where(ApplicationModel.account_id.not_in(excluded_account_ids))
         if direction_id is not None:
@@ -227,11 +251,16 @@ class QueueTaskRepository:
                     CoverLetterModel.quality_version == cover_letter_quality_version,
                 )
             ready_letter = ready_letter_statement.exists()
-            statement = statement.where(
-                ready_letter if require_ready_cover_letter else ~ready_letter
-            )
+            letter_filter = ready_letter if require_ready_cover_letter else ~ready_letter
+            if rank_before_cover_letter:
+                # Rank the whole admitted queue before considering letter readiness.
+                first_id = self._session.scalar(statement)
+                if first_id is None:
+                    return None
+                statement = statement.where(ApplicationTaskModel.id == first_id)
+            statement = statement.where(letter_filter)
         task_id = self._session.scalar(statement)
-        if task_id is None:
+        if task_id is None or (expected_task_id is not None and task_id != expected_task_id):
             return None
 
         task = self._session.scalar(
@@ -286,6 +315,7 @@ class QueueTaskRepository:
         task_id: int,
         *,
         priority_score: float,
+        scheduled_at: datetime | None = None,
     ) -> TaskRecord:
         task = self._session.get(ApplicationTaskModel, task_id)
         if (
@@ -302,7 +332,7 @@ class QueueTaskRepository:
             raise ValueError("Задание не было остановлено исправленной причиной отбора")
         task.state = TaskState.PENDING
         task.priority_score = priority_score
-        task.scheduled_at = datetime.now(UTC)
+        task.scheduled_at = as_utc(scheduled_at or datetime.now(UTC))
         task.last_error_code = None
         self._session.flush()
         return _task_record(task)
@@ -326,9 +356,10 @@ class QueueTaskRepository:
         *,
         rules_version: str,
         allowed_categories: frozenset[str] | None = None,
+        eligible_states: tuple[VacancyState, ...] = (VacancyState.QUEUED,),
     ) -> int:
         rules_ineligible = [
-            DirectionVacancyModel.state != VacancyState.QUEUED,
+            DirectionVacancyModel.state.not_in(eligible_states),
             DirectionVacancyModel.rules_version != rules_version,
         ]
         if allowed_categories is not None:
@@ -486,8 +517,23 @@ class QueueTaskRepository:
                     payload=payload,
                 )
             )
+        if target in {TaskState.COMPLETED, TaskState.SKIPPED}:
+            resolve_preparation_incidents(self._session, task.id)
         self._session.flush()
         return _task_record(task)
+
+
+def resolve_preparation_incidents(session: Session, task_id: int) -> None:
+    for incident in session.scalars(
+        select(IncidentModel).where(
+            IncidentModel.code == "APPLICATION_RETRY_EXHAUSTED",
+            IncidentModel.scope_type == "application_task",
+            IncidentModel.scope_id == task_id,
+            IncidentModel.state == IncidentState.OPEN,
+        )
+    ):
+        incident.state = IncidentState.RESOLVED
+        incident.resolved_at = datetime.now(UTC)
 
 
 class SystemStateRepository:
@@ -538,8 +584,23 @@ class SystemStateRepository:
             model.recovery_state = model.state
         elif target in {SystemState.RUNNING, SystemState.PAUSED}:
             model.recovery_state = None
+        model.captcha_case_id = str(uuid4()) if target is SystemState.CAPTCHA_REQUIRED else None
         model.state = target
         self._session.flush()
+        if (
+            target is SystemState.CAPTCHA_REQUIRED
+            and model.recovery_state is not SystemState.PAUSED
+        ):
+            # PostgreSQL delivers this only after COMMIT; a rollback cannot wake the agent.
+            self._session.execute(
+                text("SELECT pg_notify(:channel, :payload)"),
+                {
+                    "channel": CAPTCHA_AGENT_CHANNEL,
+                    "payload": json.dumps(
+                        {"state": target.value, "case_id": model.captcha_case_id}
+                    ),
+                },
+            )
         return _system_record(model)
 
     def resume_after_authentication(self) -> SystemStateRecord:
@@ -561,6 +622,7 @@ class SystemStateRepository:
         ensure_system_transition(model.state, target)
         model.state = target
         model.recovery_state = None
+        model.captcha_case_id = None
         self._session.flush()
         return _system_record(model)
 

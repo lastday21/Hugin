@@ -627,8 +627,18 @@ def test_application_process_prepares_queue_only_after_its_switch_is_enabled(
             state.state = SystemState.RUNNING
         assert worker.prepare_queue() == 1
         assert worker.prepare_queue() == 0
+        from hugin.database.models import DirectionVacancyModel
+        from hugin.domain.directions import VacancyState
+
+        with database.sessions.begin() as session:
+            tracked = session.get(DirectionVacancyModel, (direction, vacancy))
+            assert tracked is not None
+            tracked.state = VacancyState.ANALYZED
+        assert worker.prepare_queue() == 0
         with database.sessions() as session:
             assert session.scalar(select(func.count()).select_from(ApplicationModel)) == 1
+            tracked = session.get(DirectionVacancyModel, (direction, vacancy))
+            assert tracked is not None and tracked.state is VacancyState.QUEUED
     finally:
         database.close()
 

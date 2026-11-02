@@ -692,7 +692,7 @@ def test_reanalysis_keeps_archived_root_and_allows_each_active_number(
         database.close()
 
 
-def test_reanalysis_allows_new_number_after_sending_to_archived_family_member(
+def test_reanalysis_keeps_selection_but_reviews_imported_archived_family_send(
     settings: Settings,
 ) -> None:
     upgrade_database(settings)
@@ -767,9 +767,22 @@ def test_reanalysis_allows_new_number_after_sending_to_archived_family_member(
                     include_stretch=False,
                 )
                 .created
-                == 1
+                == 0
             )
             assert session.scalar(select(func.count(ApplicationModel.id))) == 2
+            from hugin.database.models import ApplicationTaskModel
+            from hugin.domain.tasks import TaskState
+
+            task = session.scalar(
+                select(ApplicationTaskModel)
+                .join(ApplicationModel)
+                .where(
+                    ApplicationModel.vacancy_id == duplicate.id,
+                )
+            )
+            assert task is not None
+            assert task.state is TaskState.REVIEW_REQUIRED, task.last_error_code
+            assert task.last_error_code == "REPOST_HISTORY_UNKNOWN"
     finally:
         database.close()
 

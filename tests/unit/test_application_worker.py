@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import json
 import threading
-from collections.abc import Callable
-from contextlib import nullcontext
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager, nullcontext
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -31,6 +32,17 @@ class FakeDatabase:
 
     def close(self) -> None:
         self.closed = True
+
+
+class FakeBackgroundProcesses:
+    enabled_flag: ClassVar[bool] = True
+
+    def __init__(self, _session: object, _account_id: int) -> None:
+        pass
+
+    def enabled(self, key: str) -> bool:
+        assert key == "applications"
+        return self.enabled_flag
 
 
 class FakeApplicationService:
@@ -173,6 +185,7 @@ def prepare_worker(
         "ApplicationAutomationService",
         FakeApplicationService,
     )
+    monkeypatch.setattr(applications, "BackgroundProcessService", FakeBackgroundProcesses)
     return applications.ApplicationWorker(
         Settings(environment="test", data_dir=tmp_path),
         browser_lock=browser_lock,
@@ -184,6 +197,7 @@ def prepare_worker(
 
 
 def setup_function() -> None:
+    FakeBackgroundProcesses.enabled_flag = True
     FakeApplicationService.job = None
     FakeApplicationService.preflight_job = None
     FakeApplicationService.prepared_job = None
@@ -222,9 +236,19 @@ def fake_job(vacancy_id: str = "101") -> ApplyJob:
     )
 
 
+@pytest.mark.parametrize(
+    "status,evidence_fails",
+    [
+        (HhApplyStatus.APPLIED, False),
+        (HhApplyStatus.ACCOUNT_WARNING, False),
+        (HhApplyStatus.ACCOUNT_WARNING, True),
+    ],
+)
 def test_worker_processes_ready_application_and_records_delay(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    status: HhApplyStatus,
+    evidence_fails: bool,
 ) -> None:
     job = cast(
         ApplyJob,
@@ -237,9 +261,19 @@ def test_worker_processes_ready_application_and_records_delay(
 
     def handle(selected: ApplyJob) -> HhApplyResult:
         handled.append(selected)
-        return HhApplyResult(HhApplyStatus.APPLIED, "https://hh.ru/vacancy/101")
+        return HhApplyResult(
+            status,
+            "https://hh.ru/vacancy/101",
+            submission_evidence={
+                "request_started": True,
+                "response_status": 200 if status is HhApplyStatus.APPLIED else 403,
+                "response_text": '{"error":"refused"}',
+            },
+        )
 
     worker = prepare_worker(monkeypatch, tmp_path, job_handler=handle)
+    if evidence_fails:
+        (tmp_path / "evidence").write_text("not a directory", encoding="utf-8")
     now = datetime(2026, 7, 27, 10, 0, tzinfo=UTC)
 
     assert worker.run_once(now)
@@ -247,10 +281,35 @@ def test_worker_processes_ready_application_and_records_delay(
     assert FakeApplicationService.day_starts == [datetime(2026, 7, 26, 19, 0, tzinfo=UTC)]
     assert len(FakeApplicationService.recorded) == 1
     _, result, delay, recorded_at = FakeApplicationService.recorded[0]
-    assert result.status is HhApplyStatus.APPLIED
-    assert delay is not None
-    assert 30 <= delay.total_seconds() <= 60
+    assert result.status is status
+    if status is HhApplyStatus.APPLIED:
+        assert delay is not None
+        assert 30 <= delay.total_seconds() <= 60
+    else:
+        assert delay is None
     assert recorded_at == now
+    events = [
+        json.loads(line)
+        for path in (tmp_path / "logs").glob("*.jsonl")
+        for line in path.read_text(encoding="utf-8").splitlines()
+    ]
+    completed = next(e for e in events if e["event"] == "apply" and e["status"] == "completed")
+    evidence = completed["details"]["submission_evidence"]
+    assert result.submission_evidence is not None
+    assert evidence["request_started"] is True
+    assert evidence["response_status"] == result.submission_evidence["response_status"]
+    assert evidence["response_text"]["characters"] == 19
+    saved_path = tmp_path / f"evidence/applications/{completed['run_id']}-response.json"
+    if status is HhApplyStatus.APPLIED:
+        assert not saved_path.exists()
+    elif evidence_fails:
+        assert completed["details"]["response_evidence_saved"] is False
+        assert any(e["event"] == "evidence.write" and e["status"] == "failed" for e in events)
+    else:
+        assert completed["details"]["response_evidence_saved"] is True
+        saved = json.loads(saved_path.read_text(encoding="utf-8"))
+        assert saved["payload"]["submission_evidence"] == result.submission_evidence
+        assert saved["payload"]["result_status"] == "ACCOUNT_WARNING"
 
 
 def test_worker_does_not_claim_application_while_browser_is_busy(
@@ -510,6 +569,371 @@ def test_automatic_queue_checks_form_before_preparing_letter(
     assert FakeApplicationService.released_preflights == [(preparation_job, now)]
     assert prepared == [preparation_job]
     assert sent == [send_job]
+
+
+@pytest.mark.parametrize("entry", ["ready", "cold"])
+def test_application_overlaps_only_one_ahead_letter(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, entry: str
+) -> None:
+    first = fake_job()
+    second = fake_job("102")
+    cast(SimpleNamespace, second).task.id = 20
+    cast(SimpleNamespace, second).application.id = 21
+    third = fake_job("103")
+    cast(SimpleNamespace, third).task.id = 30
+    cast(SimpleNamespace, third).application.id = 31
+    following = fake_job("104")
+    cast(SimpleNamespace, following).task.id = 40
+    cast(SimpleNamespace, following).application.id = 41
+    FakeApplicationService.job = first if entry == "ready" else None
+    FakeApplicationService.preflight_job = second if entry == "ready" else first
+    started = threading.Event()
+    finish = threading.Event()
+    prepared: list[ApplyJob] = []
+    sent: list[ApplyJob] = []
+    caller = threading.current_thread()
+
+    def preflight(job: ApplyJob) -> HhApplyResult:
+        assert threading.current_thread() is caller
+        if job is first:
+            FakeApplicationService.preflight_job = second
+        return HhApplyResult(HhApplyStatus.MANUAL_REVIEW_REQUIRED, job.vacancy.source_url)
+
+    def prepare_letter(job: ApplyJob) -> int:
+        prepared.append(job)
+        if job is first:
+            assert threading.current_thread() is caller
+            FakeApplicationService.prepared_job = job
+            return 1
+        assert threading.current_thread() is not caller
+        started.set()
+        assert finish.wait(5)
+        FakeApplicationService.prepared_job = job
+        return 1
+
+    def send(job: ApplyJob) -> HhApplyResult:
+        assert started.wait(1)
+        assert not finish.is_set()
+        sent.append(job)
+        return HhApplyResult(HhApplyStatus.APPLIED, job.vacancy.source_url)
+
+    worker = prepare_worker(
+        monkeypatch,
+        tmp_path,
+        job_handler=send,
+        form_preflight_handler=preflight,
+        letter_preparer=prepare_letter,
+    )
+    now = datetime(2026, 7, 27, 10, 0, tzinfo=UTC)
+    try:
+        assert worker.run_once(now)
+        assert sent == [first]
+        assert FakeApplicationService.recorded[0][1].status is HhApplyStatus.APPLIED
+        assert not finish.is_set()
+
+        FakeApplicationService.preflight_job = following
+        assert not worker.run_once(now)
+        assert FakeApplicationService.preflight_job is following
+        FakeApplicationService.job = third
+        assert worker.run_once(now)
+        assert sent == [first, third]
+        assert prepared == ([second] if entry == "ready" else [first, second])
+        assert FakeApplicationService.preflight_job is following
+        assert FakeApplicationService.released_preflights == (
+            [(second, now)] if entry == "ready" else [(first, now), (second, now)]
+        )
+
+        finish.set()
+        thread = worker._letter_thread
+        assert thread is not None
+        thread.join(5)
+        assert not thread.is_alive()
+        assert FakeApplicationService.prepared_job is second
+        assert sent == [first, third]
+    finally:
+        finish.set()
+        worker.stop()
+
+
+@pytest.mark.parametrize("failure_stage", ["preflight", "letter"])
+def test_ahead_preparation_failure_does_not_lose_claimed_application(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, failure_stage: str
+) -> None:
+    first = fake_job()
+    second = fake_job("102")
+    cast(SimpleNamespace, second).task.id = 20
+    cast(SimpleNamespace, second).application.id = 21
+    FakeApplicationService.job = first
+    FakeApplicationService.preflight_job = second
+    attempted = threading.Event()
+
+    def preflight(job: ApplyJob) -> HhApplyResult:
+        if failure_stage == "preflight":
+            attempted.set()
+            raise RuntimeError("Закрыта страница предварительной формы")
+        return HhApplyResult(HhApplyStatus.MANUAL_REVIEW_REQUIRED, job.vacancy.source_url)
+
+    def prepare_letter(_job: ApplyJob) -> int:
+        attempted.set()
+        raise RuntimeError("Модель временно недоступна")
+
+    def send(job: ApplyJob) -> HhApplyResult:
+        assert attempted.wait(1)
+        assert job is first
+        return HhApplyResult(HhApplyStatus.APPLIED, job.vacancy.source_url)
+
+    worker = prepare_worker(
+        monkeypatch,
+        tmp_path,
+        job_handler=send,
+        form_preflight_handler=preflight,
+        letter_preparer=prepare_letter,
+    )
+    now = datetime(2026, 7, 27, 10, 0, tzinfo=UTC)
+    try:
+        assert worker.run_once(now)
+        worker.stop()
+        assert attempted.is_set()
+        assert any(
+            job is first and result.status is HhApplyStatus.APPLIED
+            for job, result, _delay, _when in FakeApplicationService.recorded
+        )
+        if failure_stage == "preflight":
+            assert FakeApplicationService.recorded[0][0] is second
+            assert FakeApplicationService.recorded[0][1].status is HhApplyStatus.RETRYABLE_ERROR
+    finally:
+        worker.stop()
+
+
+@pytest.mark.parametrize("entry", ["ready", "cold"])
+def test_last_daily_slot_does_not_start_ahead_form_or_letter(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, entry: str
+) -> None:
+    first = fake_job()
+    second = fake_job("102")
+    FakeApplicationService.job = first if entry == "ready" else None
+    FakeApplicationService.preflight_job = second if entry == "ready" else first
+    FakeApplicationService.sent_today = FakeApplicationService.daily_limit - 1
+
+    def preflight(job: ApplyJob) -> HhApplyResult:
+        assert job is first
+        FakeApplicationService.preflight_job = second
+        return HhApplyResult(HhApplyStatus.MANUAL_REVIEW_REQUIRED, job.vacancy.source_url)
+
+    def prepare_letter(job: ApplyJob) -> int:
+        assert job is first
+        FakeApplicationService.prepared_job = job
+        return 1
+
+    worker = prepare_worker(
+        monkeypatch,
+        tmp_path,
+        job_handler=lambda job: HhApplyResult(HhApplyStatus.APPLIED, job.vacancy.source_url),
+        form_preflight_handler=preflight,
+        letter_preparer=prepare_letter,
+    )
+
+    assert worker.run_once()
+    assert FakeApplicationService.preflight_job is second
+    assert FakeApplicationService.recorded[0][1].status is HhApplyStatus.APPLIED
+
+
+def test_account_warning_in_ahead_form_revokes_current_submit_guard(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    first = fake_job()
+    first_values = cast(SimpleNamespace, first)
+    first_values.cover_letter_id = 15
+    first_values.cover_letter_sha256 = "a" * 64
+    second = fake_job("102")
+    cast(SimpleNamespace, second).task.id = 20
+    cast(SimpleNamespace, second).application.id = 21
+    FakeApplicationService.job = first
+    FakeApplicationService.preflight_job = second
+    sent: list[ApplyJob] = []
+    original_record = FakeApplicationService.record_result
+
+    def record(
+        service: FakeApplicationService,
+        job: ApplyJob,
+        result: HhApplyResult,
+        *,
+        apply_delay: timedelta | None,
+        now: datetime,
+    ) -> None:
+        original_record(service, job, result, apply_delay=apply_delay, now=now)
+        if result.status is HhApplyStatus.ACCOUNT_WARNING:
+            FakeApplicationService.enabled = False
+
+    def send(job: ApplyJob) -> HhApplyResult:
+        if worker._background_submission_is_allowed(job):
+            sent.append(job)
+            return HhApplyResult(HhApplyStatus.APPLIED, job.vacancy.source_url)
+        return HhApplyResult(HhApplyStatus.RETRYABLE_ERROR, job.vacancy.source_url)
+
+    monkeypatch.setattr(FakeApplicationService, "record_result", record)
+    worker = prepare_worker(
+        monkeypatch,
+        tmp_path,
+        job_handler=send,
+        form_preflight_handler=lambda job: HhApplyResult(
+            HhApplyStatus.ACCOUNT_WARNING, job.vacancy.source_url
+        ),
+        letter_preparer=lambda _job: pytest.fail("Предупреждение запрещает подготовку"),
+    )
+
+    assert worker.run_once()
+    assert sent == []
+    assert FakeApplicationService.recorded[0][0] is second
+    assert FakeApplicationService.recorded[0][1].status is HhApplyStatus.ACCOUNT_WARNING
+    assert FakeApplicationService.recorded[1][0] is first
+    assert FakeApplicationService.recorded[1][1].status is HhApplyStatus.RETRYABLE_ERROR
+
+
+@pytest.mark.parametrize("stopper", ["caller", "preparer"])
+def test_stop_tracks_ahead_letter_and_does_not_join_the_calling_thread(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, stopper: str
+) -> None:
+    first = fake_job()
+    second = fake_job("102")
+    cast(SimpleNamespace, second).task.id = 20
+    cast(SimpleNamespace, second).application.id = 21
+    FakeApplicationService.job = first
+    FakeApplicationService.preflight_job = second
+    started = threading.Event()
+    finish = threading.Event()
+    stop_returned = threading.Event()
+
+    def prepare_letter(_job: ApplyJob) -> int:
+        started.set()
+        if stopper == "preparer":
+            worker.stop(timeout_seconds=0.001)
+            stop_returned.set()
+        else:
+            assert finish.wait(5)
+        return 1
+
+    def send(job: ApplyJob) -> HhApplyResult:
+        assert started.wait(1)
+        if stopper == "preparer":
+            assert stop_returned.wait(1)
+            return HhApplyResult(HhApplyStatus.RETRYABLE_ERROR, job.vacancy.source_url)
+        return HhApplyResult(HhApplyStatus.APPLIED, job.vacancy.source_url)
+
+    worker = prepare_worker(
+        monkeypatch,
+        tmp_path,
+        job_handler=send,
+        form_preflight_handler=lambda job: HhApplyResult(
+            HhApplyStatus.MANUAL_REVIEW_REQUIRED, job.vacancy.source_url
+        ),
+        letter_preparer=prepare_letter,
+    )
+    try:
+        assert worker.run_once()
+        thread = worker._letter_thread
+        assert thread is not None and thread.daemon
+        if stopper == "caller":
+            worker.stop(timeout_seconds=0.001)
+            assert worker.running
+            assert not worker.run_once()
+        else:
+            assert stop_returned.wait(1)
+        finish.set()
+        thread.join(5)
+        assert not worker.running
+    finally:
+        finish.set()
+        worker.stop()
+
+
+@pytest.mark.parametrize("loss", ["stop", "owner", "pause", "process"])
+@pytest.mark.parametrize("boundary", ["next_model", "commit"])
+def test_letter_preparation_rolls_back_if_permission_is_lost(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, loss: str, boundary: str
+) -> None:
+    owned = True
+    committed: list[bool] = []
+    rolled_back: list[bool] = []
+    model_calls: list[str] = []
+
+    class Model:
+        def __init__(self, operation: str) -> None:
+            self.model_name = operation
+
+        def complete(self, _system: str, _prompt: str) -> str:
+            model_calls.append(self.model_name)
+            return "Готово"
+
+    class LetterSession:
+        pending_letter = False
+
+        def scalar(self, _statement: object) -> str:
+            return "Python backend"
+
+    class LetterSessions:
+        @contextmanager
+        def begin(self) -> Iterator[LetterSession]:
+            session = LetterSession()
+            try:
+                yield session
+            except Exception:
+                if session.pending_letter:
+                    rolled_back.append(True)
+                raise
+            else:
+                if session.pending_letter:
+                    committed.append(True)
+
+    class LetterDatabase:
+        sessions = LetterSessions()
+
+        def close(self) -> None:
+            pass
+
+    class LetterService:
+        def __init__(self, session: LetterSession, client: Model, *, quality_model: Model) -> None:
+            self.session = session
+            self.client = client
+            self.quality_model = quality_model
+
+        def prepare(self, **_values: object) -> SimpleNamespace:
+            nonlocal owned
+            self.session.pending_letter = True
+            self.client.complete("", "")
+            if boundary == "commit":
+                self.quality_model.complete("", "")
+            if loss == "stop":
+                worker.request_stop()
+            elif loss == "owner":
+                owned = False
+            elif loss == "pause":
+                FakeApplicationService.enabled = False
+            else:
+                FakeBackgroundProcesses.enabled_flag = False
+            if boundary == "next_model":
+                self.quality_model.complete("", "")
+            return SimpleNamespace(generated=1, reused=0, already_ready=0)
+
+    worker = prepare_worker(monkeypatch, tmp_path, execution_allowed=lambda: owned)
+    monkeypatch.setattr(applications, "create_database", lambda _settings: LetterDatabase())
+    monkeypatch.setattr(
+        applications,
+        "configured_codex_cli_client",
+        lambda _settings, *, operation, timeout_seconds: Model(operation),
+    )
+    monkeypatch.setattr(applications, "CoverLetterService", LetterService)
+
+    with pytest.raises(RuntimeError, match="Процесс остановлен"):
+        worker._prepare_letter(fake_job())
+
+    assert committed == []
+    assert rolled_back == [True]
+    assert model_calls == (
+        ["cover_letter"]
+        if boundary == "next_model"
+        else ["cover_letter", "cover_letter_quality_check"]
+    )
 
 
 def test_form_with_questions_is_recorded_without_model_call(
@@ -1086,6 +1510,7 @@ def test_worker_prepares_one_letter_for_active_direction(
         Settings(environment="test"),
         letter_preparer=lambda _job: 0,
     )
+    monkeypatch.setattr(worker, "_preparation_allowed", lambda: True)
 
     if failed:
         with pytest.raises(RuntimeError, match="Исправление качества не завершилось"):

@@ -4,6 +4,7 @@ import hashlib
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from urllib.parse import parse_qs, urlparse
 
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
@@ -67,6 +68,7 @@ from hugin.services.cover_letter_quality import QUALITY_RUBRIC_VERSION
 from hugin.services.decision_evidence import fingerprint, source_fingerprint
 from hugin.services.incidents import IncidentService
 from hugin.services.queue import QueueService
+from hugin.services.reapplication_policy import ReapplicationDecision, ReapplicationPolicyService
 from hugin.services.screening_evidence import screening_evidence
 from hugin.services.screening_forms import ScreeningDraft, ScreeningDraftService
 from hugin.services.vacancy_analysis import RULES_VERSION, RuleCategory
@@ -189,6 +191,28 @@ class ApplicationAutomationService:
         account = self._accounts.get_by_external_id(account_external_id)
         if account is None:
             raise LookupError("Аккаунт hh.ru не найден в базе")
+        return self._prepare_vacancies(account, vacancy_ids, include_stretch=include_stretch)
+
+    def prepare_vacancies_for_account_id(
+        self,
+        *,
+        account_id: int,
+        vacancy_ids: tuple[int, ...],
+        include_stretch: bool,
+        now: datetime | None = None,
+    ) -> int:
+        return self._prepare_vacancies(
+            self._accounts.get(account_id), vacancy_ids, include_stretch=include_stretch, now=now
+        )
+
+    def _prepare_vacancies(
+        self,
+        account: AccountRecord,
+        vacancy_ids: tuple[int, ...],
+        *,
+        include_stretch: bool,
+        now: datetime | None = None,
+    ) -> int:
         allowed = self._allowed_categories(include_stretch)
         created = 0
         for vacancy_id in dict.fromkeys(vacancy_ids):
@@ -210,14 +234,25 @@ class ApplicationAutomationService:
                     continue
                 candidates.append((direction, resume, tracked))
             candidates.sort(key=self._preparation_order)
-            if not candidates:
+            chosen = next(
+                (
+                    item
+                    for item in candidates
+                    if self._semantic_selection_current(
+                        item[0], self._vacancies.get(vacancy_id), item[1].id
+                    )
+                ),
+                None,
+            )
+            if chosen is None:
                 continue
-            direction, resume, tracked = candidates[0]
+            direction, resume, tracked = chosen
             item_created, _item_existing = self._prepare_tracked(
                 account,
                 direction,
                 resume,
                 tracked,
+                scheduled_at=now,
             )
             created += item_created
         return created
@@ -228,6 +263,8 @@ class ApplicationAutomationService:
         direction: DirectionRecord,
         resume: ResumeRecord,
         tracked: DirectionVacancyRecord,
+        *,
+        scheduled_at: datetime | None = None,
     ) -> tuple[int, int]:
         vacancy = self._vacancies.get(tracked.vacancy_id)
         if not self._semantic_selection_current(direction, vacancy, resume.id):
@@ -242,9 +279,61 @@ class ApplicationAutomationService:
             account.id, vacancy.id, exclude_application_id=current.id if current else None
         ):
             return 0, 1
+        if current is not None and current.state is not ApplicationState.APPLYING:
+            return 0, 1
+        decision = ReapplicationPolicyService(self._session).evaluate(
+            account.id,
+            vacancy,
+            exclude_application_id=current.id if current else None,
+        )
+        if not decision.allowed:
+            if current is None:
+                current = self._applications.create_apply_intent(
+                    account.id,
+                    vacancy.id,
+                    resume.id,
+                    direction.id,
+                )
+            task = self._tasks.get_by_application_id(current.id)
+            if task is None:
+                task = self._tasks.enqueue(current.id, self._priority(tracked), scheduled_at)
+            if task.state is TaskState.RUNNING:
+                return 0, 1
+            if (
+                task.state is TaskState.SKIPPED
+                and task.last_error_code in SELECTION_RECOVERY_ERRORS
+                and current.state is ApplicationState.APPLYING
+            ):
+                task = self._tasks.requeue_after_selection_recovery(
+                    task.id,
+                    priority_score=self._priority(tracked),
+                    scheduled_at=scheduled_at,
+                )
+            self._record_repost_decision(current, decision)
+            if task.state in {
+                TaskState.PENDING,
+                TaskState.RETRY_SCHEDULED,
+                TaskState.REVIEW_REQUIRED,
+                TaskState.INPUT_REQUIRED,
+            }:
+                self._directions.set_vacancy_state(direction.id, vacancy.id, VacancyState.QUEUED)
+            if task.state in {TaskState.PENDING, TaskState.RETRY_SCHEDULED}:
+                self._tasks.transition(task.id, TaskState.REVIEW_REQUIRED, error_code=decision.code)
+            return 0, 1
         priority = self._priority(tracked)
         if current is not None:
             task = self._tasks.get_by_application_id(current.id)
+            if (
+                task is not None
+                and task.state is TaskState.REVIEW_REQUIRED
+                and (task.last_error_code or "").startswith("REPOST_")
+            ):
+                self._tasks.transition(
+                    task.id, TaskState.RETRY_SCHEDULED, scheduled_at=datetime.now(UTC)
+                )
+                self._record_repost_decision(current, decision)
+                self._directions.set_vacancy_state(direction.id, vacancy.id, VacancyState.QUEUED)
+                return 1, 0
             if current.direction_id != direction.id:
                 if not self._can_reassign_routed_application(
                     current,
@@ -253,13 +342,21 @@ class ApplicationAutomationService:
                     tracked.vacancy_id,
                 ):
                     return 0, 1
+                if task is not None and task.state in {
+                    TaskState.PENDING,
+                    TaskState.RETRY_SCHEDULED,
+                }:
+                    task = self._tasks.transition(
+                        task.id, TaskState.SKIPPED, error_code="VACANCY_RULES_CHANGED"
+                    )
                 self._applications.reassign_direction(current.id, direction.id)
                 if task is None:
-                    self._tasks.enqueue(current.id, priority)
+                    self._tasks.enqueue(current.id, priority, scheduled_at)
                 else:
                     self._tasks.requeue_after_selection_recovery(
                         task.id,
                         priority_score=priority,
+                        scheduled_at=scheduled_at,
                     )
                 self._directions.set_vacancy_state(
                     direction.id,
@@ -268,7 +365,7 @@ class ApplicationAutomationService:
                 )
                 return 1, 0
             if task is None and current.state is ApplicationState.APPLYING:
-                self._tasks.enqueue(current.id, priority)
+                self._tasks.enqueue(current.id, priority, scheduled_at)
                 self._directions.set_vacancy_state(
                     direction.id,
                     tracked.vacancy_id,
@@ -290,6 +387,7 @@ class ApplicationAutomationService:
                 self._tasks.requeue_after_selection_recovery(
                     task.id,
                     priority_score=priority,
+                    scheduled_at=scheduled_at,
                 )
                 self._directions.set_vacancy_state(
                     direction.id,
@@ -314,7 +412,7 @@ class ApplicationAutomationService:
             resume.id,
             direction.id,
         )
-        self._tasks.enqueue(application.id, priority)
+        self._tasks.enqueue(application.id, priority, scheduled_at)
         self._directions.set_vacancy_state(
             direction.id,
             tracked.vacancy_id,
@@ -354,17 +452,19 @@ class ApplicationAutomationService:
     ) -> bool:
         if application.state is not ApplicationState.APPLYING:
             return False
-        if task is not None and (
-            not (
+        if task is not None:
+            due_pending = task.state in {TaskState.PENDING, TaskState.RETRY_SCHEDULED} and as_utc(
+                task.scheduled_at
+            ) <= datetime.now(UTC)
+            selection_stopped = (
                 task.state is TaskState.SKIPPED
                 or (
                     task.state is TaskState.REVIEW_REQUIRED
                     and task.last_error_code == "SEMANTIC_SELECTION_STALE"
                 )
-            )
-            or task.last_error_code not in SELECTION_RECOVERY_ERRORS
-        ):
-            return False
+            ) and task.last_error_code in SELECTION_RECOVERY_ERRORS
+            if not due_pending and not selection_stopped:
+                return False
         if application.direction_id is None:
             return False
         try:
@@ -375,8 +475,16 @@ class ApplicationAutomationService:
         except LookupError:
             return False
         source_category = source.rules_details.get("category")
+        source_direction = self._directions.get_for_account(
+            application.account_id, application.direction_id
+        )
+        source_resume = self._resumes.get(application.resume_id)
         return (
-            source.rules_version != RULES_VERSION
+            not source_direction.is_active
+            or not self._semantic_selection_current(
+                source_direction, self._vacancies.get(vacancy_id), source_resume.id
+            )
+            or source.rules_version != RULES_VERSION
             or source_category
             not in {
                 RuleCategory.MATCH.value,
@@ -510,6 +618,8 @@ class ApplicationAutomationService:
         if row is None:
             return False
         letter, resume, application = row
+        if not self._repost_submission_allowed(self._applications.get(application.id), selected_at):
+            return False
         if not self._application_selection_current(application):
             return False
         if self._vacancies.vacancy_has_sent_or_live_application(
@@ -615,6 +725,8 @@ class ApplicationAutomationService:
         if row is None:
             return False
         letter, resume, application = row
+        if not self._repost_submission_allowed(self._applications.get(application.id), selected_at):
+            return False
         if not self._application_selection_current(application):
             return False
         if self._vacancies.vacancy_has_sent_or_live_application(
@@ -777,6 +889,8 @@ class ApplicationAutomationService:
         )
         saved = self._save_attempt(job)
         if saved is None:
+            if (self._tasks.get(job.task.id).last_error_code or "").startswith("REPOST_"):
+                raise RuntimeError("Повторный отклик отложен; причина сохранена в очереди")
             raise RuntimeError("Смысловой отбор устарел; перед откликом нужен новый разбор")
         return saved
 
@@ -976,6 +1090,25 @@ class ApplicationAutomationService:
             selected_at
         ):
             return None
+        from hugin.services.application_candidate_pool import ApplicationCandidatePool
+
+        pools = ApplicationCandidatePool(self._session)
+        admitted = pools.admit(account_id, selected_at)
+        if admitted == frozenset():
+            return None
+        if (
+            system.next_apply_at is not None
+            and as_utc(system.next_apply_at) > selected_at
+            and self.has_pending_application_work(
+                account_id=account_id,
+                include_stretch=include_stretch,
+                require_ready_cover_letter=True,
+                require_cover_letter_quality=require_cover_letter_quality,
+                now=selected_at,
+            )
+        ):
+            # Keep a prepared task available for the end of the sending delay.
+            return None
         instruction_version = cover_letter_instruction_version(
             AiPromptSettingsService(self._session).get().cover_letter
         )
@@ -999,6 +1132,8 @@ class ApplicationAutomationService:
                 else frozenset({RuleCategory.MATCH.value})
             ),
             running_error_code=FORM_PREFLIGHT_RUNNING,
+            allowed_candidates={account_id: admitted} if admitted is not None else None,
+            rank_before_cover_letter=pools.enabled(),
         )
         if task is None:
             return None
@@ -1075,6 +1210,8 @@ class ApplicationAutomationService:
         account_id: int,
         include_stretch: bool = True,
         include_scheduled: bool = False,
+        require_ready_cover_letter: bool = False,
+        require_cover_letter_quality: bool = False,
         now: datetime | None = None,
     ) -> bool:
         selected_at = as_utc(now or datetime.now(UTC))
@@ -1114,6 +1251,31 @@ class ApplicationAutomationService:
         )
         if not include_scheduled:
             statement = statement.where(ApplicationTaskModel.scheduled_at <= selected_at)
+        if require_ready_cover_letter:
+            instruction_version = cover_letter_instruction_version(
+                AiPromptSettingsService(self._session).get().cover_letter
+            )
+            ready_letter = select(CoverLetterModel.id).where(
+                CoverLetterModel.application_id == ApplicationModel.id,
+                CoverLetterModel.resume_id == ApplicationModel.resume_id,
+                CoverLetterModel.vacancy_id == ApplicationModel.vacancy_id,
+                CoverLetterModel.state == CoverLetterState.READY,
+                func.length(func.trim(CoverLetterModel.text)) > 0,
+                CoverLetterModel.instruction_version == instruction_version,
+            )
+            if require_cover_letter_quality:
+                ready_letter = ready_letter.where(
+                    CoverLetterModel.quality_passed.is_(True),
+                    CoverLetterModel.quality_version == QUALITY_RUBRIC_VERSION,
+                )
+            statement = statement.where(
+                ready_letter.exists(),
+                VacancyModel.details_fetched_at.is_not(None),
+                or_(
+                    VacancyModel.published_at.is_(None),
+                    VacancyModel.published_at <= VacancyModel.details_fetched_at,
+                ),
+            )
         return self._session.scalar(statement) is not None
 
     def claim_exact_prepared(
@@ -1184,7 +1346,23 @@ class ApplicationAutomationService:
         )
         if letter is None or not letter.text:
             return None
-        claimed = self._tasks.claim_exact(task.id, selected_at)
+        from hugin.services.application_candidate_pool import ApplicationCandidatePool
+
+        if ApplicationCandidatePool.enabled():
+            claimed = self._queue.claim_next(
+                selected_at,
+                account_id=account_id,
+                expected_task_id=task.id,
+                require_ready_cover_letter=True,
+                cover_letter_instruction_version=instruction_version,
+                cover_letter_quality_version=(
+                    QUALITY_RUBRIC_VERSION if require_cover_letter_quality else None
+                ),
+                vacancy_rules_version=RULES_VERSION,
+                vacancy_rule_categories=frozenset(allowed_categories),
+            )
+        else:
+            claimed = self._tasks.claim_exact(task.id, selected_at)
         if claimed is None:
             return None
         try:
@@ -1356,7 +1534,36 @@ class ApplicationAutomationService:
     def applied_since(self, account_id: int, since: datetime) -> int:
         return self._applications.count_applied_since(account_id, since)
 
-    def resume_after_authentication(self) -> None:
+    def application_captcha_pending(self, account_id: int | None = None) -> bool:
+        statement = (
+            select(ApplicationTaskModel.id)
+            .join(ApplicationModel, ApplicationModel.id == ApplicationTaskModel.application_id)
+            .where(
+                ApplicationTaskModel.state == TaskState.RETRY_SCHEDULED,
+                ApplicationTaskModel.last_error_code == HhApplyStatus.CAPTCHA_REQUIRED.value,
+            )
+        )
+        if account_id is not None:
+            statement = statement.where(ApplicationModel.account_id == account_id)
+        return self._session.scalar(statement.limit(1)) is not None
+
+    def resume_after_authentication(self, *, account_id: int | None = None) -> None:
+        previous = self._system.lock().state
+        if account_id is not None and previous is SystemState.CAPTCHA_REQUIRED:
+            for task in self._session.scalars(
+                select(ApplicationTaskModel)
+                .join(ApplicationModel, ApplicationModel.id == ApplicationTaskModel.application_id)
+                .where(
+                    ApplicationModel.account_id == account_id,
+                    ApplicationTaskModel.state == TaskState.RETRY_SCHEDULED,
+                    ApplicationTaskModel.last_error_code == HhApplyStatus.CAPTCHA_REQUIRED.value,
+                )
+                .with_for_update()
+            ):
+                task.last_error_code = None
+            self._session.flush()
+        if previous is SystemState.CAPTCHA_REQUIRED and self.application_captcha_pending():
+            return
         self._system.resume_after_authentication()
 
     def record_form_preflight(
@@ -1406,6 +1613,82 @@ class ApplicationAutomationService:
         )
         return False
 
+    def recover_preparation_failure(
+        self,
+        *,
+        account_id: int,
+        task_id: int,
+        preflight: HhApplyResult,
+        now: datetime | None = None,
+    ) -> bool:
+        row = self._session.execute(
+            select(ApplicationTaskModel, ApplicationModel, VacancyModel)
+            .join(ApplicationModel, ApplicationModel.id == ApplicationTaskModel.application_id)
+            .join(VacancyModel, VacancyModel.id == ApplicationModel.vacancy_id)
+            .where(ApplicationTaskModel.id == task_id, ApplicationModel.account_id == account_id)
+            .with_for_update(of=ApplicationTaskModel)
+        ).first()
+        if row is None:
+            raise ValueError("Задание этого аккаунта не найдено")
+        task, application, vacancy = row
+        target = urlparse(preflight.final_url)
+        same_vacancy = target.path == f"/vacancy/{vacancy.hh_id}" or (
+            target.path == "/applicant/vacancy_response"
+            and parse_qs(target.query).get("vacancyId") == [vacancy.hh_id]
+        )
+        if preflight.status not in {
+            HhApplyStatus.MANUAL_REVIEW_REQUIRED,
+            HhApplyStatus.QUESTIONS_REQUIRED,
+        } or not (
+            target.scheme == "https"
+            and target.username is None
+            and target.password is None
+            and (target.hostname == "hh.ru" or (target.hostname or "").endswith(".hh.ru"))
+            and same_vacancy
+        ):
+            raise ValueError("Нет подтверждённой проверки формы именно этой вакансии")
+        if (
+            task.state is TaskState.RETRY_SCHEDULED
+            and task.last_error_code == "PREPARATION_RECOVERED"
+        ):
+            return False
+        if (
+            task.state is not TaskState.REVIEW_REQUIRED
+            or task.last_error_code != RETRY_LIMIT_REACHED
+            or application.state is not ApplicationState.APPLYING
+        ):
+            raise ValueError(
+                "Задание не остановлено ошибкой подготовки; неизвестные не повторяются"
+            )
+        selected_at = as_utc(now or datetime.now(UTC))
+        self._tasks.transition(
+            task.id,
+            TaskState.RETRY_SCHEDULED,
+            scheduled_at=selected_at,
+            error_code="PREPARATION_RECOVERED",
+        )
+        self._session.add(
+            ApplicationEventModel(
+                application_id=application.id,
+                event_type=ApplicationEventType.STATE_CHANGED,
+                payload={
+                    "source": "verified_preparation_recovery",
+                    "task_id": task.id,
+                    "task_state": TaskState.RETRY_SCHEDULED.value,
+                    "hh_status": preflight.status.value,
+                    "final_url": preflight.final_url[:1000],
+                    "confirmation": preflight.confirmation[:1000],
+                },
+            )
+        )
+        IncidentService(self._session).resolve(
+            code="APPLICATION_RETRY_EXHAUSTED",
+            scope_type="application_task",
+            scope_id=task.id,
+        )
+        self._session.flush()
+        return True
+
     def record_result(
         self,
         job: ApplyJob,
@@ -1433,6 +1716,10 @@ class ApplicationAutomationService:
             "final_url": result.final_url[:1000],
             "attempt_number": job.task.attempts,
         }
+        if result.submission_evidence is not None:
+            payload["submission_evidence"] = result.submission_evidence
+        if result.reconciliation_error_code is not None:
+            payload["reconciliation_error_code"] = result.reconciliation_error_code
         if result.status in {HhApplyStatus.APPLIED, HhApplyStatus.UNKNOWN_RESULT}:
             payload["selection_snapshot"] = self._selection_snapshot(job)
         if result.status is HhApplyStatus.APPLIED:
@@ -1655,7 +1942,52 @@ class ApplicationAutomationService:
                     account_id=job.application.account_id,
                     run_at=selected_at + timedelta(seconds=30),
                 )
-            return RecordedApplyResult(blocking=False, sent=False)
+            protection = {
+                "AUTH_REQUIRED": SystemState.AUTH_REQUIRED,
+                "CAPTCHA_REQUIRED": SystemState.CAPTCHA_REQUIRED,
+                "ACCOUNT_WARNING": SystemState.ACCOUNT_WARNING,
+            }.get(result.reconciliation_error_code or "")
+            if protection is not None:
+                self._transition_system(protection)
+            retry_at = None
+            if result.reconciliation_error_code and result.retry_after_seconds is not None:
+                retry_at = selected_at + timedelta(seconds=result.retry_after_seconds)
+                self._system.set_next_apply_at(retry_at)
+            recent_unknown = (
+                self._session.scalar(
+                    select(func.count())
+                    .select_from(ApplicationTaskModel)
+                    .join(
+                        ApplicationModel, ApplicationModel.id == ApplicationTaskModel.application_id
+                    )
+                    .where(
+                        ApplicationModel.account_id == job.application.account_id,
+                        ApplicationTaskModel.state == TaskState.UNKNOWN_RESULT,
+                        ApplicationTaskModel.updated_at
+                        >= as_utc(selected_at) - timedelta(minutes=15),
+                    )
+                )
+                or 0
+            )
+            repeated_unknown = recent_unknown >= 2
+            if repeated_unknown:
+                self._transition_system(SystemState.PAUSED)
+                IncidentService(self._session).report(
+                    code="HH_CONFIRMATION_MISSING_REPEATED",
+                    severity=IncidentSeverity.ERROR,
+                    message=(
+                        "Два или более отклика за 15 минут остались без подтверждения hh.ru. "
+                        "Очередь приостановлена для сверки; неизвестные отклики "
+                        "повторно не отправляются."
+                    ),
+                    scope_type="account",
+                    scope_id=job.application.account_id,
+                )
+            return RecordedApplyResult(
+                blocking=protection is not None or retry_at is not None or repeated_unknown,
+                sent=False,
+                next_apply_at=retry_at,
+            )
 
         system_states = {
             HhApplyStatus.AUTH_REQUIRED: SystemState.AUTH_REQUIRED,
@@ -1871,6 +2203,16 @@ class ApplicationAutomationService:
                 job.task.id, TaskState.REVIEW_REQUIRED, error_code="SEMANTIC_SELECTION_STALE"
             )
             return None
+        decision = ReapplicationPolicyService(self._session).evaluate(
+            job.application.account_id,
+            job.vacancy,
+            exclude_application_id=job.application.id,
+            profile=job.profile_snapshot,
+        )
+        self._record_repost_decision(job.application, decision)
+        if not decision.allowed:
+            self._tasks.transition(job.task.id, TaskState.REVIEW_REQUIRED, error_code=decision.code)
+            return None
         snapshot = self._selection_snapshot(job)
         snapshot["screening_forms"] = screening_evidence(self._session, job.application.id)
         snapshot["sha256"] = fingerprint({k: v for k, v in snapshot.items() if k != "sha256"})
@@ -1885,6 +2227,41 @@ class ApplicationAutomationService:
             },
         )
         return job
+
+    def _repost_submission_allowed(self, application: ApplicationRecord, now: datetime) -> bool:
+        decision = ReapplicationPolicyService(self._session).evaluate(
+            application.account_id,
+            self._vacancies.get(application.vacancy_id),
+            exclude_application_id=application.id,
+            now=now,
+            profile=application_profile_snapshot(self._session, application),
+        )
+        self._record_repost_decision(application, decision)
+        return decision.allowed
+
+    def _record_repost_decision(
+        self,
+        application: ApplicationRecord,
+        decision: ReapplicationDecision,
+    ) -> None:
+        if not decision.previous_application_ids:
+            return
+        model = self._session.scalar(
+            select(DirectionVacancyModel).where(
+                DirectionVacancyModel.direction_id == application.direction_id,
+                DirectionVacancyModel.vacancy_id == application.vacancy_id,
+            )
+        )
+        payload = decision.payload()
+        if model is not None:
+            if model.rules_details.get("repeat_policy") == payload:
+                return
+            model.rules_details = {**model.rules_details, "repeat_policy": payload}
+        self._applications.append_event(
+            application.id,
+            ApplicationEventType.APPLY_INTENT,
+            {"source": "reapplication_policy", "decision": payload},
+        )
 
     @staticmethod
     def _selection_snapshot(job: ApplyJob) -> EventPayload:
@@ -1978,6 +2355,17 @@ class ApplicationAutomationService:
             error_code=result.status.value,
             event_payload=payload,
         )
+        if result.status is HhApplyStatus.CAPTCHA_REQUIRED:
+            self._applications.append_event(
+                job.application.id,
+                ApplicationEventType.STATE_CHANGED,
+                {
+                    "source": "captcha_recovery",
+                    "task_id": job.task.id,
+                    "attempt_number": job.task.attempts,
+                    "verification_url": result.captcha_verification_url(),
+                },
+            )
         if (
             result.status is HhApplyStatus.RETRYABLE_ERROR
             and result.retry_after_seconds is not None

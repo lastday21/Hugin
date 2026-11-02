@@ -94,4 +94,5 @@ class SearchCoverage(BaseModel):
     fresh_started_at: datetime | None = None
     depth_variant_index: int = Field(default=0, ge=0)
     fresh_variant_index: int = Field(default=0, ge=0)
+    fresh_pages_since_depth: int = Field(default=0, ge=0)
     variants: list[VariantCoverage]

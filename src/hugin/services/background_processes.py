@@ -4,9 +4,9 @@ from collections import defaultdict
 from datetime import UTC, datetime, timedelta
 from typing import Literal
 
-from sqlalchemy import select
+from sqlalchemy import case, or_, select
 from sqlalchemy.dialects.postgresql import insert
-from sqlalchemy.orm import Session, load_only
+from sqlalchemy.orm import Session
 
 from hugin.database.models import (
     ApplicationModel,
@@ -30,7 +30,12 @@ from hugin.repositories.applications import ApplicationRepository
 from hugin.repositories.tasks import SystemStateRepository
 from hugin.services.application_selection_gate import ApplicationSelectionGate
 from hugin.services.autonomy import AutonomyPolicyService
-from hugin.services.selection_status import SelectionEvidence, SelectionRows
+from hugin.services.selection_status import (
+    SelectionEvidence,
+    SelectionTracking,
+    SelectionVacancy,
+    SemanticSelectionRows,
+)
 from hugin.services.vacancy_analysis import MAX_VACANCY_AGE, RULES_VERSION
 
 ProcessKey = Literal["search", "evaluation", "applications", "synchronization", "replies"]
@@ -105,6 +110,19 @@ class BackgroundProcessService:
 
     def enabled(self, key: ProcessKey) -> bool:
         return self._configured(key) and not self._blocked()
+
+    def authentication_recovery_enabled(self) -> bool:
+        state = SystemStateRepository(self._session)
+        return (
+            state.get().state in {SystemState.AUTH_REQUIRED, SystemState.CAPTCHA_REQUIRED}
+            and not state.supervised_lease_active()
+            and bool(
+                self._session.scalar(
+                    select(HhAccountModel.is_active).where(HhAccountModel.id == self._account_id)
+                )
+            )
+            and any(self._configured(key) for key in PROCESS_KEYS if key != "evaluation")
+        )
 
     def set_enabled(self, key: ProcessKey, enabled: bool) -> None:
         if key not in PROCESS_KEYS:
@@ -277,10 +295,13 @@ class BackgroundProcessService:
                     datetime.now(UTC) - as_utc(runtime.heartbeat_at) > STALE_AFTER
                 )
                 state = "interrupted" if stale else ("running" if enabled else "stopping")
-                reason = "Исполнитель не подтвердил работу" if stale else "Завершает текущий ход"
+                if stale:
+                    reason = "Исполнитель не подтвердил работу"
+                else:
+                    reason = "Выполняет текущий ход" if enabled else "Завершает текущий ход"
             elif enabled and runtime and runtime.reason:
                 state, reason = runtime.state, runtime.reason
-            if enabled and state == "waiting":
+            if enabled and state == "waiting" and not blocked:
                 if runtime is None or runtime.last_started_at is None:
                     reason = "Ожидает первого хода исполнителя"
                 elif reason in {"", "Ожидает данных или срока", "Ход завершён"}:
@@ -450,22 +471,31 @@ class BackgroundProcessService:
         return prefix + f"{label}: {self._local_time(next_run, settings)}"
 
     def _funnel(self) -> dict[str, object]:
+        oldest_publication = datetime.now(UTC) - MAX_VACANCY_AGE
+        current_evidence = (
+            (DirectionVacancyModel.rules_version == RULES_VERSION)
+            & (VacancyModel.availability == VacancyAvailability.ACTIVE)
+            & VacancyModel.details_fetched_at.is_not(None)
+            & or_(
+                VacancyModel.published_at.is_(None), VacancyModel.published_at >= oldest_publication
+            )
+        )
         records = self._session.execute(
             select(
-                DirectionVacancyModel,
-                VacancyModel,
-                CareerDirectionModel,
-                DirectionVacancyModel.rules_details["category"],
-                DirectionVacancyModel.rules_details["semantic_selection"]["key"],
-                DirectionVacancyModel.rules_details["manual_override"],
-            )
-            .options(
-                load_only(DirectionVacancyModel.rules_version),
-                load_only(
-                    VacancyModel.availability,
-                    VacancyModel.published_at,
-                    VacancyModel.details_fetched_at,
+                DirectionVacancyModel.direction_id,
+                DirectionVacancyModel.vacancy_id,
+                DirectionVacancyModel.rules_version,
+                VacancyModel.availability,
+                VacancyModel.published_at,
+                VacancyModel.details_fetched_at,
+                case((current_evidence, DirectionVacancyModel.rules_details["category"])),
+                case(
+                    (
+                        current_evidence,
+                        DirectionVacancyModel.rules_details["semantic_selection"]["key"],
+                    )
                 ),
+                case((current_evidence, DirectionVacancyModel.rules_details["manual_override"])),
             )
             .join(VacancyModel, VacancyModel.id == DirectionVacancyModel.vacancy_id)
             .join(
@@ -476,15 +506,40 @@ class BackgroundProcessService:
                 CareerDirectionModel.is_active.is_(True),
             )
         ).all()
-        rows = [(tracked, vacancy, direction) for tracked, vacancy, direction, *_ in records]
-        evidence: SelectionEvidence = {
-            (direction.id, vacancy.id): {
-                "category": category,
-                "semantic_selection": {"key": key},
-                "manual_override": override,
+        direction_ids = {record.direction_id for record in records}
+        directions = (
+            {
+                direction.id: direction
+                for direction in self._session.scalars(
+                    select(CareerDirectionModel).where(CareerDirectionModel.id.in_(direction_ids))
+                )
             }
-            for tracked, vacancy, direction, category, key, override in records
+            if direction_ids
+            else {}
+        )
+        evidence: SelectionEvidence = {
+            (record.direction_id, record.vacancy_id): {
+                "category": record[6],
+                "semantic_selection": {"key": record[7]},
+                "manual_override": record[8],
+            }
+            for record in records
         }
+        rows = [
+            (
+                SelectionTracking(
+                    record.rules_version, evidence[(record.direction_id, record.vacancy_id)]
+                ),
+                SelectionVacancy(
+                    record.vacancy_id,
+                    record.availability,
+                    record.published_at,
+                    record.details_fetched_at,
+                ),
+                directions[record.direction_id],
+            )
+            for record in records
+        ]
         grouped = defaultdict(list)
         for tracked, vacancy, direction in rows:
             grouped[vacancy.id].append((tracked, vacancy, direction))
@@ -517,7 +572,16 @@ class BackgroundProcessService:
                 TaskState.INPUT_REQUIRED,
             }:
                 uncertain.add(vacancy_id)
-        semantic = self.semantic_statuses(rows, evidence_by_identity=evidence)
+        selection_rows = [
+            (tracked, vacancy, direction)
+            for tracked, vacancy, direction in rows
+            if vacancy.id not in sent
+            and vacancy.id not in uncertain
+            and vacancy.availability == VacancyAvailability.ACTIVE
+            and vacancy.details_fetched_at is not None
+            and (vacancy.published_at is None or as_utc(vacancy.published_at) >= oldest_publication)
+        ]
+        semantic = self.semantic_statuses(selection_rows, evidence_by_identity=evidence)
         labels = {
             "sent": "Отправлены",
             "unavailable": "Недоступны",
@@ -528,7 +592,6 @@ class BackgroundProcessService:
             "rejected": "Отсеяны",
         }
         counts = dict.fromkeys(labels, 0)
-        oldest_publication = datetime.now(UTC) - MAX_VACANCY_AGE
         for vacancy_id, links in grouped.items():
             vacancy = links[0][1]
             if vacancy_id in sent:
@@ -580,7 +643,7 @@ class BackgroundProcessService:
 
     def semantic_statuses(
         self,
-        rows: SelectionRows,
+        rows: SemanticSelectionRows,
         *,
         evidence_by_identity: SelectionEvidence | None = None,
     ) -> dict[tuple[int, int], str]:

@@ -11,7 +11,7 @@ from hugin.domain.automation import AutomationJobResult
 from hugin.domain.hh_sync import HhSyncBlockedError, HhSyncRetryableError
 from hugin.domain.search_coverage import PageCheckpoint, SearchCoverage, VariantCoverage
 from hugin.domain.search_progress import fresh_search_today, search_time
-from hugin.domain.time import as_utc, day_start_utc
+from hugin.domain.time import as_utc
 from hugin.domain.vacancies import VacancyAvailability, VacancyData, VacancyUnavailableError
 from hugin.repositories.directions import DirectionRepository
 from hugin.repositories.vacancies import VacancyRepository
@@ -71,6 +71,8 @@ class PeriodSearchCycle(BackgroundSearchCycle):
             "queued": 0,
             "coverage_page_limit": None,
         }
+        result.pop("deferred", None)
+        result.pop("reason", None)
         if not allowed():
             return {**result, "reason": "Поиск остановлен"}
         now = datetime.now(UTC)
@@ -90,8 +92,6 @@ class PeriodSearchCycle(BackgroundSearchCycle):
                     "evaluation"
                 )
                 pending = gate.pending_details(account_id, now) if running_pipeline else {}
-                blocking = gate.blocking_reason(account_id, now) if running_pipeline else None
-                fresh_pending = gate.fresh_search_pending(account_id, now)
         finally:
             database.close()
         raw = previous.get("search_coverage")
@@ -126,7 +126,7 @@ class PeriodSearchCycle(BackgroundSearchCycle):
             or now - completed_fresh >= interval
         )
         started = coverage.fresh_started_at
-        if fresh_due and (started is None or as_utc(started) < day_start_utc(timezone_name, now)):
+        if fresh_due and started is None:
             if coverage.completed_at is not None:
                 coverage.boundary = max(
                     now - MAX_VACANCY_AGE, as_utc(coverage.started_at) - timedelta(days=1)
@@ -148,18 +148,34 @@ class PeriodSearchCycle(BackgroundSearchCycle):
                 variant.new_head_id = None
                 variant.new_head_at = None
             result.update(variant_index=0, next_step="search")
-        fresh = coverage.fresh_started_at is not None
-        if not fresh and running_pipeline:
-            if pending and direction_id not in pending:
-                return {**result, "reason": "Ожидает загрузки свежих вакансий других направлений"}
-            if not pending and blocking and not fresh_pending:
-                return {
-                    **result,
-                    "reason": "Ожидает оценки свежих вакансий перед продолжением поиска",
-                }
+        # An interrupted fresh sweep survives midnight. Give depth a turn after
+        # one region rotation even if new publications keep the sweep open.
+        fresh = coverage.fresh_started_at is not None and (
+            all(v.depth.complete for v in coverage.variants)
+            or coverage.fresh_pages_since_depth < len(tasks)
+        )
+        depth_due = previous.get("depth_waited_for_details") is True and any(
+            not v.depth.complete for v in coverage.variants
+        )
+        if (
+            not fresh
+            and not depth_due
+            and running_pipeline
+            and pending
+            and direction_id not in pending
+        ):
+            return {
+                **result,
+                "depth_waited_for_details": True,
+                "reason": "Ожидает загрузки свежих вакансий других направлений",
+            }
         if browser.read_profile().external_id != external_id:
             raise RuntimeError("Аккаунт в браузере выбран неверно")
-        if not fresh and (pending or result.get("next_step") in {"details", "backlog"}):
+        if (
+            not fresh
+            and not depth_due
+            and (pending or result.get("next_step") in {"details", "backlog"})
+        ):
             loaded, failed, before, had_pending = self._load_details(
                 direction_id,
                 browser,
@@ -176,6 +192,8 @@ class PeriodSearchCycle(BackgroundSearchCycle):
                 search_coverage=coverage.model_dump_json(),
             )
             if had_pending:
+                # Continuous arrivals must not keep depth behind the detail queue forever.
+                result["depth_waited_for_details"] = True
                 return result
         start = (coverage.fresh_variant_index if fresh else coverage.depth_variant_index) % len(
             tasks
@@ -246,7 +264,12 @@ class PeriodSearchCycle(BackgroundSearchCycle):
         ordered = task.filters.get("order_by") == "publication_time"
         if fresh:
             if page == 0 and found.vacancies:
-                head = found.vacancies[0]
+                head = max(
+                    found.vacancies,
+                    key=lambda vacancy: as_utc(
+                        vacancy.published_at or datetime.min.replace(tzinfo=UTC)
+                    ),
+                )
                 variant.new_head_id = head.hh_id
                 variant.new_head_at = as_utc(head.published_at) if head.published_at else None
             if variant.head_id is None:
@@ -264,13 +287,16 @@ class PeriodSearchCycle(BackgroundSearchCycle):
                 coverage.fresh_started_at = None
         else:
             cursor.observe(found.vacancies, coverage.boundary, ordered=ordered)
+            result.pop("depth_waited_for_details", None)
         finished = all(v.depth.complete for v in coverage.variants)
         if finished and coverage.completed_at is None:
             coverage.completed_at = now
         next_variant = (chosen + 1) % len(tasks)
         if fresh:
+            coverage.fresh_pages_since_depth += 1
             coverage.fresh_variant_index = next_variant
         else:
+            coverage.fresh_pages_since_depth = 0
             coverage.depth_variant_index = next_variant
         result.update(
             pages_loaded=1,

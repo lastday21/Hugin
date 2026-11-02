@@ -3,8 +3,8 @@ from __future__ import annotations
 from copy import deepcopy
 from datetime import datetime
 
-from sqlalchemy import and_, func, or_, select
-from sqlalchemy.orm import Session
+from sqlalchemy import and_, case, func, or_, select
+from sqlalchemy.orm import Session, aliased
 
 from hugin.database.models import (
     ApplicationEventModel,
@@ -165,6 +165,24 @@ class ApplicationRepository:
         return _application_record(model)
 
     def count_applied_since(self, account_id: int, since: datetime) -> int:
+        unknown = aliased(ApplicationEventModel)
+        attempted_at = (
+            select(func.max(unknown.created_at))
+            .where(
+                unknown.application_id == ApplicationEventModel.application_id,
+                unknown.event_type == ApplicationEventType.UNKNOWN_RESULT,
+                unknown.created_at <= ApplicationEventModel.created_at,
+            )
+            .correlate(ApplicationEventModel)
+            .scalar_subquery()
+        )
+        budget_at = case(
+            (
+                ApplicationEventModel.payload["source"].as_string() == "hugin_reconciliation",
+                func.coalesce(attempted_at, ApplicationEventModel.created_at),
+            ),
+            else_=ApplicationEventModel.created_at,
+        )
         return (
             self._session.scalar(
                 select(func.count(func.distinct(ApplicationEventModel.application_id)))
@@ -176,7 +194,9 @@ class ApplicationRepository:
                 )
                 .where(
                     ApplicationModel.account_id == account_id,
+                    # Reconciliation can move the budget date only backwards.
                     ApplicationEventModel.created_at >= since,
+                    budget_at >= since,
                     or_(
                         and_(
                             ApplicationEventModel.event_type == ApplicationEventType.APPLIED,

@@ -30,6 +30,8 @@ class BackgroundProcessWorker:
         heartbeat_seconds: float = 5,
         journal: OperationJournal | None = None,
         cancel: Callable[[], None] | None = None,
+        resume: Callable[[], bool] | None = None,
+        authentication_recovery: Callable[[], bool] | None = None,
         parallel: bool = False,
     ) -> None:
         if account_id < 1 or poll_seconds <= 0 or heartbeat_seconds <= 0:
@@ -41,11 +43,16 @@ class BackgroundProcessWorker:
         self._heartbeat_seconds = heartbeat_seconds
         self._journal = journal or OperationJournal(settings.data_dir)
         self._cancel = cancel
+        self._resume = resume
+        self._authentication_recovery = authentication_recovery
         self._parallel = parallel
         self._ownership: tuple[int, datetime] | None = None
         self._position = 0
         self._initialized = False
+        self._applications_idle = False
         self._stop = threading.Event()
+        self._revoked = threading.Event()
+        self._ownership_lock = threading.Lock()
         self._thread: threading.Thread | None = None
 
     @property
@@ -57,6 +64,7 @@ class BackgroundProcessWorker:
             return
         upgrade_database(self._settings)
         self._stop.clear()
+        self._revoked.clear()
         self._thread = threading.Thread(
             target=self._run_parallel if self._parallel else self._run,
             name="hugin-background-processes",
@@ -66,6 +74,7 @@ class BackgroundProcessWorker:
 
     def stop(self, timeout_seconds: float = 10) -> None:
         self._stop.set()
+        self._revoked.set()
         if self._cancel is not None:
             self._cancel()
         if self._thread is not None:
@@ -101,6 +110,7 @@ class BackgroundProcessWorker:
                         with database.sessions.begin() as session:
                             ApplicationAutomationService(session).recover_interrupted()
                         self._initialized = True
+                    recovered = self._recover_authentication()
                     for _ in PROCESS_KEYS:
                         key = PROCESS_KEYS[self._position]
                         self._position = (self._position + 1) % len(PROCESS_KEYS)
@@ -120,28 +130,20 @@ class BackgroundProcessWorker:
                             gate = ApplicationSelectionGate(session)
                             if (
                                 key in {"search", "evaluation"}
+                                and not self._applications_idle
                                 and "applications" in self._steps
                                 and service.enabled("applications")
-                                and not gate.fresh_search_pending(self._account_id)
-                                and gate.blocking_reason(self._account_id) is None
+                                and gate.blocking_reason(self._account_id, progressive=True) is None
                                 and ApplicationAutomationService(
                                     session
                                 ).has_application_work_before_search(self._account_id)
                             ):
                                 continue
                             if (
-                                key in {"evaluation", "applications"}
-                                and "search" in self._steps
-                                and service.enabled("search")
-                                and gate.fresh_search_pending(self._account_id, due_only=True)
-                            ):
-                                continue
-                            if (
                                 key == "applications"
                                 and "evaluation" in self._steps
                                 and service.enabled("evaluation")
-                                and not gate.fresh_search_pending(self._account_id)
-                                and gate.blocking_reason(self._account_id)
+                                and gate.blocking_reason(self._account_id, progressive=True)
                             ):
                                 continue
                             if (
@@ -158,7 +160,7 @@ class BackgroundProcessWorker:
                             service.started(key)
                         self._execute(key, token)
                         return True
-                    return False
+                    return recovered
                 finally:
                     ownership.execute(
                         text("SELECT pg_advisory_unlock(684721, :account)"),
@@ -166,6 +168,19 @@ class BackgroundProcessWorker:
                     )
         finally:
             database.close()
+
+    def _recover_authentication(self) -> bool:
+        if self._authentication_recovery is None or not self.has_ownership():
+            return False
+        database = create_database(self._settings)
+        try:
+            with database.sessions() as session:
+                allowed = BackgroundProcessService(
+                    session, self._account_id
+                ).authentication_recovery_enabled()
+        finally:
+            database.close()
+        return allowed and self._authentication_recovery()
 
     def _recover_processes(self, session: Session) -> list[str]:
         rows = list(
@@ -205,6 +220,8 @@ class BackgroundProcessWorker:
                 BackgroundProcessService(session, self._account_id).failed(key, str(error))
             run.fail(error)
         else:
+            if key == "applications":
+                self._applications_idle = not worked
             with database.sessions.begin() as session:
                 BackgroundProcessService(session, self._account_id).finished(key, worked)
             run.succeed(worked=worked)
@@ -236,6 +253,22 @@ class BackgroundProcessWorker:
             self._stop.wait(self._poll_seconds)
 
     def _run_parallel(self) -> None:
+        recovering = False
+        while not self._stop.is_set():
+            try:
+                # Старые ходы уже завершены; подготовка следующего письма также
+                # должна закончиться до восстановления прерванных заданий.
+                if recovering and self._resume is not None and not self._resume():
+                    self._stop.wait(self._poll_seconds)
+                    continue
+                self._revoked.clear()
+                self._run_owned_lanes()
+            except Exception as error:
+                self._journal.record("processes", "worker", status="failed", error=str(error))
+            recovering = True
+            self._stop.wait(self._poll_seconds)
+
+    def _run_owned_lanes(self) -> None:
         database = create_database(self._settings)
         try:
             with database.engine.connect().execution_options(
@@ -283,15 +316,11 @@ class BackgroundProcessWorker:
                         lanes.append(lane)
                         lane.start()
                     while any(lane.is_alive() for lane in lanes):
-                        if not self._stop.wait(self._heartbeat_seconds):
-                            ownership.execute(text("SELECT 1"))
-                        else:
-                            for lane in lanes:
-                                lane.join()
+                        if self._revoked.wait(self._heartbeat_seconds) or self._stop.is_set():
+                            break
+                        ownership.execute(text("SELECT 1"))
                 finally:
-                    self._stop.set()
-                    if self._cancel is not None:
-                        self._cancel()
+                    self._revoke_ownership()
                     for lane in lanes:
                         lane.join()
                     self._ownership = None
@@ -300,17 +329,25 @@ class BackgroundProcessWorker:
                             text("SELECT pg_advisory_unlock(684721, :account)"),
                             {"account": self._account_id},
                         )
-        except Exception as error:
-            self._journal.record("processes", "worker", status="failed", error=str(error))
         finally:
             database.close()
 
     def _run_lane(self, keys: tuple[ProcessKey, ...]) -> None:
         database = create_database(self._settings)
         try:
-            while not self._stop.is_set():
+            while not self._stop.is_set() and not self._revoked.is_set():
+                if keys[0] == "search":
+                    try:
+                        self._recover_authentication()
+                    except Exception as error:
+                        self._journal.record(
+                            "processes",
+                            "authentication.recovery",
+                            status="failed",
+                            error=str(error),
+                        )
                 for key in keys:
-                    if self._stop.is_set() or key not in self._steps:
+                    if self._stop.is_set() or self._revoked.is_set() or key not in self._steps:
                         continue
                     try:
                         if not self.has_ownership():
@@ -330,12 +367,12 @@ class BackgroundProcessWorker:
                         self._execute(key, token)
                     except Exception as error:
                         self._journal.record("processes", key, status="failed", error=str(error))
-                self._stop.wait(self._poll_seconds)
+                self._revoked.wait(self._poll_seconds)
         finally:
             database.close()
 
     def has_ownership(self) -> bool:
-        if self._stop.is_set():
+        if self._stop.is_set() or self._revoked.is_set():
             return False
         if not self._parallel:
             return True
@@ -343,6 +380,7 @@ class BackgroundProcessWorker:
         if identity is None:
             return False
         database = create_database(self._settings)
+        error_message: str | None = None
         try:
             with database.engine.connect() as connection:
                 owned = bool(
@@ -358,19 +396,33 @@ class BackgroundProcessWorker:
                         {"account": self._account_id, "pid": identity[0], "started": identity[1]},
                     )
                 )
-        except Exception:
+        except Exception as error:
+            error_message = str(error)
             owned = False
         finally:
             database.close()
         if not owned:
-            self._stop.set()
-            if self._cancel is not None:
-                self._cancel()
+            self._revoke_ownership(reason="EXECUTOR_OWNERSHIP_LOST", error=error_message)
+        return (
+            owned
+            and identity == self._ownership
+            and not self._stop.is_set()
+            and not self._revoked.is_set()
+        )
+
+    def _revoke_ownership(self, *, reason: str | None = None, error: str | None = None) -> None:
+        with self._ownership_lock:
+            if self._revoked.is_set():
+                return
+            self._revoked.set()
+        if self._cancel is not None:
+            self._cancel()
+        if reason is not None:
             self._journal.record(
                 "processes",
                 "ownership",
                 status="failed",
                 account_id=self._account_id,
-                reason="EXECUTOR_OWNERSHIP_LOST",
+                reason=reason,
+                error=error,
             )
-        return owned and not self._stop.is_set()
