@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from uuid import UUID
+
 import pytest
 from sqlalchemy import inspect, select, text
 
@@ -45,7 +47,7 @@ def test_migration_reaches_baseline(settings: Settings) -> None:
         database.close()
 
     upgrade_database(settings)
-    assert current_revision(settings) == "0033_background_processes"
+    assert current_revision(settings) == "0036_message_lifecycle"
     check_database_schema(settings)
 
     downgrade_database(settings)
@@ -61,7 +63,7 @@ def test_database_cli_manages_schema(
 
     assert cli.main(["upgrade"]) == 0
     assert cli.main(["current"]) == 0
-    assert capsys.readouterr().out.strip() == "0033_background_processes"
+    assert capsys.readouterr().out.strip() == "0036_message_lifecycle"
     assert cli.main(["check"]) == 0
     assert cli.main(["downgrade"]) == 0
 
@@ -86,12 +88,15 @@ def test_recovery_state_migration_keeps_legacy_authentication_pause(
     migrated = create_database(settings)
     try:
         with migrated.engine.connect() as connection:
-            state, recovery_state = connection.execute(
-                text("SELECT state, recovery_state FROM system_state WHERE id = 1")
+            state, recovery_state, case_id = connection.execute(
+                text("SELECT state, recovery_state, captcha_case_id FROM system_state WHERE id = 1")
             ).one()
 
         assert state == legacy_state
         assert recovery_state == "PAUSED"
+        assert (case_id is not None) == (legacy_state == "CAPTCHA_REQUIRED")
+        if case_id is not None:
+            assert str(UUID(case_id)) == case_id
     finally:
         migrated.close()
 
@@ -296,6 +301,6 @@ def test_direction_migration_preserves_existing_application(settings: Settings) 
             ).one()
 
         assert row == ("Imported data", "legacy-resume", "APPLYING")
-        assert current_revision(settings) == "0033_background_processes"
+        assert current_revision(settings) == "0036_message_lifecycle"
     finally:
         migrated.close()

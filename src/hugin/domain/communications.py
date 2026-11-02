@@ -53,6 +53,8 @@ class RecruiterMessageRecord:
     auto_send_approved: bool
     reply_template_key: str | None
     created_at: datetime
+    reply_to_message_id: int | None = None
+    superseded_by_id: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,6 +124,12 @@ class CommunicationNotFoundError(LookupError):
 
 class CommunicationStateError(ValueError):
     pass
+
+
+class SyncedMessageConflictError(CommunicationStateError):
+    def __init__(self, message_id: int) -> None:
+        super().__init__("Идентификатор сообщения hh.ru уже связан с другим содержимым")  # noqa: RUF001
+        self.message_id = message_id
 
 
 class StaleMessageDraftError(ValueError):

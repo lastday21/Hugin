@@ -76,6 +76,7 @@ class RecruiterMessageState(StrEnum):
     SENT = "SENT"
     FAILED = "FAILED"
     UNKNOWN_RESULT = "UNKNOWN_RESULT"
+    CANCELLED = "CANCELLED"
 
 
 class RecruiterActionKind(StrEnum):

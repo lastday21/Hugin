@@ -636,6 +636,7 @@ class SystemStateModel(Base):
     )
 
     id: Mapped[int] = mapped_column(primary_key=True, default=1)
+    captcha_case_id: Mapped[str | None] = mapped_column(String(36))
     state: Mapped[SystemState] = mapped_column(
         Enum(
             SystemState,
@@ -664,6 +665,18 @@ class SystemStateModel(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
     )
+
+
+class ApplicationCandidatePoolModel(Base):
+    __tablename__ = "application_candidate_pools"
+
+    account_id: Mapped[int] = mapped_column(
+        ForeignKey("hh_accounts.id", ondelete="CASCADE"), primary_key=True
+    )
+    day_started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), primary_key=True)
+    configuration_key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    vacancy_ids: Mapped[list[int]] = mapped_column(JSONB, nullable=False)
+    opened_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
 class BackgroundProcessRunModel(Base):
@@ -1144,6 +1157,12 @@ class RecruiterMessageModel(Base):
         ForeignKey("applications.id", ondelete="CASCADE"), nullable=False, index=True
     )
     hh_id: Mapped[str | None] = mapped_column(String(128))
+    reply_to_message_id: Mapped[int | None] = mapped_column(
+        ForeignKey("recruiter_messages.id", ondelete="SET NULL")
+    )
+    superseded_by_id: Mapped[int | None] = mapped_column(
+        ForeignKey("recruiter_messages.id", ondelete="SET NULL")
+    )
     direction: Mapped[MessageDirection] = mapped_column(
         Enum(
             MessageDirection,
