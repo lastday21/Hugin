@@ -261,7 +261,18 @@ def test_separate_words_for_salary_use_existing_salary_fact() -> None:
     )
 
 
-@pytest.mark.parametrize("field_type", ["radio", "select"])
+@pytest.mark.parametrize(
+    "question",
+    [
+        "Укажите ваше имя и номер телефона?",
+        "Какие зарплатные ожидания и когда готовы приступить?",
+    ],
+)
+def test_one_profile_fact_cannot_cover_different_subjects(question: str) -> None:
+    assert ScreeningDraftService._profile_category(question) is None
+
+
+@pytest.mark.parametrize("field_type", ["radio", "select", "checkbox_group"])
 @pytest.mark.parametrize(
     "question",
     [
@@ -305,8 +316,16 @@ def test_test_experience_choice_is_not_a_test_assignment() -> None:
 pytestmark = pytest.mark.integration
 
 
+@pytest.mark.parametrize(
+    "citizenship_question",
+    [
+        "Гражданство РФ? Подходит ли вам оформление по ТК РФ?",
+        "Гражданство РФ и готовность к оформлению по ТК РФ?",
+    ],
+)
 def test_draft_uses_only_confirmed_safe_answers_and_replaces_changed_form(
     settings: Settings,
+    citizenship_question: str,
 ) -> None:
     upgrade_database(settings)
     database = create_database(settings)
@@ -361,7 +380,23 @@ def test_draft_uses_only_confirmed_safe_answers_and_replaces_changed_form(
                 state=ConfirmationState.CONFIRMED,
                 allow_in_forms=True,
             )
-            session.add_all((telegram, salary))
+            full_name = VerifiedFactModel(
+                profile_id=profile.id,
+                category="full_name",
+                content="Иван Петров",
+                source_type="resume",
+                state=ConfirmationState.CONFIRMED,
+                allow_in_forms=True,
+            )
+            citizenship = VerifiedFactModel(
+                profile_id=profile.id,
+                category="citizenship",
+                content="Россия",
+                source_type="resume",
+                state=ConfirmationState.CONFIRMED,
+                allow_in_forms=True,
+            )
+            session.add_all((telegram, salary, full_name, citizenship))
             session.flush()
             session.add_all(
                 (
@@ -389,7 +424,7 @@ def test_draft_uses_only_confirmed_safe_answers_and_replaces_changed_form(
                     fields=(
                         HhScreeningField(
                             "name:telegram",
-                            "Укажите Telegram",
+                            "Ваше имя пользователя в телеграм @",
                             "text",
                             is_required=True,
                         ),
@@ -417,6 +452,18 @@ def test_draft_uses_only_confirmed_safe_answers_and_replaces_changed_form(
                             "text",
                             is_required=True,
                         ),
+                        HhScreeningField(
+                            "name:full-name",
+                            "Укажите ваше имя",
+                            "text",
+                            is_required=True,
+                        ),
+                        HhScreeningField(
+                            "name:citizenship-and-contract",
+                            citizenship_question,
+                            "textarea",
+                            is_required=True,
+                        ),
                     )
                 ),
             )
@@ -425,10 +472,12 @@ def test_draft_uses_only_confirmed_safe_answers_and_replaces_changed_form(
             assert draft.answers == {
                 "name:telegram": "@ivan",
                 "name:salary": "120000 рублей на руки",
+                "name:full-name": "Иван Петров",
             }
             assert draft.questions[0].source is AnswerSource.PROFILE
             assert draft.questions[1].source is AnswerSource.BANK
-            assert draft.unanswered_count == 3
+            assert draft.unanswered_count == 4
+            assert draft.questions[-1].answer is None
             assert draft.cover_letter is None
             pending = ScreeningDraftService(session).list_pending(account.id)
             assert len(pending) == 1
@@ -437,6 +486,42 @@ def test_draft_uses_only_confirmed_safe_answers_and_replaces_changed_form(
                 ScreeningDraftService(session).get_pending(account.id, vacancy.hh_id).form_id
                 == draft.form_id
             )
+            incomplete = session.scalar(
+                select(ScreeningAnswerModel)
+                .join(ScreeningQuestionModel)
+                .where(
+                    ScreeningQuestionModel.form_id == draft.form_id,
+                    ScreeningQuestionModel.field_key == "name:citizenship-and-contract",
+                )
+            )
+            assert incomplete is not None
+            incomplete.answer_text = citizenship.content
+            incomplete.verified_fact_id = citizenship.id
+            incomplete.source = AnswerSource.PROFILE
+            incomplete.is_confirmed = True
+            incomplete.confirmed_at = datetime.now(UTC)
+            session.flush()
+            assert (
+                ScreeningDraftService(session).reconcile_pending_answers(
+                    account.id, form_ids=(draft.form_id,)
+                )
+                == 1
+            )
+            repaired = ScreeningDraftService(session).get_pending(account.id, vacancy.hh_id)
+            assert repaired.questions[-1].answer is None
+            assert repaired.state is ScreeningFormState.INPUT_REQUIRED
+            explicit_answer = "Гражданство РФ. Оформление по ТК РФ подходит."
+            ScreeningDraftService(session).save_confirmed_answers(
+                account.id,
+                draft.form_id,
+                {"name:citizenship-and-contract": explicit_answer},
+            )
+            ScreeningDraftService(session).reconcile_pending_answers(
+                account.id, form_ids=(draft.form_id,)
+            )
+            saved = ScreeningDraftService(session).get_pending(account.id, vacancy.hh_id)
+            assert saved.questions[-1].answer == explicit_answer
+            assert saved.questions[-1].source is AnswerSource.USER
 
             changed = ScreeningDraftService(session).capture(
                 application.id,
@@ -444,7 +529,7 @@ def test_draft_uses_only_confirmed_safe_answers_and_replaces_changed_form(
                     fields=(
                         HhScreeningField(
                             "name:telegram",
-                            "Укажите Telegram",
+                            "Ваше имя пользователя в телеграм @",
                             "text",
                             is_required=True,
                         ),
@@ -459,6 +544,38 @@ def test_draft_uses_only_confirmed_safe_answers_and_replaces_changed_form(
             assert submission.form_id == changed.form_id
             assert submission.payload.answers == (("name:telegram", "@ivan"),)
             assert ScreeningDraftService(session).auto_submission_allowed(submission)
+            wrong_contact = session.scalar(
+                select(ScreeningAnswerModel)
+                .join(ScreeningQuestionModel)
+                .where(ScreeningQuestionModel.form_id == changed.form_id)
+            )
+            assert wrong_contact is not None
+            wrong_contact.answer_text = full_name.content
+            wrong_contact.verified_fact_id = full_name.id
+            session.flush()
+            assert not ScreeningDraftService(session).auto_submission_allowed(submission)
+            assert ScreeningDraftService(session).get_auto_submission(application.id) is None
+            checked = ScreeningDraftService(session).capture(
+                application.id,
+                HhScreeningForm(
+                    fields=(
+                        HhScreeningField(
+                            "name:telegram",
+                            "Ваше имя пользователя в телеграм @",
+                            "text",
+                            is_required=True,
+                        ),
+                    )
+                ),
+            )
+            assert checked.state is ScreeningFormState.REVIEW_REQUIRED
+            assert (
+                ScreeningDraftService(session).reconcile_pending_answers(
+                    account.id, form_ids=(changed.form_id,)
+                )
+                == 1
+            )
+            assert ScreeningDraftService(session).get_auto_submission(application.id) == submission
             assert session.scalar(select(func.count()).select_from(ScreeningFormModel)) == 2
             original = session.get(ScreeningFormModel, draft.form_id)
             assert original is not None
@@ -866,6 +983,16 @@ def test_explicit_assignment_is_never_a_simple_form(question: str) -> None:
     [
         ("Почему хотите работать у нас?", "textarea", (), "Разрабатываю приложения на Python."),
         (
+            "Какой график работы рассматриваете?",
+            "checkbox_group",
+            (
+                "Гибрид 3 дня офис, 2 дня удаленка",
+                "Полностью удаленная работа",
+                "Готов к офису 5\\2",
+            ),
+            "Полностью удаленная работа",
+        ),
+        (
             "Расскажите о своей последней задаче",
             "textarea",
             (),
@@ -924,7 +1051,9 @@ def test_user_confirmation_releases_nonstandard_form_and_survives_recapture(
                 stored = session.get(ScreeningFormModel, draft.form_id)
                 assert stored is not None
                 stored.submission_block_reason = (
-                    f"Вопрос «{question}» требует действий непосредственно на hh.ru."
+                    f"Формат поля «{question}» не распознан. Откройте анкету на hh.ru."
+                    if field_type == "checkbox_group"
+                    else f"Вопрос «{question}» требует действий непосредственно на hh.ru."
                 )
             saved = service.save_confirmed_answers(
                 account.id,
@@ -964,6 +1093,16 @@ def test_user_confirmation_releases_nonstandard_form_and_survives_recapture(
             assert service.get_auto_submission(application.id) is None
     finally:
         database.close()
+
+
+def test_checkbox_group_with_unread_options_stays_blocked() -> None:
+    field = HhScreeningField(
+        "schedule", "Какой график работы рассматриваете?", "checkbox_group", is_required=True
+    )
+    form = HhScreeningForm((field,))
+
+    assert not ScreeningDraftService._simple_structure(form)
+    assert ScreeningDraftService._form_block_reason(form) is not None
 
 
 def test_confirmed_form_answer_is_scoped_reused_and_requeues_application(

@@ -8,7 +8,7 @@ INDUSTRY_EXCLUSIONS = re.compile(r"(?:сфер\w*|отрасл\w*)[^?]{0,120}н�
 
 def is_fixed_choice(field_type: str, options: Sequence[str]) -> bool:
     return field_type.casefold() == "checkbox" or (
-        field_type.casefold() in {"radio", "select"} and bool(options)
+        field_type.casefold() in {"radio", "select", "checkbox_group"} and bool(options)
     )
 
 

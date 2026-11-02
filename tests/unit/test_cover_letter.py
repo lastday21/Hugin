@@ -344,7 +344,7 @@ def test_quality_trial_can_use_completed_match_vacancies(settings: Settings) -> 
     upgrade_database(settings)
     database = create_database(settings)
     writer = FakeModel([_letter()])
-    judge = FakeModel([_quality_response(naturalness=1)])
+    judge = FakeModel([_quality_response(clarity=2)])
     try:
         with database.sessions.begin() as session:
             account_id, _, _, _ = _prepare_data(session)
@@ -380,7 +380,7 @@ def test_quality_trial_retries_existing_local_validation_before_scoring(
     upgrade_database(settings)
     database = create_database(settings)
     writer = FakeModel([_gap_dominated_letter(), _letter()])
-    judge = FakeModel([_quality_response(naturalness=1)])
+    judge = FakeModel([_quality_response(clarity=2)])
     try:
         with database.sessions.begin() as session:
             account_id, _, _, _ = _prepare_data(session)
@@ -408,8 +408,8 @@ def test_prepare_saves_quality_score_and_corrects_letter_once(settings: Settings
     writer = FakeModel([_letter(), _alternative_letter()])
     judge = FakeModel(
         [
-            _quality_response(structure=3, clarity=2, individuality=1, naturalness=2),
-            _quality_response(structure=3, clarity=3, individuality=1, naturalness=2),
+            _quality_response(naturalness=1),
+            _quality_response(clarity=2),
         ]
     )
     try:
@@ -429,7 +429,7 @@ def test_prepare_saves_quality_score_and_corrects_letter_once(settings: Settings
             assert letter.text == _without_generic_closing(_alternative_letter())
             assert letter.quality_score == 9
             assert letter.quality_passed is True
-            assert letter.quality_version == "cover_letter_quality_v4"
+            assert letter.quality_version == "cover_letter_quality_v6"
             assert letter.quality_model_name == judge.model_name
             assert letter.quality_checked_at is not None
             assert letter.quality_details is not None
@@ -437,6 +437,56 @@ def test_prepare_saves_quality_score_and_corrects_letter_once(settings: Settings
             assert len(writer.prompts) == 2
             assert len(judge.prompts) == 2
             assert session.scalar(select(CoverLetterRejectionModel)) is not None
+    finally:
+        database.close()
+
+
+@pytest.mark.parametrize("failure_code", ["TEMPLATE_PHRASE", "PLACEHOLDER"])
+def test_quality_correction_validation_failures_stop_automatic_retries(
+    settings: Settings, failure_code: str
+) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    invalid_text = (
+        _letter_with_template_phrase()
+        if failure_code == "TEMPLATE_PHRASE"
+        else _letter() + "\n[НУЖНО УТОЧНИТЬ: какой продукт вы довели до production?]"
+    )
+    correction_calls = 4 if failure_code == "TEMPLATE_PHRASE" else 2
+    writer = FakeModel([_letter(), *[invalid_text] * 4])
+    judge = FakeModel([_quality_response(structure=3, clarity=2, individuality=1, naturalness=2)])
+    try:
+        with database.sessions.begin() as session:
+            account_id, _, _, _ = _prepare_data(session)
+            service = CoverLetterService(session, writer, quality_model=judge)
+            result = service.prepare(
+                account_id=account_id, direction_name="Python backend", limit=1
+            )
+
+            letter = session.scalar(select(CoverLetterModel))
+            task = session.scalar(select(ApplicationTaskModel))
+            assert result.failed == 1
+            assert letter is not None and task is not None
+            assert letter.state is CoverLetterState.FAILED
+            assert letter.text is None
+            assert letter.failure_reason == f"COVER_LETTER_RETRY_FAILED:{failure_code}"
+            assert task.state is TaskState.REVIEW_REQUIRED
+            assert task.last_error_code == "COVER_LETTER_RETRY_FAILED"
+            assert len(writer.prompts) == 1 + correction_calls
+            assert len(judge.prompts) == 1
+            rejections = session.scalars(
+                select(CoverLetterRejectionModel)
+                .where(CoverLetterRejectionModel.cover_letter_id == letter.id)
+                .order_by(CoverLetterRejectionModel.sequence_number)
+            ).all()
+            assert [r.reason_code for r in rejections] == [
+                "QUALITY_SCORE_8",
+                *[failure_code] * correction_calls,
+            ]
+
+            again = service.prepare(account_id=account_id, direction_name="Python backend", limit=1)
+            assert again.generated == again.failed == 0
+            assert len(writer.prompts) == 1 + correction_calls
     finally:
         database.close()
 
@@ -497,7 +547,7 @@ def test_sent_quality_assessment_reads_saved_letter_without_changes(settings: Se
             session.flush()
             saved_text = letter.text
 
-            judge = FakeModel([_quality_response(naturalness=1)])
+            judge = FakeModel([_quality_response(clarity=2)])
             result = CoverLetterService(session, quality_model=judge).assess_sent_quality(
                 account_id=account_id,
                 limit=25,
@@ -727,6 +777,8 @@ def test_legacy_ready_letter_is_rebuilt_before_sending(settings: Settings) -> No
     [
         "unchanged",
         "blank_lines",
+        "missing_sections",
+        "missing_sections_unbacked",
         "conditions",
         "profile",
         "duties",
@@ -751,6 +803,14 @@ def test_related_publication_checks_old_letter_before_rewriting(
             first = session.get(VacancyModel, vacancy_ids[0])
             second = session.get(VacancyModel, vacancy_ids[1])
             assert first is not None and second is not None
+            if change == "missing_sections":
+                first.description = "\n".join(
+                    (
+                        first.description or "",
+                        first.responsibilities or "",
+                        first.required_qualifications or "",
+                    )
+                )
             second.description = first.description
             second.responsibilities = first.responsibilities
             second.required_qualifications = first.required_qualifications
@@ -766,6 +826,9 @@ def test_related_publication_checks_old_letter_before_rewriting(
             source.state = CoverLetterState.SENT
             if change == "blank_lines":
                 second.description = "\n\n" + (first.description or "").replace("\n", "\n\n")
+            elif change in {"missing_sections", "missing_sections_unbacked"}:
+                second.responsibilities = None
+                second.required_qualifications = None
             if change in {"conditions", "revise", "invalid_review", "no_judge"}:
                 second.employment = "Частичная занятость"
             elif change == "profile":
@@ -839,7 +902,9 @@ def test_related_publication_checks_old_letter_before_rewriting(
                 return
             assert result.reused == 1
             assert unused_writer.prompts == []
-            assert len(judge.prompts) == (0 if change in {"unchanged", "blank_lines"} else 1)
+            assert len(judge.prompts) == (
+                0 if change in {"unchanged", "blank_lines", "missing_sections"} else 1
+            )
             if change == "conditions":
                 assert "Частичная занятость" in judge.prompts[0][1]
             elif change == "profile":
@@ -1133,12 +1198,23 @@ def test_changed_instruction_retries_previous_letter_failure(
         database.close()
 
 
+@pytest.mark.parametrize("salary_requested", [False, True])
 def test_prepare_does_not_expose_skill_list_as_completed_work(
     settings: Settings,
+    salary_requested: bool,
 ) -> None:
     upgrade_database(settings)
     database = create_database(settings)
-    model = FakeModel([_letter()])
+    model = FakeModel(
+        [
+            _letter()
+            + (
+                "\n\nРассматриваю предложения от 120 000 рублей на руки."
+                if salary_requested
+                else ""
+            )
+        ]
+    )
     try:
         with database.sessions.begin() as session:
             account_id, _, resume_id, vacancy_ids = _prepare_data(session)
@@ -1158,6 +1234,19 @@ def test_prepare_does_not_expose_skill_list_as_completed_work(
             assert work_fact_id is not None
             vacancy.key_skills = ["Python", "FastAPI", "PostgreSQL", "Redis"]
             vacancy.required_qualifications = "Python, FastAPI, PostgreSQL, Redis."
+            if salary_requested:
+                vacancy.required_qualifications += (
+                    " В сопроводительном письме просьба указывать ожидания по заработной плате."
+                )
+            salary_fact = VerifiedFactModel(
+                profile_id=profile.id,
+                category="salary_expectation",
+                content="Рассматриваю предложения от 120 000 рублей на руки.",
+                source_type="user",
+                state=ConfirmationState.CONFIRMED,
+                allow_in_letters=True,
+            )
+            session.add(salary_fact)
             session.add_all(
                 (
                     VerifiedFactModel(
@@ -1200,8 +1289,9 @@ def test_prepare_does_not_expose_skill_list_as_completed_work(
 
             assert result.generated == 1
             confirmed_facts = model.prompts[0][1].split("<confirmed_facts>", 1)[1]
-            assert confirmed_facts.count("<fact id=") == 1
+            assert confirmed_facts.count("<fact id=") == (2 if salary_requested else 1)
             assert 'category="skills"' not in confirmed_facts
+            assert ('category="salary_expectation"' in confirmed_facts) == salary_requested
             letter = session.scalar(select(CoverLetterModel))
             assert letter is not None
             linked_ids = tuple(
@@ -1211,7 +1301,126 @@ def test_prepare_does_not_expose_skill_list_as_completed_work(
                     )
                 )
             )
-            assert linked_ids == (work_fact_id,)
+            assert set(linked_ids) == (
+                {work_fact_id, salary_fact.id} if salary_requested else {work_fact_id}
+            )
+    finally:
+        database.close()
+
+
+@pytest.mark.parametrize("answers_requested", [False, True, "leave_telegram", "corporate_contact"])
+def test_prepare_includes_requested_confirmed_answers_and_tracks_their_sources(
+    settings: Settings, answers_requested: bool | str
+) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    answers = {
+        "desired_position": "Python backend-разработчик",
+        "location": "Сейчас живу в городе Учалы, Республика Башкортостан.",
+        "salary_expectation": "Рассматриваю предложения от 120 000 рублей на руки.",
+        "available_from": "Готов приступить в течение двух недель после оффера.",
+        "github": "https://github.com/candidate",
+        "email": "candidate@example.com",
+        "phone": "+7 (900) 555-01-02",
+        "telegram": "@candidate300",
+    }
+    requested_categories = (
+        set(answers)
+        if answers_requested is True
+        else ({"telegram"} if answers_requested == "leave_telegram" else set())
+    )
+    letter_text = _letter().split("\n\nБуду рад", 1)[0] + (
+        "\n\n" + "\n".join(v for k, v in answers.items() if k in requested_categories)
+        if requested_categories
+        else ""
+    )
+    model = FakeModel([letter_text] * 8)
+    try:
+        with database.sessions.begin() as session:
+            account_id, _, _, vacancy_ids = _prepare_data(session)
+            profile = session.scalar(
+                select(CandidateProfileModel).where(CandidateProfileModel.account_id == account_id)
+            )
+            vacancy = session.get(VacancyModel, vacancy_ids[0])
+            assert profile is not None and vacancy is not None
+            assert vacancy.description is not None
+            vacancy.description += " В работе используется GitHub для проверки кода."
+            if answers_requested is True:
+                vacancy.description += (
+                    "\nКак откликнуться: напишите о себе. Кто вы — Backend Developer?\n"
+                    "Какие проекты можете показать.\nGitHub / портфолио — если есть.\n"
+                    "Пожалуйста указывайте в сопроводительном письме Вашу локацию "
+                    "и ожидания по з.пл. в рублях!\nКогда готовы приступить.\n"
+                    "Тут указать контатные данные для связи."
+                )
+            elif answers_requested == "leave_telegram":
+                vacancy.description += (
+                    " При отклике оставьте, пожалуйста, свой ник в телеграм, "
+                    "так нашему эйчару будет легче связаться с вами."
+                )
+            elif answers_requested == "corporate_contact":
+                vacancy.description += " Предоставляем корпоративный телефон и доступ к Telegram."
+            else:
+                vacancy.description += (
+                    " Работа в указанном городе. Не указывайте город проживания в отклике."
+                )
+            facts = [
+                VerifiedFactModel(
+                    profile_id=profile.id,
+                    category=category,
+                    content=content,
+                    source_type="user",
+                    state=ConfirmationState.CONFIRMED,
+                    allow_in_letters=True,
+                )
+                for category, content in answers.items()
+            ]
+            session.add_all(facts)
+            session.add_all(
+                [
+                    VerifiedFactModel(
+                        profile_id=profile.id,
+                        category="email",
+                        content="private@example.com",
+                        source_type="user",
+                        state=ConfirmationState.CONFIRMED,
+                        allow_in_letters=False,
+                    ),
+                    VerifiedFactModel(
+                        profile_id=profile.id,
+                        category="phone",
+                        content="+7 (900) 999-00-00",
+                        source_type="user",
+                        state=ConfirmationState.PENDING,
+                        allow_in_letters=True,
+                    ),
+                ]
+            )
+            session.flush()
+
+            result = CoverLetterService(session, model).prepare(
+                account_id=account_id, direction_name="Python backend"
+            )
+
+            assert result.generated == 1, result.items
+            confirmed = model.prompts[0][1].split("<confirmed_facts>", 1)[1]
+            for category, content in answers.items():
+                assert (content in confirmed) == (category in requested_categories)
+            assert "private@example.com" not in confirmed
+            assert "+7 (900) 999-00-00" not in confirmed
+            letter = session.scalar(select(CoverLetterModel))
+            assert letter is not None and letter.text == letter_text
+            linked_ids = set(
+                session.scalars(
+                    select(CoverLetterFactModel.fact_id).where(
+                        CoverLetterFactModel.cover_letter_id == letter.id
+                    )
+                )
+            )
+            answer_ids = {fact.id for fact in facts}
+            assert linked_ids & answer_ids == {
+                fact.id for fact in facts if fact.category in requested_categories
+            }
     finally:
         database.close()
 
@@ -1286,6 +1495,65 @@ def test_prepare_can_select_separate_personal_project_fact(settings: Settings) -
                 )
             )
             assert project.id in linked_ids
+    finally:
+        database.close()
+
+
+def test_voice_vacancy_keeps_relevant_speech_project(settings: Settings) -> None:
+    upgrade_database(settings)
+    database = create_database(settings)
+    try:
+        with database.sessions.begin() as session:
+            account_id, direction_id, resume_id, vacancy_ids = _prepare_data(session)
+            profile = session.scalar(
+                select(CandidateProfileModel).where(CandidateProfileModel.account_id == account_id)
+            )
+            vacancy = session.get(VacancyModel, vacancy_ids[0])
+            assert profile is not None and vacancy is not None
+            vacancy.title = "Тестировщик голосовых роботов"
+            vacancy.description = (
+                "Функциональное тестирование голосовых ассистентов и Web интерфейсов."
+            )
+            vacancy.responsibilities = "Работа в команде с разработчиками, проверка результата."
+            vacancy.required_qualifications = "Основы тестирования и клиент-серверной архитектуры."
+            vacancy.preferred_qualifications = "Опыт работы с голосовыми сервисами."
+            vacancy.key_skills = []
+            unrelated = VerifiedFactModel(
+                profile_id=profile.id,
+                category="project",
+                content=(
+                    "Личный проект тренажёра. Разрабатывал серверную часть и Web интерфейсы, "
+                    "работал в команде с разработчиками, проверял результат. "
+                    "Настроил автоматические проверки на pytest."
+                ),
+                source_type="project",
+                resume_id=resume_id,
+                state=ConfirmationState.CONFIRMED,
+                allow_in_letters=True,
+            )
+            speech = VerifiedFactModel(
+                profile_id=profile.id,
+                category="project",
+                content=(
+                    "Личный проект речевого помощника.\n"
+                    "Реализовал захват звука и потоковое распознавание речи "
+                    "через SpeechKit по gRPC.\n"
+                    "Добавил запись и повторное воспроизведение сеансов для проверки."
+                ),
+                source_type="project",
+                resume_id=resume_id,
+                state=ConfirmationState.CONFIRMED,
+                allow_in_letters=True,
+            )
+            session.add_all((unrelated, speech))
+            session.flush()
+            service = CoverLetterService(session)
+            candidate = service._candidates(account_id, direction_id)[0]
+            selected = service._select_facts(candidate, direction_id)
+
+            speech_context = next((fact.content for fact in selected if fact.id == speech.id), None)
+            assert speech_context is not None
+            assert "распознавание речи через SpeechKit по gRPC" in speech_context
     finally:
         database.close()
 
@@ -1789,8 +2057,10 @@ def test_exhausted_corrections_require_review_and_stop_retries(
         database.close()
 
 
-def test_repeated_vacancy_focus_failure_stops_after_one_correction(
+@pytest.mark.parametrize("failure_code", ["NO_VACANCY_FOCUS", "PLACEHOLDER"])
+def test_repeated_non_progress_failure_stops_after_one_correction(
     settings: Settings,
+    failure_code: str,
 ) -> None:
     upgrade_database(settings)
     database = create_database(settings)
@@ -1801,7 +2071,12 @@ def test_repeated_vacancy_focus_failure_stops_after_one_correction(
         "последовательно развивать серверную часть и сохранять читаемость кода.\n\n"
         "Готов подробнее разобрать устройство серверного приложения."
     )
-    model = FakeModel([common_stack_only] * 4)
+    invalid_text = (
+        common_stack_only
+        if failure_code == "NO_VACANCY_FOCUS"
+        else _letter() + "\n[НУЖНО УТОЧНИТЬ: какой продукт вы довели до production?]"
+    )
+    model = FakeModel([invalid_text] * 4)
     try:
         with database.sessions.begin() as session:
             account_id, _, _, vacancy_ids = _prepare_data(session)
@@ -1825,7 +2100,7 @@ def test_repeated_vacancy_focus_failure_stops_after_one_correction(
             task = session.scalar(select(ApplicationTaskModel))
             assert letter is not None
             assert letter.failure_reason == (
-                "COVER_LETTER_RETRY_FAILED:NO_VACANCY_FOCUS->NO_VACANCY_FOCUS"
+                f"COVER_LETTER_RETRY_FAILED:{failure_code}->{failure_code}"
             )
             assert task is not None
             assert task.state is TaskState.REVIEW_REQUIRED
@@ -3089,7 +3364,6 @@ def test_prompt_normalization_and_context_selection() -> None:
     assert "подтвержденный пример" in prompt
     assert "НУЖНО УТОЧНИТЬ" in prompt
     assert "не заменяй прямой ответ" in prompt
-    assert "Особенность структуры именно этого письма" in prompt
     assert "Перед ответом молча проверь готовый текст" in prompt
     assert "при отсутствии Airflow, Kafka или ClickHouse" in prompt
     assert "список навыков подтверждает знание технологии" in prompt
@@ -3098,8 +3372,7 @@ def test_prompt_normalization_and_context_selection() -> None:
     assert "слова из обязанностей и требований вакансии" in prompt
     assert "не повышай техническую конкретность факта" in prompt
     assert "merge, join, groupby, pivot" in prompt
-    assert "заверши конкретным предложением" in prompt
-    assert "готов обсудить детали реализации" in prompt
+    assert "заверши последним полезным фактом" in prompt
     assert "Здравствуйте!" in prompt
 
 

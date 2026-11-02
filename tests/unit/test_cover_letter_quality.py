@@ -57,12 +57,15 @@ def _response(**changes: object) -> str:
 
 
 def test_quality_response_passes_only_with_required_score_and_dimensions() -> None:
-    passed = parse_quality_response(_response(naturalness=1))
+    passed = parse_quality_response(_response(clarity=2))
+    awkward = parse_quality_response(_response(naturalness=1))
     weak_clarity = parse_quality_response(_response(clarity=1))
     hard_failure = parse_quality_response(_response(hard_failure="Нет нужного примера"))
 
     assert passed.score == 9
     assert passed.passed
+    assert awkward.score == 9
+    assert not awkward.passed
     assert weak_clarity.score == 8
     assert not weak_clarity.passed
     assert not hard_failure.passed

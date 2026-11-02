@@ -2,16 +2,18 @@ from __future__ import annotations
 
 import hashlib
 import re
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from typing import cast
 
 from sqlalchemy import or_, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, load_only
 
 from hugin.database.models import (
     AnswerTemplateModel,
     ApplicationModel,
+    ApplicationSettingsModel,
     ApplicationTaskModel,
     CandidateProfileModel,
     CoverLetterModel,
@@ -109,6 +111,17 @@ class StoredScreeningSubmission:
 
 
 @dataclass(frozen=True, slots=True)
+class _DraftReadContext:
+    applications: dict[int, ApplicationModel]
+    vacancies: dict[int, VacancyModel]
+    resumes: dict[int, ResumeModel]
+    questions: dict[int, list[tuple[ScreeningQuestionModel, ScreeningAnswerModel | None]]]
+    cover_letters: dict[int, str]
+    # Keep the settings row alive for existing policy readers in this one list operation.
+    settings: ApplicationSettingsModel | None
+
+
+@dataclass(frozen=True, slots=True)
 class ScreeningAvailabilityCheck:
     form_id: int
     vacancy_id: str
@@ -150,7 +163,12 @@ QUESTION_KEYS: tuple[tuple[str, tuple[re.Pattern[str], ...]], ...] = (
 FACT_PATTERNS: tuple[tuple[str, tuple[re.Pattern[str], ...]], ...] = (
     (
         "full_name",
-        (re.compile(r"(?:ваше|укажите).*\bимя\b|\bфио\b", re.IGNORECASE),),
+        (
+            re.compile(
+                r"(?:ваше|укажите).*\bимя\b(?!\s+пользовател)|\bфио\b",
+                re.IGNORECASE,
+            ),
+        ),
     ),
     ("email", (re.compile(r"электронн.*почт|e-?mail", re.IGNORECASE),)),
     ("phone", (re.compile(r"телефон|номер.*связ", re.IGNORECASE),)),
@@ -216,6 +234,11 @@ SERIOUS_OBLIGATION = re.compile(
     re.IGNORECASE,
 )
 
+EMPLOYMENT_CONDITION = re.compile(
+    r"оформл\w*[\s\S]*(?:\bтк\b|трудов|\bгпх\b|\bип\b|самозан)",
+    re.IGNORECASE,
+)
+
 DATA_ACCURACY_CONFIRMATION = re.compile(
     r"(?=.*подтвержд)(?=.*(?:сведен|данн))(?=.*достоверн)",
     re.IGNORECASE | re.DOTALL,
@@ -224,6 +247,7 @@ DATA_ACCURACY_CONFIRMATION = re.compile(
 SUPPORTED_AUTOMATIC_FIELD_TYPES = frozenset(
     {
         "checkbox",
+        "checkbox_group",
         "date",
         "email",
         "number",
@@ -395,32 +419,104 @@ class ScreeningDraftService:
         return self.capture(application_id, HhScreeningForm(fields))
 
     def list_pending(self, account_id: int) -> tuple[ScreeningDraft, ...]:
-        forms = self._session.scalars(
-            select(ScreeningFormModel)
-            .join(ApplicationModel, ApplicationModel.id == ScreeningFormModel.application_id)
-            .join(VacancyModel, VacancyModel.id == ApplicationModel.vacancy_id)
-            .outerjoin(
-                ApplicationTaskModel,
-                ApplicationTaskModel.application_id == ApplicationModel.id,
+        forms = tuple(
+            self._session.scalars(
+                select(ScreeningFormModel)
+                .join(ApplicationModel, ApplicationModel.id == ScreeningFormModel.application_id)
+                .join(VacancyModel, VacancyModel.id == ApplicationModel.vacancy_id)
+                .outerjoin(
+                    ApplicationTaskModel,
+                    ApplicationTaskModel.application_id == ApplicationModel.id,
+                )
+                .where(
+                    ApplicationModel.account_id == account_id,
+                    ApplicationModel.state == ApplicationState.APPLYING,
+                    VacancyModel.availability == VacancyAvailability.ACTIVE,
+                    or_(
+                        ApplicationTaskModel.id.is_(None),
+                        ApplicationTaskModel.state.not_in((TaskState.SKIPPED, TaskState.COMPLETED)),
+                    ),
+                    ScreeningFormModel.state.in_(
+                        (
+                            ScreeningFormState.REVIEW_REQUIRED,
+                            ScreeningFormState.INPUT_REQUIRED,
+                        )
+                    ),
+                )
+                .order_by(ScreeningFormModel.updated_at, ScreeningFormModel.id)
             )
-            .where(
-                ApplicationModel.account_id == account_id,
-                ApplicationModel.state == ApplicationState.APPLYING,
-                VacancyModel.availability == VacancyAvailability.ACTIVE,
-                or_(
-                    ApplicationTaskModel.id.is_(None),
-                    ApplicationTaskModel.state.not_in((TaskState.SKIPPED, TaskState.COMPLETED)),
-                ),
-                ScreeningFormModel.state.in_(
-                    (
-                        ScreeningFormState.REVIEW_REQUIRED,
-                        ScreeningFormState.INPUT_REQUIRED,
-                    )
-                ),
-            )
-            .order_by(ScreeningFormModel.updated_at, ScreeningFormModel.id)
         )
-        return tuple(self._draft(form) for form in forms)
+        if not forms:
+            return ()
+        context = self._draft_read_context(forms)
+        return tuple(self._draft(form, context=context) for form in forms)
+
+    def _draft_read_context(self, forms: tuple[ScreeningFormModel, ...]) -> _DraftReadContext:
+        applications = {
+            item.id: item
+            for item in self._session.scalars(
+                select(ApplicationModel).where(
+                    ApplicationModel.id.in_(form.application_id for form in forms)
+                )
+            )
+        }
+        vacancies = {
+            item.id: item
+            for item in self._session.scalars(
+                select(VacancyModel)
+                .options(
+                    load_only(
+                        VacancyModel.hh_id,
+                        VacancyModel.title,
+                        VacancyModel.employer_name,
+                        VacancyModel.source_url,
+                    )
+                )
+                .where(VacancyModel.id.in_(item.vacancy_id for item in applications.values()))
+            )
+        }
+        resumes = {
+            item.id: item
+            for item in self._session.scalars(
+                select(ResumeModel)
+                .options(load_only(ResumeModel.hh_id, ResumeModel.title))
+                .where(ResumeModel.id.in_(item.resume_id for item in applications.values()))
+            )
+        }
+        questions: dict[int, list[tuple[ScreeningQuestionModel, ScreeningAnswerModel | None]]] = (
+            defaultdict(list)
+        )
+        for question, answer in self._session.execute(
+            select(ScreeningQuestionModel, ScreeningAnswerModel)
+            .outerjoin(
+                ScreeningAnswerModel, ScreeningAnswerModel.question_id == ScreeningQuestionModel.id
+            )
+            .where(ScreeningQuestionModel.form_id.in_(form.id for form in forms))
+            .order_by(ScreeningQuestionModel.position, ScreeningQuestionModel.id)
+        ):
+            questions[question.form_id].append((question, answer))
+        settings = self._session.get(ApplicationSettingsModel, 1)
+        instruction_version = cover_letter_instruction_version(
+            AiPromptSettingsService(self._session).get().cover_letter
+        )
+        cover_letters = {
+            application_id: letter
+            for application_id, letter in self._session.execute(
+                select(CoverLetterModel.application_id, CoverLetterModel.text)
+                .where(
+                    CoverLetterModel.application_id.in_(applications),
+                    CoverLetterModel.state == CoverLetterState.READY,
+                    CoverLetterModel.text.is_not(None),
+                    CoverLetterModel.instruction_version == instruction_version,
+                )
+                .distinct(CoverLetterModel.application_id)
+                .order_by(CoverLetterModel.application_id, CoverLetterModel.id.desc())
+            )
+            if letter is not None
+        }
+        return _DraftReadContext(
+            applications, vacancies, resumes, questions, cover_letters, settings
+        )
 
     def get_pending(self, account_id: int, vacancy_id: str) -> ScreeningDraft:
         form = self._session.scalar(
@@ -523,7 +619,22 @@ class ScreeningDraftService:
                     self._session.add(answer)
                     changed = True
                 if answer.is_confirmed and answer.answer_text and answer.answer_text.strip():
-                    continue
+                    if answer.source is not AnswerSource.PROFILE or self._answer_still_allowed(
+                        answer,
+                        self._session.get(VerifiedFactModel, answer.verified_fact_id)
+                        if answer.verified_fact_id is not None
+                        else None,
+                        question,
+                        application,
+                        policy,
+                        now=selected_at,
+                    ):
+                        continue
+                    answer.answer_text = None
+                    answer.verified_fact_id = None
+                    answer.is_confirmed = False
+                    answer.confirmed_at = None
+                    changed = True
                 resolved = self._resolve(
                     self._stored_field(question),
                     templates,
@@ -547,6 +658,8 @@ class ScreeningDraftService:
                 answer.is_confirmed = resolved.confirmed
                 answer.confirmed_at = selected_at if resolved.confirmed else None
 
+            if changed:
+                self._session.flush()
             if form.requires_confirmation and self._confirmed_answers_release_review(
                 form,
                 application,
@@ -961,6 +1074,11 @@ class ScreeningDraftService:
             return False
         if (
             answer.source is AnswerSource.PROFILE
+            and cls._profile_category(question.question_text) != fact.category
+        ):
+            return False
+        if (
+            answer.source is AnswerSource.PROFILE
             and fact.category == "salary_expectation"
             and not salary_profile_answer_is_compatible(question.question_text, fact.content)
         ):
@@ -1014,23 +1132,41 @@ class ScreeningDraftService:
         form.confirmed_at = sent_at or datetime.now(UTC)
         self._session.flush()
 
-    def _draft(self, form: ScreeningFormModel) -> ScreeningDraft:
-        application = self._session.get(ApplicationModel, form.application_id)
+    def _draft(
+        self, form: ScreeningFormModel, *, context: _DraftReadContext | None = None
+    ) -> ScreeningDraft:
+        application = (
+            context.applications.get(form.application_id)
+            if context is not None
+            else self._session.get(ApplicationModel, form.application_id)
+        )
         if application is None:
             raise RuntimeError("Отклик черновика отсутствует")
-        vacancy = self._session.get(VacancyModel, application.vacancy_id)
-        resume = self._session.get(ResumeModel, application.resume_id)
+        vacancy = (
+            context.vacancies.get(application.vacancy_id)
+            if context is not None
+            else self._session.get(VacancyModel, application.vacancy_id)
+        )
+        resume = (
+            context.resumes.get(application.resume_id)
+            if context is not None
+            else self._session.get(ResumeModel, application.resume_id)
+        )
         if vacancy is None or resume is None:
             raise RuntimeError("Вакансия или резюме черновика отсутствуют")
-        rows = self._session.execute(
-            select(ScreeningQuestionModel, ScreeningAnswerModel)
-            .outerjoin(
-                ScreeningAnswerModel,
-                ScreeningAnswerModel.question_id == ScreeningQuestionModel.id,
-            )
-            .where(ScreeningQuestionModel.form_id == form.id)
-            .order_by(ScreeningQuestionModel.position, ScreeningQuestionModel.id)
-        ).all()
+        rows = (
+            context.questions.get(form.id, [])
+            if context is not None
+            else self._session.execute(
+                select(ScreeningQuestionModel, ScreeningAnswerModel)
+                .outerjoin(
+                    ScreeningAnswerModel,
+                    ScreeningAnswerModel.question_id == ScreeningQuestionModel.id,
+                )
+                .where(ScreeningQuestionModel.form_id == form.id)
+                .order_by(ScreeningQuestionModel.position, ScreeningQuestionModel.id)
+            ).all()
+        )
         bank_fact_ids = {
             answer.verified_fact_id
             for _, answer in rows
@@ -1076,19 +1212,23 @@ class ScreeningDraftService:
             )
             for question, answer in rows
         )
-        cover_letter = self._session.scalar(
-            select(CoverLetterModel.text)
-            .where(
-                CoverLetterModel.application_id == application.id,
-                CoverLetterModel.state == CoverLetterState.READY,
-                CoverLetterModel.text.is_not(None),
-                CoverLetterModel.instruction_version
-                == cover_letter_instruction_version(
-                    AiPromptSettingsService(self._session).get().cover_letter
-                ),
+        cover_letter = (
+            context.cover_letters.get(application.id)
+            if context is not None
+            else self._session.scalar(
+                select(CoverLetterModel.text)
+                .where(
+                    CoverLetterModel.application_id == application.id,
+                    CoverLetterModel.state == CoverLetterState.READY,
+                    CoverLetterModel.text.is_not(None),
+                    CoverLetterModel.instruction_version
+                    == cover_letter_instruction_version(
+                        AiPromptSettingsService(self._session).get().cover_letter
+                    ),
+                )
+                .order_by(CoverLetterModel.id.desc())
+                .limit(1)
             )
-            .order_by(CoverLetterModel.id.desc())
-            .limit(1)
         )
         return ScreeningDraft(
             form_id=form.id,
@@ -1103,7 +1243,9 @@ class ScreeningDraftService:
             state=form.state,
             questions=questions,
             cover_letter=cover_letter,
-            review_reason=self._review_reason(form),
+            review_reason=self._review_reason(
+                form, questions=tuple(question for question, _ in rows)
+            ),
         )
 
     @classmethod
@@ -1115,25 +1257,38 @@ class ScreeningDraftService:
         for field in form.fields:
             if cls._prohibited(field):
                 return f"Вопрос «{field.question}» требует действий непосредственно на hh.ru."
-            if field.field_type.casefold() not in SUPPORTED_AUTOMATIC_FIELD_TYPES:
+            if not cls._supported_field(field):
                 return f"Формат поля «{field.question}» не распознан. Откройте анкету на hh.ru."
         return None
 
-    def _stored_block_reason(self, form: ScreeningFormModel) -> str | None:
-        fields = tuple(
-            self._stored_field(question)
-            for question in self._session.scalars(
-                select(ScreeningQuestionModel)
-                .where(ScreeningQuestionModel.form_id == form.id)
-                .order_by(ScreeningQuestionModel.position, ScreeningQuestionModel.id)
+    def _stored_block_reason(
+        self,
+        form: ScreeningFormModel,
+        *,
+        questions: tuple[ScreeningQuestionModel, ...] | None = None,
+    ) -> str | None:
+        if questions is None:
+            questions = tuple(
+                self._session.scalars(
+                    select(ScreeningQuestionModel)
+                    .where(ScreeningQuestionModel.form_id == form.id)
+                    .order_by(ScreeningQuestionModel.position, ScreeningQuestionModel.id)
+                )
             )
-        )
+        fields = tuple(self._stored_field(question) for question in questions)
         if form.submission_block_reason:
             obsolete_choice_reasons = {
                 f"Вопрос «{field.question}» требует действий непосредственно на hh.ru."
                 for field in fields
                 if is_fixed_choice(field.field_type, field.options) and not self._prohibited(field)
             }
+            obsolete_choice_reasons.update(
+                f"Формат поля «{field.question}» не распознан. Откройте анкету на hh.ru."
+                for field in fields
+                if field.field_type.casefold() == "checkbox_group"
+                and self._supported_field(field)
+                and not self._prohibited(field)
+            )
             if form.submission_block_reason not in obsolete_choice_reasons:
                 return form.submission_block_reason
             form.submission_block_reason = None
@@ -1158,8 +1313,13 @@ class ScreeningDraftService:
             )
         return None
 
-    def _review_reason(self, form: ScreeningFormModel) -> str | None:
-        reason = self._stored_block_reason(form)
+    def _review_reason(
+        self,
+        form: ScreeningFormModel,
+        *,
+        questions: tuple[ScreeningQuestionModel, ...] | None = None,
+    ) -> str | None:
+        reason = self._stored_block_reason(form, questions=questions)
         if reason:
             return reason
         if not AutonomyPolicyService(self._session).get().auto_submit_simple_forms:
@@ -1367,7 +1527,7 @@ class ScreeningDraftService:
             sensitive_question_text(field.question)
         ) or SERIOUS_OBLIGATION.search(field.question):
             return None
-        category = self._question_key(field.question) or self._fact_category(field.question)
+        category = self._profile_category(field.question)
         if category is None:
             return None
         for fact in facts:
@@ -1589,7 +1749,7 @@ class ScreeningDraftService:
     def _simple_field(cls, field: HhScreeningField) -> bool:
         if cls._prohibited(field):
             return False
-        if field.field_type.casefold() not in SUPPORTED_AUTOMATIC_FIELD_TYPES:
+        if not cls._supported_field(field):
             return False
         if SERIOUS_QUESTION.search(field.question) or SERIOUS_OBLIGATION.search(field.question):
             return False
@@ -1597,6 +1757,13 @@ class ScreeningDraftService:
             DATA_ACCURACY_CONFIRMATION.search(field.question) is not None
             or cls._question_key(field.question) is not None
             or cls._fact_category(field.question) is not None
+        )
+
+    @staticmethod
+    def _supported_field(field: HhScreeningField) -> bool:
+        field_type = field.field_type.casefold()
+        return field_type in SUPPORTED_AUTOMATIC_FIELD_TYPES and (
+            field_type != "checkbox_group" or bool(field.options)
         )
 
     @staticmethod
@@ -1683,6 +1850,21 @@ class ScreeningDraftService:
             if any(pattern.search(question) for pattern in patterns):
                 return key
         return None
+
+    @classmethod
+    def _profile_category(cls, question: str) -> str | None:
+        # A fact about one subject cannot answer several independent questions.
+        # Complete answers explicitly saved for this question are resolved earlier.
+        if question.count("?") > 1:
+            return None
+        categories = {
+            category
+            for category, patterns in (*QUESTION_KEYS, *FACT_PATTERNS)
+            if any(pattern.search(question) for pattern in patterns)
+        }
+        if len(categories) != 1 or EMPLOYMENT_CONDITION.search(question):
+            return None
+        return categories.pop()
 
     @staticmethod
     def _fact_category(question: str) -> str | None:
