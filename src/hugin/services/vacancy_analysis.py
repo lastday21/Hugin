@@ -35,12 +35,14 @@ from hugin.services.vacancy_duties import TechnicalDuty, technical_duty_evidence
 from hugin.services.vacancy_fit import FitAssessment, assess_fit, unsupported_administration
 from hugin.services.vacancy_skills import skill_terms
 
-RULES_VERSION = "python_it_v76"
+RULES_VERSION = "python_it_v78"
 
 _REQUIRED_OFFICE_PATTERN = re.compile(
     r"(?:"
     r"\bформат работы\s*:\s*(?:только\s+)?(?:в\s+)?офис(?:е|ный)?\b|"
-    r"\b(?:только\s+)?работа\s+в\s+офисе\b|"
+    r"\bтолько\s+работа\s+в\s+офисе\b|"
+    r"\bработа\s+в\s+офисе\b"
+    r"(?![^()\n]{0,160}\(\s*возмож\w*[^)]{0,100}удал[её]нн\w*[^)]*\))|"
     r"\bполн\w*\s+(?:рабоч\w*\s+)?день\s+в\s+офисе\b"
     r")"
 )
@@ -924,6 +926,8 @@ class PythonBackendRules:
         )
         profile_tokens = self._profile_skill_tokens(context.skills)
         rejected: list[str] = []
+        if re.search(r"(?<!\w)1[сc](?![a-zа-яё])", " ".join((title, requirements, duties))):
+            rejected.append("вакансии по 1С исключены по прямому решению пользователя")
         _, level_rejection = self._senior_level_outcome(title, requirements, duties, "")
         if level_rejection is not None:
             rejected.append(level_rejection)
@@ -1736,6 +1740,7 @@ class PythonBackendRules:
         )
         corporate_context = re.compile(r"\bкомпани\w*[^.!?;\n]{0,60}\b(?:использу\w*|применя\w*)")
         for clause in re.split(r"[.!?;\n]+", text):
+            clause = re.sub(r"\bбазов\w*\s+чтени\w*\s+[cс]\+\+", "", clause)
             if (
                 not clause
                 or optional_clause.search(clause)

@@ -58,6 +58,10 @@ def test_semantic_profession_replaces_keyword_requirement(title: str) -> None:
         {"availability": VacancyAvailability.CLOSED},
         {"published_at": datetime.now(UTC) - timedelta(days=31)},
         {"description": "Работа без оплаты"},
+        {"title": "Специалист по обеспечению качества (QA инженер 1С)"},
+        {"title": "Аналитик 1C:ERP"},
+        {"responsibilities": "Тестировать конфигурации 1С:Предприятие."},
+        {"required_qualifications": "Обязателен опыт тестирования 1С."},
         {"responsibilities": "Руководить командой разработки и отвечать за найм."},
         {"required_qualifications": "Основной обязательный стек: Java и Spring."},
         {"responsibilities": "Разрабатывать хранимые процедуры на Oracle PL/SQL."},
@@ -76,6 +80,25 @@ def test_semantic_allow_cannot_cancel_independent_constraints(change: dict[str, 
     )
     assert result.category is RuleCategory.REJECTED
     assert result.score == 0
+
+
+def test_one_c_company_context_does_not_exclude_python_work() -> None:
+    result = semantic_evaluation(
+        replace(
+            vacancy(),
+            title="Python backend разработчик",
+            description=(
+                "Компания — партнёр 1С.\nОбязанности:\nРазрабатывать Python API.\n"
+                "Требования:\nPython, FastAPI.\nБудет плюсом:\nЗнакомство с 1С."
+            ),
+        ),
+        RuleContext(),
+        DirectionScope.IT_ADJACENT,
+        SemanticDecision("ALLOW", FitTier.DIRECT, ("Python подтверждён",)),
+        DirectionScope.IT_ADJACENT,
+    )
+
+    assert result.accepted
 
 
 @pytest.mark.parametrize(

@@ -51,6 +51,8 @@ class VacancyDuplicateDetector:
             return "different_employers"
         if not self._compatible_profession(left, right):
             return "different_profession_or_required_language"
+        if self._same_complete_role(left, right):
+            return None
         left_duties = primary_duties(left.description, left.responsibilities)
         right_duties = primary_duties(right.description, right.responsibilities)
         if left_duties and right_duties and self._text_similarity(left_duties, right_duties) < 0.78:
@@ -78,7 +80,11 @@ class VacancyDuplicateDetector:
         title = self._text_similarity(left.title, right.title)
         left_body = primary_duties(left.description, left.responsibilities)
         right_body = primary_duties(right.description, right.responsibilities)
-        body = self._text_similarity(left_body, right_body)
+        body = (
+            1.0
+            if self._same_complete_role(left, right)
+            else self._text_similarity(left_body, right_body)
+        )
         if not self._salary_compatible(left, right):
             return None
         salary = self._salary_similarity(left, right)
@@ -88,6 +94,18 @@ class VacancyDuplicateDetector:
             return None
         combined = title * 0.35 + body * 0.5 + salary * 0.15
         return combined if combined >= 0.82 else None
+
+    @classmethod
+    def _same_complete_role(cls, left: VacancyRecord, right: VacancyRecord) -> bool:
+        # Extracted duties can be absent even when the complete publication is unchanged.
+        description = cls._normalized(left.description)
+        title = cls._normalized(left.title)
+        return bool(
+            description
+            and title
+            and title == cls._normalized(right.title)
+            and description == cls._normalized(right.description)
+        )
 
     @staticmethod
     def _compatible_profession(left: VacancyRecord, right: VacancyRecord) -> bool:

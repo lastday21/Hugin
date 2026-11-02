@@ -95,6 +95,27 @@ def test_renamed_publication_keeps_duplicate_protection() -> None:
     assert VacancyDuplicateDetector().find(vacancy, [other]) is not None
 
 
+def test_same_complete_description_is_not_split_by_missing_extracted_duties() -> None:
+    description = (
+        "Мы создаём сервис подбора персонала. Python, Django и PostgreSQL.\n"
+        "Чем предстоит заниматься?\nПисать тесты\nПисать фичи\nПодключать API\n"
+        "Кого мы ищем?\nНачинающего разработчика. Можно совмещать с учёбой."
+    )
+    previous = replace(
+        _vacancy(),
+        description=description,
+        responsibilities=(
+            "Писать тесты\nПисать фичи\nПодключать API\nКого мы ищем?\nНачинающего разработчика."
+        ),
+    )
+    current = replace(
+        previous, id=2, hh_id="2", description=description.casefold(), responsibilities=None
+    )
+    detector = VacancyDuplicateDetector()
+    assert detector.conflict_reason(current, previous) is None
+    assert detector.find(current, [previous]) is not None
+
+
 def test_optional_foreign_language_does_not_split_real_duplicate() -> None:
     vacancy = replace(_vacancy(), required_qualifications="Требования: Python. Будет плюсом: Java.")
     other = replace(vacancy, id=2, hh_id="2", required_qualifications="Требования: Python.")

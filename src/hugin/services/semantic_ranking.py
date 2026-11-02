@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from hugin.domain.directions import DirectionScope
@@ -30,6 +31,20 @@ def semantic_evaluation(
 ) -> RuleEvaluation:
     rules = PythonBackendRules()
     constraints = independent_constraints(vacancy, context)
+    duties = rules._mandatory_requirements(vacancy) + " " + (vacancy.responsibilities or "")
+    if not vacancy.responsibilities:
+        duties += " " + (vacancy.description or "")
+    if (
+        decision.status == "ALLOW"
+        and re.search(r"ревью|code\s+review|архитектур", duties, re.I)
+        and not re.search(r"найм|наним|увольн|кадров|аттестац|performance\s+review", duties, re.I)
+    ):
+        # Техническое руководство уже сопоставлено подтверждённым действиям кандидата.
+        constraints = tuple(
+            reason
+            for reason in constraints
+            if reason != "роль с управленческими обязанностями, существенно выше текущего опыта"
+        )
     reasons = [*constraints, *decision.reasons]
     components: list[RuleComponent] = []
     for name, score, weight, label in (
